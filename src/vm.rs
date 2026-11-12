@@ -158,6 +158,32 @@ impl InterpMega {
 
 pub(crate) const INTERP_MEGAS: usize = 4096;
 
+/// An entry of [`Vm::typed_lengths`]: typed arrays of `shape` have no own
+/// `length`, and their prototypes reach %TypedArray%.prototype's builtin
+/// getter in `holder` with no slotless `length` before it (no proxy
+/// either), while the prototype epoch is `epoch`. Each prototype on the
+/// way is one (`make_prototype`), so a change to its properties bumps the
+/// epoch; the getter's slot is relied on (`relied_slots`), so redefining
+/// it does too. As `symbol::protector`.
+#[derive(Clone, Copy)]
+struct TypedLength {
+    shape: *const Shape,
+    holder: *mut Object,
+    epoch: u32,
+}
+
+impl TypedLength {
+    const EMPTY: TypedLength = TypedLength { shape: std::ptr::null(), holder: std::ptr::null_mut(), epoch: 0 };
+}
+
+const TYPED_LENGTHS: usize = 16;
+
+#[inline(always)]
+fn typed_length_index(s: *const Shape) -> usize {
+    let a = s as usize;
+    (a >> 6 ^ a >> 12) % TYPED_LENGTHS
+}
+
 /// [`Vm::interp_megas`]' entry for `shape` and `name`.
 #[inline(always)]
 pub(crate) fn interp_mega_index(shape: *const Shape, name: u32) -> usize {
@@ -902,6 +928,14 @@ pub struct Vm {
     /// whose four ways are taken (`interp::poly_get_named`). Cleared when
     /// shapes are freed (their addresses then others').
     pub(crate) interp_megas: Box<[InterpMega]>,
+    /// Typed array shapes whose `length` is %TypedArray%.prototype's
+    /// builtin getter's (see [`TypedLength`]). Cleared when shapes are
+    /// freed, as `interp_megas`.
+    typed_lengths: [TypedLength; TYPED_LENGTHS],
+    /// Some typed array's shape has had an own `length` (a transition
+    /// adding it): compiled code no longer takes a typed array's shape
+    /// made from a known one to have none (`jit::typed_length_known`).
+    pub(crate) typed_length_added: bool,
     /// Prototype slots whose values compiled code folded (`jit::rely_on_slot`):
     /// a store of another value to one bumps `proto_epoch`; to another
     /// prototype slot, nothing (compiled code reads those when it runs).
@@ -1410,6 +1444,8 @@ impl Vm {
             mega_stores: vec![MegaStore::EMPTY; 1 + MEGAS].into_boxed_slice(),
             megamorphic: Default::default(),
             interp_megas: vec![InterpMega::EMPTY; INTERP_MEGAS].into_boxed_slice(),
+            typed_lengths: [TypedLength::EMPTY; TYPED_LENGTHS],
+            typed_length_added: false,
             relied_slots: Default::default(),
             jitted: Vec::new(),
             field_deps: HashMap::default(),
@@ -2119,6 +2155,7 @@ impl Vm {
         self.shapes = keep;
         if !dead.is_empty() {
             self.interp_megas.fill(InterpMega::EMPTY);
+            self.typed_lengths = [TypedLength::EMPTY; TYPED_LENGTHS];
         }
         let ph = &mut self.heap.gc.shape_phases;
         (ph.dead, ph.shapes_left, ph.any) = (dead.len(), self.shapes.len(), true);
@@ -2549,6 +2586,10 @@ impl Vm {
         }
         if name == self.a_sym_has_instance {
             self.has_instance_defined = true;
+        }
+        if name == self.a_length && s.class == Class::TypedArray && !self.typed_length_added {
+            self.typed_length_added = true;
+            self.bump_code_epoch();
         }
         // A dictionary shape gets the property in place.
         if s.dictionary {
@@ -3277,7 +3318,7 @@ impl Vm {
             return;
         }
         let Some((h, slot)) = self.lookup(o, name) else { return };
-        if self.is_accessor(h, slot) || self.virtual_before(o, h, name).is_some() {
+        if self.is_accessor(h, slot) || name == self.a_name && self.virtual_before(o, h, name).is_some() {
             return;
         }
         let shape = unsafe { (*o).shape } as u64;
@@ -3406,16 +3447,13 @@ impl Vm {
             {
                 return Ok(Value::number(self.length_field(o) as f64));
             }
+            if name == self.a_length || name == self.a_name {
+                return self.get_slotless(o, obj, name);
+            }
             if self.typed_numeric(o, name) {
                 return Ok(Value::UNDEFINED);
             }
-            let found = self.lookup(o, name);
-            if let Some((h, _)) = found
-                && let Some(v) = self.virtual_before(o, h, name)
-            {
-                return Ok(v);
-            }
-            Ok(match found {
+            Ok(match self.lookup(o, name) {
                 Some((h, slot)) if self.is_accessor(h, slot) => {
                     let pair = *Object::slot(h, (*(*h).shape).location(slot));
                     return self.call_getter(pair, obj);
@@ -3423,6 +3461,33 @@ impl Vm {
                 Some((h, slot)) => *Object::slot(h, (*(*h).shape).location(slot)),
                 None => return Ok(self.virtual_get(o, name)),
             })
+        }
+    }
+
+    /// [`Vm::get`] of a `length` or `name` (not an array's or a string's
+    /// `length`), out of line: a typed array's by the builtin getter
+    /// (`known_typed_length`), a slotless one nearer than a slot
+    /// (`virtual_before`).
+    #[inline(never)]
+    fn get_slotless(&mut self, o: *mut Object, obj: Value, name: Atom) -> Result<Value> {
+        unsafe {
+            if name == self.a_length && (*o).class == Class::TypedArray && self.known_typed_length(o).is_some() {
+                return Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64));
+            }
+            let found = self.lookup(o, name);
+            if let Some((h, _)) = found
+                && let Some(v) = self.virtual_before(o, h, name)
+            {
+                return Ok(v);
+            }
+            match found {
+                Some((h, slot)) if self.is_accessor(h, slot) => {
+                    let pair = *Object::slot(h, (*(*h).shape).location(slot));
+                    self.call_getter(pair, obj)
+                }
+                Some((h, slot)) => Ok(*Object::slot(h, (*(*h).shape).location(slot))),
+                None => Ok(self.virtual_get(o, name)),
+            }
         }
     }
 
@@ -3452,10 +3517,16 @@ impl Vm {
     /// or of a prototype nearer than `holder`, where `lookup` found `name`
     /// in a slot: it shadows that slot (an array with a prototype that has
     /// a `length`, say).
+    #[inline(always)]
     pub(crate) fn virtual_before(&mut self, o: *mut Object, holder: *mut Object, name: Atom) -> Option<Value> {
         if holder == o || name != self.a_length && name != self.a_name {
             return None;
         }
+        self.virtual_between(o, holder, name)
+    }
+
+    #[inline(never)]
+    fn virtual_between(&mut self, o: *mut Object, holder: *mut Object, name: Atom) -> Option<Value> {
         let mut p = o;
         while p != holder {
             if let Some(v) = self.virtual_own(p, name) {
@@ -3468,6 +3539,46 @@ impl Vm {
             p = as_object(proto);
         }
         None
+    }
+
+    /// The prototype holding the builtin `length` getter typed array `o`
+    /// reaches, if [`Vm::typed_lengths`] knows its shape does.
+    #[inline(always)]
+    pub(crate) fn known_typed_length(&self, o: *mut Object) -> Option<*mut Object> {
+        let s = unsafe { (*o).shape };
+        let e = self.typed_lengths[typed_length_index(s)];
+        (e.shape == s && e.epoch == self.proto_epoch && !s.is_null()).then_some(e.holder)
+    }
+
+    /// Typed array `o`'s `length` found to be the builtin getter in
+    /// prototype `holder`'s slot `at` (no proxy on the way, no slotless
+    /// `length` before it): known for its shape (see [`TypedLength`]).
+    #[cold]
+    #[inline(never)]
+    fn note_typed_length(&mut self, o: *mut Object, holder: *mut Object, at: *mut Value) {
+        unsafe {
+            if (*(*o).shape).dictionary {
+                return;
+            }
+            let mut p = o;
+            while p != holder {
+                let proto = (*(*p).shape).proto;
+                if !proto.is_cell() {
+                    return;
+                }
+                p = as_object(proto);
+                self.make_prototype(p);
+            }
+            // (Made prototypes may have new shapes: the slot again.)
+            let Some((h, slot)) = self.lookup(o, self.a_length) else { return };
+            let at2 = Object::slot(h, (*(*h).shape).location(slot));
+            if h != holder || at2 != at {
+                return;
+            }
+            self.relied_slots.insert(at as usize);
+            let s = (*o).shape;
+            self.typed_lengths[typed_length_index(s)] = TypedLength { shape: s, holder, epoch: self.proto_epoch };
+        }
     }
 
     /// `o`'s own slotless `length` or `name` (see `virtual_get`).
@@ -3840,6 +3951,11 @@ impl Vm {
                 };
                 return Ok(Value::number(self.length_field(o) as f64));
             }
+            if (name == self.a_length || name == self.a_name)
+                && let Some(r) = self.named_miss_slotless(ic, o, name)
+            {
+                return r;
+            }
             // Absent: cached as a load from `missing_holder`'s `undefined`
             // slot, valid (like a prototype's property) while no prototype
             // changes shape.
@@ -3864,10 +3980,6 @@ impl Vm {
                 }
                 return Ok(Value::UNDEFINED);
             };
-            // (A nearer slotless `length` or `name`: not cached.)
-            if let Some(v) = self.virtual_before(o, h, name) {
-                return Ok(v);
-            }
             let loc = (*(*h).shape).location(slot);
             // A getter's: called, never cached (noted for the JIT).
             if self.is_accessor(h, slot) {
@@ -3875,13 +3987,7 @@ impl Vm {
                     self.heap.note(object_value(h));
                     note_accessor(ic, (*o).shape, h, self.proto_epoch);
                 }
-                let pair = *Object::slot(h, loc);
-                // (A typed array's `length` by %TypedArray%.prototype's
-                // getter: what it would return, without the call.)
-                if (*o).class == Class::TypedArray && crate::typed::is_length_getter(*(*as_object(pair)).elems) {
-                    return Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64));
-                }
-                return self.call_getter(pair, obj);
+                return self.call_getter(*Object::slot(h, loc), obj);
             }
             self.heap.note(object_value(h));
             let e = Ic {
@@ -3901,6 +4007,45 @@ impl Vm {
                 }
             }
             Ok(*Object::slot(h, loc))
+        }
+    }
+
+    /// [`Vm::get_named_miss`] of a `length` or `name` (not an array's or
+    /// a string's `length`), out of line, where it isn't as for another
+    /// name: a typed array's `length` by the builtin getter (noted for the
+    /// JIT, and known for its shape: `note_typed_length`), a slotless one
+    /// nearer than a slot (`virtual_before`; not cached). `None` for the
+    /// rest.
+    #[inline(never)]
+    fn named_miss_slotless(&mut self, ic: *mut Ic, o: *mut Object, name: Atom) -> Option<Result<Value>> {
+        unsafe {
+            let typed = name == self.a_length && (*o).class == Class::TypedArray;
+            if typed && let Some(h) = self.known_typed_length(o) {
+                // (Not over a site's arrays' `length`: the interpreter's
+                // and the JIT's `get_length` take both.)
+                let w = &*ic;
+                if w.loc != LENGTH_LOC
+                    && !(w.loc == ACCESSOR_LOC && w.holder == h && w.new_shape == (*o).shape && w.epoch == self.proto_epoch)
+                {
+                    self.heap.note(object_value(h));
+                    note_accessor(ic, (*o).shape, h, self.proto_epoch);
+                }
+                return Some(Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64)));
+            }
+            let (h, slot) = self.lookup(o, name)?;
+            if let Some(v) = self.virtual_before(o, h, name) {
+                return Some(Ok(v));
+            }
+            if typed && h != o && self.is_accessor(h, slot) {
+                let at = Object::slot(h, (*(*h).shape).location(slot));
+                if crate::typed::is_length_getter(*(*as_object(*at)).elems) {
+                    self.heap.note(object_value(h));
+                    note_accessor(ic, (*o).shape, h, self.proto_epoch);
+                    self.note_typed_length(o, h, at);
+                    return Some(Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64)));
+                }
+            }
+            None
         }
     }
 

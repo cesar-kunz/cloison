@@ -16533,6 +16533,11 @@ impl Lowering<'_> {
             let mut p = (*shape).proto;
             while p.is_cell() {
                 let o = crate::object::as_object(p);
+                // (A slotless `length` or `name` nearer: see
+                // `Vm::virtual_before`.)
+                if (*self.state.vm).virtual_own(o, name).is_some() {
+                    return None;
+                }
                 let s = &*(*o).shape;
                 if let Some(slot) = s.lookup(name) {
                     if s.attrs()[slot as usize] & crate::object::ACCESSOR != 0 {

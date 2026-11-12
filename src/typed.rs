@@ -905,6 +905,18 @@ fn typed_length_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(Value::number(this_typed_seq_cst(vm, this)?.1.unwrap_or(0) as f64))
 }
 
+/// Whether `v` is `get %TypedArray%.prototype.length` (any realm's): for a
+/// typed array receiver, its length (0 if detached or out of bounds).
+pub(crate) fn is_length_getter(v: Value) -> bool {
+    v.is_cell()
+        && unsafe {
+            let o = as_object(v);
+            (*o).class == Class::Native
+                && !(*o).code.is_null()
+                && (*(*o).code).native.is_some_and(|g| g as usize == (typed_length_getter as NativeFn) as usize)
+        }
+}
+
 /// `get %TypedArray%.prototype[Symbol.toStringTag]`: the kind's name.
 pub(crate) fn typed_to_string_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if !is_class(this, Class::TypedArray) {

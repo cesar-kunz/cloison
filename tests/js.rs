@@ -9278,6 +9278,40 @@ out.join(" | ");"##;
     assert_eq!(value(src), "4:0,1,P,3 | 4:0,1,P,3 |  | true | 2,4,6 | 4,5,6 | 0,1,2 | false | 4 | 5004 | 0,1,2,3");
 }
 
+/// An indexed restriction on an unrelated object cannot affect any other
+/// receiver's stores. Once such an object becomes a prototype, its existing
+/// indexed properties must still protect those stores (#240).
+#[test]
+fn indexed_store_protector_is_scoped_to_prototypes() {
+    let src = r#"
+Object.freeze([1]);
+function fill(n) { var a = [], s = 0; for (var i = 0; i < n; i++) { a[i] = i; s += a[i]; } return s; }
+var out = 0;
+for (var k = 0; k < 100; k++) out += fill(100);
+out;
+"#;
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(20);
+    assert_eq!(display(vm.run(&m).unwrap()), "495000");
+    let st = vm.jit_stats("<script>").expect("script compiled");
+    let stencils = vm.jit_stencils("<script>").unwrap();
+    assert!(stencils.iter().any(|s| s.starts_with("set_keyed_")), "{stencils:?}");
+    assert!(st.exits <= 1, "{st:?}");
+
+    assert_eq!(
+        value(
+            r#"
+var p = Object.freeze([1]);
+function C() {} C.prototype = p;
+var o = new C(); o[0] = 7;
+[o[0], o.hasOwnProperty(0)].join();
+"#,
+        ),
+        "1,false",
+    );
+}
+
 /// An arrow function's own `"use strict"` makes it strict.
 #[test]
 fn arrow_functions_take_use_strict() {

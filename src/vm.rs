@@ -925,8 +925,8 @@ pub struct Vm {
     /// (`field_generalized`): stores through the runtime check it, as one
     /// may have invalidated what the code storing assumes.
     pub(crate) code_epoch: u32,
-    /// Some object has had an indexed accessor or a read-only element, or
-    /// a proxy became a prototype (see `protect_indices`).
+    /// Some prototype has an indexed accessor or a read-only element, or is
+    /// a proxy (see `protect_indices`).
     pub(crate) indices_protected: bool,
     /// When arrays go far, and back (see `far::Density`).
     pub(crate) density: crate::far::Density,
@@ -2635,6 +2635,8 @@ impl Vm {
                 self.protect_indices();
                 self.to_primitive_defined = true;
                 self.has_instance_defined = true;
+            } else {
+                self.protect_prototype_indices(o);
             }
             let s = &*(*o).shape;
             // The object leaves `s` (for a copy of its own).

@@ -17982,3 +17982,37 @@ out.join(' ;; ')
         r#"10:["zz%2a%3fq"]:0 ;; 10:["zz%2a%3fq"]:0 ;; 23:["c%7e"]:0 ;; 23:["c%7e"]:0 ;; 0:["aaa\nab%41\nzz%2a%3fq\r\nb c%7e"]:0 ;; 21:["b"]:0 ;; 0:["x"]:0 ;; 10:["zz%2a%3fq"]:0 ;; 10:["zz%","z"]:0 ;; 4:["ab%"]:0 ;; 4:["ab%41","%41"]:0 ;; 4419|103f18|237e27 ;; 4:["ab"]:6 ;; null:0 ;; 12:["%2a"]:15 ;; null:0 ;; 3:["😀"]:0 ;; 3:["😀x"]:0 ;; 0:["a😀"]:0 ;; "aaa\n<41>\n<3f>q\r\nb <7e>" ;; 2 ;; ["c"] ;; null:0 ;; 2:["aa\nb"]:0 ;; 2:["aa"]:0"#
     );
 }
+
+/// Slices made through `trim`, a String object's methods and slices of
+/// slices are read by the operations that copy units a word at a time
+/// past their end (concatenation, `split`, `JSON`, spreading), and `.*`'s
+/// skip after a failed attempt starts the next one at a code point: in `u`
+/// mode, past a line terminator, a surrogate pair is one unit of `.`/`[^a]`
+/// (ECMA-262 22.2.2: the input is a list of code points). Expected values
+/// from V8, SpiderMonkey, JavaScriptCore and QuickJS.
+#[test]
+fn slices_from_trim_and_string_objects_and_dot_star_in_u_mode() {
+    let src = r#"
+var out = [];
+var big = 'x'.repeat(5000) + 'abc' + 'y'.repeat(5000);
+out.push(String.prototype.substring.call(new String(big), 10, 3000).length);
+var t = '  ' + 'z'.repeat(9000) + '  '; t.charCodeAt(0);
+out.push(t.trim().length, t.trimStart().length, t.trimEnd().length);
+var u = big.slice(4000), parts = [];
+for (var i = 0; i < 50; i++) { u = u.slice(10); parts.push(u + 'q'); }
+out.push(parts[49].length, parts[49].charCodeAt(parts[49].length - 1), u.indexOf('abc'), u.lastIndexOf('abc'));
+out.push(big.slice(4999, 6100).split('abc').map(function (x) { return x.length; }).join('/'));
+var sl = big.slice(100, 4000), c = sl + sl;
+out.push(c.length, c.slice(3800, 5000) === 'x'.repeat(1200), JSON.parse(JSON.stringify(big.slice(2000, 4000))) === 'x'.repeat(2000));
+out.push([...big.slice(4000, 6000)].join('') === big.slice(4000, 6000), Symbol.for(big.slice(2, 1100)) === Symbol.for('x'.repeat(1098)));
+var s = '1\ud83d%x\n 😀b\ude00\n ';
+var m = /.*[^a]b/mu.exec(s); out.push(m.index, escape(m[0]));
+m = /.*[^a]b/u.exec(' 😀b'); out.push(m.index, escape(m[0]));
+m = /.*[^a]b/.exec(' 😀b'); out.push(m.index, escape(m[0]));
+out.join()
+"#;
+    assert_eq!(
+        value(src),
+        r#"2990,9000,9002,9002,5504,113,500,500,1/1097,7800,true,true,true,true,6,%uD83D%uDE00b,1,%uD83D%uDE00b,1,%uD83D%uDE00b"#
+    );
+}

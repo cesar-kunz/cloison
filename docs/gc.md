@@ -327,7 +327,7 @@ Every cell says how big it is from its first words (`heap::cell_size`):
 
 | kind | first word | size from | references |
 |---|---|---|---|
-| object | its shape's address (8-aligned) | `inline_cap` (header bytes 10–11) and its class's words after the header (`layout::extra_words`: `code`, `aux`), plus a flat string's units words (in `code`) or a function's upvalue count | inline slots; `props` and `elems` (arrays' payloads); a function's upvalues; a typed array's `code` (its buffer) and a cons string's `props` and `code` (its halves) |
+| object | its shape's address (8-aligned) | `inline_cap` (header bytes 10–11) and its class's words after the header (`layout::extra_words`: `code`, `aux`), plus a flat string's units words (in `code`) or a function's upvalue count | inline slots; `props` and `elems` (arrays' payloads); a function's upvalues; a typed array's `code` (its buffer), a cons string's `props` and `code` (its halves) and a slice's `props` (its parent: its `elems` points into the parent's units, in a large cell, and is not followed) |
 | array of values | `VALUES \| capacity << 32` | its header | its values |
 | byte buffer | `BYTES \| length << 32` | its header | none |
 | upvalue | `UPVALUE` | fixed, 32 bytes | `closed` |

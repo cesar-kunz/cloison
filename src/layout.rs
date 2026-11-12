@@ -48,7 +48,10 @@ pub enum Class {
     /// points to them and `elems_len` is the length (as arrays', so
     /// `length` reads the same field). `code` holds the units' words (and
     /// the string's atom, once found: `object::Object::string_atom`); a
-    /// cons string's (`elems` null) are its halves, `props` and `code`.
+    /// cons string's (`elems` null) are its halves, `props` and `code`. A
+    /// slice (`Vm::slice_string`) has no units of its own: its `elems`
+    /// points into its parent's, in a large cell, and `props` holds that
+    /// parent (null in any other flat string).
     String,
     /// A `Date`: its time value (milliseconds since the epoch, an `f64`) is
     /// kept in `code`'s bits (see `vm::date_value`).

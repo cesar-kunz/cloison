@@ -5242,9 +5242,9 @@ macro_rules! keyed_load {
 /// array's once some view is of a growable shared buffer or longer than
 /// `i32::MAX` (the bit is `RUNTIME_LENGTH` there: its length is read
 /// from the block by the runtime, or is no int32, and the class check
-/// exits on it too); `_nt` takes no typed array (whose length may be
-/// stale once a fixed-length buffer has been detached: see
-/// `Vm::views_detached`).
+/// exits on it too); `_rt` leaves a typed array's to the runtime (its
+/// `length` may be shadowed: compiled code reads it only where the
+/// receiver's type shows it isn't, see `jit::typed_length_known`).
 macro_rules! array_length {
     ($loc:tt) => {
         // target x86_64 get_length_g{}: 11 now 12 `lea; test; jnz`, `movzx eax, word [rdi+8]; and eax, 0x80ff; cmp eax, 7; ja exit; mov ebx, 0x92; bt ebx, eax; jnc exit; mov r12d, [rdi+12]` (judged 2026-10-26)
@@ -5257,6 +5257,28 @@ macro_rules! array_length {
                 exit!(s)
             }
             s.acc = unboxed((*cell(o)).elems_len as i32);
+            next!(s)
+        });
+        // An array's or a string's length, after a check that it is one,
+        // the rest (a typed array's, whose `length` may be shadowed)
+        // through the runtime, out of line: an int32 it returns unboxed,
+        // anything else an exit.
+        // target x86_64 get_length_rt_g{}: 10 `lea; test; jnz`, `movzx eax, word [rdi+8]; and eax, 0x80ff; cmp; ja; mov; bt; jnc slow; mov r12d, [rdi+12]`; the call in `__slow` (judged 2026-11-13)
+        // target x86_64 get_length_rt_m: 11 as `_g{}` after `mov rax, [r13+k]` (judged 2026-11-13)
+        stencil_slow!("get_length_rt_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if !is_cell_g(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING) {
+                slow!(s)
+            }
+            s.acc = unboxed((*cell(o)).elems_len as i32);
+            next!(s)
+        }; |s| {
+            let r = rt_call!(s, cloison_rt_get_named, get!($loc, s), Value::from_bits(imm64()));
+            let v = Value::from_bits(r);
+            if r == 0 || !s.tag.is_int32(v) {
+                exit!(s)
+            }
+            s.acc = unboxed(int(v));
             next!(s)
         });
         // target x86_64 get_length_nc_g{}: 1 `mov r12d, [rsi+12]` (docs/opcode-targets.md, group 2)

@@ -4036,6 +4036,59 @@ fn identity_ty(t: Ty) -> bool {
     })
 }
 
+/// Whether a value of type `t` is a typed array whose `length` is
+/// %TypedArray%.prototype's builtin getter's under this prototype epoch
+/// (which the compiled code is for), its slot relied on: its shape (or,
+/// `Ty::Ext`, one made from it, while none has left it: its prototype
+/// the same) has no `length`, no typed array's has ever had one
+/// (`Vm::typed_length_added`), and the prototypes reach the getter with no
+/// slotless `length` or proxy before it.
+fn typed_length_known(t: Ty) -> bool {
+    use crate::object::{ACCESSOR, Class, PROTOTYPE, as_object};
+    let Some(s) = t.shape() else { return false };
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    let shape = unsafe { &*(s as *const Shape) };
+    if shape.class != Class::TypedArray || vm.typed_length_added || shape.dictionary {
+        return false;
+    }
+    let name = vm.a_length;
+    if shape.lookup(name).is_some() {
+        return false;
+    }
+    let mut p = shape.proto;
+    let at = loop {
+        if !p.is_cell() {
+            return false;
+        }
+        let o = as_object(p);
+        unsafe {
+            if (*o).flags & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, o) || vm.virtual_own(o, name).is_some() {
+                return false;
+            }
+            let ps = &*(*o).shape;
+            if let Some(k) = ps.lookup(name) {
+                if ps.attrs()[k as usize] & ACCESSOR == 0 {
+                    return false;
+                }
+                let at = Object::slot(o, ps.location(k));
+                if !crate::typed::is_length_getter(*(*as_object(*at)).elems) {
+                    return false;
+                }
+                break at;
+            }
+            p = ps.proto;
+        }
+    };
+    if let Ty::Ext(_) = t {
+        if shape.left.get() {
+            return false;
+        }
+        shape.lineage_relied.set(true);
+    }
+    rely_on_slot(at as u64);
+    true
+}
+
 /// Whether a value of type `t` is never null or undefined.
 fn never_nullish(t: Ty) -> bool {
     matches!(t, Ty::I32 | Ty::F64 | Ty::Obj(_) | Ty::Ext(_))
@@ -4064,7 +4117,20 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 | Op::LdaConstant
         )
         && spec.acc_live.get(i + 1) == Some(&false);
-    if dead || insn.check_only && matches!(insn.op, Op::Star | Op::Ldar) {
+    // The check before a typed array's `length` (`Prop::TypedLength`)
+    // where the receiver's type shows what it would (`typed_length_known`).
+    let reg = st.regs.get(insn.reg as usize).copied().unwrap_or(Ty::Any);
+    if insn.check_only
+        && insn.op == Op::GetNamed
+        && spec.props.get(i + 1) == Some(&Prop::TypedLength)
+        && typed_length_known(reg)
+    {
+        sel.base = "nop";
+        sel.case = "";
+        sel.post = None;
+        sel.ops = None;
+        sel.out.regs.set(insn.reg as usize, reg);
+    } else if dead || insn.check_only && matches!(insn.op, Op::Star | Op::Ldar) {
         sel.base = "nop";
         sel.case = "";
     } else if insn.check_only && sel.base.starts_with("get_") {
@@ -5744,7 +5810,18 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         if prop == Prop::Length {
             use crate::object::Class;
             let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
-            if !matches!(class, Some(Class::Array | Class::String)) {
+            if class == Some(Class::TypedArray) && typed_length_known(reg) {
+                out.acc = I32;
+                let case = if spec.views_detached {
+                    "td"
+                } else if spec.checked_length_views {
+                    "na"
+                } else {
+                    "nc"
+                };
+                return Sel::new("get_length", case, out);
+            }
+            if class == Some(Class::TypedArray) {
                 let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
                 out.acc = Any;
                 return Sel {
@@ -5753,9 +5830,20 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 };
             }
             out.acc = I32;
-            // (A known array may have gone far in a call.)
-            let case = if class == Some(Class::Array) { "na" } else { "nc" };
-            return Sel::new("get_length", case, out);
+            return match class {
+                // (A known array may have gone far in a call.)
+                Some(Class::Array) => Sel::new("get_length", "na", out),
+                Some(Class::String) => Sel::new("get_length", "nc", out),
+                // A typed array's (a site that met arrays and typed
+                // arrays) through the runtime.
+                _ => {
+                    let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
+                    Sel {
+                        ops: Some((name as i32, name, 0)),
+                        ..Sel::new("get_length", "rt", out)
+                    }
+                }
+            };
         }
         // A known shape with the property. Not for a load from a
         // prototype's slot as cached (all its cases, if several): lowering
@@ -7364,6 +7452,7 @@ fn stencil_for(
         }
         ("get_length", _) if sel.case == "td" => cat!(sel.base, "_td_", loc),
         ("get_length", _) if sel.case == "d" => cat!(sel.base, "_d_", loc),
+        ("get_length", _) if sel.case == "rt" => cat!(sel.base, "_rt_", loc),
         ("get_length", _) if sel.case == "na" => cat!(sel.base, "_na_", loc),
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) => cat!(sel.base, "_", loc),
         // Stores take a boxed `acc`; a number's (`_n`) needs no barrier,

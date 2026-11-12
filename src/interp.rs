@@ -1713,10 +1713,34 @@ handlers! {
                 break;
             }
         }
+        // A typed array's `length` where its shape is known to reach the
+        // builtin getter (`Vm::known_typed_length`; not one whose length
+        // the runtime reads, `RUNTIME_LENGTH`), at a site that met arrays
+        // or it.
+        let l = (*ic).loc;
+        if (l == LENGTH_LOC || l == crate::vm::ACCESSOR_LOC) && (*o).class == Class::TypedArray {
+            tail!(typed_get_length, acc)
+        }
         // Megamorphic: see `mega_get_named` (out of line, for the hit
         // paths above to stay as they were).
         if !(*ic.add(IC_WAYS - 1)).shape.is_null() {
             tail!(mega_get_named, acc)
+        }
+        tail!(slow_get_named, acc)
+    }
+
+    // `poly_get_named`'s typed array `length`, out of line.
+    #[inline(never)]
+    fn typed_get_length(pc, acc, regs, tag) {
+        let o = as_object(*reg(pc, 1, regs));
+        let vm = &*frame_vm(regs);
+        if (*o).flags & crate::object::RUNTIME_LENGTH == 0
+            && vm.known_typed_length(o).is_some()
+            && ((*ic_at(regs, pc, 2)).loc == LENGTH_LOC
+                || *(&(*frame_code(regs)).ic_names).get_unchecked(index_at(pc, 2) as usize) == vm.a_length)
+        {
+            let n = crate::typed::ta_length(o).unwrap_or(0);
+            next!(any, Op::GetNamed.size(), Value::from_i32(n as i32))
         }
         tail!(slow_get_named, acc)
     }

@@ -1322,11 +1322,11 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         return object_value(o);
     }
     // A strict function's: the shape and immutable `callee` accessor of
-    // the first one. Its other slots stay independent: the first object
-    // is visible to user code, which may change its `length` or iterator.
-    if vm.strict_arguments.is_cell() {
+    // the first one. Its other slots are stored anew: the first object
+    // is visible to user code, which may change its `length` or
+    // iterator, or delete them (its slots then moved).
+    if vm.strict_arguments_callee.is_cell() {
         unsafe {
-            let t = as_object(vm.strict_arguments);
             let s = vm.strict_arguments_shape;
             crate::object::mark_shape(s);
             let o = vm.heap.alloc_object(&*s);
@@ -1334,8 +1334,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
             let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
             vm.store_field(o, 1, values_fn.map_or(Value::UNDEFINED, object_value));
             vm.store_field(o, 2, Value::TRUE);
-            let callee = *Object::slot(t, (*s).location(3));
-            vm.store_field(o, 3, callee);
+            vm.store_field(o, 3, vm.strict_arguments_callee);
             if !values.is_empty() {
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
@@ -1371,10 +1370,11 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
     for (i, &v) in values.iter().enumerate() {
         let _ = vm.create_data_property(ov, crate::vm::Key::Index(i as u32), v);
     }
-    // The first strict one is the template of the next ones (its elements
-    // kept alive with it, which nothing reads). Its own shape is unique,
-    // `callee` defined on it: the next ones get one of transitions, with
-    // the same keys and attributes, shared.
+    // The first strict one gives the next ones its `callee` accessor pair
+    // (kept, not the object: user code may delete its other properties,
+    // which moves its slots). Its own shape is unique, `callee` defined
+    // on it: the next ones get one of transitions, with the same keys and
+    // attributes, shared.
     unsafe {
         let t = &*(*o).shape;
         if !t.dictionary && t.keys() == [a_length, a_iter, mark, a_callee] {
@@ -1383,11 +1383,11 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
                 s = vm.transition_with(s, t.keys()[k], t.attrs()[k]);
             }
             let e = vm.elements_transition(s, crate::object::FieldType::Any);
-            // (Both realm fields: the template a root, the shape kept by
+            // (Both realm fields: the pair a root, the shape kept by
             // `Vm::fixed_shapes`.)
             if (0..4).all(|k| (*e).location(k) == t.location(k)) {
                 vm.strict_arguments_shape = e;
-                vm.strict_arguments = ov;
+                vm.strict_arguments_callee = *Object::slot(o, t.location(3));
             }
         }
     }

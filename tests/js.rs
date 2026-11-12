@@ -6923,6 +6923,27 @@ for (var run = 0; run < 20; run++) total += hot(30);
     assert_eq!(vm.jit_bound_direct_calls("hot"), 0);
 }
 
+/// A function whose prologue exits compiled code (a rest parameter, its
+/// own name, `new.target`) is not entered at its calls, which would leave
+/// at once; its loop still tiers up.
+#[test]
+fn prologue_exits_do_not_enter_calls() {
+    let src = "function rest(a, ...xs) { var s = 0; for (var i = 0; i < 30; i++) s += a; return s + xs.length; }
+var self_ = function me(a) { var s = 0; for (var i = 0; i < 30; i++) s += a; return me === self_ ? s : -1; };
+function C(a) { var s = 0; for (var i = 0; i < 30; i++) s += a; this.s = new.target === C ? s : -1; }
+var t = 0;
+for (var k = 0; k < 2000; k++) t += rest(1, 2, 3) + self_(1) + new C(1).s;
+t;";
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(2);
+    assert_eq!(display(vm.run(&m).unwrap()), (2000 * 92).to_string());
+    for function in ["rest", "me", "C"] {
+        let st = vm.jit_stats(function).expect("compiled at its loop");
+        assert!(st.osr_entries >= 1 && st.exits < 10, "{function}: {st:?}");
+    }
+}
+
 /// A mapped `arguments` aliases its frame's parameter registers: code
 /// tiering up at a loop after it would keep its own copies of them.
 #[test]

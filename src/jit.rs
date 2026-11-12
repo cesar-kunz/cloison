@@ -3018,11 +3018,11 @@ impl Feedback {
             return Prop::Length;
         }
         if matches!(insn.op, Op::GetKeyed | Op::SetKeyed) && ic.loc == crate::vm::BYTES_LOC {
-            // (A typed array's length may be stale once a fixed-length
-            // buffer has been detached: see `Vm::views_detached`.)
-            let views_detached = unsafe { (*crate::interp::current_vm()).views_detached };
+            // (Once a fixed-length buffer has been detached, a view's
+            // length may be stale: the stencils check its buffer then, see
+            // `Spec::views_detached`.)
             return match ic.epoch {
-                k @ 1..=9 if !views_detached => Prop::Typed { kind: k as u8 - 1 },
+                k @ 1..=9 => Prop::Typed { kind: k as u8 - 1 },
                 _ if insn.op == Op::SetKeyed => Prop::None,
                 _ => Prop::Runtime,
             };
@@ -3886,7 +3886,9 @@ struct Spec<'a> {
     /// A prototype's indices are protected (see `Vm::protect_indices`):
     /// element stores through the interpreter.
     indices_protected: bool,
-    /// A fixed-length buffer has been detached (see `Vm::views_detached`):
+    /// A fixed-length buffer has been detached, or one made immutable (see
+    /// `Vm::views_detached`): typed array elements through the stencils
+    /// checking the view's buffer (`tget_*_d*`, `tset_*_d*`),
     /// a typed array's `length` through the runtime.
     views_detached: bool,
     /// Some view tracks a growable shared buffer's length or is longer
@@ -5042,9 +5044,15 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         {
             let case = typed_store(Some(kind), st.acc == I32).unwrap();
             let known = reg.shape().and_then(typed_kind) == Some(kind);
+            let case = match (known, spec.views_detached) {
+                (true, false) => case,
+                (false, false) => typed_checked(case),
+                (true, true) => typed_detached(case, false),
+                (false, true) => typed_detached(case, true),
+            };
             return Sel {
                 ops: Some((typed_class_kind(kind), 0, 0)),
-                ..Sel::new("tset", if known { case } else { typed_checked(case) }, out)
+                ..Sel::new("tset", case, out)
             };
         }
         // `o[k] = acc` (see `set_keyed` in the stencils): no checks of a
@@ -5137,11 +5145,25 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     "i8_fkchk", "u8_fkchk", "u8_fkchk", "i16_fkchk", "u16_fkchk", "i32_fkchk", "u32f_fkchk", "f32_fkchk",
                     "f64_fkchk",
                 ];
-                let case = match (fk, known) {
-                    (false, true) => w,
-                    (false, false) => CHECKED[kind as usize],
-                    (true, true) => KNOWN_FK[kind as usize],
-                    (true, false) => CHECKED_FK[kind as usize],
+                const KNOWN_D: [&str; 9] = ["i8_d", "u8_d", "u8_d", "i16_d", "u16_d", "i32_d", "u32f_d", "f32_d", "f64_d"];
+                const CHECKED_D: [&str; 9] =
+                    ["i8_dchk", "u8_dchk", "u8_dchk", "i16_dchk", "u16_dchk", "i32_dchk", "u32f_dchk", "f32_dchk", "f64_dchk"];
+                const KNOWN_FKD: [&str; 9] =
+                    ["i8_fkd", "u8_fkd", "u8_fkd", "i16_fkd", "u16_fkd", "i32_fkd", "u32f_fkd", "f32_fkd", "f64_fkd"];
+                const CHECKED_FKD: [&str; 9] = [
+                    "i8_fkdchk", "u8_fkdchk", "u8_fkdchk", "i16_fkdchk", "u16_fkdchk", "i32_fkdchk", "u32f_fkdchk",
+                    "f32_fkdchk", "f64_fkdchk",
+                ];
+                let k = kind as usize;
+                let case = match (fk, known, spec.views_detached) {
+                    (false, true, false) => w,
+                    (false, false, false) => CHECKED[k],
+                    (true, true, false) => KNOWN_FK[k],
+                    (true, false, false) => CHECKED_FK[k],
+                    (false, true, true) => KNOWN_D[k],
+                    (false, false, true) => CHECKED_D[k],
+                    (true, true, true) => KNOWN_FKD[k],
+                    (true, false, true) => CHECKED_FKD[k],
                 };
                 out.acc = ty;
                 return Sel {
@@ -5503,6 +5525,21 @@ fn typed_checked(case: &str) -> &'static str {
     }
 }
 
+/// The variant of a `tset_*` case checking the view's buffer (`_d`), and
+/// its class and kind too (`_dchk`): see `Spec::views_detached`.
+fn typed_detached(case: &str, checked: bool) -> &'static str {
+    const CASES: [&str; 11] =
+        ["b8_i", "b8_f", "c8_i", "b16_i", "b16_f", "b32_i", "b32_f", "f32_i", "f32_f", "f64_i", "f64_f"];
+    const D: [&str; 11] =
+        ["b8_i_d", "b8_f_d", "c8_i_d", "b16_i_d", "b16_f_d", "b32_i_d", "b32_f_d", "f32_i_d", "f32_f_d", "f64_i_d", "f64_f_d"];
+    const DCHK: [&str; 11] = [
+        "b8_i_dchk", "b8_f_dchk", "c8_i_dchk", "b16_i_dchk", "b16_f_dchk", "b32_i_dchk", "b32_f_dchk", "f32_i_dchk",
+        "f32_f_dchk", "f64_i_dchk", "f64_f_dchk",
+    ];
+    let k = CASES.iter().position(|&c| c == case).unwrap();
+    if checked { DCHK[k] } else { D[k] }
+}
+
 /// Whether shape `s` extends shape `b`: same class, prototype and
 /// capacity, and `b`'s properties first, where `b` has them, as a shape
 /// reached from `b` by adding properties or generalizing its elements has.
@@ -5678,19 +5715,15 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         // An array's or string's length: no check if the receiver's shape
         // is one's. Once a typed array's may be stale (`views_detached`),
-        // a typed array's through the runtime, and the check takes arrays
-        // and strings only (`nt`). (The general check exits on a view's
+        // a typed array's is checked against its buffer's (`td` of a known
+        // one, `d` of any). (The general check exits on a view's
         // `RUNTIME_LENGTH`, with the class.)
         if prop == Prop::Length {
             use crate::object::Class;
             let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
             if spec.views_detached && class == Some(Class::TypedArray) {
-                let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
-                out.acc = Any;
-                return Sel {
-                    ops: Some((name as i32, name, megas_addr())),
-                    ..Sel::new("get_named_rt", "", out)
-                };
+                out.acc = I32;
+                return Sel::new("get_length", "td", out);
             }
             let known = class.is_some_and(|c| {
                 matches!(c, Class::Array | Class::String) || c == Class::TypedArray && !spec.views_detached
@@ -5706,7 +5739,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 (true, _) if class == Some(Class::Array) => "na",
                 (true, _) if class == Some(Class::TypedArray) && spec.checked_length_views => "na",
                 (true, _) => "nc",
-                (false, true) => "nt",
+                (false, true) => "d",
                 (false, false) => "",
             };
             return Sel::new("get_length", case, out);
@@ -7316,7 +7349,8 @@ fn stencil_for(
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) if sel.case == "nc" => {
             cat!(sel.base, "_nc_", loc)
         }
-        ("get_length", _) if sel.case == "nt" => cat!(sel.base, "_nt_", loc),
+        ("get_length", _) if sel.case == "td" => cat!(sel.base, "_td_", loc),
+        ("get_length", _) if sel.case == "d" => cat!(sel.base, "_d_", loc),
         ("get_length", _) if sel.case == "na" => cat!(sel.base, "_na_", loc),
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) => cat!(sel.base, "_", loc),
         // Stores take a boxed `acc`; a number's (`_n`) needs no barrier,

@@ -10957,15 +10957,6 @@ struct VmState {
     /// (see `vm_finish`).
     bails: u32,
     no_entry: HashSet<usize>,
-    /// Its prologue has an instruction compiled code exits at
-    /// (`CreateRest`, `LdaCallee`, `LdaNewTarget`): an entry at a call
-    /// would leave before doing any work, so it is refused, for good
-    /// ([`JitFunction::never_entered`]); its loops still tier up. (Not
-    /// `no_entry`, which a version already compiled bypasses: a 20-turn
-    /// loop after a rest parameter, called 2 million times, entered at
-    /// each call, exited at `CreateRest`, and entered again at the loop:
-    /// +65%.)
-    entry_bails: bool,
     /// Calls whose result their prediction missed (see `vm_finish`).
     bad_results: u32,
     /// Call entries left to the interpreter after a property or callee
@@ -16979,10 +16970,6 @@ impl JitFunction {
         let root_insns = unsafe { (*vm).jit_caches.decoded(code) }.0.clone();
         let nregs = unsafe { (*code).nregs } as usize;
         let root_len = root_insns.len();
-        // (Emitted in the prologue only, which every call runs.)
-        let entry_bails = root_insns
-            .iter()
-            .any(|i| matches!(i.op.plain(), Op::CreateRest | Op::LdaCallee | Op::LdaNewTarget));
         let mut f = JitFunction::new_from(unsafe { &(*code).bytecode }, root_insns, nregs);
         f.tiering = None;
         f.vm = Some(Box::new(VmState {
@@ -17021,7 +17008,6 @@ impl JitFunction {
             regrants: 0,
             extra: 0,
             no_entry: HashSet::default(),
-            entry_bails,
             bad_results: 0,
             cool: 0,
             settle_mark: 0,
@@ -17068,9 +17054,6 @@ impl JitFunction {
         let _compiling = Compiling::of(self.vm.as_ref().expect("a VM function").root);
         {
             let vm = self.vm.as_mut().expect("a VM function");
-            if pc == 0 && vm.entry_bails {
-                return None;
-            }
             vm.late.0 += u32::from(vm.spent && pc == 0);
             // The common case, entering at every call: nothing to redo, and
             // a version that fits the live values, found without allocating.
@@ -17270,7 +17253,6 @@ impl JitFunction {
         // and count, see `spent`.)
         let reserve = self.stats.compiles == max && !started;
         vm.no_entry.contains(&0)
-            || vm.entry_bails
             || !reserve
                 && self.stats.compiles >= max
                 && (vm.epoch != epoch || vm.field_epoch != field_epoch || !started)
@@ -17291,7 +17273,7 @@ impl JitFunction {
             return None;
         }
         let vm = self.vm.as_mut().unwrap();
-        if vm.no_entry.contains(&0) || vm.entry_bails {
+        if vm.no_entry.contains(&0) {
             return None;
         }
         let _compiling = Compiling::of(vm.root);

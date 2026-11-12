@@ -6940,8 +6940,10 @@ impl Vm {
                 // fallback instructions below require its full header.
                 // Generators and async functions suspend their frames, which
                 // needs their own compiled-frame machinery. So does a mapped
-                // `arguments`: see [`Scan::mapped_arguments`].
-                let only_interpreted = matches!(f.kind, 4..=6) || scan.mapped_arguments || f.lazy.is_some();
+                // `arguments` (see [`Scan::mapped_arguments`]); and a prologue
+                // that exits, for now (see [`Scan::prologue_exits`]).
+                let only_interpreted =
+                    matches!(f.kind, 4..=6) || scan.mapped_arguments || scan.prologue_exits || f.lazy.is_some();
                 let interpreted = !f.handlers.is_empty() || scan.needs_frame || only_interpreted;
                 let huge = scan.ops > COMPILE_SIZE_MAX;
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern_name(n)).collect();
@@ -6975,7 +6977,7 @@ impl Vm {
                     // (Several realms: every call checks the callee's.)
                     _ if !self.realms.is_empty() => 0,
                     _ if only_interpreted || huge => i32::MAX,
-                    _ if scan.intrinsic && scan.has_loop => i32::MAX,
+                    _ if scan.intrinsic && (scan.has_loop || scan.ops < INTRINSIC_ENTRY_SIZE) => i32::MAX,
                     _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                     (true, _) => self.tier_calls,
                     (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
@@ -7654,10 +7656,19 @@ struct Scan {
     /// stored (`a++` in a loop, then `arguments[0]`, gave `a` as it was at
     /// the exit). Such a function runs interpreted.
     mapped_arguments: bool,
+    /// Whether its prologue has an instruction compiled code exits at:
+    /// `CreateRest`, `LdaCallee` or `LdaNewTarget`, emitted there only, so
+    /// run at every call. Such a function runs interpreted, as before
+    /// #241: its calls would leave compiled code at once, and with its
+    /// calls interpreted, its loops entered compiled at each call cost
+    /// more than they win when short (siyuan, its named function
+    /// expressions' loops entered 100,000 to 200,000 times each: +8%
+    /// instructions).
+    prologue_exits: bool,
     /// Whether it has an `Intrinsic` (or `IteratorOpen`, `IteratorNext`),
-    /// which compiled code exits at. With a loop too, its calls are not
-    /// entered compiled until the loop tiers up by itself (once compiled,
-    /// calls enter it). (#125: entered at its calls, Octane CodeLoad's
+    /// which compiled code exits at. With a loop too, or if small (see
+    /// [`INTRINSIC_ENTRY_SIZE`]), its calls are not entered compiled until
+    /// a loop tiers up by itself (once compiled, calls enter it). (#125: entered at its calls, Octane CodeLoad's
     /// `extend` and `each`, another copy at each load whose `for … in`
     /// exits at each call, were compiled at each: -22%; -14% again once
     /// cold intrinsics no longer kept functions from being entered, #241.)
@@ -7671,12 +7682,17 @@ impl Scan {
             has_loop: false,
             needs_frame: false,
             mapped_arguments: false,
+            prologue_exits: false,
             intrinsic: false,
             ops: 0,
         };
         for op in ops(f) {
             s.has_loop |= op.is_loop();
             s.mapped_arguments |= op == crate::bytecode::Op::CreateMappedArguments;
+            s.prologue_exits |= matches!(
+                op,
+                crate::bytecode::Op::CreateRest | crate::bytecode::Op::LdaCallee | crate::bytecode::Op::LdaNewTarget
+            );
             s.intrinsic |= matches!(
                 op,
                 crate::bytecode::Op::Intrinsic | crate::bytecode::Op::IteratorOpen | crate::bytecode::Op::IteratorNext
@@ -7722,6 +7738,16 @@ fn ops(f: &crate::asm::FunctionDef) -> impl Iterator<Item = crate::bytecode::Op>
 /// same. A higher threshold for functions with loops too cost up to +70%
 /// (61, 66, 80, 82: loops in functions called a few hundred times).
 const LOOP_FREE_CALLS: i32 = 5;
+
+/// Instructions from which a loop-free function with an intrinsic (which
+/// is neither inlined nor called directly: `Code::interpreted`) is entered
+/// compiled at its calls, through the runtime from compiled callers. A
+/// smaller one mostly runs a short path, which the interpreter runs for
+/// less than an entry costs: PdfJS's JPEG `readBit` (178 instructions, a
+/// template literal on an error path, 290 million calls) +3%
+/// instructions entered; jsnes's `emulate` (thousands) -8%. (300: the
+/// same; 2,000: siyuan +0.8%.)
+const INTRINSIC_ENTRY_SIZE: usize = 500;
 
 /// Instructions past which a loop-free function is entered compiled as
 /// one with a loop is, after more calls (see [`Scan::has_loop`]).

@@ -6932,8 +6932,13 @@ impl Vm {
                 // handlers included (`interp::drive_from`). (GameBoy's
                 // `fromTypedArray`, a copy loop in a `try`, ran interpreted
                 // at each run.)
-                let interpreted = !f.handlers.is_empty() || scan.callee || scan.intrinsic || f.lazy.is_some();
-                let only_interpreted = scan.callee || f.lazy.is_some();
+                // The JIT exits before bytecodes it does not lower, so an
+                // ordinary function may still enter compiled code or be
+                // inlined when one is only on a cold path.  Generators and
+                // async functions suspend their frames, which needs their
+                // own compiled-frame machinery.
+                let only_interpreted = matches!(f.kind, 4..=6) || f.lazy.is_some();
+                let interpreted = !f.handlers.is_empty() || only_interpreted;
                 let huge = scan.ops > COMPILE_SIZE_MAX;
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern_name(n)).collect();
                 let constants: Box<[Value]> = f
@@ -6965,7 +6970,7 @@ impl Vm {
                 let calls_left = match (scan.has_loop, recursive || scan.ops >= ENTRY_COMPILE_SIZE) {
                     // (Several realms: every call checks the callee's.)
                     _ if !self.realms.is_empty() => 0,
-                    _ if only_interpreted || scan.intrinsic || huge => i32::MAX,
+                    _ if only_interpreted || huge => i32::MAX,
                     _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                     (true, _) => self.tier_calls,
                     (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
@@ -7613,9 +7618,8 @@ impl Vm {
 }
 
 
-/// What `load` needs of a function's code, in one pass: whether it has a
-/// loop ([`Scan::has_loop`]), whether it reads `arguments.callee` (see
-/// `Code::interpreted`), and its instruction count (large: see
+/// What `load` needs of a function's code in one pass: whether it has a
+/// loop ([`Scan::has_loop`]), and its instruction count (large: see
 /// [`ENTRY_COMPILE_SIZE`]).
 struct Scan {
     /// Whether calls to a function should enter its compiled code once it is
@@ -7631,16 +7635,6 @@ struct Scan {
     /// feedback is still growing and it gets compiled again (91: f and g
     /// three and two times; DeltaBlue's methods).
     has_loop: bool,
-    callee: bool,
-    /// Whether it has an `Intrinsic`, which compiled code exits at for the
-    /// interpreter to run: the function's calls run interpreted (it isn't
-    /// entered compiled, inlined nor called directly), but its loops tier
-    /// up. (#125: as [`Scan::callee`], a script with a class or a
-    /// destructuring at its top level ran its loops, and the functions
-    /// only they call, interpreted. Entered compiled, Octane CodeLoad's
-    /// `extend` and `each`, at each load another copy whose `for … in`
-    /// exits at `for_in_has` each turn, were compiled at each: -22%.)
-    intrinsic: bool,
     ops: usize,
 }
 
@@ -7648,30 +7642,10 @@ impl Scan {
     fn of(f: &crate::asm::FunctionDef) -> Scan {
         let mut s = Scan {
             has_loop: false,
-            callee: false,
-            intrinsic: false,
             ops: 0,
         };
         for op in ops(f) {
             s.has_loop |= op.is_loop();
-            // (And what the JIT doesn't compile, newer syntax's.)
-            s.callee |= matches!(
-                op,
-                crate::bytecode::Op::LdaCallee
-                    | crate::bytecode::Op::CreateRest
-                    | crate::bytecode::Op::CloseUpvalue
-                    | crate::bytecode::Op::LdaNewTarget
-                    | crate::bytecode::Op::InitialYield
-                    | crate::bytecode::Op::CreateMappedArguments
-                    | crate::bytecode::Op::AsyncStart
-                    | crate::bytecode::Op::Yield
-            );
-            // (`IteratorOpen` and `IteratorNext` as intrinsics: compiled
-            // code exits at them.)
-            s.intrinsic |= matches!(
-                op,
-                crate::bytecode::Op::Intrinsic | crate::bytecode::Op::IteratorOpen | crate::bytecode::Op::IteratorNext
-            );
             s.ops += 1;
         }
         s

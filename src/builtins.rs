@@ -1276,11 +1276,15 @@ pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: *mu
 
 /// An `arguments` object of function `callee` (null: unknown, as strict
 /// code's): an ordinary object with the values as elements, `length`,
-/// `callee` (a strict function's throws), `@@iterator`, and the hidden
+/// `callee` (throws for strict or non-simple-parameter functions),
+/// @@iterator`, and the hidden
 /// mark `Object.prototype.toString` knows it by.
 pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
-    let strict = callee.is_null() || unsafe { (*(*callee).code).strict };
-    if !strict {
+    let unmapped = callee.is_null() || unsafe {
+        let code = &*(*callee).code;
+        code.strict || !code.simple_parameters
+    };
+    if !unmapped {
         // The common case: one shape (its elements of any type from the
         // start, so `arguments.length` stays monomorphic), its slots and
         // elements stored.
@@ -1325,19 +1329,15 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
     let mark = vm.intern_name(ARGUMENTS_MARK);
     vm.add_property_with(o, mark, Value::TRUE, DONT_ENUM);
     let a_callee = vm.intern_name("callee");
-    if strict {
-        let thrower = vm.throw_type_error_fn();
-        let d = crate::props::Desc {
-            get: Some(thrower),
-            set: Some(thrower),
-            enumerable: Some(false),
-            configurable: Some(false),
-            ..Default::default()
-        };
-        let _ = vm.define_own_property(o, crate::vm::Key::Name(a_callee), &d);
-    } else {
-        vm.add_property_with(o, a_callee, object_value(callee), DONT_ENUM);
-    }
+    let thrower = vm.throw_type_error_fn();
+    let d = crate::props::Desc {
+        get: Some(thrower),
+        set: Some(thrower),
+        enumerable: Some(false),
+        configurable: Some(false),
+        ..Default::default()
+    };
+    let _ = vm.define_own_property(o, crate::vm::Key::Name(a_callee), &d);
     let ov = object_value(o);
     // Defined, not set: a prototype's setter for an index isn't called.
     for (i, &v) in values.iter().enumerate() {

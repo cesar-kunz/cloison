@@ -470,6 +470,7 @@ pub struct Code {
     /// Strict mode code: its `this` is the receiver as is, `undefined`
     /// for a plain call (see `interp::push_frame`).
     pub strict: bool,
+    pub simple_parameters: bool,
     /// For `new`: the in-object capacity to give new objects, and the root
     /// shape last used. Slack tracking: until the first `new` returns (the
     /// capacity is not `ctor_settled`), objects get a root of their own
@@ -6215,6 +6216,7 @@ impl Vm {
             reads_only: crate::interp::reads_only(f) || name.starts_with("get "),
             arguments_escape: false,
             strict: false,
+            simple_parameters: true,
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
             ctor_settled: Cell::new(true),
@@ -6932,6 +6934,7 @@ impl Vm {
                         (*c).handlers = f.handlers.into_boxed_slice();
                         (*c).compound_keys = f.compound_keys.into_boxed_slice();
                         (*c).arguments_escape = f.arguments_escape;
+                        (*c).simple_parameters = f.simple_parameters;
                         (*c).interpreted = interpreted;
                         (*c).calls_left.set(calls_left);
                         (*c).loop_budget.set(loop_budget);
@@ -6946,6 +6949,7 @@ impl Vm {
                     col: f.col,
                     bytecode,
                     strict: f.strict,
+                    simple_parameters: f.simple_parameters,
                     nparams: f.nparams,
                     length: f.length,
                     kind: f.kind,

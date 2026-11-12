@@ -6923,6 +6923,24 @@ for (var run = 0; run < 20; run++) total += hot(30);
     assert_eq!(vm.jit_bound_direct_calls("hot"), 0);
 }
 
+/// A function with a loop and an intrinsic is not entered compiled at its
+/// calls until its loop tiers up (Octane CodeLoad's `each`, a copy at each
+/// load with a short `for … in` and a spread: -14% compiled at its calls).
+#[test]
+fn intrinsic_with_short_loop_is_not_entered_at_calls() {
+    let src = "function each(o) { var n = 0; for (var k in o) n++; return Math.max(...[n, 1]); }
+var t = 0;
+for (var i = 0; i < 200; i++) t += each({a: 1, b: 2});
+t;";
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    // (Its loop's 400 turns in all, short of tiering up; calls would
+    // enter after 10.)
+    vm.set_tier_back_edges(1000);
+    assert_eq!(display(vm.run(&m).unwrap()), "400");
+    assert!(vm.jit_stats("each").is_none(), "{:?}", vm.jit_stats("each"));
+}
+
 /// A function whose prologue exits compiled code (a rest parameter, its
 /// own name, `new.target`) is not entered at its calls, which would leave
 /// at once; its loop still tiers up.

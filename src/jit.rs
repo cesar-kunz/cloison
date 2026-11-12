@@ -5059,13 +5059,19 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // receiver known to be an array (`nc`); an int32 (`i`) or an object
         // (`o`) checked against the elements' type as such; none of the
         // value where the array's exact shape says its elements take it
-        // (`nc_ia`, `nc_a`), or just that it's a number (`nc_n`).
+        // (`nc_ia`, `nc_a`), or just that it's a number (`nc_n`). Not a
+        // shape no element store fits (`NO_ELEMENTS`: a frozen, sealed or
+        // non-extensible array's, or one with elements that have
+        // attributes), typed `Any` though its elements take no store: the
+        // checking cases then, which exit on its code.
         Op::SetKeyed => {
             let array = reg.shape().is_some_and(|s| unsafe {
                 (*(s as *const Shape)).class == crate::object::Class::Array
             });
             let elems = match reg {
-                Ty::Obj(s) => Some(unsafe { (*(s as *const Shape)).elems }),
+                Ty::Obj(s) if unsafe { (*(s as *const Shape)).elems_code } != crate::layout::NO_ELEMENTS => {
+                    Some(unsafe { (*(s as *const Shape)).elems })
+                }
                 _ => None,
             };
             let object = matches!(st.acc, Ty::Obj(_) | Ty::Ext(_));

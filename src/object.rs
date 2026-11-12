@@ -248,6 +248,9 @@ impl TypedKind {
         unsafe {
             if self.is_big() {
                 crate::racy::store::<8>(p.add(i * 8), crate::bigint::to_bits(v));
+            } else if v.is_int32() {
+                // (No double conversion: ToInt32 and the clamp of an int32.)
+                self.store_i32(p, i, v.as_i32_unchecked());
             } else {
                 self.store(p, i, v.to_number());
             }

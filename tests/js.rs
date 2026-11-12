@@ -6866,7 +6866,8 @@ s + q;";
 /// ordinary function interpreted when it is on a cold path (#241).
 #[test]
 fn cold_interpreter_opcode_does_not_prevent_function_entry() {
-    let body = "s += n; ".repeat(80);
+    // (Large enough to be entered: see `vm::INTRINSIC_ENTRY_SIZE`.)
+    let body = "s += n; ".repeat(200);
     let src = format!(
         "function f(n) {{ if (n < 0) `${{n}}`; var s = 0; {body} return s; }}\
          var out = 0; for (var i = 0; i < 20; i++) out += f(i); out;"
@@ -6875,7 +6876,7 @@ fn cold_interpreter_opcode_does_not_prevent_function_entry() {
     assert!(cloison::asm::disassemble(&m).contains("Intrinsic"), "{src}");
     let mut vm = Vm::new();
     vm.set_tier_back_edges(2);
-    assert_eq!(display(vm.run(&m).unwrap()), (80 * 190).to_string());
+    assert_eq!(display(vm.run(&m).unwrap()), (200 * 190).to_string());
     let st = vm.jit_stats("f").expect("f entered compiled code");
     assert!(st.compiles >= 1 && st.exits == 0, "{st:?}");
 }
@@ -6916,10 +6917,8 @@ for (var run = 0; run < 20; run++) total += hot(30);
     vm.set_tier_back_edges(2);
     assert_eq!(display(vm.run(&m).unwrap()), "-18,-20,true,true,705900");
     assert!(vm.jit_stats("hot").is_some(), "hot did not compile");
-    // (`mapped` runs interpreted: see the next test.)
-    for function in ["rest", "self", "C"] {
-        assert!(vm.jit_stats(function).is_some(), "{function} did not compile");
-    }
+    // (Each runs interpreted: see `mapped_arguments_see_parameters_…` and
+    // `prologue_exits_keep_functions_interpreted`.)
     assert_eq!(vm.jit_bound_direct_calls("hot"), 0);
 }
 
@@ -6942,10 +6941,11 @@ t;";
 }
 
 /// A function whose prologue exits compiled code (a rest parameter, its
-/// own name, `new.target`) is not entered at its calls, which would leave
-/// at once; its loop still tiers up.
+/// own name, `new.target`) runs interpreted: entered at its calls, it
+/// would leave at once, and its short loops entered at each call cost
+/// more than they win.
 #[test]
-fn prologue_exits_do_not_enter_calls() {
+fn prologue_exits_keep_functions_interpreted() {
     let src = "function rest(a, ...xs) { var s = 0; for (var i = 0; i < 30; i++) s += a; return s + xs.length; }
 var self_ = function me(a) { var s = 0; for (var i = 0; i < 30; i++) s += a; return me === self_ ? s : -1; };
 function C(a) { var s = 0; for (var i = 0; i < 30; i++) s += a; this.s = new.target === C ? s : -1; }
@@ -6957,8 +6957,7 @@ t;";
     vm.set_tier_back_edges(2);
     assert_eq!(display(vm.run(&m).unwrap()), (2000 * 92).to_string());
     for function in ["rest", "me", "C"] {
-        let st = vm.jit_stats(function).expect("compiled at its loop");
-        assert!(st.osr_entries >= 1 && st.exits < 10, "{function}: {st:?}");
+        assert!(vm.jit_stats(function).is_none(), "{function}: {:?}", vm.jit_stats(function));
     }
 }
 

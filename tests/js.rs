@@ -17778,3 +17778,35 @@ for (var i = 0; i < 2000; i++) poisoned(hot(i));
 "#;
     assert_eq!(value(src), "ok");
 }
+
+/// The `arguments` an arrow sees in a function with non-simple
+/// parameters, and those of async functions, async generators and
+/// methods with them, are unmapped: `callee` is the %ThrowTypeError%
+/// accessor (#271). Also when the JIT inlines the function and makes
+/// its `arguments` itself.
+#[test]
+fn arguments_callee_throws_in_more_non_simple_functions() {
+    let src = r#"
+var thrower = Object.getOwnPropertyDescriptor((function () { "use strict"; return arguments; })(), "callee").get;
+function kind(a) {
+    var d = Object.getOwnPropertyDescriptor(a, "callee");
+    return d.get === thrower && d.set === thrower ? "thrower" : "get" in d ? "other" : "data";
+}
+var log = [];
+function viaArrow(a = 1) { return (() => arguments)(); }
+function inDefaultArrow(a, b = () => arguments) { return b(); }
+function simpleArrow(a) { return (() => arguments)(); }
+var o = { m(a = 1) { return arguments; }, n(a) { return arguments; } };
+log.push(kind(viaArrow()), kind(inDefaultArrow()), kind(simpleArrow()), kind(o.m()), kind(o.n()));
+function inner(a = 1) { return arguments; }
+function outer(i) { return kind(inner(i)); }
+var bad = 0;
+for (var i = 0; i < 3000; i++) if (outer(i) !== "thrower") bad++;
+log.push(bad);
+async function af(a = 1) { return arguments; }
+async function* ag(...r) { yield arguments; }
+af().then(a => { log.push(kind(a)); return ag().next(); })
+    .then(r => { log.push(kind(r.value)); globalThis.out = log.join(" "); });
+"#;
+    assert_eq!(out_after_jobs(src), "thrower thrower data thrower data 0 thrower thrower");
+}

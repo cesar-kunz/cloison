@@ -18302,6 +18302,53 @@ out.join(' ; ')
 }
 
 #[test]
+fn nearer_slotless_length_and_name_shadow_a_prototypes_slot() {
+    // OrdinaryGet stops at the first object with an own property: an
+    // array's `length`, a function's `length` and `name` have no slot
+    // but shadow a farther prototype's.
+    assert_eq!(
+        value(
+            r#"
+var fn = function foo() {};
+Object.setPrototypeOf(fn, {name: 'x', length: 9});
+var o = Object.create(fn), r = [];
+for (var i = 0; i < 3000; i++) r[i % 2] = o.name + o.length;
+var arr = [1, 2, 3]; Object.setPrototypeOf(arr, {length: 99});
+var q = Object.create(arr);
+for (var i = 0; i < 3000; i++) r[2] = q.length;
+r[3] = Reflect.get(arr, 'length', 5);
+function C() { this.n = this.length; }
+var cp = [1, 2]; Object.setPrototypeOf(cp, {length: 99}); C.prototype = cp;
+for (var i = 0; i < 3000; i++) r[4] = new C().n;
+r.join();
+"#
+        ),
+        "foo0,foo0,3,3,2"
+    );
+}
+
+#[test]
+fn inherited_length_getter_keeps_mapped_arguments_mapped() {
+    // A getter that saves `this`, reached from a mapped `arguments`
+    // whose own `length` was deleted: the object escapes, so it stays
+    // mapped to the parameters after the function returns.
+    assert_eq!(
+        value(
+            r#"
+var saved;
+Object.defineProperty(Object.prototype, 'length', {get: function () { saved = this; return 7; }, configurable: true});
+function f(a) { delete arguments.length; var n = arguments.length; return [n, function () { a = 5; }]; }
+var r = f(1);
+r[1]();
+delete Object.prototype.length;
+r[0] + ' ' + saved[0];
+"#
+        ),
+        "7 5"
+    );
+}
+
+#[test]
 fn arguments_callee_uses_parameter_simplicity() {
     let src = r#"
 function check(ok, message) {

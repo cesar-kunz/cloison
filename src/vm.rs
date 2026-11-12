@@ -3277,7 +3277,7 @@ impl Vm {
             return;
         }
         let Some((h, slot)) = self.lookup(o, name) else { return };
-        if self.is_accessor(h, slot) {
+        if self.is_accessor(h, slot) || self.virtual_before(o, h, name).is_some() {
             return;
         }
         let shape = unsafe { (*o).shape } as u64;
@@ -3406,16 +3406,16 @@ impl Vm {
             {
                 return Ok(Value::number(self.length_field(o) as f64));
             }
-            if name == self.a_length {
-                // A prototype's array/function/string-wrapper length may
-                // have no shape slot. Resolve each object's own descriptor
-                // before looking farther along the chain.
-                return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
-            }
             if self.typed_numeric(o, name) {
                 return Ok(Value::UNDEFINED);
             }
-            Ok(match self.lookup(o, name) {
+            let found = self.lookup(o, name);
+            if let Some((h, _)) = found
+                && let Some(v) = self.virtual_before(o, h, name)
+            {
+                return Ok(v);
+            }
+            Ok(match found {
                 Some((h, slot)) if self.is_accessor(h, slot) => {
                     let pair = *Object::slot(h, (*(*h).shape).location(slot));
                     return self.call_getter(pair, obj);
@@ -3445,6 +3445,45 @@ impl Vm {
                 return crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32;
             }
             crate::far::array_length(o)
+        }
+    }
+
+    /// A slotless `length` or `name` (as `virtual_get` reads it) of `o`
+    /// or of a prototype nearer than `holder`, where `lookup` found `name`
+    /// in a slot: it shadows that slot (an array with a prototype that has
+    /// a `length`, say).
+    pub(crate) fn virtual_before(&mut self, o: *mut Object, holder: *mut Object, name: Atom) -> Option<Value> {
+        if holder == o || name != self.a_length && name != self.a_name {
+            return None;
+        }
+        let mut p = o;
+        while p != holder {
+            if let Some(v) = self.virtual_own(p, name) {
+                return Some(v);
+            }
+            let proto = unsafe { (*(*p).shape).proto };
+            if !proto.is_cell() {
+                return None;
+            }
+            p = as_object(proto);
+        }
+        None
+    }
+
+    /// `o`'s own slotless `length` or `name` (see `virtual_get`).
+    pub(crate) fn virtual_own(&mut self, o: *mut Object, name: Atom) -> Option<Value> {
+        unsafe {
+            let class = (*o).class;
+            if name == self.a_length && matches!(class, Class::Array | Class::String) {
+                return Some(Value::number(self.length_field(o) as f64));
+            }
+            if (name == self.a_length || name == self.a_name)
+                && matches!(class, Class::Function | Class::Native | Class::Wrapper)
+                && let Some(d) = self.own_property(o, Key::Name(name))
+            {
+                return Some(d.value.unwrap_or(Value::UNDEFINED));
+            }
+            None
         }
     }
 
@@ -3630,10 +3669,16 @@ impl Vm {
 
     /// `p.[[Get]](name, receiver)`.
     fn get_through(&mut self, p: *mut Object, name: Atom, receiver: Value) -> Result<Value> {
-        if name == self.a_length || crate::proxy::chain_has_proxy(self, p) {
+        if crate::proxy::chain_has_proxy(self, p) {
             return crate::proxy::generic_get(self, object_value(p), Key::Name(name), receiver);
         }
-        match self.lookup(p, name) {
+        let found = self.lookup(p, name);
+        if let Some((h, _)) = found
+            && let Some(v) = self.virtual_before(p, h, name)
+        {
+            return Ok(v);
+        }
+        match found {
             // (A getter's `this` the primitive.)
             Some((h, slot)) if self.is_accessor(h, slot) => {
                 let pair = unsafe { *Object::slot(h, (*(*h).shape).location(slot)) };
@@ -3795,15 +3840,6 @@ impl Vm {
                 };
                 return Ok(Value::number(self.length_field(o) as f64));
             }
-            if name == self.a_length {
-                // No slot-only cache: an inherited virtual length is mutable
-                // without a shape change. Also discard earlier Length/data
-                // feedback when this site changes receiver kind.
-                for k in 0..IC_WAYS {
-                    *ic.add(k) = Ic::EMPTY;
-                }
-                return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
-            }
             // Absent: cached as a load from `missing_holder`'s `undefined`
             // slot, valid (like a prototype's property) while no prototype
             // changes shape.
@@ -3828,6 +3864,10 @@ impl Vm {
                 }
                 return Ok(Value::UNDEFINED);
             };
+            // (A nearer slotless `length` or `name`: not cached.)
+            if let Some(v) = self.virtual_before(o, h, name) {
+                return Ok(v);
+            }
             let loc = (*(*h).shape).location(slot);
             // A getter's: called, never cached (noted for the JIT).
             if self.is_accessor(h, slot) {
@@ -3835,7 +3875,13 @@ impl Vm {
                     self.heap.note(object_value(h));
                     note_accessor(ic, (*o).shape, h, self.proto_epoch);
                 }
-                return self.call_getter(*Object::slot(h, loc), obj);
+                let pair = *Object::slot(h, loc);
+                // (A typed array's `length` by %TypedArray%.prototype's
+                // getter: what it would return, without the call.)
+                if (*o).class == Class::TypedArray && crate::typed::is_length_getter(*(*as_object(pair)).elems) {
+                    return Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64));
+                }
+                return self.call_getter(pair, obj);
             }
             self.heap.note(object_value(h));
             let e = Ic {

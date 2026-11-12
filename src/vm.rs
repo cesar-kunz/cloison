@@ -3402,9 +3402,15 @@ impl Vm {
         }
         unsafe {
             if name == self.a_length
-                && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
+                && matches!((*o).class, Class::Array | Class::String)
             {
                 return Ok(Value::number(self.length_field(o) as f64));
+            }
+            if name == self.a_length {
+                // A prototype's array/function/string-wrapper length may
+                // have no shape slot. Resolve each object's own descriptor
+                // before looking farther along the chain.
+                return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
             }
             if self.typed_numeric(o, name) {
                 return Ok(Value::UNDEFINED);
@@ -3451,7 +3457,7 @@ impl Vm {
         loop {
             unsafe {
                 let class = (*p).class;
-                if name == self.a_length && matches!(class, Class::Array | Class::String | Class::TypedArray) {
+                if name == self.a_length && matches!(class, Class::Array | Class::String) {
                     return Value::number(self.length_field(p) as f64);
                 }
                 if matches!(class, Class::Function | Class::Native | Class::Wrapper)
@@ -3479,7 +3485,7 @@ impl Vm {
         loop {
             unsafe {
                 let class = (*p).class;
-                if name == self.a_length && matches!(class, Class::Array | Class::String | Class::TypedArray) {
+                if name == self.a_length && matches!(class, Class::Array | Class::String) {
                     return true;
                 }
                 if matches!(class, Class::Function | Class::Native | Class::Wrapper)
@@ -3624,7 +3630,7 @@ impl Vm {
 
     /// `p.[[Get]](name, receiver)`.
     fn get_through(&mut self, p: *mut Object, name: Atom, receiver: Value) -> Result<Value> {
-        if crate::proxy::chain_has_proxy(self, p) {
+        if name == self.a_length || crate::proxy::chain_has_proxy(self, p) {
             return crate::proxy::generic_get(self, object_value(p), Key::Name(name), receiver);
         }
         match self.lookup(p, name) {
@@ -3662,18 +3668,12 @@ impl Vm {
             )));
         }
         // A number's properties are `Number.prototype`'s, a boolean's
-        // `Boolean.prototype`'s.
+        // `Boolean.prototype`'s.  Use the ordered lookup path: a virtual
+        // property (such as an array's `length`) may precede a farther
+        // slot-backed property on their prototype chain.
         if obj.is_number() || obj.is_bool() {
             let o = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
-            return match self.lookup(o, name) {
-                // (A getter's `this` the primitive.)
-                Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = unsafe { *Object::slot(h, (*(*h).shape).location(slot)) };
-                    self.call_getter(pair, obj)
-                }
-                Some((h, slot)) => Ok(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) }),
-                None => Ok(Value::UNDEFINED),
-            };
+            return self.get_through(o, name, obj);
         }
         Ok(Value::UNDEFINED)
     }
@@ -3785,7 +3785,7 @@ impl Vm {
         }
         unsafe {
             if name == self.a_length
-                && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
+                && matches!((*o).class, Class::Array | Class::String)
             {
                 // Recorded for the JIT (`jit::Prop::Length`); no shape, so
                 // the interpreter's hit path never takes it.
@@ -3794,6 +3794,15 @@ impl Vm {
                     ..Ic::EMPTY
                 };
                 return Ok(Value::number(self.length_field(o) as f64));
+            }
+            if name == self.a_length {
+                // No slot-only cache: an inherited virtual length is mutable
+                // without a shape change. Also discard earlier Length/data
+                // feedback when this site changes receiver kind.
+                for k in 0..IC_WAYS {
+                    *ic.add(k) = Ic::EMPTY;
+                }
+                return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
             }
             // Absent: cached as a load from `missing_holder`'s `undefined`
             // slot, valid (like a prototype's property) while no prototype

@@ -791,7 +791,7 @@ pub fn atan2(y: f64, x: f64) -> f64 {
         // x or y is NaN
         return x + y;
     }
-    if ((hx - 0x3ff00000) as u32 | lx) == 0 {
+    if (hx.wrapping_sub(0x3ff00000) as u32 | lx) == 0 {
         // x = 1
         return atan(y);
     }

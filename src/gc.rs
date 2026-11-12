@@ -3247,7 +3247,9 @@ impl Vm {
                     let used = (*(*o).shape).slots.len();
                     let inline = crate::object::Object::inline_cap(o);
                     inline_unused += 8 * inline.saturating_sub(used);
-                    if !(*o).props.is_null() {
+                    // (A string's `props` is no property storage: a cons
+                    // string's left half, or a slice's parent.)
+                    if !(*o).props.is_null() && (*o).class != Class::String {
                         props_unused += 8 * (crate::object::Object::props_cap(o) as usize).saturating_sub(used.saturating_sub(inline));
                     }
                     if !(*o).elems.is_null() && !matches!(

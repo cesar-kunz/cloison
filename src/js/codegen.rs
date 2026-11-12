@@ -1753,12 +1753,22 @@ fn smi(e: &Expr) -> Option<i32> {
 /// operators alone (`2 ** 31 - 1`, `-0.5`, `1 << 20`), computed as the
 /// operators compute it at run time: folded.
 fn num_const(e: &Expr) -> Option<f64> {
+    num_const_within(e, NUM_CONST_DEPTH)
+}
+
+/// How deep [`num_const`] looks. Every operator's operands are tried as
+/// they are compiled: unbounded, `x + 1 + 1 + …` would take time square
+/// in its length, and recurse past the stack before `deep` stops it.
+const NUM_CONST_DEPTH: u32 = 32;
+
+fn num_const_within(e: &Expr, depth: u32) -> Option<f64> {
     use crate::interp::to_int32;
+    let depth = depth.checked_sub(1)?;
     match &e.kind {
         ExprKind::Num(v) => Some(*v),
-        ExprKind::Unary(UnOp::Neg, x) => Some(-num_const(x)?),
+        ExprKind::Unary(UnOp::Neg, x) => Some(-num_const_within(x, depth)?),
         ExprKind::Binary(op, l, r) => {
-            let (a, b) = (num_const(l)?, num_const(r)?);
+            let (a, b) = (num_const_within(l, depth)?, num_const_within(r, depth)?);
             let k = to_int32(b) as u32 & 31;
             Some(match op {
                 BinOp::Add => a + b,

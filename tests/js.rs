@@ -18103,6 +18103,21 @@ out.join()
     );
 }
 
+/// Folding looks at most `NUM_CONST_DEPTH` operators down: a long chain
+/// of `+ 1` after a variable compiles in linear time and, past the front
+/// end's depth, is the "too deeply nested" SyntaxError, as before folding
+/// (it overflowed the stack while folding was tried at every operator).
+/// A chain of literals longer than the bound still folds where it can.
+#[test]
+fn long_operator_chains_fold_within_a_bound() {
+    let n = 400;
+    assert_eq!(value(&format!("var x = 1; x{}", "+1".repeat(n))), (n + 1).to_string());
+    assert_eq!(value(&format!("1{}", "+1".repeat(n))), (n + 1).to_string());
+    assert_eq!(value(&format!("2 ** 3 * (1{})", " - 0.5".repeat(40))), "-152");
+    let e = big_stack(|| compile_error(&format!("var x = 1; x{}", "+1".repeat(200_000))));
+    assert!(e.contains("too deeply nested"), "{e}");
+}
+
 /// Iterator results get the shape the realm's first one got
 /// (`Vm::iter_result_shape`), and %ArrayIteratorPrototype%.next steps a
 /// dense array directly. The results are ordinary objects: their keys in

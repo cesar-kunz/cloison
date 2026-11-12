@@ -272,6 +272,7 @@ fn generate_from<'p>(
                     captures: false,
                     arguments_escape: true,
                     strict: f.strict,
+                    simple_parameters: simple_parameters(f),
                     line: position(f.params_pos).0,
                     col: position(f.params_pos).1,
                     lazy: Some(LazyFn {
@@ -1680,12 +1681,13 @@ fn arguments_object(p: &Program, f: usize) -> bool {
 /// parameters if aliasing could show (see `Gen::maps_arguments`): a
 /// sloppy function's with simple parameters.
 fn may_map_arguments(f: &Function) -> bool {
-    !f.strict
-        && !f.arrow
-        && !f.rest
-        && f.param_stmts == 0
-        && !f.params.is_empty()
-        && f.params.iter().all(|p| !p.starts_with('%'))
+    !f.strict && !f.arrow && !f.params.is_empty() && simple_parameters(f)
+}
+
+/// Defaults, rest parameters and destructuring make the list non-simple.
+/// An empty parameter list is simple.
+fn simple_parameters(f: &Function) -> bool {
+   !f.rest && f.param_stmts == 0 && f.params.iter().all(|p| !p.starts_with('%'))
 }
 
 /// Whether function `f` reads `arguments` only to pass them on, as
@@ -2564,6 +2566,7 @@ impl<'a> Gen<'a> {
         Ok(FunctionDef {
             name,
             strict: self.f.strict,
+            simple_parameters: simple_parameters(self.f),
             nparams: self.f.params.len() as u32,
             nregs: self.nregs as u32,
             code: self.asm.finish(),

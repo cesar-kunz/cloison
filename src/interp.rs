@@ -2202,7 +2202,9 @@ handlers! {
     fn slow_call(pc, acc, regs, tag) {
         let w = reg(pc, 2, regs);
         if let Some(r) = leaf_call(regs, *reg(pc, 1, regs), *w, w.add(1), *pc.add(3) as usize) {
+            // (As the general path below records it: not a `VIA_CALL`.)
             record_callee(pc, regs, tag);
+            (*ic_at(regs, pc, 4)).loc = 0;
             next!(any, Op::Call.size(), r)
         }
         // `f.call(that, …args)` with `f` a bytecode function: call `f`,
@@ -4964,8 +4966,7 @@ unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value,
             return None;
         }
         let code = (*o).code;
-        let leaf = (*code).leaf;
-        if leaf == 0 || (leaf == 2 && !(this.is_cell() && (*as_object(this)).class == Class::String)) {
+        if !(*code).leaf {
             return None;
         }
         let args = std::slice::from_raw_parts(args, argc);

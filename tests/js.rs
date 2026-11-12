@@ -18017,9 +18017,10 @@ out.join()
     );
 }
 
-/// Math's functions and the string methods reading a unit, called with no
-/// cell argument, run as leaf natives (`Code::leaf`, `interp::leaf_call`):
-/// directly, without `call_other`'s entry. Their results with every
+/// Math's functions, called with no cell argument, run as leaf natives
+/// (`Code::leaf`, `interp::leaf_call`): directly, without `call_other`'s
+/// entry; the string methods reading a unit, which may flatten or
+/// allocate, are called generally. Their results with every
 /// argument type, `this` of the wrong type (a number, a boolean, an
 /// object converted; null and undefined throw), argument conversions in
 /// order (valueOf called once each, the first throw wins over a symbol's
@@ -18116,6 +18117,25 @@ fn long_operator_chains_fold_within_a_bound() {
     assert_eq!(value(&format!("2 ** 3 * (1{})", " - 0.5".repeat(40))), "-152");
     let e = big_stack(|| compile_error(&format!("var x = 1; x{}", "+1".repeat(200_000))));
     assert!(e.contains("too deeply nested"), "{e}");
+}
+
+/// A call site whose callee was `f.call` (its cache `VIA_CALL`) and then a
+/// leaf native, `Math.max`, called directly: the cache no longer says
+/// `VIA_CALL` (as the general path leaves it), so compiled code calls each
+/// as it is. Expected value from V8.
+#[test]
+fn a_call_site_from_f_call_to_a_leaf_native() {
+    let src = r#"
+function g(x) { return x + 1; }
+g.m = Function.prototype.call;
+var o2 = { m: Math.max };
+function site(o, a, b) { return o.m(a, b); }
+var s = site(g, 1, 5);
+for (var i = 0; i < 3000; i++) s += site(o2, i & 7, 3);
+for (var i = 0; i < 3000; i++) s += site(i & 1 ? g : o2, i & 7, 3);
+s
+"#;
+    assert_eq!(value(src), "24756");
 }
 
 /// Iterator results get the shape the realm's first one got

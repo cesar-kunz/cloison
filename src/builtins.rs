@@ -430,7 +430,7 @@ fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `String.fromCharCode(…codes)`: each ToUint16.
-pub(crate) fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if let [v] = a
         && v.is_int32()
     {
@@ -449,7 +449,7 @@ pub(crate) fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Resul
     Ok(string(vm, &u))
 }
 
-pub(crate) fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(a, 0);
     Ok(if i >= 0.0 && (i as usize) < u.len() {
@@ -459,7 +459,7 @@ pub(crate) fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Resul
     })
 }
 
-pub(crate) fn string_char_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_char_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(a, 0);
     Ok(if i >= 0.0 && (i as usize) < u.len() {
@@ -683,7 +683,7 @@ fn string_pad_end(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     pad(vm, this, a, false)
 }
 
-pub(crate) fn string_code_point_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_code_point_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(a, 0);
     if i < 0.0 || i >= u.len() as f64 {

@@ -6933,12 +6933,15 @@ impl Vm {
                 // `fromTypedArray`, a copy loop in a `try`, ran interpreted
                 // at each run.)
                 // The JIT exits before bytecodes it does not lower, so an
-                // ordinary function may still enter compiled code or be
-                // inlined when one is only on a cold path.  Generators and
-                // async functions suspend their frames, which needs their
-                // own compiled-frame machinery.
+                // ordinary function may still enter compiled code, or tier
+                // up at a loop, when one is only on a cold path.  Do not,
+                // however, inline it or call it directly from compiled code:
+                // those paths do not make an interpreter frame, while the
+                // fallback instructions below require its full header.
+                // Generators and async functions suspend their frames, which
+                // needs their own compiled-frame machinery.
                 let only_interpreted = matches!(f.kind, 4..=6) || f.lazy.is_some();
-                let interpreted = !f.handlers.is_empty() || only_interpreted;
+                let interpreted = !f.handlers.is_empty() || scan.needs_frame || only_interpreted;
                 let huge = scan.ops > COMPILE_SIZE_MAX;
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern_name(n)).collect();
                 let constants: Box<[Value]> = f
@@ -7619,8 +7622,9 @@ impl Vm {
 
 
 /// What `load` needs of a function's code in one pass: whether it has a
-/// loop ([`Scan::has_loop`]), and its instruction count (large: see
-/// [`ENTRY_COMPILE_SIZE`]).
+/// loop ([`Scan::has_loop`]), whether an interpreter fallback needs an
+/// ordinary frame ([`Scan::needs_frame`]), and its instruction count (large:
+/// see [`ENTRY_COMPILE_SIZE`]).
 struct Scan {
     /// Whether calls to a function should enter its compiled code once it is
     /// hot: if it has a loop (whose back-edge budget restarts with each frame,
@@ -7635,6 +7639,11 @@ struct Scan {
     /// feedback is still growing and it gets compiled again (91: f and g
     /// three and two times; DeltaBlue's methods).
     has_loop: bool,
+    /// A bytecode instruction that the JIT leaves to the interpreter and
+    /// whose fallback needs a conventional frame.  Such a function still
+    /// compiles at a normal entry or loop, whose frame has that header, but
+    /// cannot be inlined or called directly from compiled code.
+    needs_frame: bool,
     ops: usize,
 }
 
@@ -7642,10 +7651,31 @@ impl Scan {
     fn of(f: &crate::asm::FunctionDef) -> Scan {
         let mut s = Scan {
             has_loop: false,
+            needs_frame: false,
             ops: 0,
         };
         for op in ops(f) {
             s.has_loop |= op.is_loop();
+            // These bytecodes all currently make compiled code exit.  A
+            // normal interpreter entry and an OSR entry have a complete
+            // frame header; direct calls and inlined frames do not.  Keep
+            // the latter paths out until their frame setup can represent
+            // every one of these states.
+            s.needs_frame |= matches!(
+                op,
+                crate::bytecode::Op::LdaCallee
+                    | crate::bytecode::Op::CreateRest
+                    | crate::bytecode::Op::CloseUpvalue
+                    | crate::bytecode::Op::LdaNewTarget
+                    | crate::bytecode::Op::InitialYield
+                    | crate::bytecode::Op::CreateMappedArguments
+                    | crate::bytecode::Op::AsyncStart
+                    | crate::bytecode::Op::Yield
+                    // `IteratorOpen` and `IteratorNext` are intrinsics too.
+                    | crate::bytecode::Op::Intrinsic
+                    | crate::bytecode::Op::IteratorOpen
+                    | crate::bytecode::Op::IteratorNext
+            );
             s.ops += 1;
         }
         s

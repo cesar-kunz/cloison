@@ -6880,6 +6880,48 @@ fn cold_interpreter_opcode_does_not_prevent_function_entry() {
     assert!(st.compiles >= 1 && st.exits == 0, "{st:?}");
 }
 
+/// Interpreter-only bytecodes may compile at an ordinary entry or a loop, but
+/// their fallback needs the header that direct and inlined calls do not make.
+#[test]
+fn interpreter_frame_opcodes_are_not_called_directly() {
+    let src = "function rest(a, ...xs) {
+  var s = 0; for (var i = 0; i < 20; i++) s += a; return s + xs.length;
+}
+function mapped(a) {
+  var s = 0; for (var i = 0; i < 20; i++) s += a;
+  arguments[0] = a + 1; return s + arguments[0];
+}
+var callee = function self(n) {
+  if (n < 0) return self === callee;
+  var s = 0; for (var i = 0; i < 20; i++) s += n; return s;
+};
+function C(n) {
+  this.ok = new.target === C;
+  var s = 0; for (var i = 0; i < 20; i++) s += n; this.x = s;
+}
+function hot(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) s += rest(i, 1) + mapped(i) + callee(i) + new C(i).x;
+  return s;
+}
+var total = 0;
+for (var run = 0; run < 20; run++) total += hot(30);
+[rest(-1, 7, 8), mapped(-1), callee(-1), new C(-1).ok, total].join(',');";
+    let m = cloison::js::compile(src).unwrap();
+    let asm = cloison::asm::disassemble(&m);
+    for op in ["CreateRest", "CreateMappedArguments", "LdaCallee", "LdaNewTarget"] {
+        assert!(asm.contains(op), "missing {op} in {src}");
+    }
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(2);
+    assert_eq!(display(vm.run(&m).unwrap()), "-18,-20,true,true,705900");
+    assert!(vm.jit_stats("hot").is_some(), "hot did not compile");
+    for function in ["rest", "mapped", "self", "C"] {
+        assert!(vm.jit_stats(function).is_some(), "{function} did not compile");
+    }
+    assert_eq!(vm.jit_bound_direct_calls("hot"), 0);
+}
+
 #[test]
 fn intrinsics_in_compiled_loops_throw_and_return_as_interpreted() {
     // Each loop compiled, with intrinsics (spread, templates, `**`,

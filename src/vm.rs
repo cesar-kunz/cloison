@@ -6939,8 +6939,9 @@ impl Vm {
                 // those paths do not make an interpreter frame, while the
                 // fallback instructions below require its full header.
                 // Generators and async functions suspend their frames, which
-                // needs their own compiled-frame machinery.
-                let only_interpreted = matches!(f.kind, 4..=6) || f.lazy.is_some();
+                // needs their own compiled-frame machinery. So does a mapped
+                // `arguments`: see [`Scan::mapped_arguments`].
+                let only_interpreted = matches!(f.kind, 4..=6) || scan.mapped_arguments || f.lazy.is_some();
                 let interpreted = !f.handlers.is_empty() || scan.needs_frame || only_interpreted;
                 let huge = scan.ops > COMPILE_SIZE_MAX;
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern_name(n)).collect();
@@ -7644,6 +7645,14 @@ struct Scan {
     /// compiles at a normal entry or loop, whose frame has that header, but
     /// cannot be inlined or called directly from compiled code.
     needs_frame: bool,
+    /// Whether it makes a mapped `arguments` (`CreateMappedArguments`, in
+    /// its prologue). While the frame runs, the object's elements are the
+    /// parameters' registers, which compiled code entered at a loop keeps
+    /// unboxed or in registers of its own: it neither writes them back for
+    /// `arguments[0]` to read nor reads back what `arguments[0] = v`
+    /// stored (`a++` in a loop, then `arguments[0]`, gave `a` as it was at
+    /// the exit). Such a function runs interpreted.
+    mapped_arguments: bool,
     ops: usize,
 }
 
@@ -7652,10 +7661,12 @@ impl Scan {
         let mut s = Scan {
             has_loop: false,
             needs_frame: false,
+            mapped_arguments: false,
             ops: 0,
         };
         for op in ops(f) {
             s.has_loop |= op.is_loop();
+            s.mapped_arguments |= op == crate::bytecode::Op::CreateMappedArguments;
             // These bytecodes all currently make compiled code exit.  A
             // normal interpreter entry and an OSR entry have a complete
             // frame header; direct calls and inlined frames do not.  Keep

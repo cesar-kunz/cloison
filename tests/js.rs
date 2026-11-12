@@ -6916,10 +6916,40 @@ for (var run = 0; run < 20; run++) total += hot(30);
     vm.set_tier_back_edges(2);
     assert_eq!(display(vm.run(&m).unwrap()), "-18,-20,true,true,705900");
     assert!(vm.jit_stats("hot").is_some(), "hot did not compile");
-    for function in ["rest", "mapped", "self", "C"] {
+    // (`mapped` runs interpreted: see the next test.)
+    for function in ["rest", "self", "C"] {
         assert!(vm.jit_stats(function).is_some(), "{function} did not compile");
     }
     assert_eq!(vm.jit_bound_direct_calls("hot"), 0);
+}
+
+/// A mapped `arguments` aliases its frame's parameter registers: code
+/// tiering up at a loop after it would keep its own copies of them.
+#[test]
+fn mapped_arguments_see_parameters_assigned_in_loops() {
+    let src = "function inc(a) {
+  for (var i = 0; i < 300; i++) a++;
+  return arguments[0];
+}
+function store(a) {
+  var s = 0;
+  for (var i = 0; i < 300; i++) { arguments[0] = i; s += a; }
+  return s;
+}
+function str(a) {
+  var s;
+  for (var i = 0; i < 300; i++) { arguments[0] = 'x'; s = a + 1; }
+  return s;
+}
+var r = [];
+for (var k = 0; k < 20; k++) r = [inc(5), store(1), str(5)];
+r.join(',');";
+    for tier in [1, 2, 1000] {
+        let m = cloison::js::compile(src).unwrap();
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(tier);
+        assert_eq!(display(vm.run(&m).unwrap()), "305,44850,x1", "tier {tier}");
+    }
 }
 
 #[test]

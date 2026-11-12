@@ -3833,8 +3833,8 @@ struct Spec<'a> {
     /// which could add a transition while the code runs (only calls check
     /// the code epoch after them).
     stable_ok: bool,
-    /// The VM's indices are protected (see `Vm::protect_indices`): element
-    /// stores through the interpreter.
+    /// A prototype's indices are protected (see `Vm::protect_indices`):
+    /// element stores through the interpreter.
     indices_protected: bool,
     /// A fixed-length buffer has been detached (see `Vm::views_detached`):
     /// a typed array's `length` through the runtime.

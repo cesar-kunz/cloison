@@ -6,7 +6,7 @@
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 // FxHash: interning the builtins' names at startup was mostly SipHash.
-use crate::jit::HashMap;
+use crate::jit::{HashMap, HashSet};
 use std::fmt;
 
 use crate::asm::Module;
@@ -194,7 +194,7 @@ pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
 }
 
 /// A property key: an element index or a name.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Key {
     Index(u32),
     Name(Atom),
@@ -5407,14 +5407,16 @@ impl Vm {
                 }
             }
         } else if v.is_cell() {
-            let mut seen: Vec<Key> = Vec::new();
+            // `for … in` visits every object on the prototype chain.  A
+            // vector here made a flat object with n properties take O(n²)
+            // comparisons before it could produce its keys.
+            let mut seen: HashSet<Key> = HashSet::default();
             let mut o = as_object(v);
             loop {
                 for (key, enumerable) in self.own_keys(o) {
-                    if seen.contains(&key) {
+                    if !seen.insert(key) {
                         continue;
                     }
-                    seen.push(key);
                     if enumerable {
                         let mut u = Vec::new();
                         match key {

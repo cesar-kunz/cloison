@@ -261,7 +261,7 @@ realm_fields! {
     arguments_shape: *const Shape = NO_SHAPE => arguments_shape;
     mapped_arguments_shape: *const Shape = NO_SHAPE => mapped_arguments_shape;
     iter_result_shape: *const Shape = NO_SHAPE => iter_result_shape;
-    strict_arguments: Value = Value::UNDEFINED => strict_arguments;
+    strict_arguments_callee: Value = Value::UNDEFINED => strict_arguments_callee;
     strict_arguments_shape: *const Shape = NO_SHAPE => strict_arguments_shape;
     regexp_proto_shape: *const Shape = NO_SHAPE => regexp_proto_shape;
     regexp_slots: [i32; crate::vm::REGEXP_FNS] = [0; crate::vm::REGEXP_FNS] => regexp_slots;

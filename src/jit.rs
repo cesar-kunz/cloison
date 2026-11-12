@@ -5719,35 +5719,23 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         if matches!(reg, I32 | F64) {
             return bail(out);
         }
-        // An array's or string's length: no check if the receiver's shape
-        // is one's. Once a typed array's may be stale (`views_detached`),
-        // a typed array's is checked against its buffer's (`td` of a known
-        // one, `d` of any). (The general check exits on a view's
-        // `RUNTIME_LENGTH`, with the class.)
+        // Only arrays' and strings' `length` is in the header whatever
+        // their prototypes; a typed array's (a known one's, or one at a
+        // site that met arrays too) through the runtime.
         if prop == Prop::Length {
             use crate::object::Class;
             let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
-            if spec.views_detached && class == Some(Class::TypedArray) {
-                out.acc = I32;
-                return Sel::new("get_length", "td", out);
+            if !matches!(class, Some(Class::Array | Class::String)) {
+                let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
+                out.acc = Any;
+                return Sel {
+                    ops: Some((name as i32, name, megas_addr())),
+                    ..Sel::new("get_named_rt", "", out)
+                };
             }
-            let known = class.is_some_and(|c| {
-                matches!(c, Class::Array | Class::String) || c == Class::TypedArray && !spec.views_detached
-            });
             out.acc = I32;
-            // (A known array may have gone far in a call, its shape still
-            // extending the known one: `na` checks; a string's or a typed
-            // array's length is where `nc` reads it, but a growable shared
-            // buffer's view's is read from its block, by the runtime, and
-            // one past `i32::MAX` is no int32: `na`'s check of `FAR` is of
-            // `RUNTIME_LENGTH` in a view.)
-            let case = match (known, spec.views_detached) {
-                (true, _) if class == Some(Class::Array) => "na",
-                (true, _) if class == Some(Class::TypedArray) && spec.checked_length_views => "na",
-                (true, _) => "nc",
-                (false, true) => "d",
-                (false, false) => "",
-            };
+            // (A known array may have gone far in a call.)
+            let case = if class == Some(Class::Array) { "na" } else { "nc" };
             return Sel::new("get_length", case, out);
         }
         // A known shape with the property. Not for a load from a

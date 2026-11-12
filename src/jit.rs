@@ -609,8 +609,44 @@ extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
     if crate::props::is_object(b) {
         return 0;
     }
+    // A typed array's element at a number (a double key: an index summed
+    // with a `Uint32Array`'s element, pdf.js's `getLinearizedBlockData`),
+    // without making a property key of it.
+    if let Some(i) = typed_index(a, b) {
+        unsafe {
+            let o = crate::object::as_object(a);
+            let kind = crate::object::TypedKind::from_u8((*o).kind);
+            return kind.load((*o).elems.cast(), i).to_bits();
+        }
+    }
     let vm = unsafe { &mut *crate::interp::current_vm() };
     reading(vm, |vm| vm.get_keyed(a, b).map_or(0, |v| v.to_bits()))
+}
+
+/// `key` as an index within typed array `o`'s length, if `o` is one of
+/// a kind with no BigInts and `key` is a number naming such an index.
+#[inline(always)]
+fn typed_index(o: Value, key: Value) -> Option<usize> {
+    use crate::object::{Class, TypedKind, as_object};
+    if !o.is_cell() {
+        return None;
+    }
+    unsafe {
+        let p = as_object(o);
+        if (*p).class != Class::TypedArray || TypedKind::from_u8((*p).kind).is_big() {
+            return None;
+        }
+        let i = if key.is_int32() {
+            usize::try_from(key.as_i32_unchecked()).ok()?
+        } else {
+            let d = key.as_number()?;
+            if !(d >= 0.0 && d < u32::MAX as f64 && d.trunc() == d) {
+                return None;
+            }
+            d as usize
+        };
+        (i < crate::typed::ta_length(p).unwrap_or(0)).then_some(i)
+    }
 }
 
 /// `f`, a runtime call that may run a native (`String.prototype.trim` as
@@ -757,6 +793,20 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
     }
     if !o.is_cell() || !key.is_int32() || key.as_i32_unchecked() < 0 {
         return 0;
+    }
+    // A number into a mutable typed array within its length: stored as
+    // is (its conversion calls no code), no property key made.
+    if v.is_number()
+        && let Some(i) = typed_index(o, key)
+    {
+        unsafe {
+            let p = crate::object::as_object(o);
+            if !crate::typed::is_immutable_view(p) {
+                let kind = crate::object::TypedKind::from_u8((*p).kind);
+                kind.store_value((*p).elems.cast(), i, v);
+                return 1;
+            }
+        }
     }
     unsafe {
         let p = crate::object::as_object(o);
@@ -5058,8 +5108,12 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             });
             // A typed array's element, of the kind the cache saw: checked to
             // be one unless the receiver's shape says so.
+            // (A double key, the same with `_fk`: an index summed with a
+            // `Uint32Array`'s element, pdf.js's `output[index + xs[x]]`,
+            // went through the runtime.)
+            let fk = st.acc == F64;
             if let Prop::Typed { kind } = prop
-                && ix
+                && (ix || fk)
             {
                 use crate::object::TypedKind as K;
                 let known = reg.shape().and_then(typed_kind) == Some(kind);
@@ -5077,10 +5131,22 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 };
                 const CHECKED: [&str; 9] =
                     ["i8_chk", "u8_chk", "u8_chk", "i16_chk", "u16_chk", "i32_chk", "u32f_chk", "f32_chk", "f64_chk"];
+                const KNOWN_FK: [&str; 9] =
+                    ["i8_fk", "u8_fk", "u8_fk", "i16_fk", "u16_fk", "i32_fk", "u32f_fk", "f32_fk", "f64_fk"];
+                const CHECKED_FK: [&str; 9] = [
+                    "i8_fkchk", "u8_fkchk", "u8_fkchk", "i16_fkchk", "u16_fkchk", "i32_fkchk", "u32f_fkchk", "f32_fkchk",
+                    "f64_fkchk",
+                ];
+                let case = match (fk, known) {
+                    (false, true) => w,
+                    (false, false) => CHECKED[kind as usize],
+                    (true, true) => KNOWN_FK[kind as usize],
+                    (true, false) => CHECKED_FK[kind as usize],
+                };
                 out.acc = ty;
                 return Sel {
                     ops: Some((typed_class_kind(kind), 0, 0)),
-                    ..Sel::new("tget", if known { w } else { CHECKED[kind as usize] }, out)
+                    ..Sel::new("tget", case, out)
                 };
             }
             // (A site that gave up on the stencils, but with an int32 key

@@ -6239,7 +6239,39 @@ macro_rules! typed_load {
             $set;
             next!($s)
         });
+        // A double key in `facc` (an index plus a `Uint32Array`'s element):
+        // one naming an index, else the exit.
+        stencil!("tget_", $w, "_fk_", loc!($loc); |$s| {
+            let Some(i) = f64_index($s.facc) else { exit!($s) };
+            let Some($e) = typed_elem(get!($loc, $s), i, $size) else { exit!($s) };
+            $set;
+            next!($s)
+        });
+        stencil!("tget_", $w, "_fkchk_", loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            if !is_typed($s.tag, o, imm() as u32) {
+                exit!($s)
+            }
+            let Some(i) = f64_index($s.facc) else { exit!($s) };
+            let Some($e) = typed_elem(o, i, $size) else { exit!($s) };
+            $set;
+            next!($s)
+        });
     };
+}
+
+/// Double `d` as an array index (`-0` as 0), if it names one.
+#[inline(always)]
+fn f64_index(d: f64) -> Option<u32> {
+    // Below 2^32 and not negative (but `-0`), on the bits, as
+    // `f64_to_int32`: a compare with a double would load a constant from
+    // `.rodata`. Then the truncation is exact, and must give `d` back.
+    let b = d.to_bits() & !(1 << 63);
+    if d.to_bits() >> 63 != 0 && b != 0 || (b >> 52) >= 1023 + 32 {
+        return None;
+    }
+    let i = unsafe { d.to_int_unchecked::<i64>() };
+    (i as f64 == d && i != u32::MAX as i64).then_some(i as u32)
 }
 
 macro_rules! typed_store {

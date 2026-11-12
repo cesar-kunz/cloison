@@ -702,10 +702,16 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: *mut Object) -> Result<Vec<Vec<u16>>>
     let mut cur = o;
     loop {
         for key in own_keys(vm, cur)? {
-            if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) || !seen.insert(key) {
+            if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) || seen.contains(&key) {
                 continue;
             }
-            if get_own_property(vm, cur, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+            // (A key a trap lists without a property hides nothing: only
+            // one with a descriptor joins VisitedKeys, 14.7.5.10.2.1.)
+            let Some(d) = get_own_property(vm, cur, key)? else {
+                continue;
+            };
+            seen.insert(key);
+            if d.enumerable == Some(true) {
                 let mut u = Vec::new();
                 match key {
                     Key::Index(i) => u.extend(i.to_string().encode_utf16()),

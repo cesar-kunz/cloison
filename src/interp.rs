@@ -4672,7 +4672,9 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
         let callee = (*fo).code;
         let new = top.add(HEADER);
         let n = (*callee).nregs as usize;
-        if new.add(n) > vm.stack_end || native_stack_low(vm) {
+        // (Past the compiled calls' limit, the callee is interpreted: its
+        // calls take no native stack.)
+        if new.add(n) > vm.stack_end || native_stack_exhausted(vm) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         write_frame_header(vm, new, callee, std::ptr::null(), std::ptr::null_mut(), 0);
@@ -5558,11 +5560,34 @@ pub(crate) fn native_stack_low(vm: &Vm) -> bool {
     (&raw const here as usize) < vm.native_limit
 }
 
-/// A `RangeError` if the native stack is past the run's limit: for
-/// natives that recurse over their input (`JSON.parse`'s nesting).
+/// Native stack a native may use past the run's limit for compiled calls
+/// (`Vm::native_limit`). Compiled code calling compiled code runs each
+/// callee on the native stack, so a deep but ordinary JavaScript recursion
+/// (ECharts' force layout, a step calling the next from its callback)
+/// can use up that limit; the interpreter then makes the calls in its own
+/// frames, and the natives it calls there (`Math.random`, `forEach` and
+/// its callback) still need some stack of their own.
+pub(crate) const NATIVE_EXTRA: usize = 512 << 10;
+
+/// Whether the native stack is past what natives may use: [`NATIVE_EXTRA`]
+/// past the run's limit, and never within [`crate::stack::RESERVE`] of the
+/// thread's stack end.
+#[inline(always)]
+pub(crate) fn native_stack_exhausted(vm: &Vm) -> bool {
+    let here = 0u8;
+    let here = &raw const here as usize;
+    here < vm.native_limit && {
+        let floor = vm.native_limit.saturating_sub(NATIVE_EXTRA).max(crate::stack::end() + crate::stack::RESERVE);
+        here < floor
+    }
+}
+
+/// A `RangeError` if the native stack is past what natives may use (see
+/// [`native_stack_exhausted`]): for natives that recurse over their input
+/// (`JSON.parse`'s nesting).
 #[inline(always)]
 pub(crate) fn check_native_stack(vm: &Vm) -> crate::vm::Result<()> {
-    if native_stack_low(vm) {
+    if native_stack_exhausted(vm) {
         return Err(Error::range_error("Maximum call stack size exceeded"));
     }
     Ok(())

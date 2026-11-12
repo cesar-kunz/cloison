@@ -6975,6 +6975,7 @@ impl Vm {
                     // (Several realms: every call checks the callee's.)
                     _ if !self.realms.is_empty() => 0,
                     _ if only_interpreted || huge => i32::MAX,
+                    _ if scan.intrinsic && scan.has_loop => i32::MAX,
                     _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                     (true, _) => self.tier_calls,
                     (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
@@ -7653,6 +7654,14 @@ struct Scan {
     /// stored (`a++` in a loop, then `arguments[0]`, gave `a` as it was at
     /// the exit). Such a function runs interpreted.
     mapped_arguments: bool,
+    /// Whether it has an `Intrinsic` (or `IteratorOpen`, `IteratorNext`),
+    /// which compiled code exits at. With a loop too, its calls are not
+    /// entered compiled until the loop tiers up by itself (once compiled,
+    /// calls enter it). (#125: entered at its calls, Octane CodeLoad's
+    /// `extend` and `each`, another copy at each load whose `for … in`
+    /// exits at each call, were compiled at each: -22%; -14% again once
+    /// cold intrinsics no longer kept functions from being entered, #241.)
+    intrinsic: bool,
     ops: usize,
 }
 
@@ -7662,11 +7671,16 @@ impl Scan {
             has_loop: false,
             needs_frame: false,
             mapped_arguments: false,
+            intrinsic: false,
             ops: 0,
         };
         for op in ops(f) {
             s.has_loop |= op.is_loop();
             s.mapped_arguments |= op == crate::bytecode::Op::CreateMappedArguments;
+            s.intrinsic |= matches!(
+                op,
+                crate::bytecode::Op::Intrinsic | crate::bytecode::Op::IteratorOpen | crate::bytecode::Op::IteratorNext
+            );
             // These bytecodes all currently make compiled code exit.  A
             // normal interpreter entry and an OSR entry have a complete
             // frame header; direct calls and inlined frames do not.  Keep

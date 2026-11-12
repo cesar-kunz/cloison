@@ -470,6 +470,7 @@ pub struct Code {
     /// Strict mode code: its `this` is the receiver as is, `undefined`
     /// for a plain call (see `interp::push_frame`).
     pub strict: bool,
+    /// Its parameter list is simple (see `asm::FunctionDef::simple_parameters`).
     pub simple_parameters: bool,
     /// For `new`: the in-object capacity to give new objects, and the root
     /// shape last used. Slack tracking: until the first `new` returns (the

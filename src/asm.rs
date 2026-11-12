@@ -71,8 +71,10 @@ pub struct FunctionDef {
     pub arguments_escape: bool,
     /// Strict mode code: `this` is passed as is (see `ast::Function::strict`).
     pub strict: bool,
-    // Whether the formal parameter list contains only binding identifiers.
-    pub simple_parameters : bool,
+    /// Its parameter list is simple (no default, rest or pattern): if
+    /// sloppy, its `arguments` gets the function as `callee`, else the
+    /// %ThrowTypeError% accessor (see `builtins::arguments_object_of`).
+    pub simple_parameters: bool,
     /// Where it starts in its source (its parameter list's `(`), 1-based
     /// line and column, for `CLOISON_JIT_LOG` and `CLOISON_JIT_DUMP_FN`: (0, 0)
     /// if unknown or neither is set (see `codegen::positions`).

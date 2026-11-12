@@ -9312,6 +9312,25 @@ var o = new C(); o[0] = 7;
     );
 }
 
+/// Promoting a writable typed array must inspect its element flags, not make
+/// a vector of every index just to find that none is restricted (#240).
+#[test]
+fn large_writable_typed_array_prototype_keeps_indexed_stores_compiled() {
+    let src = r#"
+Object.create(new Uint8Array(1 << 20));
+function fill(n) { var a = [], s = 0; for (var i = 0; i < n; i++) { a[i] = i; s += a[i]; } return s; }
+var out = 0;
+for (var k = 0; k < 100; k++) out += fill(100);
+out;
+"#;
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(20);
+    assert_eq!(display(vm.run(&m).unwrap()), "495000");
+    let stencils = vm.jit_stencils("<script>").expect("script compiled");
+    assert!(stencils.iter().any(|s| s.starts_with("set_keyed_")), "{stencils:?}");
+}
+
 /// An arrow function's own `"use strict"` makes it strict.
 #[test]
 fn arrow_functions_take_use_strict() {

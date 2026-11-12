@@ -9334,6 +9334,64 @@ a[2] = 4; a[1] = 5; Array.prototype.push.call(a, 6);
     );
 }
 
+/// A typed array's element at a double key (an index plus a
+/// `Uint32Array`'s element, pdf.js's `output[index + xs[x]]`) is loaded in
+/// compiled code, not through the runtime; a key naming no index (a
+/// fraction, a negative, 2^32 - 1, NaN) or past the end is `undefined`,
+/// and `-0` is 0 (#240: once keyed stores compiled, pdf.js ran 50% more
+/// instructions through the runtime's keyed loads).
+#[test]
+fn typed_arrays_load_at_double_keys() {
+    let src = r#"
+var kinds = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];
+var out = [];
+for (var K of kinds) {
+  var sum = new Function("a", "idx", "off", "var s = 0; for (var x = 0; x < idx.length; x++) { var v = a[off + idx[x]]; s += v === undefined ? 1000 : v; } return s;");
+  var a = new K(16); for (var i = 0; i < 16; i++) a[i] = i * 3 - 7;
+  var idx = new Uint32Array([0, 1, 2, 3, 4, 5, 6, 7]);
+  var s = 0; for (var r = 0; r < 3000; r++) s += sum(a, idx, 0.5 - 0.5);
+  var keys = [0.5 - 0.5, -0, 1.5, -1, 15, 16, 2 ** 32 - 1, 2 ** 32, NaN, Infinity, 3];
+  var got = keys.map(function (k) { var t = 0; for (var r = 0; r < 50; r++) t = sum(a, [0], k); return t; });
+  out.push(K.name + " " + s + " " + got.join(","));
+}
+out.join("\n");
+"#;
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    let got = display(vm.run(&m).unwrap());
+    let tail = "1000,1000,38,1000,1000,1000,1000,1000,2";
+    assert_eq!(
+        got,
+        [
+            format!("Int8Array 84000 -7,-7,{tail}"),
+            format!("Uint8Array 2388000 249,249,{tail}"),
+            format!("Uint8ClampedArray 120000 0,0,{tail}"),
+            format!("Int16Array 84000 -7,-7,{tail}"),
+            format!("Uint16Array 589908000 65529,65529,{tail}"),
+            format!("Int32Array 84000 -7,-7,{tail}"),
+            format!("Uint32Array 38654705748000 4294967289,4294967289,{tail}"),
+            format!("Float32Array 84000 -7,-7,{tail}"),
+            format!("Float64Array 84000 -7,-7,{tail}"),
+        ]
+        .join("\n")
+    );
+
+    let src = r#"
+function fksum(a, idx, off) { var s = 0; for (var x = 0; x < idx.length; x++) s += a[off + idx[x]]; return s; }
+var a = new Int16Array(64), idx = new Uint32Array(32), t = 0;
+for (var i = 0; i < 64; i++) a[i] = i;
+for (var i = 0; i < 32; i++) idx[i] = i;
+for (var r = 0; r < 3000; r++) t += fksum(a, idx, r & 7);
+t;
+"#;
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(display(vm.run(&m).unwrap()), "1824000");
+    let stencils = vm.jit_stencils("fksum").expect("fksum compiled");
+    assert!(stencils.iter().any(|s| s.starts_with("tget_i16_fk")), "{stencils:?}");
+    assert!(!stencils.iter().any(|s| s.starts_with("get_keyed_rt")), "{stencils:?}");
+}
+
 /// A recursion through compiled code and a native's callback, deeper than
 /// the native stack compiled calls may use, still calls natives: the
 /// interpreter makes the calls past that limit, and natives have stack of

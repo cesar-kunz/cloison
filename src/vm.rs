@@ -5136,17 +5136,17 @@ impl Vm {
                 }
                 _ => {}
             }
+            // (A new element: a prototype's setter or read-only one, or a
+            // typed array, may take the store.)
+            if self.indices_protected && !Self::has_element(o, i) && self.set_new_element(obj, o, i, value)? {
+                return Ok(());
+            }
             // Far past the elements of an object that isn't an array (a
             // map keyed by numbers): a named property, not as many holes.
             if (*o).class != Class::Array && self.sparse_key(o, i) {
                 (*o).flags |= crate::object::SPARSE;
                 let a = self.intern_name(&i.to_string());
                 return self.set(obj, a, value);
-            }
-            // (A new element: a prototype's setter or read-only one may
-            // take the store.)
-            if self.indices_protected && !Self::has_element(o, i) && self.set_new_element(obj, o, i, value)? {
-                return Ok(());
             }
             // Past an array's dense elements: far if it is, or if the
             // store would leave it too sparse (see `far::Density`).
@@ -5173,8 +5173,9 @@ impl Vm {
 
     /// `obj[i] = value` where `obj` (object `o`) has no element `i`, once
     /// indices are protected (see `protect_indices`): whether the store
-    /// is done, by a setter on the prototype chain, or failed on a
-    /// read-only element there (else `obj` gets the element).
+    /// is done, by a setter on the prototype chain, failed on a read-only
+    /// element there, or taken by a typed array there without the index
+    /// (else `obj` gets the element).
     #[cold]
     fn set_new_element(&mut self, obj: Value, o: *mut Object, i: u32, value: Value) -> Result<bool> {
         if self.own_property(o, Key::Index(i)).is_some() {
@@ -5198,6 +5199,11 @@ impl Vm {
                     return Ok(true);
                 }
                 return Ok(false);
+            }
+            // (TypedArray [[Set]] for another receiver: an index that isn't
+            // valid stops there, the store done.)
+            if unsafe { (*po).class } == Class::TypedArray {
+                return Ok(true);
             }
             p = unsafe { (*(*po).shape).proto };
         }

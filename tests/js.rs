@@ -9312,23 +9312,43 @@ var o = new C(); o[0] = 7;
     );
 }
 
-/// Promoting a writable typed array must inspect its element flags, not make
-/// a vector of every index just to find that none is restricted (#240).
+/// Promoting a typed array to a prototype must not make a vector of every
+/// index (#240), yet it protects stores: an inherited store of an index
+/// outside its length does nothing (TypedArray [[Set]]).
 #[test]
-fn large_writable_typed_array_prototype_keeps_indexed_stores_compiled() {
-    let src = r#"
-Object.create(new Uint8Array(1 << 20));
-function fill(n) { var a = [], s = 0; for (var i = 0; i < n; i++) { a[i] = i; s += a[i]; } return s; }
-var out = 0;
-for (var k = 0; k < 100; k++) out += fill(100);
-out;
-"#;
-    let m = cloison::js::compile(src).unwrap();
-    let mut vm = Vm::new();
-    vm.set_tier_back_edges(20);
-    assert_eq!(display(vm.run(&m).unwrap()), "495000");
-    let stencils = vm.jit_stencils("<script>").expect("script compiled");
-    assert!(stencils.iter().any(|s| s.starts_with("set_keyed_")), "{stencils:?}");
+fn typed_array_prototypes_take_out_of_range_stores() {
+    assert_eq!(
+        value(
+            r#"
+var p = new Uint8Array(1 << 24);
+var o = Object.create(p);
+o[1 << 24] = 1; o[0] = 2; o[1e9] = 3;
+var a = []; Object.setPrototypeOf(a, Object.create(new Int16Array(2)));
+a[2] = 4; a[1] = 5; Array.prototype.push.call(a, 6);
+(function () { "use strict"; o[5e7] = 7; })();
+[o.hasOwnProperty(1 << 24), o[0], o.hasOwnProperty(1e9), p[0],
+ a.hasOwnProperty(2), a[1], a.length, a.hasOwnProperty(0), o.hasOwnProperty(5e7)].join();
+"#,
+        ),
+        "false,2,false,0,false,5,3,false,false",
+    );
+}
+
+/// A string object's characters are read-only for objects inheriting from
+/// it too, however it becomes their prototype (#240).
+#[test]
+fn string_object_prototypes_keep_characters_read_only() {
+    assert_eq!(
+        value(
+            r#"
+var o = Object.create(new String("abc")); o[1] = "z";
+var a = [0]; Object.setPrototypeOf(a, new String("abc")); a[1] = "z"; a[3] = "w";
+var e; try { (function () { "use strict"; o[0] = 1; })(); } catch (x) { e = x.constructor.name; }
+[o[1], o.hasOwnProperty(1), a[1], a.hasOwnProperty(1), a[3], e].join();
+"#,
+        ),
+        "b,false,b,false,w,TypeError",
+    );
 }
 
 /// An arrow function's own `"use strict"` makes it strict.

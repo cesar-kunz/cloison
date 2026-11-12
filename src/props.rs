@@ -500,7 +500,10 @@ impl Vm {
             }
             indices.sort_unstable();
             indices.dedup();
-            let far_enum = |i: u32| far.iter().find(|&&(j, _)| j == i).is_none_or(|&(_, e)| e);
+            // (Sorted, so that each index finds its attributes in log time: a
+            // linear search per index made a sparse object's keys O(n²).)
+            far.sort_unstable_by_key(|&(i, _)| i);
+            let far_enum = |i: u32| far.binary_search_by_key(&i, |&(j, _)| j).ok().is_none_or(|at| far[at].1);
             out.extend(indices.into_iter().map(|i| (Key::Index(i), far_enum(i))));
             // The properties without slots (see `own_property`).
             let flags = (*o).flags;

@@ -35,8 +35,7 @@ object model, and the allocation and escape behaviour discussed in
   recursion, closure, object, new, proto, call-method
   (`Function.prototype.call`), array, global, null, define-property, for-in,
   throw, math, typeof, instanceof, arguments, literal, typed-array, getter.
-  `--features` selects the files a front end in progress can already
-  handle.
+  `--features` selects the files that need only the listed features.
 
 ### Running
 
@@ -48,11 +47,10 @@ node bench/run.mjs --update               # rewrite `expect` from Node (the refe
 node bench/run.mjs --engine "target/release/cloison" bench/micro/0*.js
 ```
 
-- `--engine CMD` runs `CMD file` and compares the number it prints. cloison's
-  driver should accept either a `.js` file (parsed and compiled to bytecode
-  on the fly) or a bytecode file from the bytecode compiler, so both paths
-  are checked against the same expectations: compile each file ahead of time
-  and run the output with `--engine` too.
+- `--engine CMD` runs `CMD file` and compares the number it prints. cloison
+  takes either a `.js` file (compiled to bytecode on the fly) or a bytecode
+  listing (`.asm`), so both paths are checked against the same
+  expectations.
 - Node timings are only indicative. Each file runs in a fresh `vm` context
   (so `Object.prototype` changes don't leak between files), and Node
   accesses globals in such a context slowly, which shows in the
@@ -89,8 +87,8 @@ node bench/run.mjs --engine "target/release/cloison" bench/micro/0*.js
   disassemblies of one function. Maglev's sizes are cached by Node
   version and file contents. Functions are matched by name and source
   position (`name:line:col`, which `CLOISON_JIT_LOG` prints). `--pieces`
-  breaks cloison's final code down per stencil family and per task of
-  [docs/maglev-size-tasks.md](../docs/maglev-size-tasks.md);
+  breaks cloison's final code down per stencil family and per size
+  task (`TASKS` in the script);
   `--pieces --record` appends the task totals to
   [maglev-tasks.tsv](maglev-tasks.tsv), by commit, and every run shows the
   change since the last record.

@@ -128,7 +128,7 @@ the JS side (tens of KB), and ICU4X and its data come with the plugin:
 - Host builds would have to link dynamically: `dlopen` from a static
   glibc binary is unsupported in practice (the plugin would need the
   same glibc), and static musl has no `dlopen`. That costs the startup
-  time static linking saves (see the README's "Building").
+  time static linking saves (see "Building" in [cloison in depth](README-long.md#building)).
 
 Every call crosses the C interface, but `Intl`'s calls are coarse (one
 comparison or formatting each); string arguments go as UTF-16 pointers

@@ -13,7 +13,7 @@ console, CyberChef (Apache-2.0), PCjs (MIT) booting FreeDOS, TiddlyWiki
 a reference run.
 
 Measured on the host and engine builds of [octane.md](octane.md) (cloison
-at 00bd4d1 on 2026-11-13, the other engines on 2026-11-11),
+of 2026-11-13, the other engines on 2026-11-11),
 by `scripts/compare/webapps.py` (results in `bench/compare/webapps.tsv`):
 one run per engine and app, the process's wall time from start to exit and
 its peak RSS. cloison's runs are at a load of 2 to 4; the other engines' at
@@ -36,8 +36,8 @@ in a geomean, and a geomean over fewer apps says how many.
 - **With its JIT it is twice as fast as ARK's JIT**, and about 5 to 6
   times slower than V8, JavaScriptCore and SpiderMonkey.
 - The JIT gains less here than on Octane (1.3× over the interpreter,
-  geomean): a function using an instruction that has no stencil runs in
-  the interpreter.
+  geomean): compiled code exits to the interpreter at an instruction that
+  has no stencil, and generators and async functions run interpreted.
 
 ## Wall time with a JIT, seconds (lower is better)
 
@@ -83,9 +83,9 @@ in a geomean, and a geomean over fewer apps says how many.
 
 KetteVM runs none of the apps yet (it doesn't parse regular expressions).
 
-## Since 4f08e81
+## Since the runs of 2026-11-11
 
-Since the runs of 2026-11-11 (cloison at 4f08e81), the interpreter's
+Since the runs of 2026-11-11 (cloison of 2026-11-09), the interpreter's
 geomean went from 101 s to 61 s and the JIT's from 97 s to 47 s: array
 destructuring, `for…of` and spread skip the iterator protocol while
 arrays' iteration is untouched (Excalidraw 164 s → 66 s), for-in is

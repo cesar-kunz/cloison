@@ -16,6 +16,12 @@ A note on the motivating example: with no declaration,
 strict mode), so the object is externally visible (`globalThis.obj` after
 the call). Everything below assumes `let`/`const`.
 
+The collector parts of this design (the internal heap, its frame-rooted
+collection and bulk free, the externalization barrier, the transitive
+walk and the two-heap invariant) are superseded by `docs/gc.md`, which
+keeps one heap; scalar replacement (A), compact layouts (B) and the
+DeltaBlue measurement plan stand.
+
 ## Internal and external
 
 An object is **external** if the outside world can observe it, and
@@ -308,7 +314,9 @@ the inline caches do. That's why tiering is the default.
 ### Deletes and dictionary mode
 
 A `delete` gives the object a **unique** shape of its own: a copy without
-the property, with a table and field cells of its own (`Vm::remove_named`).
+the property, with a table and field cells of its own (`Vm::remove_named`);
+deleting the property it got last instead takes it back to the shared
+shape it got it from (`Vm::parent_without_last`).
 Caches still hold it, so an object that deletes once and is read after
 keeps its reads cached. A plain object deleting **again** (not a
 prototype, nor the global object, nor one with flags) goes to **dictionary
@@ -317,13 +325,13 @@ delete moving the slots after the property down one (`Vm::dict_remove`),
 an add appending one (`Vm::transition_with`), the fields all one cell
 typed `Any` (`Vm::dictionary_cell`). No new shape, table or cell per add
 or delete: one object's add/delete churn makes none (del.js, issue #6:
-14.5 s and 718 MB at c0dc14c, 1 s and 16 MB).
+14.5 s and 718 MB on the master of 2026-10-29, 1 s and 16 MB).
 
 Since its slots change without its address changing, nothing may rely on
 one: no inline cache holds one (`install`, `note_accessor`), nor the VM's
 lookup, megamorphic load and store tables (`Vm::lookup`, `mega_note`,
-`mega_store_note`), nor a constructor's result (`construct_done`), nor a
-field's or the elements' type (`FieldType::of`, `push_key`), nor the JIT's
+`mega_store_note`, the interpreter's `Vm::interp_megas`), nor a
+constructor's result (`construct_done`), nor a field's or the elements' type (`FieldType::of`, `push_key`), nor the JIT's
 types (`Ty::of`); its elements are `Any`, so no elements transition copies
 it. Every access to it takes the miss path. Anything else that would copy
 its shape (attributes, extensibility, the prototype, becoming a prototype,
@@ -760,9 +768,8 @@ objects, `{x, y}` points) are where A should be measured.
   suspended frames held by internal objects.
 - **`eval`, `with`, `arguments`, debuggers** defeat static analysis: no
   virtual objects in such functions. Internal objects still work.
-- **GC.** Both heaps can start simple: copying for the internal heap
-  (it moves external-marked objects out), non-moving mark-and-sweep for the
-  external heap; generational later.
+- **GC.** Superseded by `docs/gc.md`: one generational mark-region heap,
+  mostly non-moving, marked concurrently, no internal heap.
 
 ## Plan
 
@@ -774,7 +781,8 @@ objects, `{x, y}` points) are where A should be measured.
    frames. **A JS front end** to run real programs such as DeltaBlue.
 3. **The internal heap**: allocate internal by default, the externalization
    barrier and transitive externalization, the frame-rooted collector, bulk
-   free, an invariant-checking debug mode.
+   free, an invariant-checking debug mode. Dropped for `docs/gc.md`'s
+   collector.
 4. **Virtual objects**: escape analysis and scalar replacement in the
    bytecode compiler, `Materialize` with VirtualObject descriptors.
 5. **JIT**: property-access stencils fed by inline caches, shape checks as
@@ -782,11 +790,13 @@ objects, `{x, y}` points) are where A should be measured.
 
 ### Status
 
-Steps 1 and 2 have started. The JS front end (`src/js/`) parses the ES5
-subset the microbenchmarks are written in and compiles what the
-instruction set covers; its output for the reference listings in
-`bench/bytecode/` is checked instruction by instruction. The bytecode runs on
-`src/object.rs` (objects, shapes, the heap), `src/vm.rs` (inline-cache
+Steps 1 and 2 are done, step 3 is dropped (see `docs/gc.md`), and step 4
+is not started (scalar replacement happens in the JIT instead, below).
+The JS front end (`src/js/`) parses the whole language; its output for
+the reference listings in `bench/bytecode/` is checked instruction by
+instruction (`tests/bench_bytecode.rs`). The bytecode runs on
+`src/object.rs` (objects, shapes), `src/heap.rs` and `src/gc.rs` (the heap
+and its collector), `src/vm.rs` (inline-cache
 misses, closures, arrays, natives) and the interpreter (`src/interp.rs`).
 In place:
 
@@ -801,7 +811,7 @@ In place:
   object can have any more become zombies (`Vm::sweep_shapes`), whose
   prototypes may die and whose addresses are never reused.
 - Scalar replacement of objects that never escape compiled code, which
-  allocates them only at exits (see `docs/future-work.md`).
+  allocates them only at exits.
 - Inline caches for `GetNamed`, `SetNamed` (including cached transitions
   to in-object slots), `LdaGlobal` and `StaGlobal`, holding the shape and
   the location; named accesses are polymorphic (up to four shapes). Prototype loads cache the holder too. Prototypes
@@ -814,7 +824,8 @@ In place:
 
 Step 5 has started too. Hot loops in VM frames tier up into the JIT
 (on-stack replacement from the interpreter), and calls to hot functions
-with loops enter their compiled code. Property accesses compile
+with loops, large ones or recursive ones enter their compiled code
+(`Scan::has_loop` in `src/vm.rs`). Property accesses compile
 to stencils fed by the inline caches, with shape guards as exits. The JIT's
 type lattice knows objects of a known shape (`Obj(shape)`), so a guard
 that passed, or a shape seen at entry, isn't checked again. Fields have
@@ -824,13 +835,10 @@ elements' type (`Shape::elems`), likewise. Calls are compiled too: inlined
 behind a guard on the callee (or a dispatch on up to four callees),
 straight into the callee's compiled code (itself included, for
 recursion; the result then has the callee's return type, checked), or
-through the runtime. Details and
-numbers: `docs/future-work.md`, "Property access in the JIT, and shape
-types".
+through the runtime (see `docs/direct-calls.md`).
 
-Still missing from steps 1–2: a collector (the heap is an arena freed with
-the VM), megamorphic caches,
-property attributes, strings, sloppy-mode `this`, exceptions (`try`),
-closures over variables, and the opcodes the front end still rejects
-(`%`, shifts and bitwise operators by a variable, unary `-` of a variable,
-object literals, `switch`, `for … in`, doubles and strings as constants).
+What this list once had missing from steps 1–2 has since landed: the
+collector (`docs/gc.md`), megamorphic caches (in compiled code, and for
+loads in the interpreter, `Vm::interp_megas`), property attributes,
+strings, sloppy-mode `this`, exceptions, closures over variables, and the
+opcodes the front end rejected.

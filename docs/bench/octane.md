@@ -1,14 +1,14 @@
 # Octane against other engines
 
 Measured on one Linux x86-64 host (AMD EPYC 9454P, Zen 4, 96 cores,
-shared): cloison at b881c56 on 2026-11-13, the other engines on 2026-11-11. Made by `scripts/compare/octane.py`
+shared): cloison of 2026-11-13, the other engines on 2026-11-11. Made by `scripts/compare/octane.py`
 (results in `bench/compare/octane.tsv`, tables by `scripts/compare/report.py`).
 
 The engines, each run directly (not through a wrapper shell):
 
 | engine | version | with a JIT | without |
 |---|---|---|---|
-| cloison | b881c56 | default | `CLOISON_NO_JIT=1` |
+| cloison | 2026-11-13 | default | `CLOISON_NO_JIT=1` |
 | V8 (`d8`) | 15.8.30 | default | `--jitless` |
 | JavaScriptCore | 323696 (GTK port) | default | `--useJIT=false` |
 | SpiderMonkey | 159.0b1 | default | `--no-blinterp --no-baseline --no-ion --no-native-regexp` |
@@ -82,8 +82,8 @@ regular expressions or `~`). A geomean over fewer benchmarks says how many.
 | **geomean** | **7,488** | **5,625** | **4,359** | **2,002** | **3,003** | **3,000** (6) | **1,715** (2) |
 
 V8, JavaScriptCore and SpiderMonkey are ahead on CodeLoad, which measures
-loading code: cloison compiles all of an `eval`'s functions to bytecode up
-front. V8 is ahead on RegExp.
+loading code: cloison compiles an `eval`'s functions to bytecode at their
+first calls, but skims every one's tokens up front. V8 is ahead on RegExp.
 
 ## Fixed work without a JIT: G instructions (lower is better)
 

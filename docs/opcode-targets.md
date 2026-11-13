@@ -191,7 +191,7 @@ target above.
 | `tund/tnull_j*`, `_g<k>` | `cmp r12, 10; jne` ✓ | `cmp x20, #10; b.ne` ✓ | — |
 | `tnsh_j*` (`== null`) | `lea rax, [r12-2]; test rax, -9; je` ✓ | `sub; tst; b.eq` ✓ | — |
 | `test_seq`/`tseq_*` (`===`, generic) | 3 tests + `cmp` + `jcc` | similar | generic only; int32 operands use `teq_*_ii` |
-| doubles with `>`, `<=`, `>=` | through `jrel`/`test_rel` (runtime for doubles) | same | double compares for the new relations aren't specialized |
+| doubles with `>`, `<=`, `>=` | through `jrel`/`test_rel` (runtime for doubles) | same | double compares for the new relations aren't specialized (since 2026-10-28 their compare-and-jumps are: `tgt_j?_ff_g<k>` & co., `ucomisd; jbe L`) |
 
 Not fused yet (each a few instructions over the ideal):
 `lda_smi k; Test… a; JumpIf…` (`if (x > 3)`; ideal `cmp esi, 3; jle`),
@@ -199,7 +199,7 @@ Not fused yet (each a few instructions over the ideal):
 star a; ldar a; JumpIfGreaterEqualSmi k` loop tails (the `incjlt` analogue),
 `ldar a; MulSmi k; star b` (`imul ebx?, esi, k`), shifts from slot to slot.
 
-### Size (x86-64, vs bd102e0)
+### Size (x86-64, vs the code before group 1)
 
 | | before | after | |
 |---|---:|---:|---:|
@@ -227,6 +227,13 @@ fields to memory offsets and immediates (shift counts, condition codes)
 is natural there. x86-64 only partially: register fields span REX bits
 and REX presence changes instruction length, so only same-length
 members (e.g. the rdi/rsi/rdx/rcx slots) can share a template.
+
+Done for slot registers on x86-64 (2026-10-28): `build.rs` decodes each
+family's register fields (`x86_fields`) and the JIT patches the low 3
+bits, a template per REX class (rdi rsi rdx rcx; r8 r9), members laid
+out otherwise kept explicit: 3969 stencils with 174,150 bytes of code
+became 1656 (820 templates) with 83,588. Immediates, offsets and
+condition codes as fields are not done on either.
 
 ---
 
@@ -408,7 +415,7 @@ was just freed from ran 46M or 61M cycles (13, frontend stalls 1.2M vs
 8.8M, same code); code now comes from a reserved range never reused.
 Loop-head alignment (16/32/64 with `nop` padding): ±5% either way, dropped.
 
-Results vs 57628c5: 50 −22%, 14 −22%, 12 −21%, 10 −21%, 64 −19%, 15 −16%.
+Results vs the code before this pass (2026-10-08): 50 −22%, 14 −22%, 12 −21%, 10 −21%, 64 −19%, 15 −16%.
 
 ## Call setup and register slots (2026-10-08)
 
@@ -445,7 +452,7 @@ Compile time is now the largest gap in 80/82/91 (half the run).
 
 ## Group 3 (2026-10-09): bitwise on registers, `~x`, `-x`, ToNumber, typed arrays, upvalues, keyed runtime paths
 
-Opcodes from 75d2217, 4ad23f9 and cb6b81b. Ideal first, then the stencils
+Opcodes from three commits of 2026-10-09. Ideal first, then the stencils
 as emitted (LLVM 23.1.3, `scripts/stencils-asm.sh`), then the JIT's
 sequences in Octane (`CLOISON_JIT_LOG`, `CLOISON_COUNT`, `perf` with
 `CLOISON_PERF_MAP`). Hot-path instructions, excluding the trailing `jmp`.
@@ -593,7 +600,7 @@ interpreter's own fast path inline, the runtime only for the rest:
 the identical `set_keyed_` helper into it otherwise, and a stencil can't
 jump into another's helper.)
 
-### Results (x86-64, cycles:u, interleaved base/new runs, median of paired ratios; vs 9a32511)
+### Results (x86-64, cycles:u, interleaved base/new runs, median of paired ratios; vs the group as first committed, 2026-10-09)
 
 | | base | new | change | spread |
 |---|---:|---:|---:|---|
@@ -627,7 +634,7 @@ compare (gbemu, 2 per access); shifts on registers via BMI2 (x86-64, 4);
 `neg_i` / `check_acc_num` exit layout (1); arm64's register-offset loads
 (`lda_upvalue`, `tget`: 1 each); `set_frame_func`'s offset (2).
 
-Micros (`scripts/perf.sh --ab` vs 9a32511, 76 benchmarks): none changed
+Micros (`scripts/perf.sh --ab` vs the same base, 76 benchmarks): none changed
 beyond its spread.
 
 ## Group 3, second pass (2026-10-09): the keyed store's key, `_chk`, exit layout
@@ -690,7 +697,7 @@ Shifts on registers (x86-64: rcx is slot 3; `shlx` needs BMI2 dispatch);
 `ubfiz` + register-offset loads (`tget_u16`, `lda_upvalue`: 1 each);
 `set_frame_func`'s offset (2, once per call).
 
-### Results, second pass (x86-64, cycles:u, interleaved, 9 rounds; vs d1f52fa)
+### Results, second pass (x86-64, cycles:u, interleaved, 9 rounds; vs the first pass, 2026-10-09)
 
 | | change | spread |
 |---|---:|---|
@@ -795,7 +802,7 @@ stencils.text +1.1% (21 new stencils), runtime flat. Test:
 
 ---
 
-## T1 (2026-10-14): Navier-Stokes `lin_solve`'s inner loop, at f6d86a0
+## T1 (2026-10-14): Navier-Stokes `lin_solve`'s inner loop
 
     for (var i=1; i<=width; i++)
         lastX = x[currentRow] = (x0[currentRow] + a*(lastX+x[++currentRow]+x[++lastRow]+x[++nextRow])) * invC;
@@ -833,9 +840,11 @@ per register, so double temporaries get XMMs; (2) a double elements kind
 load is `movq` + `sub` with no branch; (3) bounds checks hoisted for
 induction variables with known ranges; (4) loop-invariant conversions
 hoisted; (5) overflow checks dropped on increments bounded by a checked
-length.
+length. (1) was done the same day as `split_temps`: a temporary whose
+reads follow its `Star` in straight-line code gets a register of its
+own, homed by its own type (Navier-Stokes −45% cycles).
 
-## Every hot stencil, ideal code pass (2026-10-26, at 496edba)
+## Every hot stencil, ideal code pass (2026-10-26)
 
 The 155 families with no target that run at least 0.05% of the compiled
 code (mean of `CLOISON_COUNT` over Octane's 15 benchmarks), judged on both
@@ -882,6 +891,10 @@ more than it costs instructions.
    sta_global, set_tro_nc, set_own and sta_global_oop. It is about a day of
    work, verified under `CLOISON_GC_VERIFY`. Separately, sta_upvalue reads
    `u.at` twice; reading it once is a trivial fix.
+   - Done on x86-64 (2026-10-27): one asm block (`barrier_asm`, plain
+     labels, not `asm goto`), 9 instructions after the store for a young
+     host and 16 for an old one (were 24 and 21), no `push rbp`; arm64's
+     Rust reordered (the host's age first, `tst; ccmp; b.lo`).
 2. **Generic `==` (`teq_j?_g/m`, `test_eq_m/g`)**: 6–9 against 37–40
    counted, about 39 on x86-64 and 33 on arm64.
    - LLVM put the both-int32 path out of line, and on the object path
@@ -894,6 +907,9 @@ more than it costs instructions.
      `test_seq_m` (31 against 14) have the same problem. The fix: branch
      out of line on equal bits, and once the tag test has passed, test bit
      1 (`test r10b, 2` / `tbz #1`) instead of a mask.
+   - Since 2026-10-27 the fall-through is the equal-bits case (a double
+     cold) and more is decided inline: `loose_eq_fast` 30 where 37–40,
+     two objects under `===` 14 on x86-64.
 3. **`create_array_n`**: 85 against 42 on x86-64 (about 20), 51 against 43
    on arm64. The causes: the bump check, r8/r9 spilled, `imm` loaded
    twice, and an unrolled fill loop.
@@ -902,11 +918,18 @@ more than it costs instructions.
      (`lea; cmp; ja`, not `mov; sub; cmp; jb; lea`), and zero with
      16-byte stores.
    - The earlier target of 13 for n = 2 predates the metadata byte.
+   - Done (2026-10-27): `bump` is `lea; cmp; ja`, cells are zeroed 16
+     bytes a store, and `create_array_n` fills by a countdown loop (asm
+     on x86-64): 85 → 49 (arm64 51 → 48), `create_object_<n>` 16–20
+     (arm64 19–24); 45 and 15–19 on x86-64 since the 32-byte header
+     (2026-10-28).
 4. **The cell test on x86-64**: about 14, one instruction across 12
    families (get_own, get_oop, get_proto, get_length, get_keyed*,
    guard_cell, check_shape, check_acc_shape). `tag | 2` is built with
    `mov rax, r14; or rax, 2`. Writing `tag + 2` gives `mov; add`, so the
-   fix is a one-line asm `lea rax, [r14 + 2]` in `is_cell`.
+   fix is a one-line asm `lea rax, [r14 + 2]` in `is_cell`. Done
+   (2026-10-27, `is_cell_g`) in 45 families, not the write barrier's (the
+   opaque mask made LLVM lay the stores out longer).
 5. **`get_named_rt` and `set_named_rt`**:
    - **get_named_rt**: LLVM falls through into the runtime call. The fix
      is to split it into a `__slow` piece as `get_keyed_rt_` does, and drop
@@ -915,6 +938,10 @@ more than it costs instructions.
    - **set_named_rt**: on x86-64, `mega_store` runs 82 instructions where 42
      do. The fix is the entry pointer computed once with early returns,
      and no barrier for `_i` (about 16).
+   - Both done (2026-10-28): the runtime call in a `__slow` helper, the
+     name an immediate, no spills: x86-64 `get_named_rt` 36 → 25,
+     `set_named_rt` 82 → 46, `set_named_rt_i` 58 → 28 (arm64 41 → 30,
+     52 → 47, 38 → 35).
 6. **Keyed stores**:
    - **The type dispatch**: it builds a setcc boolean (`fits_code`). Making
      ANY the fall-through, with early exits, is worth about 15 on x86-64
@@ -928,20 +955,27 @@ more than it costs instructions.
    compared, giving a `mov r12d, 7` after `cmp r12, 7`. That `mov` blocks a
    direct `je L`: `jfalse` is 4 instructions against 2. `jtofalse` also
    merges its two boolean tests into `and -2; cmp 6`. A build.rs peephole
-   dropping the repeated `mov` fixes all four.
+   dropping the repeated `mov` fixes all four. Done on x86-64
+   (2026-10-27) by `asm goto` instead (`jump_if_bits`): `jtrue` and
+   `jfalse` 4 → 2, `jtofalse` 7 → 4, `jtotrue` 6 → 4; arm64 unchanged.
 8. **Calls**:
    - **`call_direct_code`** (50 against 32): LLVM made the runtime call the
      fall-through, which costs 2 taken branches per direct call. A cold
      hint on the runtime arm fixes it. `call_direct` and `construct_direct`
-     probably share it.
+     probably share it. Done (2026-10-27, `cold_path()` on the runtime
+     arm of all four): `call_direct_code` 50 → 27 (arm64 52 → 30),
+     `call_direct` 41 → 26.
    - **The epoch compare** in `call`, `call_done` and `call_direct_code`
-     should be `cmp dword [m], imm32` (about 2.3).
+     should be `cmp dword [m], imm32` (about 2.3). Not done: by `asm
+     goto`, in a stencil making a runtime call, LLVM moved the
+     stack-aligning `push` into the exit's block.
    - **`test_instanceof_m`** (28 against 25): it walks a pointer through the
      cache, where fixed offsets, `imm_zext()` and `ldp` on arm64 do better.
 9. **Ints in place**: `add_ii` (4 against 2), `addi_g` (5 against 3) and
    `inc_i` (4 against 2), about 6 together.
    - They should add in place with an undo exit stub, as `add_smi_i`
-     does.
+     does. (Not done for `acc`; `Add r; Star r` on an int32 slot runs in
+     place since 2026-10-27, `add_into_u<k>`.)
    - `add_smi_wrap_i` should be `add r12d, k`.
    - `add_smi_iif` needs a sign-extended imm32 (R_X86_64_32S, which
      `HoleImm` doesn't take yet).

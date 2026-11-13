@@ -11,8 +11,9 @@ Not worth building yet:
   A sandbox only matters to an embedder running untrusted JS in-process,
   and only once an attacker already has an engine memory-corruption bug.
 - **The heap is still moving.** The GC, strings, exceptions, closures and
-  buffers are still missing. Each would need the sandbox's rules and an
-  audit, and that is cheaper once they have settled.
+  buffers were missing then; they have since landed (October and November
+  2026) on raw addresses, so the sandbox would now be a retrofit of each,
+  with its rules and an audit.
 - **The cost lands in the hot paths.** Expect 1–3% on property-heavy code,
   and an extra `add` on arm64 field loads. Without the testing and fuzzing
   of plan step 4, the guarantee would also be unverified.
@@ -25,7 +26,9 @@ What to keep in mind meanwhile, because it is cheap now and expensive later:
 2. **The allocator and GC rewrite.** Allocate from one reservation, and
    track positions as offsets or bounded indices from its base. Adding
    offsets after the GC exists would be the most expensive part of a later
-   retrofit.
+   retrofit. Half done: the collector (`docs/gc.md`) allocates every heap
+   from one shared reservation, a 32 GiB slice each (`src/heap.rs`), but
+   references stay raw addresses.
 3. **No Rust addresses stored in heap objects.** Natives, host objects and
    strings reach Rust-side data through tables or IDs.
 
@@ -290,11 +293,16 @@ once references are offsets. But it is a separate decision and optional
 
 - **Values** are NaN-boxed with JSC's encoding; cells are raw 48-bit
   addresses (`src/value.rs`).
-- **Object headers** (`src/object.rs`) are 48 bytes of raw pointers:
-  `shape`, `props`, `elems`, `code`, plus `class`, `flags` and the lengths.
-- **The heap** is a bump arena of `mmap`ed chunks.
-- **Shapes** are `Box<Shape>` in the Rust heap: trusted, and already outside
-  any future sandbox. They hold `Vec`s, `RefCell`s and field-type cells.
+- **Object headers** (`layout::Header`) are 32 bytes: raw pointers
+  `shape`, `props` and `elems`, plus `class`, `flags`, the in-object
+  capacity and `elems_len`; functions and the other classes with one have
+  a `code` word after it.
+- **The heap** (`src/heap.rs`, `docs/gc.md`) is 32 KiB blocks of a
+  reservation all heaps of the process share, with side tables (a
+  metadata byte per 16-byte granule, a card byte per 128 bytes) beside it.
+- **Shapes** are slab-allocated in the Rust heap (`object::ShapeSlab`):
+  trusted, and already outside any future sandbox. They hold `Vec`s,
+  `RefCell`s and field-type cells.
 - **`Code`** is likewise trusted, and holds the bytecode, the inline caches
   (shape pointers and `Value`s), and the JIT's code.
 - **The VM stack** (register files and frame headers) is a Rust allocation,
@@ -304,7 +312,7 @@ once references are offsets. But it is a separate decision and optional
   - `guard_shape` compares the header's first word with a 64-bit hole, which
     on x86-64 is a `movabs` plus a `cmp`;
   - fields are `[o + imm]` and `[[o+16] + imm]`;
-  - keyed loads check `[o+32]` and load `[[o+24] + 8i]`;
+  - keyed loads check `[o+12]` (a `u32`) and load `[[o+24] + 8i]`;
   - `array_length` reads the `class` byte.
 - **Pinned registers in compiled code:**
 
@@ -322,10 +330,13 @@ once references are offsets. But it is a separate decision and optional
   - **`ctx`:** points to the *exit cell*, a `u32` local to the JIT driver
     (`NO_EXIT` while code runs, so nested entries can share one cell). Direct
     calls pass it along unchanged.
-- **Single-threaded.** cloison has no workers or shared memory, so the
-  concurrent double fetches behind several V8 bypasses can only come back
-  through reentrancy (a getter or native that changes the object between
-  two reads).
+- **Mostly single-threaded.** JS runs on one thread per VM; the
+  collector marks on a thread of its own (`docs/gc.md`), and test262's
+  agents (`src/agent.rs`) are threads with VMs of their own sharing
+  `SharedArrayBuffer`s' memory (`src/shared.rs`). Shared buffers hold only
+  data, so the concurrent double fetches behind several V8 bypasses come
+  back mostly through reentrancy (a getter or native that changes the
+  object between two reads).
 
 What would leave the sandbox today, if objects were inside one: cell
 `Value`s, `shape`, `props`, `elems` and `code`. Everything else in the
@@ -493,17 +504,18 @@ sandbox.**
 - **The heap's allocation state:** the bump pointer is in the VM page; mark
   bitmaps come later.
 
-A future GC fits inside this:
+The GC (`docs/gc.md`, built since on raw addresses) would fit inside this:
 
 - It traces with trusted shapes and untrusted lengths, and writes only
   through `B + offset`.
-- Mark bitmaps outside the sandbox are indexed by `offset >> 3`, so they are
-  bounded at 64 MiB of address space, like V8's tables.
+- Its side tables outside the sandbox (a metadata byte per 16-byte
+  granule, a card per 128 bytes) would be indexed by `offset >> 4` and
+  `>> 7`, so bounded at 256 MiB and 32 MiB of address space per 4 GiB,
+  like V8's tables.
 - Fooling the GC into freeing a live object (V8 calls this acceptable) only
   produces in-sandbox aliasing.
-- `docs/object-model.md` splits the heap into internal and external regions.
-  Both live in the cage. "Is it internal?" can become an offset-range
-  compare instead of a header bit, which is cheaper and can't be forged.
+- `docs/object-model.md`'s split into internal and external regions was
+  dropped for `docs/gc.md`'s single heap, so this no longer applies.
 
 ### Discipline for trusted Rust code
 
@@ -541,18 +553,10 @@ Rust collections, not raw cage pointers.
 
 Once references are offsets, storing them in 32 bits is a layout choice:
 
-- **Headers:** the header goes from 48 to 32 bytes, as below. A two-field
-  object shrinks from 64 to 48 bytes, a quarter less memory touched. That
-  matters, since page faults are a fifth of JIT time and allocation is a
-  large share of the object benchmarks.
-
-  ```text
-   0  shape id u32 | class u8 | flags u8 | _ u16
-   8  props u32    | props_cap u32
-  16  elems u32    | elems_len u32
-  24  elems_cap u32| code id u32
-  32  inline slots …
-  ```
+- **Headers:** the header went from 48 to 32 bytes without compression
+  (2026-10-28: the capacities held by the arrays' cells, `code` only in
+  the classes using it), so the layout this proposed is overtaken;
+  32-bit references would shrink it further.
 
 - **Value slots** stay 64-bit NaN-boxed: unboxed doubles in fields are a
   large part of cloison's numeric speed. Hermes' `SmallHermesValue` (32-bit
@@ -643,10 +647,10 @@ Each step builds on its own and is measured with `--ab` before the next.
    bounded buffers and typed arrays, Wasm memories, pkey protection of
    tables, and a hardware mode.
 
-**Ordering with the GC.** The planned allocator and GC rewrite
-(`docs/future-work.md`, "To revisit with the allocator rewrite and the
-GC") should be written against offsets and the cage layout. Steps 1–3 are
-best done before it, or together with it, rather than after.
+**Ordering with the GC.** The allocator and GC rewrite was to be written
+against offsets and the cage layout, steps 1–3 before it or with it. It
+landed first (`docs/gc.md`), on raw addresses: steps 1–3 are now a
+retrofit of it.
 
 ## Sources
 

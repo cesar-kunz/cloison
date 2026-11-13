@@ -47,7 +47,7 @@ cargo build --release --quiet --bin cloison
 # `--pieces`: cloison's final code (as below: each function's last compile
 # per entry) per stencil family, hot, out-of-line and exits apart
 # (`CLOISON_JIT_LOG=pieces`), summed over the files, and per task of
-# docs/maglev-size-tasks.md (the families each task shrinks). Table in
+# its size tasks (`TASKS`: the families each task shrinks). Table in
 # perf-history/pieces-<commit>.md; `--record` appends the task totals to
 # bench/maglev-tasks.tsv (`commit<TAB>task<TAB>bytes`) and every run shows
 # the change since the last record.
@@ -67,7 +67,7 @@ if [[ ${1:-} == --pieces ]]; then
 import collections, os, re, subprocess, sys
 
 commit, record, *files = sys.argv[1:]
-# The families each task shrinks (docs/maglev-size-tasks.md), by kind of
+# The families each task shrinks (the size tasks against Maglev), by kind of
 # code; S5 and S8 (encodings) touch every family.
 TASKS = [
     ("S1 push", "hot|ool", r"array_push|wrapper:cloison_rt_array_push"),
@@ -130,7 +130,7 @@ if os.path.exists(tsv):
     if prev:
         last = {r[1]: int(r[2]) for r in recs if r[0] == prev[-1]}
         last_commit = prev[-1]
-lines = [f"cloison {commit}: final code per task of docs/maglev-size-tasks.md, bytes over {len(files)} files "
+lines = [f"cloison {commit}: final code per size task, bytes over {len(files)} files "
          f"(`scripts/vs-maglev.sh --pieces`)" + (f", change since {last_commit}" if last else ""), "",
          "| task | bytes | before | change |", "|---|---:|---:|---:|"]
 for t, b in rows:

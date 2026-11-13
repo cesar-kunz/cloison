@@ -18,7 +18,8 @@ instruction.
   state lives in `preserve_none` arguments, so in registers, and each
   handler ends in `become` to the next. A second handler table encodes
   "the accumulator is an int32" so hot arithmetic skips type checks.
-  Comparison-and-jump pairs, `Star r; Ldar s` and a statement's `r++`
+  Comparison-and-jump pairs, `Star r; Ldar s`, a statement's `r++`,
+  `GetNamed` chains and 21 more hot pairs (`PAIRS` in `src/bytecode.rs`)
   are quickened into superinstructions.
 - **Objects** (`src/object.rs`, `src/vm.rs`) have shapes in transition
   trees, in-object slots, inline caches that record field types and
@@ -94,10 +95,11 @@ instruction.
   the VM frames it keeps up to date (an inlined call's frame and a
   scalar-replaced object are materialized at the exit); tier-up is by
   on-stack replacement at loop back edges.
-- **Features land in the interpreter first.** A function using an
-  instruction the JIT doesn't know runs interpreted, so new language
-  features (classes, destructuring, generators, async functions) cost
-  the JIT nothing and can't slow hot ES5 code.
+- **Features land in the interpreter first.** Compiled code exits to
+  the interpreter at an instruction the JIT doesn't know (generators and
+  async functions run interpreted), so new language features (classes,
+  destructuring, generators, async functions) cost the JIT nothing and
+  can't slow hot ES5 code.
 - **A mostly non-moving collector.** Conservative native roots let
   runtime Rust hold raw pointers without handles everywhere; a nursery,
   card marking and concurrent old-generation marking are built on top,
@@ -170,9 +172,8 @@ realm is made, nothing checks; after, the JIT is off.
 The gaps are mostly whole features and early errors: decorators,
 non-ASCII identifiers beyond an approximation (Rust's `is_alphabetic`, not
 Unicode's ID_Start and ID_Continue), early errors for invalid syntax that
-the parser accepts (most of the failures left), `super` and private names
-in a direct `eval` in a class field's initializer, and part of Unicode's
-case folding in regexps (`/\u0390/ui` doesn't match `\u1fd3`).
+the parser accepts (most of the failures left), and private names in a
+direct `eval`.
 
 ## Testing
 
@@ -249,7 +250,8 @@ from each collector's trace), `m3.py` (bytes per object of each kind, from
 the RSS `probe.py` samples after full collections), `compile.py` (loading,
 JIT compile time, deoptimizations), `probes.py` (memory given back, limits,
 realms), `webapps.py` (real web apps' bundles: time, peak RSS and
-whether they did the reference's work) and `report.py` (the tables, ratios and ranks), results in
+whether they did the reference's work), `report.py` (the tables, ratios and ranks) and
+`chart.py` (the README's chart, from `octane.tsv` and `startup.tsv`), results in
 `bench/compare/`.
 
 Environment flags: `CLOISON_NO_JIT` (the interpreter alone),
@@ -338,8 +340,8 @@ diffed between targets.
   async functions and generators, `Reflect`, `Proxy`, BigInt, class
   fields, iterator helpers, `using` declarations and modules (top-level
   `await`, `import()`, JSON modules) and arrays of any length up to
-  2^32 − 1, sparse ones too, are in; decorators, Unicode's identifier tables and part of its
-  case folding in regexps are not.
+  2^32 − 1, sparse ones too, are in; decorators and Unicode's identifier
+  tables are not.
   See [Standards support](#standards-support) for test262 by edition;
   Octane and the microbenchmarks are also checked against Node.
 - **Nightly only**, and Linux is the reference; macOS runs on Apple silicon only.
@@ -349,9 +351,10 @@ diffed between targets.
   across its own tiers and collector settings), each bug fixed with a
   regression test.
 - **Large programs recompile as their feedback changes**, and a function
-  that has used up its compilations runs interpreted from then on,
-  however hot it gets. Loading a script (parsing it and compiling to
-  bytecode) is several times slower than in V8 or JavaScriptCore.
+  that has used up its compilations (and the one more it gets 10,000
+  calls later) runs interpreted from then on, however hot it gets.
+  Loading a script (parsing it and compiling to bytecode) is several
+  times slower than in V8 or JavaScriptCore.
 
 ## Layout
 

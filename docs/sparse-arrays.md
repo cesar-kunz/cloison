@@ -1,9 +1,10 @@
 # Sparse arrays
 
-Design for arrays whose elements are far apart. Today an array's elements
-are always dense: `x = []; x[2 ** 27] = 1` allocates 2^27 holes (1 GB), and
-an index or length from `MAX_ELEMENTS` (2^28) up throws
-`RangeError: array index too large for this engine`. That has two costs:
+Design for arrays whose elements are far apart, implemented (see
+"Status"). Before it an array's elements were always dense: `x = [];
+x[2 ** 27] = 1` allocated 2^27 holes (1 GB), and an index or length from
+`MAX_ELEMENTS` (2^28) up threw
+`RangeError: array index too large for this engine`. That had two costs:
 
 - **Amplification.** One store can allocate up to 2 GiB. The fuzzer's
   `oom` on test262's `15.4_A1.1_T10` came from this (cloison-fuzz
@@ -12,9 +13,10 @@ an index or length from `MAX_ELEMENTS` (2^28) up throws
   everywhere else ("Large array indices" in the same file). Of the 142
   test262 files in `built-ins/{Array,Object,Reflect,JSON,Function}` and
   `language` that use a length or index from 2^28 to 2^32, 18 fail on
-  "too large for this engine" (cloison e2d511b). They are in
-  `Array/length`, `Array/S15.4.5.2_*`, `indexOf`, `lastIndexOf`, `push`,
-  `Object.defineProperty` and `Object.defineProperties`. Two more fail for
+  "too large for this engine" (cloison of 2026-10-24, before far
+  arrays). They are in `Array/length`, `Array/S15.4.5.2_*`, `indexOf`,
+  `lastIndexOf`, `push`, `Object.defineProperty` and
+  `Object.defineProperties`. Two more fail for
   unrelated reasons. The rest pass, each within 500 MB.
 
 Goals, in order:
@@ -51,9 +53,10 @@ Goals, in order:
 
 A new array flag, `FAR`, means the following. It is bit 128, which is
 already given a different meaning per class: `FN_NAME_DELETED` on
-functions, `ERROR` on plain objects, `RESIZABLE` on buffers. On arrays,
-strings and typed-array views the bit is free. That lets the `length`
-stencils test it under one mask (see "Compiled code").
+functions, `ERROR` on plain objects, `RESIZABLE` on buffers,
+`RUNTIME_LENGTH` on typed-array views (whose length the stencils then
+leave to the runtime too). On arrays and strings the bit is free. That
+lets the `length` stencils test it under one mask (see "Compiled code").
 
 > This array's `length` is not `elems_len`. `elems[0..elems_len)` is still
 > its dense prefix: real elements, holes as `EMPTY`. The length, and the
@@ -87,7 +90,8 @@ them to the far store would end the shape growth that
 
 ### Invariants
 
-- `FAR` ⇒ `class == Array`, `slow_elements` applied, `code` is the far store.
+- `FAR` ⇒ `class == Array`, `far_elements` applied, the elements' last
+  slot is the far store.
 - `FAR` ⇒ `elems_len ≤ length`. No far key is below `elems_len`, and none
   is at or past `length`.
 - Not `FAR` and `class == Array` ⇒ `length == elems_len ≤ MAX_ELEMENTS`, as
@@ -176,7 +180,8 @@ measured by `bench/sparse/sweep.sh` over a grid: D ∈ {1/2, 1/4, 1/8, 1/16,
 `bench/sparse/pareto.py` scores each setting by the geometric mean of
 its time and peak RSS as multiples of the best setting per workload, and
 lists the Pareto front. `bench/sparse/results.tsv` is the run the defaults
-come from (cloison 45d00fe, 3 runs a point, host load about 30 of 96).
+come from (cloison of 2026-10-24, with the fix below, 3 runs a point, host
+load about 30 of 96).
 
 - **W decides most.** Every setting on the front has W = 8 KiB. With a
   larger W, `many` (2,000 arrays of ten elements and one key 20,000 past
@@ -194,7 +199,7 @@ come from (cloison 45d00fe, 3 runs a point, host load about 30 of 96).
   are level.
 - The first sweep's memory was the collector's, not the arrays': compiled
   code growing an array by index reached no safepoint, so the collection
-  asked for waited (fixed in 45d00fe: `strided` K=64 dense took 13 GB).
+  asked for waited (fixed the same day: `strided` K=64 dense took 13 GB).
 
 ## Runtime (Rust)
 
@@ -203,8 +208,8 @@ Each site below either reads `elems_len` as `length` or appends. Under
 
 - `length` reads: `props::own_property` (`Value::from_i32(elems_len)`; it
   must become `Value::number` because a length can exceed i32), and
-  `vm.rs` `get_named` and friends (the `matches!(class, Array | String |
-  TypedArray)` sites near lines 2261, 2308, 2336, 2542, 2625 and 2723).
+  `Vm::get` and friends (the `matches!(class, Array | String)` sites, all
+  through `Vm::length_field`).
 - `set_keyed`: a far store; `set_keyed_flagged` (`FAR` is a flag, so it
   already gets there); `set_array_length`; `define_array_length`;
   `grow_elements`; `set_element`.
@@ -222,10 +227,8 @@ Each site below either reads `elems_len` as `length` or appends. Under
   - `array::dense()` requires `flags & !(EXTERNAL | PROTOTYPE) == 0`, so it
     excludes `FAR`;
   - `array_iterator_next` uses `length_of`;
-  - `interp::to_string` of an array (`interp.rs:3374`) reads `elems_len`
-    and must check `FAR`.
-- GC: trace `code` for an `Array` with `FAR`. The heap record
-  (`gc.rs:2076`, `elems_unused`) counts the store.
+- GC: nothing to add. The store is in the elements' cell, traced with
+  them.
 
 ## Compiled code and the interpreter
 
@@ -238,11 +241,11 @@ for its length, and never append.
 | Loads `i < elems_len` (stencils, `interp` `GetKeyed`) | read `elems[i]` | unchanged: a real element, or a hole that goes to the runtime |
 | Stores, appends and pushes (`set_keyed_ap_*`, `array_push_*`, the interpreter's append) | gated by `elems_code` | `slow_elements` gates them: runtime |
 | `array_pop_` | `pop_class_flags` | add `FAR` to `POP_EXIT_FLAGS` |
-| `get_length_` and `get_length_nt_` | class check only | read class and flags as one u16, as `pop_class_flags` does; `FAR` fails the match. No extra load |
-| `get_length_nc_` (class known from a shape) | no check | test the flags byte, exit on `FAR` |
+| `get_length_` (and `_rt_`, `_d_`) | class check only | read class and flags as one u16, as `pop_class_flags` does; `FAR` fails the match. No extra load |
+| `get_length_na_` (an array known from a shape; `_nc_`, a string's or typed array's, tests nothing) | no check | test the flags byte, exit on `FAR` |
 | Interpreter length IC (`poly_get_named`, `LENGTH_LOC`) | class check | add `flags & FAR == 0` |
 
-Why `get_length_nc_` needs the test: `Ty::Ext(s)` facts survive calls. A
+Why `get_length_na_` needs the test: `Ty::Ext(s)` facts survive calls. A
 transition only appends slots, so a stale fact still reads correctly (see
 the comment on `jit::Ty`). A callee can therefore make an array `FAR` while
 the caller still knows it is an `Array`. Without the test, the caller would
@@ -285,10 +288,10 @@ Which methods use it:
 - **Skip holes, so jumping is exact:** `forEach`, `map` (its result is
   created with `length = len`, so it goes far too), `filter`, `some`,
   `every`, `reduce`, `reduceRight`, `indexOf`, `lastIndexOf` (downward),
-  `flat`, `flatMap`, `concat`, `slice`, `splice`, `copyWithin`, `reverse`
-  (pairs from the two ends), and `sort` (SortIndexedProperties collects the
-  present elements, sorts them, writes them back from 0 and deletes the
-  rest).
+  `flat`, `flatMap`, `concat`, `slice`, and `sort` (SortIndexedProperties
+  collects the present elements, sorts them, writes them back from 0 and
+  deletes the rest). `splice`, `copyWithin` and `reverse` (pairs from the
+  two ends) could too, but don't yet (see "Status").
 - **`includes`:** holes count as `undefined`. Search present elements, and
   if the value sought is `undefined` and any index is missing, the answer
   is true.
@@ -303,12 +306,12 @@ Which methods use it:
 
 ## Status
 
-Implemented: 6fb8658 (store, flag, policy, settings, compiled-code
-guards), 4939098 (builtins over present elements, the density count at
-reallocation, the preallocation floor), 45d00fe (the collection before a
-keyed store from compiled code), and the defaults from the sweep. test262:
+Implemented on 2026-10-24: the store, flag, policy, settings and
+compiled-code guards; the builtins over present elements, the density
+count at reallocation and the preallocation floor; the collection before a
+keyed store from compiled code; and the defaults from the sweep. test262:
 19 more pass (the 18 "too large for this engine" ones and
-`S15.4_A1.1_T10`, an oom), none fewer. 209f9f8 fixed, on the way, compiled
+`S15.4_A1.1_T10`, an oom), none fewer. A fix on the way stopped compiled
 appends to a sealed or non-extensible array whose elements had changed
 type, which the slow shape relies on.
 

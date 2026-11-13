@@ -33,7 +33,7 @@ memory as multiples of the best setting per workload, its worst cases, and
 the same against the engines' best, and lists the Pareto front.
 
 [results.tsv](results.tsv) is the sweep the defaults (`1/16,1/8,8k,16m`)
-come from: cloison 45d00fe, 3 runs a point, the host's load about 30 of
+come from: cloison of 2026-10-24, 3 runs a point, the host's load about 30 of
 its 96 threads (single-threaded runs; read times to 10% or so). Its
 summary:
 

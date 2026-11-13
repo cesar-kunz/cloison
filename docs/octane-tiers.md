@@ -2,9 +2,9 @@
 
 Made by `scripts/octane-tiers.sh` (also written to the ignored `perf-history/octane-tiers-<commit>.{md,tsv}`).
 
-## b881c56
+## 2026-11-13, after the catch fix
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison b881c56, V8 14.6.202.34-node.28 capped at each tier (V8's columns from the 4f08e81 runs below). Load average at the start and end: 2.70 6.00.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison of 2026-11-13, V8 14.6.202.34-node.28 capped at each tier (V8's columns from the 2026-11-09 runs below). Load average at the start and end: 2.70 6.00.
 
 | benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -28,9 +28,9 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 cloison interp vs Ignition 1.03x (ahead on 12), Sparkplug 0.76x (ahead on 7), Maglev 0.14x (ahead on 0), Turbofan 0.15x (ahead on 1) (of 15; above 1x: cloison scores higher)
 cloison JIT vs Ignition 4.07x (ahead on 12), Sparkplug 3.01x (ahead on 12), Maglev 0.56x (ahead on 3), Turbofan 0.60x (ahead on 3) (of 15; above 1x: cloison scores higher)
 
-## 4f08e81
+## 2026-11-09
 
-Octane scores (higher is better; medians of 3 runs, 4 at a time on cores of their own): cloison 4f08e81, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 20.23 34.80.
+Octane scores (higher is better; medians of 3 runs, 4 at a time on cores of their own): cloison of 2026-11-09, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 20.23 34.80.
 
 | benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -56,15 +56,15 @@ cloison JIT vs Ignition 4.06x (ahead on 12), Sparkplug 3.00x (ahead on 12), Magl
 
 The host was shared and loaded (another user's link jobs): V8's Turbofan, whose compiler runs on threads of its own, scores below Maglev on several benchmarks here, so its column understates it.
 
-## 0fbcab6, Apple silicon, against other engines
+## 2026-11-05, Apple silicon, against other engines
 
 Moved from the README (2026-11-11); not rerun since.
 
-Octane scores on an Apple silicon Mac, cloison's JIT at 0fbcab6 against
+Octane scores on an Apple silicon Mac, cloison's JIT of 2026-11-05 against
 V8 14.6 capped at Sparkplug, at Maglev, and with all tiers (higher is
 better; cloison's are medians of five runs of `scripts/octane.sh`'s
-`-score.js` scripts, V8's single runs at c842d29 from a local script,
-`perf-history/octane-engines.sh`, which the repository ignores; c842d29
+`-score.js` scripts, V8's single runs of 2026-10-16 from a local script,
+`perf-history/octane-engines.sh`, which the repository ignores; that code
 rebuilt and run the same way scores within 3% of the figures it gave
 then):
 
@@ -92,8 +92,8 @@ functions of CodeLoad's `eval`s when they are first called; cloison compiles
 every function of every `eval` up front.
 
 Against other engines and V8's tiers, on an Apple silicon Mac (higher is
-better; cloison's JIT at 0fbcab6 as above, the others single runs at
-c842d29 from the same local script: V8 14.6 capped at each tier and with
+better; cloison's JIT of 2026-11-05 as above, the others single runs of
+2026-10-16 from the same local script: V8 14.6 capped at each tier and with
 all of them, the macOS 27 JavaScriptCore, SpiderMonkey 140 and QuickJS
 2026-06-04; ARKTS is OpenHarmony's ARK JS runtime, `ark_js_vm` at
 ets_runtime cf2d2a08f, each benchmark compiled to `.abc` by `es2abc` at
@@ -129,9 +129,9 @@ undeclared globals, NavierStokes and GameBoy fail on strict mode's
 errors, PdfJS needs `console` and CodeLoad `eval` (unsupported). Hence no
 geomean for it.
 
-## 213fcdf
+## 2026-10-13, before the plan
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 213fcdf, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 32.70 17.94.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison of 2026-10-13 (before the plan), V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 32.70 17.94.
 
 | benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -155,12 +155,12 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 cloison interp vs Ignition 0.74x (ahead on 9), Sparkplug 0.55x (ahead on 1), Maglev 0.09x (ahead on 0), Turbofan 0.08x (ahead on 0) (of 15; above 1x: cloison scores higher)
 cloison JIT vs Ignition 2.17x (ahead on 9), Sparkplug 1.62x (ahead on 8), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: cloison scores higher)
 
-## 6ef4928: cloison on the whole core too
+## 2026-10-13, same code: cloison on the whole core too
 
 From here on cloison gets the whole core, as Node does: its marker thread had
-competed with the program for one CPU (splay +40%). Same code as 213fcdf.
+competed with the program for one CPU (splay +40%). Same code as above.
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 6ef4928, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 6.76 26.82.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison of 2026-10-13 (on the whole core), V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 6.76 26.82.
 
 | benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -186,7 +186,7 @@ cloison JIT vs Ignition 2.81x (ahead on 11), Sparkplug 1.81x (ahead on 9), Magle
 
 ## Steps 0–5 of the plan
 
-Measured on the `-run.js` files against 6ef4928 (`perf stat`, medians of
+Measured on the `-run.js` files against the whole-core run's code (`perf stat`, medians of
 3 interleaved runs), cycles: pdfjs −23% (instructions −26%, page faults
 −42%), earley-boyer −15%, zlib −6%, gbemu −4% (page faults −45%), box2d
 −3%; DeltaBlue's instructions unchanged. The binary is 25 KB smaller;
@@ -218,14 +218,14 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 cloison interp vs Ignition 0.83x (ahead on 12), Sparkplug 0.61x (ahead on 4), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: cloison scores higher)
 cloison JIT vs Ignition 2.32x (ahead on 11), Sparkplug 1.72x (ahead on 10), Maglev 0.30x (ahead on 1), Turbofan 0.25x (ahead on 0) (of 15; above 1x: cloison scores higher)
 
-## 668042a: after steps 0–12
+## 2026-10-13: after steps 0–12
 
-V8's columns are reused from the 6ef4928+ run (V8 doesn't change with
-cloison). The cloison JIT's geomean went from 15621 (6ef4928) to 18119: +16%.
+V8's columns are reused from the whole-core run (V8 doesn't change with
+cloison). The cloison JIT's geomean went from 15621 (the whole-core run) to 18119: +16%.
 By benchmark: raytrace +101%, earley-boyer +68%, pdfjs +49%, splay
 +41%, typescript +10%, zlib +7%; DeltaBlue level.
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 668042a, V8 14.6.202.34-node.28 capped at each tier (V8's columns from perf-history/octane-tiers-6ef4928+.tsv). Load average at the start and end: 2.36 5.05.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison of 2026-10-13 (after step 12), V8 14.6.202.34-node.28 capped at each tier (V8's columns from the whole-core run's perf-history/octane-tiers-6ef4928+.tsv). Load average at the start and end: 2.36 5.05.
 
 | benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -249,7 +249,7 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 cloison interp vs Ignition 0.85x (ahead on 12), Sparkplug 0.63x (ahead on 5), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: cloison scores higher)
 cloison JIT vs Ignition 2.57x (ahead on 12), Sparkplug 1.91x (ahead on 10), Maglev 0.33x (ahead on 1), Turbofan 0.28x (ahead on 0) (of 15; above 1x: cloison scores higher)
 
-## Where the JIT gains little: findings and plan (at 213fcdf)
+## Where the JIT gains little: findings and plan (2026-10-13, before its steps)
 
 The JIT gains little over cloison's interpreter on raytrace (1.8x), earley-boyer
 (1.8x), box2d (2.1x), splay (1.1x), pdfjs (1.05x) and typescript (0.9x).
@@ -365,14 +365,19 @@ regressions (`perf.sh --ab`).
 Order: 0–5 first (small and measured), then 6, the widest at medium
 effort, then 7–9, then 12 and 13.
 
-Done: 0–5 (see "Steps 0–5 of the plan" above). Step 4 measured smaller
-than in the investigation (typescript −1.6% instructions, box2d −1.1%).
+Done: 0–5 (see "Steps 0–5 of the plan" above); 6–9 (9 in part) and 12
+below; 10 as the `char_code_at` and `from_char_code` stencils (pdfjs
+−10.4% cycles; 2026-10-13). Not done: 11 (a closure still gets its
+`prototype` at creation) and 13 (the nursery grows by minor
+collections' time since 2026-10-22, up to 32 MiB, not by survival; no
+pretenuring). Step 4 measured smaller than in the investigation
+(typescript −1.6% instructions, box2d −1.1%).
 The barrier checker (`CLOISON_GC_CHECK_BARRIER`) also had a false positive
 on splay: while a sweep is pending, a dead old cell it hadn't reached
 held a stale pointer into memory already reused by young cells. The
 checker now skips cells of the old color while sweeping.
 
-Step 6, measured with `perf stat` instructions against 04becf3: box2d
+Step 6, measured with `perf stat` instructions against step 5's code (2026-10-13): box2d
 −2.6%, pdfjs −4.2%, typescript unchanged. That is far below the estimate.
 Functions that had been refused now run compiled, and that exposed three
 other problems:
@@ -403,7 +408,7 @@ its `n` elements (in compiled code `create_array_n`, the elements' cell
 from the same bump allocation), followed by a `PushLiteral` per element.
 The JIT lowers each `PushLiteral` to the `array_push` stencils, which
 join the elements' type through their push cache. Measured with
-`perf stat` against 571717c:
+`perf stat` against step 6's code (2026-10-13):
 
 - splay −35.5% cycles, −37.5% instructions, peak RSS 778 → 650 MB;
 - pdfjs −2.5% instructions;
@@ -423,7 +428,7 @@ address is reused.
 
 The stencil reads the function's `prototype` inline when the function has
 the plain function shape. On a miss, the runtime answers and fills the
-cache. Measured with `perf stat` against 19f666f: earley-boyer −9.2%
+cache. Measured with `perf stat` against step 7's code (2026-10-13): earley-boyer −9.2%
 cycles (−12.7% instructions; a one-entry cache gave −6.8%), every other
 benchmark unchanged.
 
@@ -436,7 +441,7 @@ calls went through `cloison_rt_call` → `vm_run` → `fitting_version`.
 They aren't tail calls: the call is in a loop and its result is tested.
 Now such a call gets a site of its own, claimed pending as for mutual
 recursion. Its first call binds a version for its types, whose own
-self calls fit it. Measured with `perf stat` against bfa73bc:
+self calls fit it. Measured with `perf stat` against step 8's code (2026-10-13):
 earley-boyer −18% cycles (−18.8% instructions), the others unchanged.
 
 Left in earley-boyer:
@@ -445,8 +450,8 @@ Left in earley-boyer:
 - allocation (memset, `alloc_slow`, `free_young`, about 12%);
 - `sc_list`, which reads `arguments`: entered through `vm_run` 13M times.
 
-Calls from compiled code into functions running in the interpreter (at
-232d4ae). Measured, not guessed:
+Calls from compiled code into functions running in the interpreter (after the
+self calls, 2026-10-13). Measured, not guessed:
 
 - **A call through the runtime into compiled code is cheap,** about 250
   cycles. Earley-Boyer's 2.3M runtime calls to closures of an already
@@ -489,7 +494,7 @@ code is the same; the churn was elsewhere:
   be given up. Past half a function's compilations, a site whose cache
   is full and still misses is given up at its first exit.
 
-Measured with `perf stat` against 4d55b75:
+Measured with `perf stat` against the code binding by code (2026-10-13):
 
 - typescript −5.2% cycles (−2.9% instructions);
 - `preAssignScopes` and `emitParensAndCommentsInPlace` now run compiled,
@@ -522,7 +527,7 @@ the interpreter. Now `new C(…)` inlines it:
 - *Not the inlining budget:* past it, a `new` went through the runtime,
   in `renderScene` for one, with both functions interpreted.
 
-Measured with `perf stat` against 96c93fc:
+Measured with `perf stat` against the versions' policy's code (2026-10-13):
 
 - raytrace −48.3% cycles (−56.9% instructions), 1.9×;
 - the others unchanged;

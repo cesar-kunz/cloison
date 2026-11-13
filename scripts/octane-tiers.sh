@@ -50,6 +50,8 @@ import concurrent.futures as cf, math, os, queue, statistics, subprocess, sys, t
 node, reps, jobs, timeout, out, commit, v8_from, *benches = sys.argv[1:]
 reps, jobs, timeout = int(reps), int(jobs), int(timeout)
 v8 = subprocess.run([node, "-p", "process.versions.v8"], capture_output=True, text=True).stdout.strip()
+# (Its date, not its hash, in the text for docs: hashes don't survive a rewrite.)
+when = subprocess.run(["git", "log", "-1", "--format=%cs"], capture_output=True, text=True).stdout.strip()
 runner = 'console.log(String(require("vm").runInThisContext(require("fs").readFileSync(process.argv[1], "utf8"))))'
 configs = [
     ("cloison interp", lambda f: (["target/release/cloison", f], {"CLOISON_NO_JIT": "1"})),
@@ -143,7 +145,7 @@ with open(out + ".tsv", "w") as f:
 
 fmt = lambda s: "-" if s is None else f"{s:.0f}" if s >= 100 else f"{s:.3g}"
 lines = [f"Octane scores (higher is better; medians of {reps} runs, {jobs} at a time on cores of their own): "
-         f"cloison {commit}, V8 {v8} capped at each tier"
+         f"cloison of {when}{' (with changes)' if commit.endswith('+') else ''}, V8 {v8} capped at each tier"
          + (f" (V8's columns from {v8_from})" if v8_from else "")
          + f". Load average at the start and end: {' '.join(load)}.\n",
          "| benchmark | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]

@@ -275,7 +275,8 @@ does not.
   bound of 1.3 ms ([discussion][cpython-revert]). Go's Green Tea marker
   (default in 1.26) cut marking CPU 10–40% by scanning objects page by
   page rather than in discovery order ([Go blog][greentea]); the marker
-  below queues work per block for the same reason.
+  below keeps one mark stack and prefetches through a ring instead
+  (step 6, *Prefetching*).
 - **Value encoding.** Float self-tagging (OOPSLA 2025, [paper][self-tag])
   reports 2.4–3.6× on float-heavy code against boxing. Out of scope here;
   the collector assumes nothing about numbers beyond "a cell is a pointer
@@ -288,17 +289,18 @@ does not.
 - **The mutator**: the one JS thread. It allocates, runs the barrier, and
   runs every stop-the-world phase itself at a safepoint (JSC's "conn":
   only the mutator reads frames, the native stack and Rust structures).
-- **A collector thread** (later a small pool) marks and sweeps the old
-  generation while the mutator runs. It reads cells and writes the
-  metadata, the mark queues and the block lists; of the Rust data cells
-  point to it reads only a shape's `mark`, `proto` and `parent` (in a
-  marking that collects shapes), a function's `Code::upvalues` length
-  and `mark`, and a `Regex`'s `mark`, storing the `mark`s (atomics). It
-  never reads a `Vm` field or an inline cache. What it reads while the
-  mutator writes is accessed atomically on both sides (Relaxed: the
-  plain instructions on x86-64 and arm64), as "The header word" and "The
-  other words" at `layout::Header` lay down, with the two invariants
-  that make that enough: the marker never follows a pointer to a young
+- **A collector thread** (one: more were not warranted, step 6; pauses
+  use several) marks and sweeps the old generation while the mutator
+  runs. It reads cells and writes the metadata, the mark queues and the
+  block lists; of the Rust data cells point to it reads only a shape's
+  `mark`, `proto` and `parent` (in a marking that collects shapes), a
+  function's `Code::upvalues` length and `mark`, and a `Regex`'s `mark`,
+  storing the `mark`s (atomics). It never reads a `Vm` field or an
+  inline cache. What it reads while the mutator writes is accessed
+  atomically on both sides (Relaxed: the plain instructions on x86-64
+  and arm64), as "The header word" and "The other words" at
+  `layout::Header` lay down, with the two invariants that make that
+  enough: the marker never follows a pointer to a young
   cell, and nothing it may reach is freed but in a pause or once
   marking ended.
 
@@ -321,7 +323,7 @@ blocks:
   compiled code's inline allocation to the runtime after a few cells.
 - **Large cells** get a run of whole blocks, reused once free.
 - **Metadata**, beside the heap, one byte per granule
-  (`meta_bias + addr / 16`): at a cell's first granule `YOUNG` (allocated
+  (`SIDE + addr / 16`): at a cell's first granule `YOUNG` (allocated
   since the last collection) or the color it was last marked with (an
   old cell), and `END` at an old cell's last granule; 0 elsewhere. A
   conservative word is a cell exactly when its granule's byte is `YOUNG`
@@ -616,8 +618,11 @@ value of each entry whose key is live and drains again, until no new
 value is marked, then clears the entries whose keys are not live. A
 minor collection counts old cells live, so it clears young keys' entries
 only; entries stored while the marker runs are no different (the
-barrier's card marks don't make them strong). `WeakRef` and
-`FinalizationRegistry` don't exist yet. Rust-side resources reachable from cells
+barrier's card marks don't make them strong). A `WeakRef` is such a
+collection of its target alone, which stays alive until the current job
+ends (`Vm::kept_alive`, a root); a `FinalizationRegistry` one of its
+unregister tokens, whose cleanup callback is never called (as the spec
+allows). Rust-side resources reachable from cells
 (`Regex` boxes) are freed after a full marking, in its final pause
 (`Vm::prune_regexps`), once no live `RegExp` uses them, none was used
 during the marking and no frame holds one; nothing else needs a
@@ -626,8 +631,8 @@ finalizer.
 ### Interaction with the JIT
 
 - **Inline allocation** keeps its bump of `Heap::ptr` against `end`, and
-  writes the new cell's metadata byte (`Heap`'s third word is the
-  metadata's bias). The slow path is a runtime call, so a safepoint.
+  writes the new cell's metadata byte (at `SIDE + addr / 16`, a
+  constant). The slow path is a runtime call, so a safepoint.
 - **Stores** get the card mark as part of the stencil, elided by type.
 - **Embedded cells** are recorded per compiled version and lowering, and
   are roots while those live (see Roots, 4); nothing the collector does
@@ -984,7 +989,8 @@ runs) and the microbenchmarks.
 
 8. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer; headers are 32 bytes now,
-   from 48), ephemerons with ES6, evacuating the nursery's survivors.
+   from 48), evacuating the nursery's survivors. (Ephemerons, also here
+   once, came with `WeakMap` and `WeakSet`: "Weak references".)
 
 ## Risks
 

@@ -1,8 +1,8 @@
 # Memory and size against other engines
 
 Measured on the host and engine builds of [octane.md](octane.md) (cloison
-on 2026-11-13, Octane at b881c56, the rest at 00bd4d1; the other engines
-on 2026-11-11).
+on 2026-11-13: Octane's runs after a fix to catch parameters, the rest before
+it; the other engines on 2026-11-11).
 Peak RSS is `/usr/bin/time`'s maximum resident set, one run each; the
 empty script's figures are by `scripts/compare/startup.py` (`bench/compare/startup.tsv`).
 

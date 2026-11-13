@@ -1,6 +1,6 @@
 # Direct calls: what they cost, and a cheaper convention
 
-Status: design, 2026-10-08. Step 1 and a wrapper-free call on x86-64 and arm64 implemented (see Measured).
+Status: design, 2026-11-13. Step 1, a wrapper-free call on x86-64 and arm64, and a dispatch for varying callees implemented (see Measured); steps 2-6 not done.
 
 ## Why
 
@@ -11,7 +11,7 @@ protocol of the direct call itself does: in 1000 calls of `deltaBlue()`
 `call_direct` about 4%. fib (90) is nothing but calls: 32M instructions for
 fib(27), at 4.6 per cycle.
 
-## A direct call today (x86-64, fib)
+## A direct call as it was (x86-64, fib, 2026-10-08)
 
 Caller, `call_direct` (`stencils/stencils.rs`), with the arguments already
 stored into the callee's frame (two `mov [r13+…]`, by `direct_setup`):
@@ -122,7 +122,14 @@ paths (the callee exited, the checks failed) are a cold stub calling
 `cloison_direct_exit` and `cloison_rt_call`, as the wrapper did. Measured: fib
 (90) and mutual recursion (91) -18%, 54 -8%, 63 -8%, DeltaBlue's
 `octane-db.js` -4.8% (Octane score ~46700 -> ~48300); hot code +6%
-(`jit.all.hot`). `new` (`construct_direct`) still uses the wrapper.
+(`jit.all.hot`). `new` (`construct_direct`) and a call to a site bound
+by code (`call_direct_code`) still use the wrapper.
+
+A varying callee (2026-10-13): a site whose bound callee isn't the one
+called, 8 times, gets sites of its own for the others, found by the
+callee's address in a 1024-slot table (`DISPATCH`), which a closure
+mismatch looks in, in the cold part, before calling through the runtime.
+gbemu's `OPCODE[op](this)`: calls through the runtime 8.95M -> 0.26M.
 
 On arm64 (2026-10-09), the same piece: it saves the link register,
 which `blr` overwrites, besides the live slot registers, all of them
@@ -138,9 +145,8 @@ rest.
 
 ## Recommendation
 
-Steps 1–3 are local to `call_direct`, the wrapper and the callee's return,
-on both architectures, about 30 lines each: do them first, measure each.
-Step 4 changes when sites bind (an unbind must invalidate callers), a
-medium change. Steps 5 and 6 change the calling convention of all
-compiled code; take them on only if 1–4 leave the call protocol a large
-share of DeltaBlue's time.
+Step 1 is done; removing the wrapper overtook steps 2 and 3 for calls in
+VM frames (they apply only to the wrapper's remaining users), and step 4
+was left, judged worth 1-2% against invalidating callers (above). Steps 5 and 6 change
+the calling convention of all compiled code; take them on only if the
+call protocol stays a large share of DeltaBlue's time.

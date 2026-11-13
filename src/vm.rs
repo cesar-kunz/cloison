@@ -337,6 +337,7 @@ pub(crate) fn as_field(ft: FieldType, v: Value) -> Value {
 /// shape if one does (it may be stale: a field generalized since, or a
 /// prototype changed), else in the first free way. With every way taken
 /// (the site is megamorphic), `e` replaces way 0, and the result is true.
+#[inline(always)]
 unsafe fn install(ic: *mut Ic, e: Ic) -> bool {
     unsafe {
         // (Nor a dictionary shape, changed in place: see `Shape::dictionary`.)
@@ -933,9 +934,15 @@ pub struct Vm {
     /// freed, as `interp_megas`.
     typed_lengths: [TypedLength; TYPED_LENGTHS],
     /// Some typed array's shape has had an own `length` (a transition
-    /// adding it): compiled code no longer takes a typed array's shape
-    /// made from a known one to have none (`jit::typed_length_known`).
-    pub(crate) typed_length_added: bool,
+    /// adding it), or some typed array a prototype other than its kind's
+    /// (with no `length` of its own and %TypedArray%.prototype for
+    /// prototype when it got its first typed array: see
+    /// `typed::note_proto`), or one was made while another realm was:
+    /// compiled code no longer reads a typed array's `length` from its
+    /// header on its class alone (`jit::typed_lengths_standard`), nor
+    /// takes a typed array's shape made from a known one to have no
+    /// `length` (`jit::typed_length_known`).
+    pub(crate) typed_length_unusual: bool,
     /// Prototype slots whose values compiled code folded (`jit::rely_on_slot`):
     /// a store of another value to one bumps `proto_epoch`; to another
     /// prototype slot, nothing (compiled code reads those when it runs).
@@ -1325,6 +1332,8 @@ pub struct Vm {
     pub(crate) a_value_of: Atom,
     /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
     pub(crate) array_push_fn: *mut Object,
+    /// %TypedArray%.prototype (see `jit::typed_lengths_standard`).
+    pub(crate) typed_array_prototype: *mut Object,
     pub(crate) array_pop_fn: *mut Object,
     /// `String.prototype.charCodeAt` and `String.fromCharCode`, which
     /// compiled code inlines (see `jit::Insn::native`).
@@ -1445,7 +1454,7 @@ impl Vm {
             megamorphic: Default::default(),
             interp_megas: vec![InterpMega::EMPTY; INTERP_MEGAS].into_boxed_slice(),
             typed_lengths: [TypedLength::EMPTY; TYPED_LENGTHS],
-            typed_length_added: false,
+            typed_length_unusual: false,
             relied_slots: Default::default(),
             jitted: Vec::new(),
             field_deps: HashMap::default(),
@@ -1595,6 +1604,7 @@ impl Vm {
             a_to_string: Atom(0),
             a_value_of: Atom(0),
             array_push_fn: std::ptr::null_mut(),
+            typed_array_prototype: std::ptr::null_mut(),
             array_pop_fn: std::ptr::null_mut(),
             char_code_at_fn: std::ptr::null_mut(),
             from_char_code_fn: std::ptr::null_mut(),
@@ -2587,9 +2597,8 @@ impl Vm {
         if name == self.a_sym_has_instance {
             self.has_instance_defined = true;
         }
-        if name == self.a_length && s.class == Class::TypedArray && !self.typed_length_added {
-            self.typed_length_added = true;
-            self.bump_code_epoch();
+        if name == self.a_length && s.class == Class::TypedArray {
+            self.typed_length_unusual();
         }
         // A dictionary shape gets the property in place.
         if s.dictionary {
@@ -3581,6 +3590,14 @@ impl Vm {
         }
     }
 
+    /// See `Vm::typed_length_unusual`.
+    pub(crate) fn typed_length_unusual(&mut self) {
+        if !self.typed_length_unusual {
+            self.typed_length_unusual = true;
+            self.bump_code_epoch();
+        }
+    }
+
     /// `o`'s own slotless `length` or `name` (see `virtual_get`).
     pub(crate) fn virtual_own(&mut self, o: *mut Object, name: Atom) -> Option<Value> {
         unsafe {
@@ -3824,12 +3841,23 @@ impl Vm {
             )));
         }
         // A number's properties are `Number.prototype`'s, a boolean's
-        // `Boolean.prototype`'s.  Use the ordered lookup path: a virtual
-        // property (such as an array's `length`) may precede a farther
-        // slot-backed property on their prototype chain.
+        // `Boolean.prototype`'s. (A `length` or `name` through the ordered
+        // lookup: a slotless one, an array's `length`, say, may precede a
+        // farther slot on their prototype chain.)
         if obj.is_number() || obj.is_bool() {
             let o = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
-            return self.get_through(o, name, obj);
+            if name == self.a_length || name == self.a_name {
+                return self.get_through(o, name, obj);
+            }
+            return match self.lookup(o, name) {
+                // (A getter's `this` the primitive.)
+                Some((h, slot)) if self.is_accessor(h, slot) => {
+                    let pair = unsafe { *Object::slot(h, (*(*h).shape).location(slot)) };
+                    self.call_getter(pair, obj)
+                }
+                Some((h, slot)) => Ok(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) }),
+                None => Ok(Value::UNDEFINED),
+            };
         }
         Ok(Value::UNDEFINED)
     }
@@ -7493,6 +7521,7 @@ impl Vm {
             self.regexp_constructor,
             self.array_push_fn,
             self.array_pop_fn,
+            self.typed_array_prototype,
         ]
         .into_iter()
         .chain(self.typed_prototypes.iter().copied())
@@ -7558,6 +7587,7 @@ impl Vm {
             &mut self.regexp_constructor,
             &mut self.array_push_fn,
             &mut self.array_pop_fn,
+            &mut self.typed_array_prototype,
             &mut self.thrower,
             &mut self.eval_function,
             &mut self.job_queue,

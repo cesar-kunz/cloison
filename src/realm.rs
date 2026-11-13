@@ -221,6 +221,7 @@ realm_fields! {
     shared_atomics: *mut Object = NULL => shared_atomics;
     function_call_fn: *mut Object = NULL => function_call_fn;
     array_push_fn: *mut Object = NULL => array_push_fn;
+    typed_array_prototype: *mut Object = NULL => typed_array_prototype;
     array_pop_fn: *mut Object = NULL => array_pop_fn;
     char_code_at_fn: *mut Object = NULL => char_code_at_fn;
     from_char_code_fn: *mut Object = NULL => from_char_code_fn;

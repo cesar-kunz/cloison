@@ -363,6 +363,27 @@ pub(crate) fn view_byte_length_seq_cst(vm: &mut Vm, o: *mut Object) -> Option<us
 /// target, `Object.setPrototypeOf`) on it can't: compiled code is dropped
 /// and checks the kind of each (`Vm::typed_protos_crossed`).
 pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
+    // (And whether its `length` is %TypedArray%.prototype's getter's as
+    // for any of its kind: see `Vm::typed_length_unusual`. A kind's
+    // prototype not one yet is checked here, before its first typed
+    // array makes it one; one is checked where code is compiled, and a
+    // change to it moves the prototype epoch.)
+    if !vm.typed_length_unusual {
+        let usual = proto.is_cell()
+            && vm.realms.is_empty()
+            && as_object(proto) == vm.typed_prototypes[k as usize]
+            && unsafe {
+                let p = as_object(proto);
+                let s = &*(*p).shape;
+                (*p).flags & crate::object::PROTOTYPE != 0
+                    || !s.dictionary
+                        && s.lookup(vm.a_length).is_none()
+                        && s.proto == object_value(vm.typed_array_prototype)
+            };
+        if !usual {
+            vm.typed_length_unusual();
+        }
+    }
     if vm.typed_protos_crossed || !proto.is_cell() {
         return;
     }
@@ -1499,6 +1520,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // `%TypedArray%` (abstract) and its prototype, the concrete kinds'.
     let shared = vm.new_object(op);
+    vm.typed_array_prototype = shared;
     let ta = vm.native_function("TypedArray", typed_array_abstract, 0, any, true);
     link_constructor(vm, ta, shared);
     vm.define_natives(ta, &[("from", typed_from as NativeFn, 1), ("of", typed_of, 0)]);

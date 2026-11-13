@@ -4036,19 +4036,66 @@ fn identity_ty(t: Ty) -> bool {
     })
 }
 
+/// Whether every typed array's `length` is %TypedArray%.prototype's builtin
+/// getter's under this prototype epoch (which the compiled code is for),
+/// its slot relied on, so that compiled code reads a typed array's from
+/// its header on its class alone, as an array's: no typed array's shape
+/// has a `length`, each has its kind's prototype, which has none (a kind's
+/// prototype not one yet was checked when it got its first typed array,
+/// see `typed::note_proto`), with %TypedArray%.prototype for prototype,
+/// all of one realm (`Vm::typed_length_unusual`).
+fn typed_lengths_standard() -> bool {
+    use crate::object::{ACCESSOR, PROTOTYPE, as_object};
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    if vm.typed_length_unusual || !vm.realms.is_empty() {
+        return false;
+    }
+    let name = vm.a_length;
+    let sp = vm.typed_array_prototype;
+    unsafe {
+        if sp.is_null() || (*sp).flags & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, sp) {
+            return false;
+        }
+        let ss = &*(*sp).shape;
+        let Some(k) = ss.lookup(name) else { return false };
+        if ss.attrs()[k as usize] & ACCESSOR == 0 {
+            return false;
+        }
+        let at = Object::slot(sp, ss.location(k));
+        if !crate::typed::is_length_getter(*(*as_object(*at)).elems) {
+            return false;
+        }
+        for &p in &vm.typed_prototypes {
+            if (*p).flags & PROTOTYPE == 0 {
+                continue;
+            }
+            let s = &*(*p).shape;
+            if s.dictionary
+                || s.lookup(name).is_some()
+                || s.proto != crate::object::object_value(sp)
+                || crate::proxy::is_proxy(vm, p)
+            {
+                return false;
+            }
+        }
+        rely_on_slot(at as u64);
+    }
+    true
+}
+
 /// Whether a value of type `t` is a typed array whose `length` is
 /// %TypedArray%.prototype's builtin getter's under this prototype epoch
 /// (which the compiled code is for), its slot relied on: its shape (or,
 /// `Ty::Ext`, one made from it, while none has left it: its prototype
 /// the same) has no `length`, no typed array's has ever had one
-/// (`Vm::typed_length_added`), and the prototypes reach the getter with no
+/// (`Vm::typed_length_unusual`), and the prototypes reach the getter with no
 /// slotless `length` or proxy before it.
 fn typed_length_known(t: Ty) -> bool {
     use crate::object::{ACCESSOR, Class, PROTOTYPE, as_object};
     let Some(s) = t.shape() else { return false };
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let shape = unsafe { &*(s as *const Shape) };
-    if shape.class != Class::TypedArray || vm.typed_length_added || shape.dictionary {
+    if shape.class != Class::TypedArray || vm.typed_length_unusual || shape.dictionary {
         return false;
     }
     let name = vm.a_length;
@@ -4123,7 +4170,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     if insn.check_only
         && insn.op == Op::GetNamed
         && spec.props.get(i + 1) == Some(&Prop::TypedLength)
-        && typed_length_known(reg)
+        && (typed_length_known(reg) || typed_lengths_standard())
     {
         sel.base = "nop";
         sel.case = "";
@@ -5794,6 +5841,13 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // (`views_detached`), 0 where its buffer is detached (`td`).
         if prop == Prop::TypedLength {
             out.acc = I32;
+            // (No check before it where every typed array's is the
+            // getter's, as for `Prop::Length` below: the class checked
+            // where the type isn't a typed array's.)
+            let known = reg.shape().is_some_and(|s| unsafe { (*(s as *const Shape)).class } == crate::object::Class::TypedArray);
+            if !known && typed_lengths_standard() {
+                return Sel::new("get_length", if spec.views_detached { "d" } else { "" }, out);
+            }
             let case = if spec.views_detached {
                 "td"
             } else if spec.checked_length_views {
@@ -5810,7 +5864,13 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         if prop == Prop::Length {
             use crate::object::Class;
             let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
-            if class == Some(Class::TypedArray) && typed_length_known(reg) {
+            // Every typed array's `length` the getter's: as an array's
+            // (`typed_lengths_standard`), checked against its buffer's once
+            // a fixed-length buffer was detached (`td` of a known one, `d`
+            // of any). (The general check exits on a view's
+            // `RUNTIME_LENGTH`, with the class.)
+            let standard = !matches!(class, Some(Class::Array | Class::String)) && typed_lengths_standard();
+            if class == Some(Class::TypedArray) && (standard || typed_length_known(reg)) {
                 out.acc = I32;
                 let case = if spec.views_detached {
                     "td"
@@ -5834,8 +5894,9 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 // (A known array may have gone far in a call.)
                 Some(Class::Array) => Sel::new("get_length", "na", out),
                 Some(Class::String) => Sel::new("get_length", "nc", out),
-                // A typed array's (a site that met arrays and typed
-                // arrays) through the runtime.
+                _ if standard => Sel::new("get_length", if spec.views_detached { "d" } else { "" }, out),
+                // A typed array's (one whose `length` may be another's)
+                // through the runtime.
                 _ => {
                     let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
                     Sel {

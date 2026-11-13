@@ -1,0 +1,28 @@
+# Every pull request and every push to master: the tests on x86-64 Linux,
+# as `cargo test --release` runs them locally. The slower checks (arm64,
+# the `intl` feature, test262) run nightly (nightly.yml).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests (x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # (The toolchain rust-toolchain.toml pins.)
+      - run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release

@@ -1,0 +1,65 @@
+# Once a day (and by hand, from the Actions tab): the tests on arm64 and
+# with the `intl` feature, and test262 against the failures known.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  arm64:
+    name: Tests (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      # The static musl build the README tests under qemu, run natively.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER: env
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --target aarch64-unknown-linux-musl
+
+  intl:
+    name: Tests (intl)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --features intl
+
+  test262:
+    name: test262
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      # (At the commit tests/test262-known-fails.txt was made at.)
+      - name: Check out test262
+        run: |
+          rev=$(sed -n 's/^# test262 //p' tests/test262-known-fails.txt)
+          git init -q test262
+          git -C test262 fetch -q --depth 1 https://github.com/tc39/test262.git "$rev"
+          git -C test262 checkout -q FETCH_HEAD
+      - name: Run test262
+        run: |
+          python3 -I scripts/test262-editions.py | tee editions.txt
+          { echo '```'; cat editions.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Compare with the failures known
+        run: python3 -I scripts/test262-check.py tests/test262-known-fails.txt fails-all.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262
+          path: |
+            editions.tsv
+            fails-all.txt

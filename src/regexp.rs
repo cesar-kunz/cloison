@@ -3603,7 +3603,7 @@ mod tests {
     /// bailing at a surrogate), and the interpreter match as the reference
     /// matcher does, backtracking and in lookbehinds too, on text of pairs,
     /// lone halves and ASCII. (Whether a half is alone, all three ask
-    /// `alone`: `tests/js.rs` has the cases.)
+    /// `alone`: `tests/scripts/` has the cases.)
     #[test]
     fn unicode_units_never_split_pairs() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;

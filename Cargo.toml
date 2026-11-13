@@ -30,6 +30,12 @@ debug = "line-tables-only"
 [dev-dependencies]
 # For the tests of build/verify.rs.
 iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
+# The harness of tests/scripts.rs: one test per script.
+libtest-mimic = "0.8"
+
+[[test]]
+name = "scripts"
+harness = false
 
 [build-dependencies]
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "macho"] }

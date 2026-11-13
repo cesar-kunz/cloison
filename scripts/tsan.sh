@@ -4,12 +4,13 @@
 # concurrent marker and agents' threads, in the Rust code. Not in
 # compiled code or `meta_word`'s asm, which TSan doesn't see: the JIT is
 # off (`CLOISON_NO_JIT`) but where a test sets the tier, as tests/js.rs's
-# do (the stencils are built for this layout too). The heap's
+# and tests/scripts/'s do (the stencils are built for this layout too). The heap's
 # reservation is laid out for TSan's memory (`cloison_tsan`, see
 # build.rs). Exits non-zero on a report or a failure; scripts/tsan.supp
 # holds the races known benign.
 #
-#   scripts/tsan.sh                        # the unit tests, tests/heaps.rs, tests/js.rs
+#   scripts/tsan.sh                        # the unit tests, tests/heaps.rs,
+#                                          # tests/js.rs, tests/scripts/
 #   scripts/tsan.sh --test heaps agent     # cargo test's arguments
 #   CYCLES=1 scripts/tsan.sh               # with CLOISON_GC_CYCLES=1:
 #                                          # collections back to back
@@ -18,7 +19,7 @@ cd "$(dirname "$0")/.."
 args=("$@")
 # (16 test threads: the heaps of 8 GiB that fit are 128, and an agent
 # test takes 65.)
-[ $# -gt 0 ] || args=(--lib --test heaps --test js -- --test-threads=16)
+[ $# -gt 0 ] || args=(--lib --test heaps --test js --test scripts -- --test-threads=16)
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target/tsan}
 export RUSTFLAGS="-Zsanitizer=thread"
 export CLOISON_NO_JIT=1

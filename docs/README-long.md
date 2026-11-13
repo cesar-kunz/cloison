@@ -174,8 +174,10 @@ case folding in regexps (`/\u0390/ui` doesn't match `\u1fd3`).
 
 The differential tests run each program in four engine configurations
 (the interpreter alone, and tiered up after 1, 2 and 1,000 loop back
-edges) and the results must agree: the JavaScript tests (`tests/js.rs`,
-which also verify the heap after each run), the bytecode ones
+edges) and the results must agree: the JavaScript tests (the scripts of
+`tests/scripts/`, each with its expected result in a leading comment, and
+`tests/js.rs` for those that use the embedding API; both verify the heap
+after each run), the bytecode ones
 (`tests/objects.rs`), the programs of `bench/micro/` and of
 `tests/octane/`, which carry Node's value as the reference
 (`tests/interp.rs` tests the interpreter alone). Several tests are
@@ -191,12 +193,12 @@ scripts/tsan.sh                                            # under ThreadSanitiz
 ```
 
 `scripts/tsan.sh` runs tests (the unit tests, `tests/heaps.rs` and
-`tests/js.rs` by default, or cargo test's arguments) under
+`tests/js.rs` and `tests/scripts/` by default, or cargo test's arguments) under
 ThreadSanitizer on x86-64 Linux, with `-Zbuild-std` (`rustup component
 add rust-src`): it finds races between the mutator, the concurrent
 marker and agents in the Rust code, not in compiled code or asm, which
 TSan doesn't see (the JIT is
-off but where a test sets the tier, as `tests/js.rs`'s do). `CYCLES=1`
+off but where a test sets the tier, as the JavaScript tests do). `CYCLES=1`
 adds `CLOISON_GC_CYCLES`. Such a build moves the heap's reservation and
 side tables below 2 TiB, out of TSan's shadow memory, with room for 128
 heaps of 8 GiB (`cloison_tsan` in `build.rs`); `scripts/tsan.supp` lists

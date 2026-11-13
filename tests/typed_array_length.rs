@@ -2,19 +2,6 @@
 use cloison::vm::{Vm, display};
 
 #[test]
-fn typed_array_length_uses_property_descriptors() {
-    let src = include_str!("fixtures/typed-array-length.js");
-    let module = cloison::js::compile(src).unwrap();
-    for budget in [i64::MAX, 1, 2, 1000] {
-        let mut vm = Vm::new();
-        vm.set_tier_back_edges(budget);
-        let result = vm.run(&module).unwrap_or_else(|e| panic!("tier {budget}: {e}"));
-        assert_eq!(display(result), "ok", "tier {budget}");
-        vm.verify_heap();
-    }
-}
-
-#[test]
 fn host_length_lookup_respects_virtual_ancestors() {
     let mut vm = Vm::new();
     let setup = cloison::js::compile(

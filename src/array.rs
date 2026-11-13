@@ -574,7 +574,8 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
                 for i in 0..n / 2 {
                     swap_words(e.add(i), e.add(n - 1 - i));
                 }
-            } else {
+            } else if n > 1 {
+                // (`elems` is null where none were allocated: no slice.)
                 std::slice::from_raw_parts_mut(e, n).reverse();
             }
             // (Every slot may now hold what was elsewhere: barriered.)

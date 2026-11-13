@@ -34,6 +34,15 @@ ENGINES = {
     "jsc-nojit": (JSC + ["--useJIT=false"], JSC_ENV),
     "sm": (SM, SM_ENV),
     "sm-nojit": (SM + ["--no-blinterp", "--no-baseline", "--no-ion", "--no-native-regexp"], SM_ENV),
+    # Each engine's JITs up to a tier, beside cloison's one (a baseline JIT
+    # with types): V8's Sparkplug (baseline) and Maglev (mid-tier), not
+    # TurboFan; JavaScriptCore's Baseline JIT and DFG, not FTL;
+    # SpiderMonkey's Baseline, not Ion (Warp).
+    "v8-sparkplug": ([f"{E}/v8/v8", "--max-opt=1"], {}),
+    "v8-maglev": ([f"{E}/v8/v8", "--max-opt=2"], {}),
+    "jsc-baseline": (JSC + ["--useDFGJIT=false"], JSC_ENV),
+    "jsc-dfg": (JSC + ["--useFTLJIT=false"], JSC_ENV),
+    "sm-baseline": (SM + ["--no-ion"], SM_ENV),
     "qjs": ([f"{E}/quickjs/qjs"], {}),
     # Bellard's QuickJS, KetteVM (interpreter only) and OpenHarmony's ARK
     # (`ark_js_vm` on `.abc` files `es2abc` compiles; asm interpreter, and its JIT).
@@ -44,6 +53,7 @@ ENGINES = {
                  "--compiler-enable-jit=true"], {"LD_LIBRARY_PATH": ARK_LD}),
 }
 JIT = ["cloison", "v8", "jsc", "sm", "ark-jit"]
+TIERS = ["v8-sparkplug", "v8-maglev", "jsc-baseline", "jsc-dfg", "sm-baseline"]
 NOJIT = ["cloison-nojit", "v8-jitless", "jsc-nojit", "sm-nojit", "quickjs", "kette", "ark"]
 
 

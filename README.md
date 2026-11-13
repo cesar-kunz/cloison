@@ -10,6 +10,11 @@
 A JavaScript engine in Rust: a register-bytecode interpreter and a
 copy-and-patch JIT, in one small static binary.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/cesar-kunz/cloison/bench/chart-dark.svg">
+  <img alt="Bar charts, measured nightly: Octane's geomean score with JITs off (each engine's interpreter) and with JITs up to a like tier (V8's Sparkplug and Maglev, JavaScriptCore's Baseline and DFG, SpiderMonkey's Baseline; the full engines fainter), an empty script's RSS and Octane's peak RSS; cloison against V8, JavaScriptCore, SpiderMonkey and QuickJS. The tables below have the figures." src="https://raw.githubusercontent.com/cesar-kunz/cloison/bench/chart-light.svg">
+</picture>
+
 - **Small**: one 6.4 MB static binary, no other files; an empty script runs
   in 2 ms and 4.5 MB of RSS.
 - **The fastest interpreter measured on Octane**: 1.33× V8's Ignition, 1.7×

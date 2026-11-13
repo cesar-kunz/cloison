@@ -42,7 +42,7 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
     // are any, a second renames them apart (see `Parser::reference`).
     let lexical = has_lexical(toks);
     let (first, table) = parse_pass(toks, arena, skim && !lexical, true, None, None, None, None)?;
-    if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
+    if table.trivial() {
         return Ok(first);
     }
     parse_pass(toks, arena, skim, false, Some(table), Some(&first), None, None).map(|(p, _)| p)
@@ -94,7 +94,7 @@ pub fn parse_source_code_as<'a>(
     let mut toks = super::lex::lex_source(src, false)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
-    if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
+    if table.trivial() {
         return Ok(first);
     }
     let mut toks = super::lex::lex_source(src, false)?;
@@ -108,7 +108,7 @@ pub fn parse_source_code_as<'a>(
 pub fn parse_module_source<'a>(src: &Source, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex_source(src, true)?;
     let (first, table) = parse_pass(&mut toks, arena, false, false, None, None, None, Some(id))?;
-    if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
+    if table.trivial() {
         return Ok(first);
     }
     let mut toks = super::lex::lex_source(src, true)?;
@@ -302,16 +302,16 @@ struct Table {
     decls: crate::jit::HashMap<usize, Vec<(Name, u8)>>,
     /// A function has parameter defaults (see `Parser::push_body_vars`).
     defaults: bool,
-    /// A function is in a catch clause, which may close over its
-    /// parameter (see `Parser::push_vars`).
+    /// A function in a catch clause refers to its parameter, or a direct
+    /// `eval` is in one (see `Parser::note_catch_ref`).
     catch_closure: bool,
 }
 
 impl Table {
     /// Nothing to rename but catch parameters (renamed only along with
-    /// other names, or for a direct `eval`, which sees a catch parameter
-    /// apart from its function's `var` by the name: see `parse_with`), no
-    /// function closing over one.
+    /// other names), no function closing over one and no direct `eval`
+    /// seeing one (which sees a catch parameter apart from its function's
+    /// `var` by the name).
     fn trivial(&self) -> bool {
         !self.defaults && !self.catch_closure && self.decls.values().flatten().all(|&(_, kind)| kind == CATCH)
     }
@@ -1861,6 +1861,9 @@ impl<'a> Parser<'_, 'a, '_> {
                 // compiled lazily, it couldn't declare them again.)
                 && free.iter().all(|n| self.resolve(n).is_none())
             {
+                for n in &free {
+                    self.note_catch_ref(n);
+                }
                 let end = self.toks[self.i - 1].pos + 1;
                 let f = &mut self.functions[index];
                 f.end = end;
@@ -2684,6 +2687,9 @@ impl<'a> Parser<'_, 'a, '_> {
                     // A direct `eval` (see `Function::has_eval`), which may
                     // read `arguments`.
                     self.functions[self.current].has_eval = true;
+                    if self.collect && self.frames.iter().any(|f| f.catch) {
+                        self.table.catch_closure = true;
+                    }
                     let k = self.non_arrow();
                     // (Its code may read `new.target`, and `arguments`:
                     // a function's, not a module's, which has neither.)
@@ -3214,9 +3220,28 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.functions[k].uses_arguments = true;
             }
         }
+        self.note_catch_ref(&name);
         match self.resolve(&name) {
             Some(r) => ExprKind::Ident(r),
             None => ExprKind::Ident(name),
+        }
+    }
+
+    /// In the first pass, a reference to `name` here: if it is a catch
+    /// parameter's from outside the function it's in, the function closes
+    /// over the parameter, which it sees only renamed apart from the
+    /// enclosing function's variables (see `Table::trivial`).
+    fn note_catch_ref(&mut self, name: &Name) {
+        if !self.collect || self.table.catch_closure {
+            return;
+        }
+        let mut inner = false;
+        for f in self.frames.iter().rev() {
+            if f.catch && f.names.iter().any(|(o, _)| o == name) {
+                self.table.catch_closure = inner;
+                return;
+            }
+            inner |= f.vars;
         }
     }
 
@@ -3353,12 +3378,6 @@ impl<'a> Parser<'_, 'a, '_> {
     /// before its parameters), which shadow outer block-scoped bindings.
     /// (The names come from the first pass's function starting there.)
     fn push_vars(&mut self, key: usize) {
-        // (A function in a catch clause sees its parameter only renamed
-        // apart from the enclosing function's variables: see
-        // `Table::trivial`.)
-        if self.collect && self.frames.iter().any(|f| f.catch) {
-            self.table.catch_closure = true;
-        }
         let names = match self.prev {
             Some(prev) => {
                 let pos = self.toks[key].pos;
@@ -3408,6 +3427,10 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.redeclared = Some((self.toks[self.i.saturating_sub(1)].pos, format!("`{name}` has already been declared")));
             }
             decls.push((name.clone(), kind));
+            // (Its name, for `Parser::note_catch_ref`.)
+            if kind == CATCH {
+                self.frames.last_mut().unwrap().names.push((name.clone(), name.clone()));
+            }
             return name.clone();
         }
         let Some((_, r)) = frame.names.iter().find(|(o, _)| o == name) else {

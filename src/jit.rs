@@ -421,6 +421,106 @@ pub(crate) fn retire_functions(
     drop(snaps);
 }
 
+/// After this many full collections in which a function's compiled code
+/// wasn't used, the direct calls into it are unbound; after this many more,
+/// it is retired (see [`age_functions`]).
+const IDLE_UNBIND: u8 = 2;
+const IDLE_RETIRE: u8 = 2;
+/// (The first doubles, up to this, each time the function turns out to be
+/// in use after its calls were unbound: Splay, a full collection every few
+/// milliseconds, lost 2% to its calls binding again.)
+const IDLE_UNBIND_MAX: u8 = 16;
+
+/// Code aging, at a full collection: the functions of `kept` (see
+/// [`kept_by_function`]) to retire, their compiled code not used for
+/// `IDLE_UNBIND + IDLE_RETIRE` full collections (or more: see
+/// `IDLE_UNBIND_MAX`). A function is used when
+/// a frame runs it at a collection, when the runtime enters it
+/// (`vm_prepare`) or binds a call site to it (`direct_version`). Direct
+/// calls enter it unseen: once it looks idle for `IDLE_UNBIND`
+/// collections, the sites bound to it are unbound (as `unbind_calls`
+/// leaves them), and one that still calls it binds again through the
+/// runtime, which counts as a use. Code that ran once and doesn't any more
+/// (a program's setup, a phase gone by) is dropped so, with its lowering
+/// and what they keep.
+pub(crate) fn age_functions(vm: &mut crate::vm::Vm, kept: &[KeptBy]) -> HashSet<*const crate::vm::Code> {
+    let (unbind_at, retire_at) = age_limits();
+    let mut gone = HashSet::default();
+    let mut unbind: HashSet<*const crate::vm::Code> = HashSet::default();
+    if unbind_at == 0 {
+        return gone;
+    }
+    for k in kept {
+        let Ok(mut j) = (unsafe { (*k.code).jit.try_borrow_mut() }) else { continue };
+        let Some(f) = j.as_mut() else { continue };
+        let patience = f.patience.max(unbind_at);
+        if f.used.replace(false) || !k.running.is_empty() {
+            // (Used since its calls were unbound: likely called directly
+            // all along, and asked less often.)
+            if f.idle >= patience {
+                f.patience = patience.saturating_mul(2).min(IDLE_UNBIND_MAX.max(unbind_at));
+            }
+            f.idle = 0;
+            continue;
+        }
+        f.idle = f.idle.saturating_add(1);
+        if f.idle == patience {
+            unbind.insert(k.code);
+        } else if f.idle >= patience.saturating_add(retire_at) {
+            gone.insert(k.code);
+        }
+    }
+    if unbind.is_empty() {
+        return gone;
+    }
+    // (The versions unbound stay their functions'; one a site held alone
+    // goes with the others retired, once no frame runs it.)
+    let mut versions: Vec<Rc<JitCode>> = Vec::new();
+    fn unbind_site(site: &mut CallSite, of: &HashSet<*const crate::vm::Code>, out: &mut Vec<Rc<JitCode>>) {
+        if of.contains(&site.callee) && !site.self_call && site.target.is_some() {
+            out.extend(site.target.take());
+            if site.entry != 0 {
+                site.entry = 0;
+                site.pending = site.claim.is_some();
+                site.rebind = true;
+            }
+        }
+        if let Some(d) = &mut site.dispatch {
+            for s in d.sites.values_mut() {
+                unbind_site(s.get_mut(), of, out);
+            }
+        }
+    }
+    let (alive_snaps, alive_codes): (Vec<_>, Vec<_>) = ALIVE.with(|a| {
+        let a = a.borrow();
+        (a.0.iter().copied().collect(), a.1.iter().copied().collect())
+    });
+    for s in alive_snaps {
+        for site in unsafe { &(*s).sites } {
+            unbind_site(unsafe { &mut *site.get() }, &unbind, &mut versions);
+        }
+    }
+    for c in alive_codes {
+        for site in unsafe { &(*c).forks } {
+            unbind_site(unsafe { &mut *site.get() }, &unbind, &mut versions);
+        }
+    }
+    for v in versions {
+        if Rc::strong_count(&v) == 1 {
+            vm.jit_caches.retired.push(v);
+        }
+    }
+    gone
+}
+
+fn age_limits() -> (u8, u8) {
+    static L: std::sync::OnceLock<(u8, u8)> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        let v = |n: &str, d: u8| std::env::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        (v("CLOISON_JIT_IDLE_UNBIND", IDLE_UNBIND), v("CLOISON_JIT_IDLE_RETIRE", IDLE_RETIRE))
+    })
+}
+
 /// [`mark_referenced_codes`] for the frames and call sites of a snapshot
 /// or a version.
 fn mark_codes_of(
@@ -10273,6 +10373,13 @@ pub struct JitFunction {
     /// collection ([`JitFunction::retire`]): each later one goes back to
     /// it.
     retired_base: Option<u32>,
+    /// Entered through the runtime, or a call site bound to it, since the
+    /// last full collection; the full collections since it last was; and
+    /// those after which the calls into it are unbound, if not the
+    /// default (see [`age_functions`]).
+    used: std::cell::Cell<bool>,
+    idle: u8,
+    patience: u8,
     tiering: Option<Tiering>,
     /// Back edges left before tiering up, and calls so far.
     back_edges_left: i64,
@@ -11150,6 +11257,7 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
         return Version::Busy;
     }
     let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, vm)));
+    f.used.set(true);
     // Cooling after an exit: binding waits (calls meanwhile go through the
     // interpreter, which counts the cooling down).
     if let Some(v) = &f.vm
@@ -16258,6 +16366,9 @@ impl JitFunction {
             last: None,
             fits: Default::default(),
             retired_base: None,
+            used: std::cell::Cell::new(true),
+            idle: 0,
+            patience: 0,
             tiering: Some(Tiering::default()),
             back_edges_left: Tiering::default().back_edges,
             calls: 0,
@@ -16343,6 +16454,7 @@ impl JitFunction {
     ) -> Option<(Rc<JitCode>, Value, usize)> {
         // Field types read while lowering and compiling are this function's.
         let _compiling = Compiling::of(self.vm.as_ref().expect("a VM function").root);
+        self.used.set(true);
         {
             let vm = self.vm.as_mut().expect("a VM function");
             vm.late.0 += u32::from(vm.spent && pc == 0);

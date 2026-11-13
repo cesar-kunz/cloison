@@ -255,9 +255,13 @@ pub(crate) struct KeptBy {
     /// The codes they compiled: its own and those inlined, whose inline
     /// caches' cells they took (see `Vm::weak_kept`).
     pub(crate) codes: Vec<*const crate::vm::Code>,
-    /// Its code can't be dropped now: a frame runs a version of it, or its
-    /// state is in use.
+    /// Its code can't be dropped now: its state is in use.
     pub(crate) held: bool,
+    /// Its versions a frame runs, which stay if it is retired; and of
+    /// `addrs` and `dispatched`, the addresses they and their lowerings
+    /// refer to.
+    pub(crate) running: Vec<*const JitCode>,
+    pub(crate) running_addrs: Vec<usize>,
 }
 
 /// At a full marking, the cells compiled code alive keeps and the codes it
@@ -287,7 +291,15 @@ pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::
             }
             Some(*index.entry(code).or_insert_with(|| {
                 let held = unsafe { (*code).jit.try_borrow_mut().is_err() };
-                by.push(KeptBy { code, addrs: Vec::new(), dispatched: Vec::new(), codes: Vec::new(), held });
+                by.push(KeptBy {
+                    code,
+                    addrs: Vec::new(),
+                    dispatched: Vec::new(),
+                    codes: Vec::new(),
+                    held,
+                    running: Vec::new(),
+                    running_addrs: Vec::new(),
+                });
                 by.len() - 1
             }))
         };
@@ -312,10 +324,27 @@ pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::
             ranges.push((at, at + std::mem::size_of::<JitCode>(), k));
         }
         ranges.sort_unstable();
+        // (The versions a word of the stacks points into, or at.)
+        let mut on: HashSet<usize> = HashSet::default();
         for &w in words {
             let i = ranges.partition_point(|r| r.0 <= w);
             if i > 0 && w < ranges[i - 1].1 {
-                by[ranges[i - 1].2].held = true;
+                on.insert(ranges[i - 1].0);
+            }
+        }
+        for c in codes.iter().map(|&c| unsafe { &*c }) {
+            let at = c as *const JitCode as usize;
+            if !on.contains(&(c.mem.ptr as usize)) && !on.contains(&at) {
+                continue;
+            }
+            let Some(s) = c.snap.as_ref() else { continue };
+            let Some(k) = of(&mut by, s) else { continue };
+            let k = &mut by[k];
+            k.running.push(c);
+            k.running_addrs.extend_from_slice(c.kept.addrs());
+            k.running_addrs.extend_from_slice(s.kept.addrs());
+            for site in c.forks.iter().chain(&s.sites) {
+                site_addrs(unsafe { &*site.get() }, &mut k.running_addrs);
             }
         }
         for k in by.iter_mut() {
@@ -331,7 +360,11 @@ pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::
 /// versions and lowerings, those retired too, and every call site bound to
 /// one unbound, to bind again at its next call (as `unbind_calls` leaves
 /// it). What the functions learned stays (see `JitFunction::retire`).
-pub(crate) fn retire_functions(vm: &mut crate::vm::Vm, gone: &HashSet<*const crate::vm::Code>) {
+pub(crate) fn retire_functions(
+    vm: &mut crate::vm::Vm,
+    gone: &HashSet<*const crate::vm::Code>,
+    running: &HashSet<*const JitCode>,
+) {
     let of = |c: &JitCode| c.snap.as_ref().is_some_and(|s| s.frames.first().is_some_and(|f| gone.contains(&f.code)));
     // (Dropped at the end: a version dropping leaves `ALIVE`, and the
     // sites of one dropped are still to visit.)
@@ -377,7 +410,14 @@ pub(crate) fn retire_functions(vm: &mut crate::vm::Vm, gone: &HashSet<*const cra
             j.retire(&mut versions, &mut snaps);
         }
     }
-    drop(versions);
+    // Those a frame runs stay until it has left them (`free_retired`), each
+    // held once.
+    let mut kept: HashSet<*const JitCode> = HashSet::default();
+    for v in versions {
+        if running.contains(&Rc::as_ptr(&v)) && kept.insert(Rc::as_ptr(&v)) {
+            vm.jit_caches.retired.push(v);
+        }
+    }
     drop(snaps);
 }
 

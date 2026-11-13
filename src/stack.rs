@@ -31,6 +31,8 @@ fn find_end() -> usize {
             if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) == 0 {
                 libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
                 libc::pthread_attr_destroy(&mut attr);
+                #[cfg(target_env = "musl")]
+                let addr = main_thread_end(addr as usize + size).map_or(addr as usize, |e| e.min(addr as usize));
                 (addr as usize).max(1)
             } else {
                 1
@@ -38,6 +40,27 @@ fn find_end() -> usize {
         };
         END.with(|e| e.set(end));
         end
+    }
+}
+
+/// On the main thread, the lowest address its stack, ending at `top`, may
+/// grow to: musl's `pthread_getattr_np` gives the main thread's stack as
+/// far as it is mapped so far (at the start, less than [`RESERVE`]: every
+/// check failed), glibc's as far as `RLIMIT_STACK` lets it grow, which
+/// the kernel keeps free below its top. (No limit: 8 MiB, Linux's usual.)
+/// None on another thread, whose stack is as it was made.
+#[cfg(target_env = "musl")]
+fn main_thread_end(top: usize) -> Option<usize> {
+    unsafe {
+        if libc::getpid() as libc::c_long != libc::syscall(libc::SYS_gettid) {
+            return None;
+        }
+        let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let limit = match libc::getrlimit(libc::RLIMIT_STACK, &mut l) {
+            0 if l.rlim_cur != libc::RLIM_INFINITY => l.rlim_cur as usize,
+            _ => 8 << 20,
+        };
+        Some(top.saturating_sub(limit))
     }
 }
 

@@ -7656,6 +7656,28 @@ macro_rules! check_callee {
             *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = f.to_bits();
             next!(s)
         });
+        // A case of a polymorphic inlined call, inlined for any closure of
+        // a code (as `check_callee_code`): what isn't one takes the branch,
+        // to the next case.
+        stencil!("callee_code_jne_", loc!($loc); |s| {
+            let f = get!($loc, s);
+            let p = f.to_bits() as *const u8;
+            if !is_cell(s.tag, f) || (*header(p)).class != class::FUNCTION || (*header(p)).code != imm64() {
+                jump!(s)
+            }
+            *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = f.to_bits();
+            next!(s)
+        });
+        // A case of a polymorphic call's dispatch, for any closure of a
+        // code: what isn't one takes the branch, to the next case.
+        stencil!("callee_is_code_jne_", loc!($loc); |s| {
+            let f = get!($loc, s);
+            let p = f.to_bits() as *const u8;
+            if !is_cell(s.tag, f) || (*header(p)).class != class::FUNCTION || (*header(p)).code != imm64() {
+                jump!(s)
+            }
+            next!(s)
+        });
         // A case of a polymorphic inlined call: another callee takes the
         // branch, to the next case.
         // target aarch64 callee_jne_g{}: 5 callee (3), `cmp`, branch (docs/arm64-targets.md)

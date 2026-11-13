@@ -2002,6 +2002,38 @@ fn direct_calls_dispatched_on_the_callee_agree_with_node() {
     assert_eq!(value(&format!("{DIRECT_DISPATCH}\nmain();")), "73149");
 }
 
+/// A call dispatched on callees that are closures made anew time and
+/// again (with upvalues of their own, one with a handler, which runs
+/// interpreted): each case is for any closure of its code, and calls it
+/// with its own upvalues; then another function and a native join them.
+/// The expected value is Node's.
+const DISPATCH_BY_CODE: &str = r#"
+function make(k) {
+  var big = []; for (var j = 0; j < 50; j++) big.push(k + j);
+  function a(x) { var s = 0; for (var j = 0; j < 3; j++) s += big[j]; return s + x; }
+  function b(x) { try { return big[k % 50] - x; } finally { k++; } }
+  function c(x) { return x * 2; }
+  return [a, b, c];
+}
+function run(fs, n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) { var f = fs[i % fs.length]; s += f(i); }
+  return s;
+}
+function main() {
+  var s = 0;
+  for (var p = 0; p < 40; p++) s += run(make(p), 3000);
+  var fs = make(7);
+  fs.push(function (x) { return -x; }, Math.abs);
+  return s + run(fs, 3000);
+}
+"#;
+
+#[test]
+fn calls_dispatched_on_the_callees_code_agree_with_node() {
+    assert_eq!(value(&format!("{DISPATCH_BY_CODE}\nmain();")), "126052700");
+}
+
 /// `typeof` of every kind of value, of an undeclared global (no
 /// ReferenceError), and in a compiled loop. The expected value is Node's.
 const TYPEOF: &str = r#"

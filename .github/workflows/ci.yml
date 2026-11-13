@@ -1,6 +1,7 @@
 # Every pull request and every push to master: the tests on x86-64 Linux,
-# as `cargo test --release` runs them locally. The slower checks (arm64,
-# the `intl` feature, test262) run nightly (nightly.yml).
+# as `cargo test --release` runs them locally, and rustfmt and clippy
+# (warnings are errors). The slower checks (arm64, the `intl` feature,
+# test262) run nightly (nightly.yml).
 name: CI
 
 on:
@@ -26,3 +27,15 @@ jobs:
       - run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
+
+  lint:
+    name: rustfmt and clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features intl -- -D warnings

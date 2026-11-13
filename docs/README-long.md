@@ -187,8 +187,9 @@ checkout in `test262/`), which writes the table above;
 `scripts/test262-check.py` compares its failures with those known
 (`tests/test262-known-fails.txt`, which names the test262 commit).
 
-GitHub Actions runs the tests on x86-64 for every pull request and push
-to master (`.github/workflows/ci.yml`), and nightly the tests on arm64
+GitHub Actions runs the tests on x86-64, `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` (also with `intl`) for every
+pull request and push to master (`.github/workflows/ci.yml`), and nightly the tests on arm64
 and with the `intl` feature, and test262 against the failures known
 (`nightly.yml`, also run by hand from the Actions tab).
 

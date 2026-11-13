@@ -10200,6 +10200,10 @@ pub struct JitFunction {
     /// Per entry's bytecode offset, its versions' checks for
     /// `fitting_version` (built there; emptied when versions change).
     fits: std::cell::RefCell<HashMap<usize, Rc<[Fit]>>>,
+    /// Its compilations counted after its first retirement by a
+    /// collection ([`JitFunction::retire`]): each later one goes back to
+    /// it.
+    retired_base: Option<u32>,
     tiering: Option<Tiering>,
     /// Back edges left before tiering up, and calls so far.
     back_edges_left: i64,
@@ -16114,19 +16118,30 @@ impl JitFunction {
     }
 
     /// Drop its versions and its lowering, handed to `versions` and `snaps`
-    /// (see [`retire_functions`]): its next entry lowers it again and
-    /// compiles anew. What it learned from its exits stays, and the
-    /// compilations of the versions dropped don't count against it.
+    /// (see [`retire_functions`]): it is lowered again and compiles anew
+    /// after a cooling, the caches cleared with it filling meanwhile. What
+    /// it learned from its exits stays. Neither the compilations of the
+    /// versions dropped nor those since its last retirement count against
+    /// it, nor its bails so far: a call compiled before its cleared cache
+    /// had a callee again bails once, and costs a compilation. pdfjs's
+    /// `decodeBaseline`, its closures made anew for each image and retired
+    /// at each collection, spent its 32 compilations so, then ran in the
+    /// interpreter: +5% for the whole run.
     fn retire(&mut self, versions: &mut Vec<Rc<JitCode>>, snaps: &mut Vec<Rc<Snapshot>>) {
         let Some(vm) = self.vm.as_mut() else { return };
         let before = versions.len();
         versions.extend(self.versions.drain().flat_map(|(_, vs)| vs).map(|(_, c)| c));
-        self.stats.compiles = self.stats.compiles.saturating_sub((versions.len() - before) as u32);
+        let left = self.stats.compiles.saturating_sub((versions.len() - before) as u32);
+        let base = *self.retired_base.get_or_insert(left);
+        self.stats.compiles = left.min(base);
         self.fits.get_mut().clear();
         self.live_at.clear();
         self.last = None;
         snaps.push(std::mem::replace(&mut vm.snap, Rc::new(Snapshot::empty())));
         vm.dirty = true;
+        vm.cool = COOL_ENTRIES;
+        (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
+        vm.bail_exits.retain(|pc, _| vm.no_entry.contains(pc));
         self.note_spent();
     }
 
@@ -16151,6 +16166,7 @@ impl JitFunction {
             live_at: HashMap::default(),
             last: None,
             fits: Default::default(),
+            retired_base: None,
             tiering: Some(Tiering::default()),
             back_edges_left: Tiering::default().back_edges,
             calls: 0,

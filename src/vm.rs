@@ -387,7 +387,7 @@ unsafe fn global_way(code: &Code, ic: u32) {
 }
 
 impl Ic {
-    const EMPTY: Ic =
+    pub(crate) const EMPTY: Ic =
         Ic { shape: std::ptr::null(), holder: std::ptr::null_mut(), new_shape: std::ptr::null(), loc: 0, epoch: 0 };
 }
 

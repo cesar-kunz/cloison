@@ -255,6 +255,11 @@ pub struct Gc {
     last_end: Option<std::time::Instant>,
     /// Print what each kind of root reaches (`CLOISON_GC_ROOTS`).
     roots_report: bool,
+    /// A full marking holds what compiled code refers to weakly (see
+    /// `Vm::weak_kept`); off with `CLOISON_GC_STRONG_KEPT`.
+    weak_kept: bool,
+    /// The marking under way does: no lowering is.
+    weak_now: bool,
     /// After each stop-the-world full collection, print the small blocks'
     /// occupancy and what in them could not move (`CLOISON_GC_FRAG`).
     frag_report: bool,
@@ -304,6 +309,8 @@ impl Gc {
             cycles: env("CLOISON_GC_CYCLES"),
             check_barriers: env("CLOISON_GC_CHECK_BARRIER"),
             roots_report: env("CLOISON_GC_ROOTS"),
+            weak_kept: !env("CLOISON_GC_STRONG_KEPT"),
+            weak_now: false,
             frag_report: env("CLOISON_GC_FRAG"),
             slots_check: env("CLOISON_GC_SLOTS"),
             evacuate: match std::env::var("CLOISON_GC_EVACUATE").as_deref() {
@@ -557,6 +564,13 @@ pub(crate) struct KeptCells {
     table: Option<KeptTable>,
 }
 
+impl KeptCells {
+    /// The addresses kept.
+    pub(crate) fn addrs(&self) -> &[usize] {
+        &self.addrs
+    }
+}
+
 impl Drop for KeptCells {
     fn drop(&mut self) {
         if let Some(t) = &self.table {
@@ -571,6 +585,17 @@ impl Drop for KeptCells {
             }
         }
     }
+}
+
+/// A full marking's progress through what compiled code refers to (see
+/// `Vm::weak_kept`).
+#[derive(Default)]
+struct WeakKept {
+    started: bool,
+    done: bool,
+    /// What the functions with compiled code alive refer to.
+    kept: Vec<crate::jit::KeptBy>,
+    retired: usize,
 }
 
 /// What a collection marks.
@@ -2309,6 +2334,7 @@ impl Vm {
         }
         let color = if kind == Collection::Full { self.heap.next_color() } else { self.heap.color };
         let full = matches!(kind, Collection::Full | Collection::Final);
+        self.heap.gc.weak_now = self.heap.gc.weak_kept && !(full && crate::jit::compiling());
         let mode = Mode {
             color,
             kind: match kind {
@@ -2593,16 +2619,184 @@ impl Vm {
         // reached only through another's value (`m.set(k, new WeakMap)`).
         let mut tables: Vec<*mut Object> = Vec::new();
         let mut found = vec![false; self.weak_tables.len()];
+        // (What compiled code refers to, once the rest is marked: see
+        // `weak_kept`. What that marks may make keys live.)
+        let mut weak = WeakKept::default();
+        let mut marked = true;
         loop {
-            if full {
-                unsafe { self.mark_codes_and_shapes(m, sp, regs) };
+            while marked {
+                if full {
+                    unsafe { self.mark_codes_and_shapes(m, sp, regs) };
+                }
+                marked = unsafe { self.ephemeron_values(m, &mut found, &mut tables) } && full;
             }
-            if !unsafe { self.ephemeron_values(m, &mut found, &mut tables) } || !full {
+            if !full {
                 break;
+            }
+            match unsafe { self.weak_kept(m, sp, regs, &mut weak) } {
+                Some(more) => marked = more,
+                None => break,
             }
         }
         unsafe { self.ephemeron_clear(m.mode, &tables) };
         self.weak_tables = tables;
+    }
+
+    /// A full marking holds weakly the cells compiled code refers to: those
+    /// it keeps (see `gc::KeptCells`: the constants it embeds, the closures
+    /// its call sites are bound to), and those the inline caches of the
+    /// codes it compiled hold (a call's callees, a load's prototype: it
+    /// took their addresses, and the caches don't change while it runs in
+    /// the interpreter's place). One that nothing else reaches goes, with
+    /// the compiled code of the functions referring to it
+    /// (`jit::retire_functions`: they compile again when they next run),
+    /// and its way of the cache. As roots, they held what the program had
+    /// dropped for as long as the code lived: a function compiled while it
+    /// worked on one object graph held that graph (the TypeScript app's
+    /// live cells grew from 450 MiB to 1.5 GiB over its run, 14M of 18M of
+    /// them reached from there only; see notes/memory-peaks.md).
+    ///
+    /// In steps, each after the marking has marked all it reaches
+    /// (`ephemerons`, which goes on after one that marked a cell: whether
+    /// it did; `None` once there is no more to do). First the cells of the
+    /// functions held (`jit::KeptBy::held`: a frame runs their code, which
+    /// reads them) are marked, and what they reach; all of them while a
+    /// lowering is under way (what it took is in no snapshot yet: the
+    /// caches' are marked with their codes then, `Gc::weak_now`). Then the
+    /// other functions referring to a cell left unmarked are retired, and
+    /// what is kept still is marked (were one's code to stay, it is held
+    /// from then on), until none is left; and last the caches' ways
+    /// holding a cell unmarked are cleared. Every cell compiled code alive
+    /// or an inline cache refers to is live after it.
+    unsafe fn weak_kept(&mut self, m: &mut Marking, sp: usize, regs: *mut Value, st: &mut WeakKept) -> Option<bool> {
+        let color = m.mode.color;
+        let report = self.heap.gc.roots_report;
+        let listed = |vm: &Vm| {
+            let words = unsafe { vm.stack_words(sp, regs) };
+            let set = &vm.code_set;
+            crate::jit::kept_by_function(&words, &|c| set.contains(&(c as usize)))
+        };
+        unsafe {
+            if !st.started {
+                st.started = true;
+                if !self.heap.gc.weak_now {
+                    for a in self.heap.kept_addrs() {
+                        self.mark_interior(m, a);
+                    }
+                    st.done = true;
+                } else {
+                    st.kept = listed(self);
+                    for k in st.kept.iter().filter(|k| k.held) {
+                        self.mark_kept_by(m, k);
+                    }
+                }
+                let n = m.drain(&|| false);
+                if report {
+                    eprintln!("  roots kept, held: {n} cells");
+                }
+                return Some(n > 0);
+            }
+            if st.done {
+                return None;
+            }
+            let heap = &self.heap;
+            let dead = |a: usize| heap.cell_containing(a).is_some_and(|p| *crate::heap::meta(p) & COLOR != color);
+            // The codes with a cache holding a cell unmarked.
+            let from = self.heap.gc.codes_from;
+            let live =
+                |c: &crate::vm::Code| c.pinned.get() || c.mark.load(std::sync::atomic::Ordering::Relaxed) >= from;
+            let stale: crate::jit::HashSet<*const crate::vm::Code> = (self.codes.iter())
+                .filter(|c| {
+                    live(c)
+                        && c.made_ics().iter().any(|ways| {
+                            (*ways.get()).iter().any(|ic| heap.contains(ic.holder as usize) && dead(ic.holder as usize))
+                        })
+                })
+                .map(|c| &**c as *const crate::vm::Code)
+                .collect();
+            let gone: crate::jit::HashSet<*const crate::vm::Code> = (st.kept.iter())
+                .filter(|k| {
+                    !k.held
+                        && (k.addrs.iter().chain(&k.dispatched).any(|&a| dead(a))
+                            || k.codes.iter().any(|c| stale.contains(c)))
+                })
+                .map(|k| k.code)
+                .collect();
+            if gone.is_empty() {
+                // (What no function listed keeps: a lowering's, a version
+                // without a snapshot's.)
+                for a in self.heap.kept_addrs() {
+                    self.mark_interior(m, a);
+                }
+                let n = m.drain(&|| false);
+                if n > 0 {
+                    if report {
+                        eprintln!("  kept, no function's: {n} cells");
+                    }
+                    return Some(true);
+                }
+                let mut ways_cleared = 0;
+                for &c in &stale {
+                    for ways in (*c).made_ics().iter() {
+                        let ways = &mut *ways.get();
+                        let gone = |ic: &crate::vm::Ic| heap.contains(ic.holder as usize) && dead(ic.holder as usize);
+                        if ways.iter().any(gone) {
+                            // (The ways left, in their order: the first is
+                            // the latest, or the one the interpreter checks.)
+                            let mut left = [crate::vm::Ic::EMPTY; crate::vm::IC_WAYS];
+                            for (k, ic) in ways.iter().filter(|ic| !gone(ic)).enumerate() {
+                                left[k] = *ic;
+                            }
+                            ways_cleared += ways.iter().filter(|ic| gone(ic)).count();
+                            *ways = left;
+                        }
+                    }
+                }
+                if report {
+                    eprintln!("  kept: {ways_cleared} ways of {} codes' inline caches cleared", stale.len());
+                }
+                return None;
+            }
+            crate::jit::retire_functions(self, &gone);
+            st.retired += gone.len();
+            // (What is kept still, and the functions whose code stayed:
+            // none should, their versions held by a call under way alone.)
+            let before = st.kept.len();
+            st.kept = listed(self);
+            let mut stayed = 0;
+            for k in st.kept.iter_mut().filter(|k| gone.contains(&k.code)) {
+                k.held = true;
+                stayed += 1;
+            }
+            for a in self.heap.kept_addrs() {
+                self.mark_interior(m, a);
+            }
+            for k in st.kept.iter().filter(|k| k.held) {
+                self.mark_kept_by(m, k);
+            }
+            let n = m.drain(&|| false);
+            if report {
+                eprintln!(
+                    "  kept: {} functions' compiled code of {before} retired ({} for a cache's cell; {stayed} stayed), {n} cells marked after",
+                    gone.len(),
+                    stale.len()
+                );
+            }
+            Some(n > 0)
+        }
+    }
+
+    /// Mark what the compiled code of a function held refers to: the cells
+    /// it keeps, and those its codes' inline caches hold (see `weak_kept`).
+    unsafe fn mark_kept_by(&self, m: &mut Marking, k: &crate::jit::KeptBy) {
+        unsafe {
+            for &a in k.addrs.iter().chain(&k.dispatched) {
+                self.mark_interior(m, a);
+            }
+            for &c in k.codes.iter().filter(|&&c| self.code_set.contains(&(c as usize))) {
+                self.mark_ic_holders(m, &*c);
+            }
+        }
     }
 
     /// A full marking's live codes, and shapes if it collects them (see
@@ -2741,6 +2935,16 @@ impl Vm {
             for &c in code.constants.iter() {
                 m.value(c);
             }
+            // (Held weakly otherwise: see `weak_kept`.)
+            if !self.heap.gc.weak_now {
+                self.mark_ic_holders(m, code);
+            }
+        }
+    }
+
+    /// Mark the cells `code`'s inline caches hold (see `mark_code_refs`).
+    unsafe fn mark_ic_holders(&self, m: &mut Marking, code: &crate::vm::Code) {
+        unsafe {
             for ways in code.made_ics().iter() {
                 for ic in (*ways.get()).iter() {
                     let h = ic.holder as usize;
@@ -3330,12 +3534,17 @@ impl Vm {
     /// found live: see `mark_live_codes_and_shapes`).
     unsafe fn mark_structures(&mut self, m: &mut Marking) {
         unsafe {
-            // (Only the live structures': what compiled code dropped
-            // embedded is not a root.)
-            for a in self.heap.kept_addrs() {
+            // What structures being made refer to. (What compiled code
+            // keeps is marked once the roots' cells are: see `weak_kept`.)
+            let all = if self.heap.gc.weak_now { Vec::new() } else { self.heap.kept_addrs() };
+            for i in 0..self.heap.gc.pending_kept.len() {
+                let a = self.heap.gc.pending_kept[i];
                 self.mark_interior(m, a);
             }
-            self.roots_report(m, "kept");
+            for a in all {
+                self.mark_interior(m, a);
+            }
+            self.roots_report(m, "kept, pending");
             // (A marking that doesn't collect shapes keeps them all.)
             if !self.heap.gc.shape_cycle {
                 for s in self.shapes() {

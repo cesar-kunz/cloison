@@ -5731,7 +5731,7 @@ impl<'a> Gen<'a> {
                 let valued: Vec<_> = kept.iter().zip(&at).filter(|(b, q)| b.3.is_none() && **q == p).map(|(b, _)| *b).collect();
                 // (Four registers each, in the room left past those in use,
                 // with some for loading an import's holder or a value.)
-                let part_size = (256usize.saturating_sub(self.temp as usize + 12) / 4).clamp(1, 48);
+                let part_size = (256usize.saturating_sub(self.temp + 12) / 4).clamp(1, 48);
                 for part in valued.chunks(part_size).chain(valued.is_empty().then_some(&[][..])) {
                     let first = self.alloc(pos)?;
                     self.lda_smi(p as i32);

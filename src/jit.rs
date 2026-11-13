@@ -19162,6 +19162,204 @@ pub fn census(vm: &crate::vm::Vm) -> (Vec<(&'static str, usize)>, Vec<(&'static 
     (counts, bytes)
 }
 
+/// Every word the JIT keeps that may be a shape's address, to `out` (see
+/// `Vm::free_zombies`, which frees no shape one is): per function its
+/// lowering's instructions, properties and cases, its versions' entry
+/// types and those they widened to; per compiled version its return type
+/// and its snapshot's, whatever version still refers to it (a call site
+/// bound to it, the retired): scalar-replaced objects, call sites (`this`
+/// shapes, claimed types, dispatch tables), `instanceof` caches. And the
+/// cells it compares or reads by address that it doesn't keep
+/// (`instanceof` caches' prototypes, `VmState::root_func`), which a
+/// collection moving cells pins (`gc::Evacuation`). False if a function's
+/// state is borrowed (being compiled): none is freed then.
+pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool {
+    fn ty(t: Ty, out: &mut dyn FnMut(u64)) {
+        if let Ty::Obj(s) | Ty::Ext(s) = t {
+            out(s);
+        }
+    }
+    fn ft(t: FieldType, out: &mut dyn FnMut(u64)) {
+        if let FieldType::Obj(s) = t {
+            out(s as u64);
+        }
+    }
+    fn state(st: &TypeState, out: &mut dyn FnMut(u64)) {
+        ty(st.acc, out);
+        for (_, t) in st.regs.iter() {
+            ty(t, out);
+        }
+    }
+    fn insns(is: &[Insn], out: &mut dyn FnMut(u64)) {
+        for i in is {
+            for w in [i.guard, i.assume, i.exit_const] {
+                out(w);
+            }
+        }
+    }
+    fn prop(p: &Prop, out: &mut dyn FnMut(u64)) {
+        match *p {
+            Prop::None
+            | Prop::Runtime
+            | Prop::Upvalue { .. }
+            | Prop::UpvalueAt { .. }
+            | Prop::Delete { .. }
+            | Prop::ClosureLocal { .. }
+            | Prop::ArgumentsOf { .. }
+            | Prop::Closure { .. }
+            | Prop::Typed { .. }
+            | Prop::Length
+            | Prop::TypedLength
+            | Prop::Append
+            | Prop::InstanceOf { .. }
+            | Prop::Poly { .. }
+            | Prop::Call { .. } => {}
+            Prop::Own { shape, ft: f, .. } | Prop::Oop { shape, ft: f, .. } => {
+                out(shape);
+                ft(f, out);
+            }
+            Prop::Proto { shape, addr, ft: f } => {
+                out(shape);
+                // (A prototype's slot: its cell must not move while a
+                // version compiled later may embed it.)
+                out(addr);
+                ft(f, out);
+            }
+            Prop::Transition { shape, new_shape, ft: f, .. } => {
+                out(shape);
+                out(new_shape);
+                ft(f, out);
+            }
+            Prop::Const { value, expect, ft: f, .. } => {
+                out(value);
+                out(expect);
+                ft(f, out);
+            }
+            Prop::Global { shape, ft: f, .. } => {
+                out(shape);
+                ft(f, out);
+            }
+            Prop::Keyed { shape, elems } => {
+                out(shape);
+                ft(elems, out);
+            }
+        }
+    }
+    fn case(c: &Case, out: &mut dyn FnMut(u64)) {
+        out(c.shape & !FAMILY);
+        match c.loc {
+            CaseLoc::Transition { new_shape, .. } => out(new_shape),
+            // (A prototype's slot, as `Prop::Proto`'s.)
+            CaseLoc::Proto(addr) => out(addr),
+            CaseLoc::Own(_) | CaseLoc::Oop(_) => {}
+        }
+        ft(c.ft, out);
+    }
+    struct Walk<'a> {
+        seen: HashSet<usize>,
+        out: &'a mut dyn FnMut(u64),
+    }
+    impl Walk<'_> {
+        fn code(&mut self, c: &Rc<JitCode>) {
+            if !self.seen.insert(Rc::as_ptr(c) as usize) {
+                return;
+            }
+            ty(c.ret, self.out);
+            for s in &c.forks {
+                self.site(unsafe { &*s.get() });
+            }
+            if let Some(s) = &c.snap {
+                self.snap(s);
+            }
+        }
+        fn snap(&mut self, s: &Rc<Snapshot>) {
+            if !self.seen.insert(Rc::as_ptr(s) as usize) {
+                return;
+            }
+            if self.seen.insert(s.insns.as_ptr() as usize) {
+                insns(&s.insns, self.out);
+            }
+            for m in s.mats.values().flatten() {
+                (self.out)(m.shape as u64);
+            }
+            for site in &s.sites {
+                self.site(unsafe { &*site.get() });
+            }
+            for c in &s.caches {
+                for e in c.iter() {
+                    (self.out)(e.get().shape);
+                    // (A cell: compared by address, so it must not move.)
+                    (self.out)(e.get().proto);
+                }
+            }
+        }
+        fn site(&mut self, s: &CallSite) {
+            (self.out)(s.this_shape);
+            if let Some(c) = &s.ctor {
+                (self.out)(c.done_shape);
+                (self.out)(c.header[0]);
+            }
+            if let Some((this, args)) = &s.claim {
+                ty(*this, self.out);
+                for &t in args {
+                    ty(t, self.out);
+                }
+            }
+            if let Some(t) = &s.target {
+                self.code(t);
+            }
+            if let Some(d) = &s.dispatch {
+                for site in d.sites.values() {
+                    self.site(unsafe { &*site.get() });
+                }
+            }
+        }
+    }
+    let mut w = Walk { seen: HashSet::default(), out };
+    for code in vm.codes.iter().chain(&vm.condemned) {
+        ty(code.ret_hint.get(), w.out);
+        let Ok(jit) = code.jit.try_borrow() else { return false };
+        let Some(f) = jit.as_ref() else { continue };
+        if w.seen.insert(f.insns.as_ptr() as usize) {
+            insns(&f.insns, w.out);
+        }
+        for vs in f.versions.values() {
+            for (st, c) in vs {
+                state(st, w.out);
+                w.code(c);
+            }
+        }
+        for st in f.wide.values() {
+            state(st, w.out);
+        }
+        let Ok(fits) = f.fits.try_borrow() else { return false };
+        for fit in fits.values().flat_map(|f| f.iter()) {
+            if let Some(t) = fit.acc {
+                ty(t, w.out);
+            }
+            for &(_, t) in &fit.regs {
+                ty(t, w.out);
+            }
+            w.code(&fit.code);
+        }
+        if let Some(v) = f.vm.as_ref() {
+            // (A cell, read by address: it must not move.)
+            (w.out)(v.root_func as u64);
+            for p in &v.props {
+                prop(p, w.out);
+            }
+            for c in v.polys.iter().flatten() {
+                case(c, w.out);
+            }
+            w.snap(&v.snap);
+        }
+    }
+    for r in &vm.jit_caches.retired {
+        w.code(r);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19580,202 +19778,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Every word the JIT keeps that may be a shape's address, to `out` (see
-/// `Vm::free_zombies`, which frees no shape one is): per function its
-/// lowering's instructions, properties and cases, its versions' entry
-/// types and those they widened to; per compiled version its return type
-/// and its snapshot's, whatever version still refers to it (a call site
-/// bound to it, the retired): scalar-replaced objects, call sites (`this`
-/// shapes, claimed types, dispatch tables), `instanceof` caches. And the
-/// cells it compares or reads by address that it doesn't keep
-/// (`instanceof` caches' prototypes, `VmState::root_func`), which a
-/// collection moving cells pins (`gc::Evacuation`). False if a function's
-/// state is borrowed (being compiled): none is freed then.
-pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool {
-    fn ty(t: Ty, out: &mut dyn FnMut(u64)) {
-        if let Ty::Obj(s) | Ty::Ext(s) = t {
-            out(s);
-        }
-    }
-    fn ft(t: FieldType, out: &mut dyn FnMut(u64)) {
-        if let FieldType::Obj(s) = t {
-            out(s as u64);
-        }
-    }
-    fn state(st: &TypeState, out: &mut dyn FnMut(u64)) {
-        ty(st.acc, out);
-        for (_, t) in st.regs.iter() {
-            ty(t, out);
-        }
-    }
-    fn insns(is: &[Insn], out: &mut dyn FnMut(u64)) {
-        for i in is {
-            for w in [i.guard, i.assume, i.exit_const] {
-                out(w);
-            }
-        }
-    }
-    fn prop(p: &Prop, out: &mut dyn FnMut(u64)) {
-        match *p {
-            Prop::None
-            | Prop::Runtime
-            | Prop::Upvalue { .. }
-            | Prop::UpvalueAt { .. }
-            | Prop::Delete { .. }
-            | Prop::ClosureLocal { .. }
-            | Prop::ArgumentsOf { .. }
-            | Prop::Closure { .. }
-            | Prop::Typed { .. }
-            | Prop::Length
-            | Prop::TypedLength
-            | Prop::Append
-            | Prop::InstanceOf { .. }
-            | Prop::Poly { .. }
-            | Prop::Call { .. } => {}
-            Prop::Own { shape, ft: f, .. } | Prop::Oop { shape, ft: f, .. } => {
-                out(shape);
-                ft(f, out);
-            }
-            Prop::Proto { shape, addr, ft: f } => {
-                out(shape);
-                // (A prototype's slot: its cell must not move while a
-                // version compiled later may embed it.)
-                out(addr);
-                ft(f, out);
-            }
-            Prop::Transition { shape, new_shape, ft: f, .. } => {
-                out(shape);
-                out(new_shape);
-                ft(f, out);
-            }
-            Prop::Const { value, expect, ft: f, .. } => {
-                out(value);
-                out(expect);
-                ft(f, out);
-            }
-            Prop::Global { shape, ft: f, .. } => {
-                out(shape);
-                ft(f, out);
-            }
-            Prop::Keyed { shape, elems } => {
-                out(shape);
-                ft(elems, out);
-            }
-        }
-    }
-    fn case(c: &Case, out: &mut dyn FnMut(u64)) {
-        out(c.shape & !FAMILY);
-        match c.loc {
-            CaseLoc::Transition { new_shape, .. } => out(new_shape),
-            // (A prototype's slot, as `Prop::Proto`'s.)
-            CaseLoc::Proto(addr) => out(addr),
-            CaseLoc::Own(_) | CaseLoc::Oop(_) => {}
-        }
-        ft(c.ft, out);
-    }
-    struct Walk<'a> {
-        seen: HashSet<usize>,
-        out: &'a mut dyn FnMut(u64),
-    }
-    impl Walk<'_> {
-        fn code(&mut self, c: &Rc<JitCode>) {
-            if !self.seen.insert(Rc::as_ptr(c) as usize) {
-                return;
-            }
-            ty(c.ret, self.out);
-            for s in &c.forks {
-                self.site(unsafe { &*s.get() });
-            }
-            if let Some(s) = &c.snap {
-                self.snap(s);
-            }
-        }
-        fn snap(&mut self, s: &Rc<Snapshot>) {
-            if !self.seen.insert(Rc::as_ptr(s) as usize) {
-                return;
-            }
-            if self.seen.insert(s.insns.as_ptr() as usize) {
-                insns(&s.insns, self.out);
-            }
-            for m in s.mats.values().flatten() {
-                (self.out)(m.shape as u64);
-            }
-            for site in &s.sites {
-                self.site(unsafe { &*site.get() });
-            }
-            for c in &s.caches {
-                for e in c.iter() {
-                    (self.out)(e.get().shape);
-                    // (A cell: compared by address, so it must not move.)
-                    (self.out)(e.get().proto);
-                }
-            }
-        }
-        fn site(&mut self, s: &CallSite) {
-            (self.out)(s.this_shape);
-            if let Some(c) = &s.ctor {
-                (self.out)(c.done_shape);
-                (self.out)(c.header[0]);
-            }
-            if let Some((this, args)) = &s.claim {
-                ty(*this, self.out);
-                for &t in args {
-                    ty(t, self.out);
-                }
-            }
-            if let Some(t) = &s.target {
-                self.code(t);
-            }
-            if let Some(d) = &s.dispatch {
-                for site in d.sites.values() {
-                    self.site(unsafe { &*site.get() });
-                }
-            }
-        }
-    }
-    let mut w = Walk { seen: HashSet::default(), out };
-    for code in vm.codes.iter().chain(&vm.condemned) {
-        ty(code.ret_hint.get(), w.out);
-        let Ok(jit) = code.jit.try_borrow() else { return false };
-        let Some(f) = jit.as_ref() else { continue };
-        if w.seen.insert(f.insns.as_ptr() as usize) {
-            insns(&f.insns, w.out);
-        }
-        for vs in f.versions.values() {
-            for (st, c) in vs {
-                state(st, w.out);
-                w.code(c);
-            }
-        }
-        for st in f.wide.values() {
-            state(st, w.out);
-        }
-        let Ok(fits) = f.fits.try_borrow() else { return false };
-        for fit in fits.values().flat_map(|f| f.iter()) {
-            if let Some(t) = fit.acc {
-                ty(t, w.out);
-            }
-            for &(_, t) in &fit.regs {
-                ty(t, w.out);
-            }
-            w.code(&fit.code);
-        }
-        if let Some(v) = f.vm.as_ref() {
-            // (A cell, read by address: it must not move.)
-            (w.out)(v.root_func as u64);
-            for p in &v.props {
-                prop(p, w.out);
-            }
-            for c in v.polys.iter().flatten() {
-                case(c, w.out);
-            }
-            w.snap(&v.snap);
-        }
-    }
-    for r in &vm.jit_caches.retired {
-        w.code(r);
-    }
-    true
 }

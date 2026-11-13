@@ -3611,7 +3611,7 @@ impl Vm {
             /// Where the cell at `p` went, if it is a candidate's and moved.
             #[inline(always)]
             fn to(&self, p: usize) -> Option<usize> {
-                if !self.0.has(p) || p % GRANULE != 0 {
+                if !self.0.has(p) || !p.is_multiple_of(GRANULE) {
                     return None;
                 }
                 unsafe { Forward::at(p) }

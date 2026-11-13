@@ -705,7 +705,9 @@ pub fn field_fits(want: u64, v: Value) -> bool {
 
 /// A shape's transitions of one kind: none until its first, a list then.
 /// Most shapes have none (MathJax's 805,000 of 830,000): two empty
-/// `RefCell<Vec>`s took 64 of a shape's 184 bytes, these take 32.
+/// `RefCell<Vec>`s took 64 of a shape's 184 bytes, these take 32 (the
+/// box is what keeps an empty one a word).
+#[allow(clippy::box_collection)]
 pub(crate) struct Transitions<T>(RefCell<Option<Box<Vec<T>>>>);
 
 impl<T> Default for Transitions<T> {
@@ -886,6 +888,11 @@ impl CellSlab {
     pub fn len(&self) -> usize {
         self.live
     }
+
+    /// No cell in use.
+    pub fn is_empty(&self) -> bool {
+        self.live == 0
+    }
 }
 
 impl Drop for CellSlab {
@@ -971,7 +978,7 @@ pub(crate) fn is_shape_address(a: usize) -> bool {
         }
         let off = a - slab.sorted[i - 1];
         let size = size_of::<ShapeSlot>();
-        off < SLAB_SHAPES * size && off % size == 0 && unsafe { (*(a as *const ShapeSlot)).used }
+        off < SLAB_SHAPES * size && off.is_multiple_of(size) && unsafe { (*(a as *const ShapeSlot)).used }
     })
 }
 

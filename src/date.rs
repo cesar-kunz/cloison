@@ -255,7 +255,8 @@ fn time_clip(t: f64) -> f64 {
 fn local_tza(t: f64) -> (f64, String) {
     let secs = (t / MS_PER_SECOND).floor();
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let time: libc::time_t = secs as libc::time_t;
+    // (`time_t` by inference: musl's alias is deprecated, its width to change.)
+    let time = secs as _;
     let got = unsafe { !libc::localtime_r(&time, &mut tm).is_null() };
     if !got {
         let (y, d) = year_and_day(t);

@@ -2112,7 +2112,7 @@ impl Vm {
     fn new_field_cell(&mut self) -> *const FieldCell {
         let p = self.field_cells.alloc();
         self.cells_made += 1;
-        if self.cells_made % 4096 == 0 {
+        if self.cells_made.is_multiple_of(4096) {
             self.shapes_made_check();
         }
         p
@@ -2489,7 +2489,7 @@ impl Vm {
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         self.shapes.push(b);
         self.shapes_made += 1;
-        if self.shapes_made % 4096 == 0 {
+        if self.shapes_made.is_multiple_of(4096) {
             self.shapes_made_check();
         }
         p

@@ -536,7 +536,7 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
             if target.is_cell() && i.is_int32() && kind == Value::from_i32(1) {
                 let t = as_object(target);
                 let n = i.as_i32_unchecked();
-                if (*t).class == Class::Array && (*t).flags & crate::far::FAR == 0 && n >= 0 && n < i32::MAX {
+                if (*t).class == Class::Array && (*t).flags & crate::far::FAR == 0 && (0..i32::MAX).contains(&n) {
                     if n as u32 >= (*t).elems_len {
                         vm.store_element(st, 0, Value::UNDEFINED);
                         return Ok(None);

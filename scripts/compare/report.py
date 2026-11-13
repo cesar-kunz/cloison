@@ -3,11 +3,9 @@ then a geomean per engine with its ratio to the best and its rank."""
 import collections, math, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from eng import OUT
+from eng import OUT, JIT, NOJIT
 BENCHES = ("richards deltablue crypto raytrace earley-boyer regexp splay navier-stokes "
            "pdfjs mandreel gbemu code-load box2d zlib typescript").split()
-JIT = ["cloison", "v8", "jsc", "sm"]
-NOJIT = ["cloison-nojit", "v8-jitless", "jsc-nojit", "sm-nojit", "qjs"]
 
 
 def load(name):
@@ -20,6 +18,20 @@ def load(name):
             except ValueError:
                 pass
     return d
+
+
+def load_status(name):
+    """webapps.tsv's rows: the numbers, and each run's status (ok, work, fail)."""
+    d, st = collections.defaultdict(dict), {}
+    if os.path.exists(f"{OUT}/{name}"):
+        for l in open(f"{OUT}/{name}"):
+            e, b, k, v = l.rstrip("\n").split("\t")
+            if k == "status":
+                st[(e, b)] = v
+            elif k != "why":
+                d[(e, b)][k] = float(v)
+    # A run that failed or did other work than the reference counts for nothing.
+    return {key: m for key, m in d.items() if st.get(key) == "ok"}, st
 
 
 def geomean(xs):
@@ -39,12 +51,21 @@ def fmt(v):
     return f"{v:.2f}"
 
 
-def table(title, d, metric, engines, higher_better, scale=1.0, benches=BENCHES, agg="geomean"):
+def table(title, d, metric, engines, higher_better, scale=1.0, benches=BENCHES, agg="geomean", common=True):
     """Per-benchmark values, the geomean, its ratio to the best, the rank."""
     print(f"\n### {title}\n")
     print("| benchmark | " + " | ".join(engines) + " |")
     print("|---|" + "---:|" * len(engines))
     complete = [b for b in benches if all(metric in d.get((e, b), {}) for e in engines)]
+    if not common:
+        # Each engine's geomean over what it ran, with how many it ran.
+        g = {e: geomean([d[(e, b)][metric] * scale for b in benches if metric in d.get((e, b), {})]) for e in engines}
+        n = {e: sum(metric in d.get((e, b), {}) for b in benches) for e in engines}
+        for b in benches:
+            print(f"| {b} | " + " | ".join(fmt(d.get((e, b), {}).get(metric, float('nan')) * scale) for e in engines) + " |")
+        print("| **geomean** (of what ran) | " + " | ".join(f"**{fmt(g[e])}**" for e in engines) + " |")
+        print("| ran | " + " | ".join(str(n[e]) for e in engines) + " |")
+        return g
     for b in benches:
         print(f"| {b} | " + " | ".join(fmt(d.get((e, b), {}).get(metric, float('nan')) * scale) for e in engines) + " |")
     # (Counts and pauses can be 0: summed over the benchmarks, not a geomean.)
@@ -72,6 +93,16 @@ if __name__ == "__main__":
     table("CPU time (s), JIT engines", o, "cpu_ms", JIT, False, 1e-3)
     table("Peak RSS (MB), JIT engines", o, "rss_mb", JIT, False)
     table("Peak RSS (MB), interpreters", o, "rss_mb", NOJIT, False)
+    w, wst = load_status("webapps.tsv")
+    if w:
+        from webapps import APPS as apps
+        print("\n## W1: the web apps (lower is better; — failed or did other work)")
+        table("Wall time (s), JIT engines", w, "wall_s", JIT, False, benches=apps)
+        table("Wall time (s), interpreters", w, "wall_s", NOJIT, False, benches=apps)
+        table("Wall time (s), JIT engines, each over what it ran", w, "wall_s", JIT, False, benches=apps, common=False)
+        table("Wall time (s), interpreters, each over what it ran", w, "wall_s", NOJIT, False, benches=apps, common=False)
+        table("Peak RSS (MB), JIT engines", w, "rss_mb", JIT, False, benches=apps)
+        table("Peak RSS (MB), interpreters", w, "rss_mb", NOJIT, False, benches=apps)
     if gc:
         gce = ["cloison", "v8", "jsc", "sm"]
         print("\n## M6: generations")

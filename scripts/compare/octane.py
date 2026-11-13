@@ -7,24 +7,24 @@ engine, bench, metric, value.
 """
 import os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from eng import ENGINES, run, ROOT, OUT, TMP
+from eng import ENGINES, run, abc, ROOT, OUT, TMP
 
 OCT = os.path.join(ROOT, "target", "octane")
 BENCHES = ("richards deltablue crypto raytrace earley-boyer regexp splay navier-stokes "
            "pdfjs mandreel gbemu code-load box2d zlib typescript").split()
 def wrapper(engine, path):
-    """A script printing `path`'s completion value (as cloison prints a script's)."""
+    """A script printing `path`'s completion value (as cloison prints a script's):
+    a copy whose last line, the completion, is passed to `print`; for ARK
+    compiled to `.abc`, with the harness's `alert` declared (`es2abc`
+    compiles every script as strict mode code)."""
     if engine == "cloison" or engine == "cloison-nojit":
         return path
-    w = f"{TMP}/wrap/{engine}-{os.path.basename(path)}"
+    w = f"{TMP}/wrap/{os.path.basename(path)}"
     os.makedirs(f"{TMP}/wrap", exist_ok=True)
-    if engine == "qjs":
-        w += ".mjs"
-        src = (f'import * as std from "qjs:std";\nglobalThis.read = std.loadFile;\n'
-               f'print((0, eval)(std.loadFile({path!r})));\n')
-    else:
-        src = f"print((0, eval)(read({path!r})));\n"
-    open(w, "w").write(src)
+    lines = open(path).read().rstrip("\n").split("\n")
+    open(w, "w").write("\n".join(lines[:-1] + [f"print({lines[-1].rstrip(';')});"]) + "\n")
+    if engine.startswith("ark"):
+        return abc(w, "var alert;\n") or w
     return w
 
 
@@ -38,7 +38,7 @@ def emit(e, b, k, v):
 if __name__ == "__main__":
     engines = sys.argv[1].split(",") if len(sys.argv) > 1 and sys.argv[1] != "all" else list(ENGINES)
     benches = sys.argv[2:] or BENCHES
-    OUT = open(f"{OUT}/octane.tsv", "a")
+    OUT = open(os.environ.get("OCTANE_TSV", f"{OUT}/octane.tsv"), "a")
 
     for b in benches:
         for e in engines:

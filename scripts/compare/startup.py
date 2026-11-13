@@ -1,17 +1,19 @@
 """L1 (startup) and M1 (baseline RSS): an empty script and a hello world."""
 import os, re, statistics, sys
 sys.path.insert(0, os.path.dirname(__file__))
-from eng import ENGINES, run, OUT, TMP
+from eng import ENGINES, run, abc, OUT, TMP
 
 open(f"{TMP}/empty.js", "w").write("0\n")
 open(f"{TMP}/hello.js", "w").write('print("hello")\n')
 N = 50
 out = open(f"{OUT}/startup.tsv", "w")
 out.write("engine\tempty_wall_ms\tempty_cpu_ms\tempty_Minstr\tempty_rss_mb\thello_wall_ms\thello_cpu_ms\thello_Minstr\thello_rss_mb\n")
-for name in ENGINES:
+for name in (sys.argv[1].split(",") if len(sys.argv) > 1 else ENGINES):
     row = [name]
     for s in ("empty", "hello"):
         f = f"{TMP}/{s}.js"
+        if name.startswith("ark"):
+            f = abc(f)
         r = run(name, f, wrap=["perf", "stat", "-r", str(N), "-x,", "-e", "instructions,task-clock"])
         instr = int(re.search(r"^(\d+),,instructions", r.stderr, re.M).group(1))
         cpu = float(re.search(r"^([\d.]+),msec,task-clock", r.stderr, re.M).group(1))

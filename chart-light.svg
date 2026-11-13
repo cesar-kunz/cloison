@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="506" viewBox="0 0 920 506" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img">
+<text x="0" y="18" font-size="15" font-weight="600" fill="#1f2328">Octane, JITs off</text>
+<text x="0" y="36" font-size="12" fill="#59636e">each engine&#x27;s interpreter · score, higher is better</text>
+<text x="164" y="62" font-size="12.5" text-anchor="end" fill="#1f2328" font-weight="600">cloison</text>
+<path d="M172,50 h208.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-208.0 z" fill="#2a78d6"><title>cloison: 7,488</title></path>
+<text x="390.0" y="62" font-size="12" fill="#1f2328" font-weight="600">7,488</text>
+<text x="164" y="86" font-size="12.5" text-anchor="end" fill="#1f2328">V8 Ignition</text>
+<path d="M172,74 h155.2 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-155.2 z" fill="#86847d"><title>V8 Ignition: 5,625</title></path>
+<text x="337.2" y="86" font-size="12" fill="#59636e">5,625</text>
+<text x="164" y="110" font-size="12.5" text-anchor="end" fill="#1f2328">JSC LLInt</text>
+<path d="M172,98 h119.4 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-119.4 z" fill="#86847d"><title>JSC LLInt: 4,359</title></path>
+<text x="301.4" y="110" font-size="12" fill="#59636e">4,359</text>
+<text x="164" y="134" font-size="12.5" text-anchor="end" fill="#1f2328">QuickJS</text>
+<path d="M172,122 h81.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-81.0 z" fill="#86847d"><title>QuickJS: 3,003</title></path>
+<text x="263.0" y="134" font-size="12" fill="#59636e">3,003</text>
+<text x="164" y="158" font-size="12.5" text-anchor="end" fill="#1f2328">SpiderMonkey</text>
+<path d="M172,146 h52.7 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-52.7 z" fill="#86847d"><title>SpiderMonkey: 2,002</title></path>
+<text x="234.7" y="158" font-size="12" fill="#59636e">2,002</text>
+<line x1="172" y1="46" x2="172" y2="165" stroke="#d1d9e0" stroke-width="1"/>
+<text x="480" y="18" font-size="15" font-weight="600" fill="#1f2328">Memory of an empty script</text>
+<text x="480" y="36" font-size="12" fill="#59636e">RSS in MB · lower is better</text>
+<text x="644" y="62" font-size="12.5" text-anchor="end" fill="#1f2328">QuickJS</text>
+<path d="M652,50 h16.2 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-16.2 z" fill="#86847d"><title>QuickJS: 3.0</title></path>
+<text x="678.2" y="62" font-size="12" fill="#59636e">3.0</text>
+<text x="644" y="86" font-size="12.5" text-anchor="end" fill="#1f2328" font-weight="600">cloison</text>
+<path d="M652,74 h26.3 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-26.3 z" fill="#2a78d6"><title>cloison: 4.5</title></path>
+<text x="688.3" y="86" font-size="12" fill="#1f2328" font-weight="600">4.5</text>
+<text x="644" y="110" font-size="12.5" text-anchor="end" fill="#1f2328">V8</text>
+<path d="M652,98 h107.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-107.0 z" fill="#86847d"><title>V8: 16.5</title></path>
+<text x="769.0" y="110" font-size="12" fill="#59636e">16.5</text>
+<text x="644" y="134" font-size="12.5" text-anchor="end" fill="#1f2328">SpiderMonkey</text>
+<path d="M652,122 h127.2 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-127.2 z" fill="#86847d"><title>SpiderMonkey: 19.5</title></path>
+<text x="789.2" y="134" font-size="12" fill="#59636e">19.5</text>
+<text x="644" y="158" font-size="12.5" text-anchor="end" fill="#1f2328">JavaScriptCore</text>
+<path d="M652,146 h208.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-208.0 z" fill="#86847d"><title>JavaScriptCore: 31.5</title></path>
+<text x="870.0" y="158" font-size="12" fill="#59636e">31.5</text>
+<line x1="652" y1="46" x2="652" y2="165" stroke="#d1d9e0" stroke-width="1"/>
+<text x="0" y="204" font-size="15" font-weight="600" fill="#1f2328">Octane, JIT tiers</text>
+<text x="0" y="222" font-size="12" fill="#59636e">up to a tier, full engines fainter · score, higher is better</text>
+<text x="164" y="248" font-size="12.5" text-anchor="end" fill="#1f2328">V8 Maglev</text>
+<path d="M172,236 h161.9 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-161.9 z" fill="#86847d"><title>V8 Maglev: 60,509</title></path>
+<text x="343.9" y="248" font-size="12" fill="#59636e">60,509</text>
+<text x="164" y="272" font-size="12.5" text-anchor="end" fill="#1f2328">JSC DFG</text>
+<path d="M172,260 h129.7 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-129.7 z" fill="#86847d"><title>JSC DFG: 48,765</title></path>
+<text x="311.7" y="272" font-size="12" fill="#59636e">48,765</text>
+<text x="164" y="296" font-size="12.5" text-anchor="end" fill="#1f2328" font-weight="600">cloison</text>
+<path d="M172,284 h77.2 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-77.2 z" fill="#2a78d6"><title>cloison: 29,627</title></path>
+<text x="259.2" y="296" font-size="12" fill="#1f2328" font-weight="600">29,627</text>
+<text x="164" y="320" font-size="12.5" text-anchor="end" fill="#1f2328">JSC Baseline</text>
+<path d="M172,308 h39.5 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-39.5 z" fill="#86847d"><title>JSC Baseline: 15,865</title></path>
+<text x="221.5" y="320" font-size="12" fill="#59636e">15,865</text>
+<text x="164" y="344" font-size="12.5" text-anchor="end" fill="#1f2328">SpiderMonkey Baseline</text>
+<path d="M172,332 h25.7 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-25.7 z" fill="#86847d"><title>SpiderMonkey Baseline: 10,837</title></path>
+<text x="207.7" y="344" font-size="12" fill="#59636e">10,837</text>
+<text x="164" y="368" font-size="12.5" text-anchor="end" fill="#1f2328">V8 Sparkplug</text>
+<path d="M172,356 h21.5 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-21.5 z" fill="#86847d"><title>V8 Sparkplug: 9,317</title></path>
+<text x="203.5" y="368" font-size="12" fill="#59636e">9,317</text>
+<text x="164" y="402" font-size="12.5" text-anchor="end" fill="#59636e">V8, all tiers</text>
+<path d="M172,390 h208.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-208.0 z" fill="#c4c2bb"><title>V8, all tiers: 77,321</title></path>
+<text x="390.0" y="402" font-size="12" fill="#59636e">77,321</text>
+<text x="164" y="426" font-size="12.5" text-anchor="end" fill="#59636e">JSC, all tiers</text>
+<path d="M172,414 h195.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-195.0 z" fill="#c4c2bb"><title>JSC, all tiers: 72,564</title></path>
+<text x="377.0" y="426" font-size="12" fill="#59636e">72,564</text>
+<text x="164" y="450" font-size="12.5" text-anchor="end" fill="#59636e">SpiderMonkey, all tiers</text>
+<path d="M172,438 h125.3 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-125.3 z" fill="#c4c2bb"><title>SpiderMonkey, all tiers: 47,163</title></path>
+<text x="307.3" y="450" font-size="12" fill="#59636e">47,163</text>
+<line x1="172" y1="232" x2="172" y2="457" stroke="#d1d9e0" stroke-width="1"/>
+<text x="480" y="204" font-size="15" font-weight="600" fill="#1f2328">Peak memory on Octane, JIT tiers</text>
+<text x="480" y="222" font-size="12" fill="#59636e">geomean peak RSS in MB · lower is better</text>
+<text x="644" y="248" font-size="12.5" text-anchor="end" fill="#1f2328">V8 Sparkplug</text>
+<path d="M652,236 h50.9 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-50.9 z" fill="#86847d"><title>V8 Sparkplug: 56.5</title></path>
+<text x="712.9" y="248" font-size="12" fill="#59636e">56.5</text>
+<text x="644" y="272" font-size="12.5" text-anchor="end" fill="#1f2328">V8 Maglev</text>
+<path d="M652,260 h52.9 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-52.9 z" fill="#86847d"><title>V8 Maglev: 58.5</title></path>
+<text x="714.9" y="272" font-size="12" fill="#59636e">58.5</text>
+<text x="644" y="296" font-size="12.5" text-anchor="end" fill="#1f2328">SpiderMonkey Baseline</text>
+<path d="M652,284 h65.8 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-65.8 z" fill="#86847d"><title>SpiderMonkey Baseline: 71.8</title></path>
+<text x="727.8" y="296" font-size="12" fill="#59636e">71.8</text>
+<text x="644" y="320" font-size="12.5" text-anchor="end" fill="#1f2328" font-weight="600">cloison</text>
+<path d="M652,308 h70.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-70.0 z" fill="#2a78d6"><title>cloison: 76.1</title></path>
+<text x="732.0" y="320" font-size="12" fill="#1f2328" font-weight="600">76.1</text>
+<text x="644" y="344" font-size="12.5" text-anchor="end" fill="#1f2328">JSC Baseline</text>
+<path d="M652,332 h148.7 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-148.7 z" fill="#86847d"><title>JSC Baseline: 157</title></path>
+<text x="810.7" y="344" font-size="12" fill="#59636e">157</text>
+<text x="644" y="368" font-size="12.5" text-anchor="end" fill="#1f2328">JSC DFG</text>
+<path d="M652,356 h190.7 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-190.7 z" fill="#86847d"><title>JSC DFG: 200</title></path>
+<text x="852.7" y="368" font-size="12" fill="#59636e">200</text>
+<text x="644" y="402" font-size="12.5" text-anchor="end" fill="#59636e">V8, all tiers</text>
+<path d="M652,390 h60.8 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-60.8 z" fill="#c4c2bb"><title>V8, all tiers: 66.7</title></path>
+<text x="722.8" y="402" font-size="12" fill="#59636e">66.7</text>
+<text x="644" y="426" font-size="12.5" text-anchor="end" fill="#59636e">SpiderMonkey, all tiers</text>
+<path d="M652,414 h75.3 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-75.3 z" fill="#c4c2bb"><title>SpiderMonkey, all tiers: 81.6</title></path>
+<text x="737.3" y="426" font-size="12" fill="#59636e">81.6</text>
+<text x="644" y="450" font-size="12.5" text-anchor="end" fill="#59636e">JSC, all tiers</text>
+<path d="M652,438 h208.0 a4,4 0 0 1 4,4 v7 a4,4 0 0 1 -4,4 h-208.0 z" fill="#c4c2bb"><title>JSC, all tiers: 218</title></path>
+<text x="870.0" y="450" font-size="12" fill="#59636e">218</text>
+<line x1="652" y1="232" x2="652" y2="457" stroke="#d1d9e0" stroke-width="1"/>
+<text x="0" y="498" font-size="11" fill="#59636e">Linux x86-64; docs/bench has every benchmark, the versions and flags.</text>
+</svg>

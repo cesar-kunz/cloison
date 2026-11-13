@@ -2,33 +2,31 @@
 
 Made by `scripts/octane-tiers.sh` (also written to the ignored `perf-history/octane-tiers-<commit>.{md,tsv}`).
 
-## 00bd4d1
+## b881c56
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 00bd4d1, V8 14.6.202.34-node.28 capped at each tier (V8's columns from the 4f08e81 runs below). Load average at the start and end: 2.67 5.71.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison b881c56, V8 14.6.202.34-node.28 capped at each tier (V8's columns from the 4f08e81 runs below). Load average at the start and end: 2.70 6.00.
 
 | benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
-| richards | 2959 | 42814 | 2051 | 2757 | 40640 | 50609 |
-| deltablue | 2543 | 61119 | 2054 | 2889 | 57622 | 120103 |
-| crypto | 3324 | 25412 | 1489 | 2471 | 36524 | 50382 |
-| raytrace | 6960 | 42845 | 5323 | 7326 | 85173 | 133420 |
-| earley-boyer | 10039 | 28084 | 8397 | 13542 | 62842 | 94521 |
-| regexp | 3528 | 4732 | 5221 | 6708 | 11647 | 11910 |
-| splay | 9213 | 10734 | 6887 | 7385 | 9325 | 35053 |
-| navier-stokes | 4578 | 21263 | 2172 | 3110 | 38063 | 38803 |
-| pdfjs | 11313 | 17815 | 10658 | 16362 | 69792 | 33180 |
-| mandreel | 5052 | 36212 | 3371 | 4874 | 56174 | 55468 |
-| gbemu | 16142 | 69113 | 9603 | 14444 | 120565 | 44248 |
-| code-load | 25139 | 24956 | 45437 | 44785 | 45123 | 22824 |
-| box2d | 9840 | 36723 | 5627 | 8302 | 114632 | 52155 |
-| zlib | 3807 | 39365 | 109466 | 109466 | 109702 | 64862 |
-| typescript | 29973 | 43120 | 25184 | 34895 | 85517 | 41929 |
-| **geomean** (15) | **7168** | **28304** | **7054** | **9538** | **51188** | **47990** |
+| richards | 2937 | 43273 | 2051 | 2757 | 40640 | 50609 |
+| deltablue | 2536 | 61324 | 2054 | 2889 | 57622 | 120103 |
+| crypto | 3482 | 25405 | 1489 | 2471 | 36524 | 50382 |
+| raytrace | 6901 | 42919 | 5323 | 7326 | 85173 | 133420 |
+| earley-boyer | 10127 | 27943 | 8397 | 13542 | 62842 | 94521 |
+| regexp | 3424 | 4695 | 5221 | 6708 | 11647 | 11910 |
+| splay | 9021 | 11383 | 6887 | 7385 | 9325 | 35053 |
+| navier-stokes | 4578 | 21327 | 2172 | 3110 | 38063 | 38803 |
+| pdfjs | 11366 | 17850 | 10658 | 16362 | 69792 | 33180 |
+| mandreel | 5197 | 35312 | 3371 | 4874 | 56174 | 55468 |
+| gbemu | 16128 | 69180 | 9603 | 14444 | 120565 | 44248 |
+| code-load | 30212 | 29675 | 45437 | 44785 | 45123 | 22824 |
+| box2d | 9812 | 36650 | 5627 | 8302 | 114632 | 52155 |
+| zlib | 3769 | 39355 | 109466 | 109466 | 109702 | 64862 |
+| typescript | 30229 | 42787 | 25184 | 34895 | 85517 | 41929 |
+| **geomean** (15) | **7262** | **28694** | **7054** | **9538** | **51188** | **47990** |
 
-cloison interp vs Ignition 1.02x (ahead on 12), Sparkplug 0.75x (ahead on 7), Maglev 0.14x (ahead on 0), Turbofan 0.15x (ahead on 1) (of 15; above 1x: cloison scores higher)
-cloison JIT vs Ignition 4.01x (ahead on 12), Sparkplug 2.97x (ahead on 12), Maglev 0.55x (ahead on 3), Turbofan 0.59x (ahead on 3) (of 15; above 1x: cloison scores higher)
-
-CodeLoad lost 17% to 7f4f7ee, which parses code twice when a function starts in a catch clause; the others are within 5% of 4f08e81's.
+cloison interp vs Ignition 1.03x (ahead on 12), Sparkplug 0.76x (ahead on 7), Maglev 0.14x (ahead on 0), Turbofan 0.15x (ahead on 1) (of 15; above 1x: cloison scores higher)
+cloison JIT vs Ignition 4.07x (ahead on 12), Sparkplug 3.01x (ahead on 12), Maglev 0.56x (ahead on 3), Turbofan 0.60x (ahead on 3) (of 15; above 1x: cloison scores higher)
 
 ## 4f08e81
 

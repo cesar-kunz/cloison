@@ -5,13 +5,13 @@ copy-and-patch JIT, in one small static binary.
 
 - **Small**: one 6.4 MB static binary, no other files; an empty script runs
   in 2 ms and 4.5 MB of RSS.
-- **The fastest interpreter measured on Octane**: 1.32× V8's Ignition, 1.7×
+- **The fastest interpreter measured on Octane**: 1.33× V8's Ignition, 1.7×
   JavaScriptCore's LLInt, 2.5× QuickJS, 3.7× SpiderMonkey's interpreter.
 - **A copy-and-patch JIT** (x86-64 and arm64) that LLVM writes ahead of
   time: 3× V8's Sparkplug on Octane, ahead of Maglev on DeltaBlue and
   Richards, 5.7× OpenHarmony's ARK JIT (on the six benchmarks it runs).
-- **Lean on Octane**: an 80 MB peak with the JIT (V8 67, SpiderMonkey 82,
-  JavaScriptCore 218), 54 MB without.
+- **Lean on Octane**: a 76 MB peak with the JIT (V8 67, SpiderMonkey 82,
+  JavaScriptCore 218), 51 MB without.
 - **Modern JavaScript**: ES5 through ES2026 and most Stage 3 proposals,
   98.2% of test262.
 - **Real applications run**: TypeScript's compiler, pdf.js, Excalidraw,
@@ -36,8 +36,8 @@ Octane on Linux x86-64 (higher is better; geomeans over its 15 benchmarks):
 
 | | cloison | V8 | JavaScriptCore | SpiderMonkey | QuickJS |
 |---|---:|---:|---:|---:|---:|
-| without a JIT | **7,445** | 5,625 | 4,359 | 2,002 | 3,003 |
-| with a JIT | 29,340 | 77,321 | 72,564 | 47,163 | — |
+| without a JIT | **7,488** | 5,625 | 4,359 | 2,002 | 3,003 |
+| with a JIT | 29,627 | 77,321 | 72,564 | 47,163 | — |
 
 Size and memory (lower is better):
 
@@ -45,8 +45,8 @@ Size and memory (lower is better):
 |---|---:|---:|---:|---:|---:|
 | binary, MB | 6.4 | 35.6 + 10.8 ICU | 36.8 + 39 ICU | 44.7 | 2.9 |
 | empty script, RSS MB | 4.5 | 16.5 | 31.5 | 19.5 | 3.0 |
-| Octane peak RSS, JIT, MB | 80 | 67 | 218 | 82 | — |
-| Octane peak RSS, no JIT, MB | 54 | 56 | 108 | 76 | 28 |
+| Octane peak RSS, JIT, MB | 76 | 67 | 218 | 82 | — |
+| Octane peak RSS, no JIT, MB | 51 | 56 | 108 | 76 | 28 |
 
 The reports, with every benchmark, the engines' versions and flags, ARK
 and KetteVM:

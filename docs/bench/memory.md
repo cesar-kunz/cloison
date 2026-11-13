@@ -1,7 +1,8 @@
 # Memory and size against other engines
 
 Measured on the host and engine builds of [octane.md](octane.md) (cloison
-at 00bd4d1 on 2026-11-13, the other engines on 2026-11-11).
+on 2026-11-13, Octane at b881c56, the rest at 00bd4d1; the other engines
+on 2026-11-11).
 Peak RSS is `/usr/bin/time`'s maximum resident set, one run each; the
 empty script's figures are by `scripts/compare/startup.py` (`bench/compare/startup.tsv`).
 
@@ -12,11 +13,9 @@ empty script's figures are by `scripts/compare/startup.py` (`bench/compare/start
 - **An empty script runs in 2.0 ms and 4.5 MB**, next to QuickJS (1.5 ms,
   3.0 MB) and 5 to 12 times faster and 3.7 to 14 times smaller than V8,
   JavaScriptCore, SpiderMonkey and ARK.
-- **Octane's peak RSS with the JIT is 80 MB** (geomean), about V8's (67) and
+- **Octane's peak RSS with the JIT is 76 MB** (geomean), about V8's (67) and
   SpiderMonkey's (82), a third of JavaScriptCore's (218); **without a JIT
-  54 MB**, below every engine but QuickJS, which counts references.
-  Mandreel's peak doubled to 244 MB with 7d40996, which parses a program
-  with a direct `eval` twice (to rename its catch parameters apart).
+  51 MB**, below every engine but QuickJS, which counts references.
 - On the web apps the peak is about twice V8's and SpiderMonkey's (JIT
   geomean 765 MB against 379 and 381, JavaScriptCore 715): objects take 2
   to 4 times V8's bytes (V8 compresses pointers to 4 bytes), and the
@@ -46,39 +45,39 @@ of `Intl`; cloison, QuickJS and KetteVM don't, much of the difference.
 | deltablue | 59.2 | 38.9 | 319 | 49.6 | 125 |
 | crypto | 21.0 | 34.5 | 170 | 34.5 | — |
 | raytrace | 48.0 | 35.2 | 333 | 32.5 | 112 |
-| earley-boyer | 127 | 98.1 | 345 | 175 | — |
-| regexp | 55.5 | 47.1 | 354 | 36.3 | 153 |
-| splay | 510 | 247 | 728 | 361 | 603 |
+| earley-boyer | 128 | 98.1 | 345 | 175 | — |
+| regexp | 54.8 | 47.1 | 354 | 36.3 | 153 |
+| splay | 508 | 247 | 728 | 361 | 603 |
 | navier-stokes | 12.0 | 33.0 | 48.0 | 26.2 | — |
-| pdfjs | 190 | 137 | 378 | 202 | — |
-| mandreel | 244 | 80.7 | 236 | 110 | — |
+| pdfjs | 185 | 137 | 378 | 202 | — |
+| mandreel | 132 | 80.7 | 236 | 110 | — |
 | gbemu | 86.3 | 70.8 | 117 | 69.4 | — |
-| code-load | 167 | 106 | 200 | 144 | — |
-| box2d | 45.7 | 52.8 | 102 | 73.3 | 119 |
-| zlib | 69.2 | 53.3 | 210 | 135 | — |
+| code-load | 165 | 106 | 200 | 144 | — |
+| box2d | 45.6 | 52.8 | 102 | 73.3 | 119 |
+| zlib | 69.8 | 53.3 | 210 | 135 | — |
 | typescript | 372 | 180 | 446 | 251 | — |
-| **geomean** | **79.5** | **66.7** | **218** | **81.6** | **158** (6) |
+| **geomean** | **76.1** | **66.7** | **218** | **81.6** | **158** (6) |
 
 ## Octane's fixed work, peak RSS in MB, without a JIT
 
 | | cloison | V8 `--jitless` | JSC no JIT | SpiderMonkey no JIT | QuickJS | ARK | KetteVM |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | richards | 12.8 | 18.8 | 57.0 | 21.0 | 11.2 | 65.2 | — |
-| deltablue | 32.2 | 23.2 | 65.2 | 64.9 | 11.2 | 94.5 | 12.0 |
-| crypto | 15.0 | 21.8 | 65.6 | 29.5 | 11.2 | — | — |
-| raytrace | 19.5 | 36.8 | 291 | 74.2 | 11.2 | 78.8 | — |
-| earley-boyer | 93.9 | 85.5 | 294 | 170 | 17.0 | — | — |
-| regexp | 28.5 | 30.8 | 128 | 37.3 | 11.2 | 119 | — |
-| splay | 392 | 274 | 303 | 389 | 144 | 523 | 768 |
+| deltablue | 31.5 | 23.2 | 65.2 | 64.9 | 11.2 | 94.5 | 12.0 |
+| crypto | 15.8 | 21.8 | 65.6 | 29.5 | 11.2 | — | — |
+| raytrace | 18.8 | 36.8 | 291 | 74.2 | 11.2 | 78.8 | — |
+| earley-boyer | 92.0 | 85.5 | 294 | 170 | 17.0 | — | — |
+| regexp | 29.2 | 30.8 | 128 | 37.3 | 11.2 | 119 | — |
+| splay | 395 | 274 | 303 | 389 | 144 | 523 | 768 |
 | navier-stokes | 12.0 | 24.8 | 29.2 | 22.5 | 11.2 | — | — |
-| pdfjs | 138 | 122 | 298 | 177 | 38.9 | — | — |
-| mandreel | 244 | 62.2 | 115 | 89.2 | 56.8 | — | — |
-| gbemu | 78.0 | 81.8 | 62.5 | 80.5 | 23.2 | — | — |
-| code-load | 166 | 101 | 185 | 143 | 74.2 | — | — |
+| pdfjs | 130 | 122 | 298 | 177 | 38.9 | — | — |
+| mandreel | 128 | 62.2 | 115 | 89.2 | 56.8 | — | — |
+| gbemu | 77.3 | 81.8 | 62.5 | 80.5 | 23.2 | — | — |
+| code-load | 164 | 101 | 185 | 143 | 74.2 | — | — |
 | box2d | 31.4 | 103 | 61.1 | 93.0 | 12.0 | 81.0 | — |
-| zlib | 19.5 | 24.0 | 33.0 | 25.3 | 134 | — | — |
+| zlib | 13.9 | 24.0 | 33.0 | 25.3 | 134 | — | — |
 | typescript | 262 | 168 | 173 | 207 | 137 | — | — |
-| **geomean** | **54.4** | **55.9** | **108** | **75.5** | **27.6** | **116** (6) | **96.0** (2) |
+| **geomean** | **50.6** | **55.9** | **108** | **75.5** | **27.6** | **116** (6) | **96.0** (2) |
 
 ## The web apps, peak RSS in MB, with a JIT ([webapps.md](webapps.md))
 

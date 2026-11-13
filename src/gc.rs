@@ -2659,15 +2659,24 @@ impl Vm {
     /// In steps, each after the marking has marked all it reaches
     /// (`ephemerons`, which goes on after one that marked a cell: whether
     /// it did; `None` once there is no more to do). First the cells of the
-    /// functions held (`jit::KeptBy::held`: a frame runs their code, which
-    /// reads them) are marked, and what they reach; all of them while a
-    /// lowering is under way (what it took is in no snapshot yet: the
-    /// caches' are marked with their codes then, `Gc::weak_now`). Then the
-    /// other functions referring to a cell left unmarked are retired, and
-    /// what is kept still is marked (were one's code to stay, it is held
-    /// from then on), until none is left; and last the caches' ways
-    /// holding a cell unmarked are cleared. Every cell compiled code alive
-    /// or an inline cache refers to is live after it.
+    /// functions held (`jit::KeptBy::held`: their state is in use) are
+    /// marked, and of the versions a frame runs (`KeptBy::running`) those
+    /// they and their lowerings keep, and what they reach; all of them
+    /// while a lowering is under way (what it took is in no snapshot yet:
+    /// the caches' are marked with their codes then, `Gc::weak_now`). Then
+    /// the other functions referring to a cell left unmarked are retired
+    /// (one a frame runs too, for a cell of its other versions or of its
+    /// caches: the versions under way stay until the frame leaves them),
+    /// and what is kept still is marked, until none is left; and last the
+    /// caches' ways holding a cell unmarked are cleared. Every cell
+    /// compiled code alive or an inline cache refers to is live after it.
+    ///
+    /// (A function a frame runs was held whole at first, its caches'
+    /// holders with it. The TypeScript app's checker functions, recursive
+    /// and on the stack at every full marking, held one to three earlier
+    /// programs each that way, 1.5M cells apiece, half of them through
+    /// caches naming a later checker's functions than the version under
+    /// way was compiled for: 3.1 to 4.2 GB at its peak, 2.1 to 2.4 since.)
     unsafe fn weak_kept(&mut self, m: &mut Marking, sp: usize, regs: *mut Value, st: &mut WeakKept) -> Option<bool> {
         let color = m.mode.color;
         let report = self.heap.gc.roots_report;
@@ -2686,8 +2695,18 @@ impl Vm {
                     st.done = true;
                 } else {
                     st.kept = listed(self);
-                    for k in st.kept.iter().filter(|k| k.held) {
-                        self.mark_kept_by(m, k);
+                    for k in &st.kept {
+                        if k.held {
+                            self.mark_kept_by(m, k);
+                            continue;
+                        }
+                        // (A version under way: what it and its snapshot
+                        // embed. Not its codes' caches: it embeds no
+                        // holder it doesn't keep, and a way whose holder
+                        // dies is cleared below.)
+                        for &a in &k.running_addrs {
+                            self.mark_interior(m, a);
+                        }
                     }
                 }
                 let n = m.drain(&|| false);
@@ -2757,7 +2776,9 @@ impl Vm {
                 }
                 return None;
             }
-            crate::jit::retire_functions(self, &gone);
+            let running: crate::jit::HashSet<*const crate::jit::JitCode> =
+                st.kept.iter().flat_map(|k| k.running.iter().copied()).collect();
+            crate::jit::retire_functions(self, &gone, &running);
             st.retired += gone.len();
             // (What is kept still, and the functions whose code stayed:
             // none should, their versions held by a call under way alone.)
@@ -2771,7 +2792,7 @@ impl Vm {
             for a in self.heap.kept_addrs() {
                 self.mark_interior(m, a);
             }
-            for k in st.kept.iter().filter(|k| k.held) {
+            for k in st.kept.iter().filter(|k| k.held && !gone.contains(&k.code)) {
                 self.mark_kept_by(m, k);
             }
             let n = m.drain(&|| false);

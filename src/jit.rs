@@ -4337,11 +4337,17 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         {
             return Sel::new("bail", "", out);
         }
+        _ if insn.guard & CALL_CODE_GUARD != 0 => {
+            return Sel { ops: Some((0, insn.guard & !CALL_CODE_GUARD, 0)), ..Sel::new("callee_is_code_jne", "", out) };
+        }
         _ if insn.guard & CODE_GUARD != 0 && !insn.next_case => {
             return Sel {
                 ops: Some((insn.imm, insn.guard & !CODE_GUARD, 0)),
                 ..Sel::new("check_callee_code", "", out)
             };
+        }
+        _ if insn.guard & CODE_GUARD != 0 => {
+            return Sel { ops: Some((insn.imm, insn.guard & !CODE_GUARD, 0)), ..Sel::new("callee_code_jne", "", out) };
         }
         _ if insn.guard != 0 && insn.next_case => {
             return Sel { ops: Some((0, insn.guard, 0)), ..Sel::new("callee_jne", "", out) };
@@ -5226,6 +5232,10 @@ const THIS_GUARD: u64 = 2;
 /// it, and writes it to the inlined frame's header (`imm` bytes from the
 /// registers): `check_callee_code` (see `inline_by_code`).
 const CODE_GUARD: u64 = 1;
+/// In a guard of a polymorphic call's dispatch (`Insn::next_case`): the
+/// callee is any closure of the code (see `binds_by_code`); nothing is
+/// written.
+const CALL_CODE_GUARD: u64 = 2;
 
 /// Whether code may assign the variable upvalue `k` of `code` is, once
 /// the function declaring it has returned: whether a function nested in
@@ -5407,6 +5417,23 @@ fn smi_registers(
 /// from the closure's `prototype`).
 fn inline_by_code(fo: *mut Object, i: &Insn) -> bool {
     i.op != Op::Construct && unsafe { (*(*fo).code).closures_made.get() > 1 && (&(*(*fo).code).closures).is_empty() }
+}
+
+/// Whether a direct call (not `new`'s) to `fo` binds to its code, for any
+/// closure of it (see `CallSite::by_code`).
+fn binds_by_code(fo: *mut Object) -> bool {
+    unsafe { !(&(*(*fo).code).upvalues).is_empty() || (*(*fo).code).closures_made.get() > 1 }
+}
+
+/// Whether a case of a polymorphic call `i`, for `fo`, which implies the
+/// receiver's shape `shape` (or 0), is inlined for any closure of `fo`'s
+/// code (see `inline_by_code`): if it implies none. (The TypeScript
+/// checker's functions, closures of one scope made anew for each program,
+/// call each other's callbacks so: a case guarding one closure kept its
+/// checker's program, and its function was compiled again once that went,
+/// 1,400 times a run.)
+fn next_case_by_code(shape: u64, fo: *mut Object, i: &Insn) -> bool {
+    shape == 0 && inline_by_code(fo, i)
 }
 
 /// Whether cells of shape `s` are primitives (strings, symbols, BigInts).
@@ -7184,6 +7211,8 @@ fn stencil_for(
         ("star", _) => cat!("star_", loc),
         ("check_callee", _) => cat!("check_callee_", loc),
         ("check_callee_code", _) => cat!("check_callee_code_", loc),
+        ("callee_code_jne", _) => cat!("callee_code_jne_", loc),
+        ("callee_is_code_jne", _) => cat!("callee_is_code_jne_", loc),
         ("callee_jne", _) => cat!("callee_jne_", loc),
         (
             "guard_cell" | "guard_object" | "shape_jne" | "shape_guard" | "family_jne" | "family_guard" | "check_shape",
@@ -14109,7 +14138,13 @@ impl Lowering<'_> {
                         let last = n + 1 == fos.len();
                         let guard = (!last).then(|| {
                             let mut g = synth(Op::Nop, i.reg, frame, i.pc);
-                            (g.guard, g.next_case) = (fo as u64, true);
+                            // (Any closure of its code, where its site
+                            // binds to that: see `cached_callees`.)
+                            g.guard = match binds_by_code(fo) {
+                                true => unsafe { (*fo).code as u64 | CALL_CODE_GUARD },
+                                false => fo as u64,
+                            };
+                            g.next_case = true;
                             self.push(g, Prop::None)
                         });
                         self.emit_call(frame, i, fo, guard.is_some());
@@ -14513,7 +14548,13 @@ impl Lowering<'_> {
             if unsafe { (*w.holder).class } != Class::Function || w.loc == crate::vm::VIA_CALL {
                 return Vec::new();
             }
-            if !fos.contains(&w.holder) {
+            // (One case for the closures of a code its site binds to: the
+            // TypeScript checker's functions, closures made anew for each
+            // program, had a case each here, whose guard kept its program,
+            // and were compiled again once that went.)
+            let same =
+                |&fo: &*mut Object| fo == w.holder || unsafe { (*fo).code == (*w.holder).code } && binds_by_code(fo);
+            if !fos.iter().any(same) {
                 fos.push(w.holder);
             }
         }
@@ -14589,7 +14630,7 @@ impl Lowering<'_> {
         // runtime, each a closure other than the one bound): any closure of
         // its code is called directly. (Not for `new`, whose `this` comes
         // from the closure's prototype.)
-        if i.op != Op::Construct && unsafe { !(&(*callee).upvalues).is_empty() || (*callee).closures_made.get() > 1 } {
+        if i.op != Op::Construct && binds_by_code(fo) {
             site.by_code = true;
             site.closure = callee as u64;
         } else {
@@ -15516,9 +15557,16 @@ impl Lowering<'_> {
             (cell.guard, cell.on_shape) = (1, true);
             self.push(cell, Prop::None);
         }
+        // (A case inlined for any closure of its code takes the others of
+        // that code after it.)
+        let taken = |k: usize| {
+            (0..k).any(|a| next_case_by_code(shapes[a], fos[a], i) && unsafe { (*fos[a]).code == (*fos[k]).code })
+        };
+        let cases: Vec<usize> = (0..fos.len()).filter(|&k| !taken(k)).collect();
         let mut rets = Vec::new();
-        for (k, &fo) in fos.iter().enumerate() {
-            let last = k + 1 == fos.len();
+        for (n, &k) in cases.iter().enumerate() {
+            let fo = fos[k];
+            let last = n + 1 == cases.len();
             let (guard, r) = self.inline_case(frame, i, fo, depth, !last, Some((shapes[k], &aliases)), 0);
             if let Some(pc) = fused {
                 let g = &mut self.out.insns[guard];
@@ -16021,10 +16069,13 @@ impl Lowering<'_> {
         // shared by many objects' accessors, inlined for any closure of
         // its code, read them through a header nothing wrote: the URL
         // constructor's, called before, in sass's importer.)
-        let by_code = !next_case
-            && hoisted.is_none()
+        // (Nor a case of a polymorphic call whose callee implies its
+        // receiver's shape: another closure of its code may be found under
+        // another, and the cases may dispatch on the shape, see
+        // `inline_poly`.)
+        let by_code = hoisted.is_none_or(|(shape, _)| next_case_by_code(shape, fo, i))
             && alloc == 0
-            && !std::mem::take(&mut self.accessor_call)
+            && !(hoisted.is_none() && std::mem::take(&mut self.accessor_call))
             && inline_by_code(fo, i);
         // (Checked for by its code, the closure isn't referred to: kept,
         // each function inlining one of a TypeScript checker's held that

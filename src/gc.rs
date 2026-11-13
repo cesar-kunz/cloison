@@ -2645,12 +2645,16 @@ impl Vm {
     /// A full marking holds weakly the cells compiled code refers to: those
     /// it keeps (see `gc::KeptCells`: the constants it embeds, the closures
     /// its call sites are bound to), and those the inline caches of the
-    /// codes it compiled hold (a call's callees, a load's prototype: it
-    /// took their addresses, and the caches don't change while it runs in
-    /// the interpreter's place). One that nothing else reaches goes, with
-    /// the compiled code of the functions referring to it
-    /// (`jit::retire_functions`: they compile again when they next run),
-    /// and its way of the cache. As roots, they held what the program had
+    /// codes it compiled hold (a call's callees, a load's prototype: the
+    /// caches don't change while it runs in the interpreter's place). One
+    /// kept that nothing else reaches goes, with the compiled code of the
+    /// functions keeping it (`jit::retire_functions`: they compile again
+    /// when they next run); one a cache alone holds, with its way of the
+    /// cache (the code compiled from it stays: it embeds no cell it
+    /// doesn't keep, and its guard for the one gone fails as it would for
+    /// any other. Retired for it too, at first, the TypeScript app's
+    /// functions were compiled again 3,000 to 4,700 times more a run, 4%
+    /// of its time). As roots, they held what the program had
     /// dropped for as long as the code lived: a function compiled while it
     /// worked on one object graph held that graph (the TypeScript app's
     /// live cells grew from 450 MiB to 1.5 GiB over its run, 14M of 18M of
@@ -2664,9 +2668,9 @@ impl Vm {
     /// they and their lowerings keep, and what they reach; all of them
     /// while a lowering is under way (what it took is in no snapshot yet:
     /// the caches' are marked with their codes then, `Gc::weak_now`). Then
-    /// the other functions referring to a cell left unmarked are retired
-    /// (one a frame runs too, for a cell of its other versions or of its
-    /// caches: the versions under way stay until the frame leaves them),
+    /// the other functions keeping a cell left unmarked are retired
+    /// (one a frame runs too, for a cell of its other versions: the
+    /// versions under way stay until the frame leaves them),
     /// and what is kept still is marked, until none is left; and last the
     /// caches' ways holding a cell unmarked are cleared. Every cell
     /// compiled code alive or an inline cache refers to is live after it.
@@ -2734,11 +2738,7 @@ impl Vm {
                 .map(|c| &**c as *const crate::vm::Code)
                 .collect();
             let gone: crate::jit::HashSet<*const crate::vm::Code> = (st.kept.iter())
-                .filter(|k| {
-                    !k.held
-                        && (k.addrs.iter().chain(&k.dispatched).any(|&a| dead(a))
-                            || k.codes.iter().any(|c| stale.contains(c)))
-                })
+                .filter(|k| !k.held && k.addrs.iter().chain(&k.dispatched).any(|&a| dead(a)))
                 .map(|k| k.code)
                 .collect();
             if gone.is_empty() {
@@ -2798,7 +2798,7 @@ impl Vm {
             let n = m.drain(&|| false);
             if report {
                 eprintln!(
-                    "  kept: {} functions' compiled code of {before} retired ({} for a cache's cell; {stayed} stayed), {n} cells marked after",
+                    "  kept: {} functions' compiled code of {before} retired ({} codes' caches hold a dead cell; {stayed} stayed), {n} cells marked after",
                     gone.len(),
                     stale.len()
                 );

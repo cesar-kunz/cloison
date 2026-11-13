@@ -1,9 +1,12 @@
 # The garbage collector
 
-Status: 2026-10-10. Steps 1 to 6 of the plan below are implemented in
-`src/heap.rs` and `src/gc.rs` (step 7 is later work): minor collections,
-and major ones marked and swept by a second thread between two short
-pauses (`CLOISON_GC_STW` keeps the stop-the-world full collection).
+Status: 2026-11-11. Steps 1 to 7 of the plan below are implemented in
+`src/heap.rs` and `src/gc.rs` (step 8 is later work): minor collections;
+major ones marked and swept by a second thread between two short
+pauses (`CLOISON_GC_STW` keeps the stop-the-world full collection); and,
+since 2026-11-03, evacuation of fragmented blocks in a cycle's final
+pause, the cells nothing pins moved and every reference to them updated
+(step 7).
 This revision replaces the first one (a parallel copying
 nursery with precise roots), whose two premises implementation showed
 false: see "Why not a copying nursery". Supersedes the collector parts of
@@ -11,8 +14,9 @@ false: see "Why not a copying nursery". Supersedes the collector parts of
 
 ## Decision
 
-A **non-moving generational mark-region collector with conservative
-native roots, concurrent on the old generation**:
+A **mostly non-moving generational mark-region collector with
+conservative native roots, concurrent on the old generation**, which
+moves cells only to empty fragmented blocks:
 
 - one reservation of address space in 32 KiB blocks; cells up to 8 KiB
   are bump-allocated through *holes* (runs of free 16-byte granules) and
@@ -34,7 +38,11 @@ native roots, concurrent on the old generation**:
   record of mutated cells (the HotSpot CMS arrangement);
 - major collections marked by a collector thread while the mutator runs,
   with two short pauses, and swept concurrently from the metadata;
-- pacing from measurement.
+- pacing from measurement;
+- evacuation, Immix's: when the small blocks hold over twice the bytes
+  live in them, a cycle's final pause moves the movable cells of the
+  sparsest blocks (up to 32 MiB), pinning what a conservative word, a
+  Rust structure or compiled code refers to.
 
 Collections run only at safepoints: allocation never collects, so Rust
 runtime code may hold values in locals across allocations; the native
@@ -81,6 +89,13 @@ range. V8 measured its non-moving young generation as a loss against
 the Scavenger; Whippet measured `nofl` with sticky marks as competitive
 for Guile, whose roots are conservative like cloison's. The plan measures it
 at each step.
+
+Moving came back later in a narrower form (step 7): not the nursery, but
+the cells of fragmented old blocks, and only those nothing pins. What a
+conservative word, compiled code or a Rust structure refers to stays,
+which is under 0.5% of the live bytes measured (Octane, the web apps);
+Rust code that holds raw values across a safepoint copies them onto the
+VM stack first, where they are exact slots a move updates.
 
 ## Numbers the design is for
 
@@ -499,6 +514,9 @@ Concurrent, with two short pauses, the marker thread doing the rest
    On Splay it takes 2.5 ms; marking in one pause took 30 ms there. If
    the heap outgrows twice its trigger before the marker is done, the
    final pause runs anyway and the mutator finishes the marking.
+   When the cycle's start chose evacuation candidates, the final pause
+   then moves their unpinned cells and updates the slots recorded into
+   them (plan step 7).
 4. **Concurrent sweep**: the marker thread sweeps the small blocks from
    their metadata (the dead cells' bytes cleared, live bytes counted)
    and hands them back: blocks with room to allocation, empty ones to the
@@ -519,7 +537,9 @@ Concurrent, with two short pauses, the marker thread doing the rest
 final pause also walks every root again in one pass and panics on a
 reachable cell the concurrent marking left unmarked.
 
-Correctness of concurrent marking rests on four facts: nothing moves;
+Correctness of concurrent marking rests on four facts: nothing moves
+while the marker runs (evacuation moves cells in the final pause, the
+marker stopped);
 every word of a cell is a valid value or a header at every instant (the
 mutator stores whole words, each an atomic store the marker loads
 atomically, `layout::Word`, and moves an old array's values a word at a
@@ -750,11 +770,9 @@ runs) and the microbenchmarks.
      marker finishes well inside a cycle: the lead is under a third of the
      room), an age bit (EarleyBoyer, the most promoting benchmark, spends
      2% collecting; Splay's survivors are long-lived and an age bit would
-     mark them twice), and evacuation. Splay's fragmentation comes from
-     deleting random nodes, so any placement pins blocks; evacuating
-     would need the concurrent marker to record slots into candidate
-     blocks and pin what conservative words and compiled code refer to,
-     for one benchmark's memory (still a seventh of no collector's).
+     mark them twice). Evacuation, deferred here for Splay alone, was
+     taken up once the web apps showed the same fragmentation at a larger
+     scale (their blocks 21-40% full after a full collection): step 7.
    - *Evacuation, measured* (`CLOISON_GC_FRAG`: after each
      stop-the-world full collection, the small blocks by occupancy and
      the bytes in them that could not move). What pins a cell: a native
@@ -899,9 +917,74 @@ runs) and the microbenchmarks.
      headroom's bytes: 4.40 s); its pauses' free phase 74 -> 92 ms.
      Others within noise, their peak RSS unchanged.
 
-7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
-   most objects in one or two granules fewer), shapes as collectable
-   cells, ephemerons with ES6.
+7. **Evacuation** (done, 2026-10-31 to 11-03, #16-#21). In stages, each
+   with its check:
+   - *Nothing unmovable at a collection*: arguments natives take from
+     Rust lists are copied to the VM stack first
+     (`interp::with_args_on_stack`); a handle scope or a native holding
+     Rust copies of values raises `Vm::unmovable`, and a collection then
+     moves nothing (`CLOISON_SIZES` prints `unmovable_fulls`: 0 on Octane
+     and the 15 web apps).
+   - *Slots, not values*: tracing visits reference slots, and the roots
+     are enumerated as updatable slots (`Vm::each_root_slot`,
+     `gc::Root`); `CLOISON_GC_SLOTS` checks that the slots reach every
+     marked cell, and after an evacuation that none still refers to a
+     moved one (`Vm::check_forwarded`).
+   - *A moving stress mode*, `CLOISON_GC_EVACUATE=all` (`Vm::evacuate`):
+     every movable cell moves at every full collection and the old copy
+     is poisoned. Pinned: what the roots pin (native stack words, what
+     Rust structures logged, what compiled code embeds), the global
+     object and the intrinsics, prototypes compiled code or constructor
+     tracking hold by address, what the VM's tables key by address, and
+     byte buffers (typed views point into them). Collections hashed by
+     address are rehashed rather than pinned (excalidraw's `Map` keys
+     alone held 6,240 blocks). The lookup and megamorphic tables are
+     emptied. Octane, the test suite and the web apps pass under it.
+   - *Candidates and forwarding*: after a sweep, when the small blocks in
+     use are over twice the bytes live in them, the sparsest under half
+     full are candidates (`Vm::choose_candidates`, from what the sweep
+     found, `Heap::swept_free`) if they would give back 32 MiB and a
+     tenth of the blocks in use. The next marking records the slots into
+     them from cells outside (`Candidates::note`), so a move updates the
+     roots, the recorded slots and the moved cells, not the heap
+     (TypeScript's update 673 -> 21-57 ms). A moved cell is forwarded in
+     place: `FORWARDED` in its metadata, its new address in its second
+     word.
+   - *In the concurrent final pause* (`Vm::evacuate_from`): the start
+     pause sets `EVAC` (0x08) on the candidates' old cells; the barrier's
+     mask is `YOUNG | COLOR | EVAC`, an immediate in the stencils too, so
+     a store of a candidate's cell into an old one dirties its card; the
+     start pause, the minor collections of the cycle, their card scans,
+     the marker and the final pause record the slots into the candidates
+     they trace. The final pause moves the cells marked `EVAC` and not
+     `PINNED` (0x10), up to 32 MiB, on the collector's threads (copies,
+     recorded slots and moved cells updated in parallel: TypeScript's
+     largest move 245 -> 109 ms). A move that would give back under
+     8 MiB is skipped, and the next 1, 2, 4... cycles choose none
+     (`Gc::fruitless`: CyberChef's candidates die before the final
+     pause).
+   - *Policy* (`gc::Policy`, every knob `CLOISON_GC_EVACUATE_*`): 10% of
+     the blocks in use to give back, and no candidates within 500 ms of
+     the last cycle's start (`gc::too_soon`), as V8's memory reducer
+     compacts when allocation slows: Splay's cycles come a fifth of a
+     second apart, and evacuating at each took 5% off its peak and added
+     22% to its time; the web apps' come seconds apart.
+     `CLOISON_GC_EVACUATE=0` turns it off.
+
+   Measured on the web apps, peak RSS against no evacuation (the default
+   concurrent collector, one run each, 2026-11-02): snap -24%,
+   excalidraw -14%, echarts -14%, tiddlywiki -9%, mathjax -7%,
+   TypeScript -5%, sheetjs -1%, the rest within their noise (sass and
+   siyuan vary by ±10% run to run); the longest pauses up to 183 ms
+   (sheetjs, 114 without). Octane doesn't evacuate (Splay's cycles are
+   too close), and its instructions are level (within 0.5%). Evacuation's
+   peak saving is bounded by the blocks left after a collection less
+   twice the live bytes and the nursery: about 110-390 MiB on the web
+   apps, about none on Splay, whose live set fills its blocks.
+
+8. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
+   most objects in one or two granules fewer; headers are 32 bytes now,
+   from 48), ephemerons with ES6, evacuating the nursery's survivors.
 
 ## Risks
 
@@ -918,8 +1001,13 @@ runs) and the microbenchmarks.
 - **Fragmentation.** Survivors pin their granules. Holes are granule-
   precise, so the waste is the survivors themselves and holes too small
   for the next allocation; `CLOISON_GC_STATS` reports free granules in
-  partly used blocks so the cost is visible, and evacuation is step 6's
-  remedy.
+  partly used blocks so the cost is visible, and evacuation (step 7)
+  moves the movable cells out of the sparsest blocks.
+- **A missed slot is a dangling reference** once a cell moves.
+  `CLOISON_GC_EVACUATE=all` moves everything it may at every full
+  collection and poisons the old copies, and `CLOISON_GC_SLOTS` checks
+  after each move that no slot still refers to a moved cell; Octane, the
+  test suite and the web apps run under both.
 - **Concurrency bugs** are kept to the marker's reads of cells and
   writes of metadata; the verifier compares a concurrent mark with a
   stop-the-world one.

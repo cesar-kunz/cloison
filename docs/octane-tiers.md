@@ -2,6 +2,135 @@
 
 Made by `scripts/octane-tiers.sh` (also written to the ignored `perf-history/octane-tiers-<commit>.{md,tsv}`).
 
+## 00bd4d1
+
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 00bd4d1, V8 14.6.202.34-node.28 capped at each tier (V8's columns from the 4f08e81 runs below). Load average at the start and end: 2.67 5.71.
+
+| benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
+|---|---:|---:|---:|---:|---:|---:|
+| richards | 2959 | 42814 | 2051 | 2757 | 40640 | 50609 |
+| deltablue | 2543 | 61119 | 2054 | 2889 | 57622 | 120103 |
+| crypto | 3324 | 25412 | 1489 | 2471 | 36524 | 50382 |
+| raytrace | 6960 | 42845 | 5323 | 7326 | 85173 | 133420 |
+| earley-boyer | 10039 | 28084 | 8397 | 13542 | 62842 | 94521 |
+| regexp | 3528 | 4732 | 5221 | 6708 | 11647 | 11910 |
+| splay | 9213 | 10734 | 6887 | 7385 | 9325 | 35053 |
+| navier-stokes | 4578 | 21263 | 2172 | 3110 | 38063 | 38803 |
+| pdfjs | 11313 | 17815 | 10658 | 16362 | 69792 | 33180 |
+| mandreel | 5052 | 36212 | 3371 | 4874 | 56174 | 55468 |
+| gbemu | 16142 | 69113 | 9603 | 14444 | 120565 | 44248 |
+| code-load | 25139 | 24956 | 45437 | 44785 | 45123 | 22824 |
+| box2d | 9840 | 36723 | 5627 | 8302 | 114632 | 52155 |
+| zlib | 3807 | 39365 | 109466 | 109466 | 109702 | 64862 |
+| typescript | 29973 | 43120 | 25184 | 34895 | 85517 | 41929 |
+| **geomean** (15) | **7168** | **28304** | **7054** | **9538** | **51188** | **47990** |
+
+cloison interp vs Ignition 1.02x (ahead on 12), Sparkplug 0.75x (ahead on 7), Maglev 0.14x (ahead on 0), Turbofan 0.15x (ahead on 1) (of 15; above 1x: cloison scores higher)
+cloison JIT vs Ignition 4.01x (ahead on 12), Sparkplug 2.97x (ahead on 12), Maglev 0.55x (ahead on 3), Turbofan 0.59x (ahead on 3) (of 15; above 1x: cloison scores higher)
+
+CodeLoad lost 17% to 7f4f7ee, which parses code twice when a function starts in a catch clause; the others are within 5% of 4f08e81's.
+
+## 4f08e81
+
+Octane scores (higher is better; medians of 3 runs, 4 at a time on cores of their own): cloison 4f08e81, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 20.23 34.80.
+
+| benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
+|---|---:|---:|---:|---:|---:|---:|
+| richards | 2941 | 42712 | 2051 | 2757 | 40640 | 50609 |
+| deltablue | 2567 | 63096 | 2054 | 2889 | 57622 | 120103 |
+| crypto | 3393 | 25405 | 1489 | 2471 | 36524 | 50382 |
+| raytrace | 6887 | 42876 | 5323 | 7326 | 85173 | 133420 |
+| earley-boyer | 9851 | 28042 | 8397 | 13542 | 62842 | 94521 |
+| regexp | 3331 | 4856 | 5221 | 6708 | 11647 | 11910 |
+| splay | 9274 | 11232 | 6887 | 7385 | 9325 | 35053 |
+| navier-stokes | 4515 | 21284 | 2172 | 3110 | 38063 | 38803 |
+| pdfjs | 11302 | 16891 | 10658 | 16362 | 69792 | 33180 |
+| mandreel | 4928 | 35162 | 3371 | 4874 | 56174 | 55468 |
+| gbemu | 15586 | 67473 | 9603 | 14444 | 120565 | 44248 |
+| code-load | 30584 | 30250 | 45437 | 44785 | 45123 | 22824 |
+| box2d | 9467 | 37449 | 5627 | 8302 | 114632 | 52155 |
+| zlib | 3683 | 38166 | 109466 | 109466 | 109702 | 64862 |
+| typescript | 29379 | 42801 | 25184 | 34895 | 85517 | 41929 |
+| **geomean** (15) | **7155** | **28622** | **7054** | **9538** | **51188** | **47990** |
+
+cloison interp vs Ignition 1.01x (ahead on 12), Sparkplug 0.75x (ahead on 7), Maglev 0.14x (ahead on 0), Turbofan 0.15x (ahead on 1) (of 15; above 1x: cloison scores higher)
+cloison JIT vs Ignition 4.06x (ahead on 12), Sparkplug 3.00x (ahead on 12), Maglev 0.56x (ahead on 3), Turbofan 0.60x (ahead on 3) (of 15; above 1x: cloison scores higher)
+
+The host was shared and loaded (another user's link jobs): V8's Turbofan, whose compiler runs on threads of its own, scores below Maglev on several benchmarks here, so its column understates it.
+
+## 0fbcab6, Apple silicon, against other engines
+
+Moved from the README (2026-11-11); not rerun since.
+
+Octane scores on an Apple silicon Mac, cloison's JIT at 0fbcab6 against
+V8 14.6 capped at Sparkplug, at Maglev, and with all tiers (higher is
+better; cloison's are medians of five runs of `scripts/octane.sh`'s
+`-score.js` scripts, V8's single runs at c842d29 from a local script,
+`perf-history/octane-engines.sh`, which the repository ignores; c842d29
+rebuilt and run the same way scores within 3% of the figures it gave
+then):
+
+| benchmark | V8 | V8 Maglev | cloison | V8 Sparkplug |
+|---|---:|---:|---:|---:|
+| Richards | 51,460 | 37,357 | 38,119 | 2,877 |
+| DeltaBlue | 133,129 | 58,951 | 48,484 | 3,190 |
+| Crypto | 60,295 | 33,389 | 24,967 | 2,887 |
+| RayTrace | 141,412 | 89,095 | 45,953 | 8,806 |
+| EarleyBoyer | 114,968 | 70,293 | 26,886 | 14,517 |
+| RegExp | 13,883 | 13,456 | 3,941 | 7,509 |
+| Splay | 102,198 | 100,162 | 21,975 | 18,651 |
+| NavierStokes | 40,473 | 26,955 | 15,551 | 3,346 |
+| PdfJS | 95,899 | 87,999 | 18,879 | 19,104 |
+| Mandreel | 105,810 | 68,189 | 39,622 | 5,744 |
+| GameBoy | 147,921 | 138,912 | 67,207 | 16,714 |
+| CodeLoad | 74,977 | 75,635 | 42,063 | 75,696 |
+| Box2D | 152,509 | 126,873 | 41,956 | 10,110 |
+| zlib | 123,337 | 124,544 | 39,103 | 124,645 |
+| TypeScript | 181,891 | 176,601 | 63,817 | 52,150 |
+| **geomean** | **88,060** | **67,804** | **30,341** | **11,951** |
+
+V8 runs zlib (asm.js) through its wasm pipeline, and compiles the
+functions of CodeLoad's `eval`s when they are first called; cloison compiles
+every function of every `eval` up front.
+
+Against other engines and V8's tiers, on an Apple silicon Mac (higher is
+better; cloison's JIT at 0fbcab6 as above, the others single runs at
+c842d29 from the same local script: V8 14.6 capped at each tier and with
+all of them, the macOS 27 JavaScriptCore, SpiderMonkey 140 and QuickJS
+2026-06-04; ARKTS is OpenHarmony's ARK JS runtime, `ark_js_vm` at
+ets_runtime cf2d2a08f, each benchmark compiled to `.abc` by `es2abc` at
+ets_frontend a7487a110, median of three runs; on macOS its build leaves
+the asm interpreter out, so this is its C++ interpreter, with no JIT or
+AOT):
+
+| benchmark | JSC | V8 | V8 Maglev | SpiderMonkey | cloison | V8 Sparkplug | V8 Ignition | QuickJS | ARKTS | cloison / Maglev |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Richards | 49,006 | 51,460 | 37,357 | 15,025 | 38,119 | 2,877 | 1,675 | 1,298 | 619 | 1.02 |
+| DeltaBlue | 82,912 | 133,129 | 58,951 | 17,118 | 48,484 | 3,190 | 1,584 | 1,379 | 599 | 0.82 |
+| Crypto | 76,263 | 60,295 | 33,389 | 26,215 | 24,967 | 2,887 | 1,665 | 1,315 | — | 0.75 |
+| Mandreel | 113,441 | 105,810 | 68,189 | 42,404 | 39,622 | 5,744 | 4,061 | 4,189 | — | 0.58 |
+| NavierStokes | 33,471 | 40,473 | 26,955 | 21,263 | 15,551 | 3,346 | 2,473 | 2,621 | — | 0.58 |
+| CodeLoad | 82,525 | 74,977 | 75,635 | 45,252 | 42,063 | 75,696 | 75,863 | 21,234 | — | 0.56 |
+| RayTrace | 204,829 | 141,412 | 89,095 | 51,452 | 45,953 | 8,806 | 5,811 | 2,841 | 1,422 | 0.52 |
+| GameBoy | 168,246 | 147,921 | 138,912 | 102,991 | 67,207 | 16,714 | 11,591 | 11,341 | — | 0.48 |
+| EarleyBoyer | 124,227 | 114,968 | 70,293 | 51,415 | 26,886 | 14,517 | 8,343 | 3,674 | — | 0.38 |
+| TypeScript | 175,386 | 181,891 | 176,601 | 112,638 | 63,817 | 52,150 | 30,157 | 20,696 | — | 0.36 |
+| Box2D | 162,440 | 152,509 | 126,873 | 67,910 | 41,956 | 10,110 | 6,487 | 5,523 | 3,725 | 0.33 |
+| zlib | 46,747 | 123,337 | 124,544 | 104,811 | 39,103 | 124,645 | 122,350 | 2,731 | — | 0.31 |
+| RegExp | 22,616 | 13,883 | 13,456 | 11,875 | 3,941 | 7,509 | 5,581 | 491 | 624 | 0.29 |
+| Splay | 130,031 | 102,198 | 100,162 | 44,771 | 21,975 | 18,651 | 15,270 | 10,119 | 1,397 | 0.22 |
+| PdfJS | 98,632 | 95,899 | 87,999 | 63,155 | 18,879 | 19,104 | 12,464 | 5,548 | — | 0.21 |
+| **geomean** | **88,521** | **88,060** | **67,804** | **41,718** | **30,341** | **11,951** | **8,168** | **3,830** | — | **0.45** |
+
+`es2abc` compiles every script as strict mode code, so Octane runs on ARK
+only with its harness's `alert` declared (`var alert;` first) and not at
+all where a benchmark relies on sloppy mode or what the runtime lacks:
+EarleyBoyer (octal escapes), TypeScript (assigns `arguments`) and zlib
+(`delete` of a variable) don't compile, Crypto and Mandreel assign
+undeclared globals, NavierStokes and GameBoy fail on strict mode's
+errors, PdfJS needs `console` and CodeLoad `eval` (unsupported). Hence no
+geomean for it.
+
 ## 213fcdf
 
 Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 213fcdf, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 32.70 17.94.

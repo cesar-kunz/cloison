@@ -413,7 +413,8 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// not yet finished (see `catch_up`).
 fn grow_delay() {
     static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let us = *DELAY.get_or_init(|| std::env::var("CLOISON_TEST_GROW_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    let us =
+        *DELAY.get_or_init(|| std::env::var("CLOISON_TEST_GROW_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     if us > 0 {
         std::thread::sleep(std::time::Duration::from_micros(us));
     }
@@ -594,7 +595,13 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// (of an integer kind; `waitable`: `Int32Array` or `BigInt64Array`) in
 /// bounds (`write`: of a mutable buffer), and `index` converted, an
 /// element's index in it.
-fn access(vm: &mut Vm, ta: Value, index: Value, waitable: bool, write: bool) -> Result<(*mut Object, TypedKind, usize)> {
+fn access(
+    vm: &mut Vm,
+    ta: Value,
+    index: Value,
+    waitable: bool,
+    write: bool,
+) -> Result<(*mut Object, TypedKind, usize)> {
     if !is_class(ta, Class::TypedArray) {
         return Err(Error::type_error("Atomics: the argument is not a typed array"));
     }
@@ -1008,7 +1015,8 @@ pub(crate) fn settling(vm: &Vm) -> bool {
     s.waits.iter().any(|(w, _, _)| {
         let b = w.block as *mut Block;
         let refs = unsafe { (*b).refs.load(SeqCst) };
-        let own = s.blocks.iter().filter(|&&x| x == b).count() + s.waits.iter().filter(|(x, _, _)| x.block == w.block).count();
+        let own = s.blocks.iter().filter(|&&x| x == b).count()
+            + s.waits.iter().filter(|(x, _, _)| x.block == w.block).count();
         refs > own || w.deadline.is_some() || w.notified.load(SeqCst)
     })
 }

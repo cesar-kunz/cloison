@@ -94,13 +94,7 @@ pub(crate) unsafe fn copy(src: *const u8, dst: *mut u8, n: usize) {
 /// # Safety
 /// As [`copy`].
 pub(crate) unsafe fn copy_if(shared: bool, src: *const u8, dst: *mut u8, n: usize) {
-    unsafe {
-        if shared {
-            copy(src, dst, n)
-        } else {
-            std::ptr::copy(src, dst, n)
-        }
-    }
+    unsafe { if shared { copy(src, dst, n) } else { std::ptr::copy(src, dst, n) } }
 }
 
 #[cfg(test)]

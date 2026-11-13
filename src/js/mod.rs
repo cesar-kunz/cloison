@@ -11,7 +11,6 @@ pub mod codegen;
 pub mod lex;
 pub mod parse;
 
-
 use crate::asm::{Checked, LazyFn, Module};
 use lex::Source;
 
@@ -192,7 +191,13 @@ pub fn compile_direct_eval_source(
     let (source, at) = src.unit_string();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source_code_as(src, &arena, skim, Some((strict, chain, !bound.is_empty(), global, new_target, home, live_this))).and_then(|mut p| {
+        parse::parse_source_code_as(
+            src,
+            &arena,
+            skim,
+            Some((strict, chain, !bound.is_empty(), global, new_target, home, live_this)),
+        )
+        .and_then(|mut p| {
             p.eval_upvalues = bound.to_vec();
             codegen::generate_lazy_units(&p, 0, &source, &*at, &[])
         })

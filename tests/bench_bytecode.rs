@@ -17,9 +17,7 @@ fn listings_match_their_benchmarks() {
     files.sort();
     assert!(!files.is_empty());
     for f in files {
-        let js = root
-            .join("micro")
-            .join(f.with_extension("js").file_name().unwrap());
+        let js = root.join("micro").join(f.with_extension("js").file_name().unwrap());
         let js = std::fs::read_to_string(&js).unwrap_or_else(|e| panic!("{}: {e}", js.display()));
         let expect = js
             .lines()
@@ -33,23 +31,14 @@ fn listings_match_their_benchmarks() {
             let mut vm = Vm::new();
             vm.set_warm_tier(false);
             vm.set_tier_back_edges(budget);
-            let v = vm
-                .run(&module)
-                .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
-            assert_eq!(
-                display(v),
-                expect.trim(),
-                "{} (tier at {budget})",
-                f.display()
-            );
+            let v = vm.run(&module).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            assert_eq!(display(v), expect.trim(), "{} (tier at {budget})", f.display());
         }
     }
 }
 
 fn listing(name: &str) -> cloison::asm::Checked {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("bench/bytecode")
-        .join(name);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/bytecode").join(name);
     cloison::asm::parse(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -63,11 +52,7 @@ fn hot_property_loops_compile_without_repeated_guards() {
     vm.set_warm_tier(false);
     vm.run(&listing("34-chained-loads.asm")).unwrap();
     let s = vm.jit_stencils("main").expect("main's loop compiled");
-    assert!(
-        s.iter()
-            .all(|n| !n.starts_with("get_") || n.starts_with("get_own_nc_")),
-        "{s:?}"
-    );
+    assert!(s.iter().all(|n| !n.starts_with("get_") || n.starts_with("get_own_nc_")), "{s:?}");
     assert!(s.iter().any(|n| n.contains("set_own_nc_")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("tlt_jf_ii_")), "{s:?}");
     // 21: `vs` is known at entry, with elements of `v`'s shape, so `vs[i]`
@@ -77,11 +62,7 @@ fn hot_property_loops_compile_without_repeated_guards() {
     vm.run(&listing("21-monomorphic-get.asm")).unwrap();
     let s = vm.jit_stencils("main").expect("main's loop compiled");
     assert!(s.iter().any(|n| n.starts_with("get_keyed_i_nc_")), "{s:?}");
-    assert!(
-        s.iter()
-            .all(|n| !n.starts_with("get_own_") || n.starts_with("get_own_nc_")),
-        "{s:?}"
-    );
+    assert!(s.iter().all(|n| !n.starts_with("get_own_") || n.starts_with("get_own_nc_")), "{s:?}");
     // `v.mark == r % 5` and `n += v.value` on int32 fields (the add in
     // place on `n`'s slot).
     assert!(s.iter().any(|n| n.starts_with("teq_jt_ii_")), "{s:?}");
@@ -94,28 +75,17 @@ fn loops_with_calls_compile_with_the_callee_inlined() {
     // constant: a store changing it drops the code, see `FieldCell`), nor
     // as the callee; a method from a prototype holding it needs neither (its
     // slots are stable while the code's prototype epoch holds).
-    for (name, want, checked) in [
-        ("10-call-global-function.asm", "tlt_jf_", false),
-        ("23-prototype-method.asm", "add_ii_", false),
-    ] {
+    for (name, want, checked) in
+        [("10-call-global-function.asm", "tlt_jf_", false), ("23-prototype-method.asm", "add_ii_", false)]
+    {
         let mut vm = Vm::new();
         vm.set_warm_tier(false);
         vm.run(&listing(name)).unwrap();
         let s = vm.jit_stencils("main").expect("main's loop compiled");
-        let loop_end = s
-            .iter()
-            .position(|n| n.starts_with("jlt_smi") || n.starts_with("incjlt"))
-            .expect("the loop");
+        let loop_end = s.iter().position(|n| n.starts_with("jlt_smi") || n.starts_with("incjlt")).expect("the loop");
         let body = &s[..loop_end];
-        assert!(
-            !body.iter().any(|n| n.starts_with("check_callee_")),
-            "{name}: {s:?}"
-        );
-        assert_eq!(
-            body.iter().any(|n| n.starts_with("guard_word")),
-            checked,
-            "{name}: {s:?}"
-        );
+        assert!(!body.iter().any(|n| n.starts_with("check_callee_")), "{name}: {s:?}");
+        assert_eq!(body.iter().any(|n| n.starts_with("guard_word")), checked, "{name}: {s:?}");
         assert!(!body.iter().any(|n| n == "call"), "{name}: {s:?}");
         assert!(body.iter().any(|n| n.starts_with(want)), "{name}: {s:?}");
     }

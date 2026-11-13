@@ -425,7 +425,9 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
     let k = trap_key(vm, key);
     let r = call_function(vm, f, h, &[t, k])?;
     if !r.is_undefined() && !is_object(r) {
-        return Err(Error::type_error("The proxy's 'getOwnPropertyDescriptor' trap returned neither an object nor undefined"));
+        return Err(Error::type_error(
+            "The proxy's 'getOwnPropertyDescriptor' trap returned neither an object nor undefined",
+        ));
     }
     let target = get_own_property(vm, as_object(t), key)?;
     if r.is_undefined() {
@@ -461,7 +463,12 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
                     return Err(broken("getOwnPropertyDescriptor", "reported a writable property as non-writable"));
                 }
             }
-            _ => return Err(broken("getOwnPropertyDescriptor", "reported a configurable or missing property as non-configurable")),
+            _ => {
+                return Err(broken(
+                    "getOwnPropertyDescriptor",
+                    "reported a configurable or missing property as non-configurable",
+                ));
+            }
         }
     }
     Ok(Some(d))
@@ -498,9 +505,13 @@ pub(crate) fn proxy_define(vm: &mut Vm, o: *mut Object, key: Key, d: &Desc) -> R
                 return Err(broken("defineProperty", "defined a property incompatible with the target's"));
             }
             if config_false && td.configurable == Some(true) {
-                return Err(broken("defineProperty", "defined a property configurable on the target as non-configurable"));
+                return Err(broken(
+                    "defineProperty",
+                    "defined a property configurable on the target as non-configurable",
+                ));
             }
-            if td.is_data() && td.configurable == Some(false) && td.writable == Some(true) && d.writable == Some(false) {
+            if td.is_data() && td.configurable == Some(false) && td.writable == Some(true) && d.writable == Some(false)
+            {
                 return Err(broken("defineProperty", "made a writable, non-configurable property non-writable"));
             }
             Ok(true)

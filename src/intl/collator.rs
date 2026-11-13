@@ -5,7 +5,10 @@
 //! other collation types).
 
 use super::icu::{self, CaseFirst, CollatorKey, Sensitivity};
-use super::{Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, resolve_locale, root, slot, string_array, string_option, supported_locales};
+use super::{
+    Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, resolve_locale, root, slot,
+    string_array, string_option, supported_locales,
+};
 use crate::builtins::is_class;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::temporal::arg;
@@ -32,13 +35,18 @@ struct Flags {
 
 impl Flags {
     fn pack(self) -> i32 {
-        self.search as i32 | (self.sensitivity as i32) << 1 | (self.ignore_punctuation as i32) << 3 | (self.numeric as i32) << 4 | (self.case_first as i32) << 5
+        self.search as i32
+            | (self.sensitivity as i32) << 1
+            | (self.ignore_punctuation as i32) << 3
+            | (self.numeric as i32) << 4
+            | (self.case_first as i32) << 5
     }
 
     fn unpack(f: i32) -> Flags {
         Flags {
             search: f & 1 != 0,
-            sensitivity: [Sensitivity::Base, Sensitivity::Accent, Sensitivity::Case, Sensitivity::Variant][(f >> 1 & 3) as usize],
+            sensitivity: [Sensitivity::Base, Sensitivity::Accent, Sensitivity::Case, Sensitivity::Variant]
+                [(f >> 1 & 3) as usize],
             ignore_punctuation: f >> 3 & 1 != 0,
             numeric: f >> 4 & 1 != 0,
             case_first: [CaseFirst::False, CaseFirst::Lower, CaseFirst::Upper][(f >> 5 & 3) as usize],
@@ -88,7 +96,8 @@ fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         ],
     )?;
     let sensitivity = match string_option(vm, options, "sensitivity", &SENSITIVITIES)? {
-        Some(s) => [Sensitivity::Base, Sensitivity::Accent, Sensitivity::Case, Sensitivity::Variant][SENSITIVITIES.iter().position(|&x| x == s).unwrap()],
+        Some(s) => [Sensitivity::Base, Sensitivity::Accent, Sensitivity::Case, Sensitivity::Variant]
+            [SENSITIVITIES.iter().position(|&x| x == s).unwrap()],
         None => Sensitivity::Variant,
     };
     let ignore_punctuation = bool_option(vm, options, "ignorePunctuation")?.unwrap_or(false);
@@ -97,9 +106,16 @@ fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         sensitivity,
         ignore_punctuation,
         numeric: r.values[2].as_deref() == Some("true"),
-        case_first: [CaseFirst::False, CaseFirst::Lower, CaseFirst::Upper][CASE_FIRSTS.iter().position(|&x| Some(x) == r.values[1].as_deref()).unwrap_or(0)],
+        case_first: [CaseFirst::False, CaseFirst::Lower, CaseFirst::Upper]
+            [CASE_FIRSTS.iter().position(|&x| Some(x) == r.values[1].as_deref()).unwrap_or(0)],
     };
-    let key = CollatorKey { locale: r.data_locale, sensitivity, ignore_punctuation, numeric: flags.numeric, case_first: flags.case_first };
+    let key = CollatorKey {
+        locale: r.data_locale,
+        sensitivity,
+        ignore_punctuation,
+        numeric: flags.numeric,
+        case_first: flags.case_first,
+    };
     let handle = match vm.intl.collator_ids.get(&key) {
         Some(&h) => h,
         None => {
@@ -124,7 +140,10 @@ fn this_collator(this: Value, what: &str) -> Result<*mut Object> {
     if is_class(this, Class::Intl) {
         Ok(as_object(this))
     } else {
-        Err(Error::type_error(format!("Method Intl.Collator.prototype.{what} called on incompatible receiver {}", crate::vm::shown(this))))
+        Err(Error::type_error(format!(
+            "Method Intl.Collator.prototype.{what} called on incompatible receiver {}",
+            crate::vm::shown(this)
+        )))
     }
 }
 

@@ -49,7 +49,8 @@ impl Time {
 
     /// Nanoseconds since midnight.
     pub fn nanos(&self) -> i64 {
-        ((((self.hour as i64 * 60 + self.minute as i64) * 60 + self.second as i64) * 1000 + self.millisecond as i64) * 1000
+        ((((self.hour as i64 * 60 + self.minute as i64) * 60 + self.second as i64) * 1000 + self.millisecond as i64)
+            * 1000
             + self.microsecond as i64)
             * 1000
             + self.nanosecond as i64
@@ -368,8 +369,18 @@ impl Unit {
     ];
     pub const SINGULAR: [&'static str; 10] =
         ["year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
-    pub const PLURAL: [&'static str; 10] =
-        ["years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds"];
+    pub const PLURAL: [&'static str; 10] = [
+        "years",
+        "months",
+        "weeks",
+        "days",
+        "hours",
+        "minutes",
+        "seconds",
+        "milliseconds",
+        "microseconds",
+        "nanoseconds",
+    ];
 
     pub fn name(self) -> &'static str {
         Unit::SINGULAR[self as usize]

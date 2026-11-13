@@ -47,11 +47,11 @@
 //! `s` leaves the int32 range after ~65k iterations and `add` takes its slow
 //! path from then on. `scripts/bench.sh` runs the whole matrix under `perf`.
 
-use std::process::exit;
-use std::time::Instant;
 use cloison::bytecode::{Arg, Assembler, Op};
 use cloison::jit::JitFunction;
 use cloison::value::Value;
+use std::process::exit;
+use std::time::Instant;
 
 const S: u8 = 0;
 const I: u8 = 1;
@@ -69,23 +69,16 @@ fn usage() -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (Some(program), Some(codegen)) = (args.get(1), args.get(2)) else {
-        usage()
-    };
+    let (Some(program), Some(codegen)) = (args.get(1), args.get(2)) else { usage() };
     let smi = match codegen.as_str() {
         "generic" => false,
         "smi" => true,
         _ => usage(),
     };
-    let n: i32 = args
-        .get(3)
-        .map_or(100_000_000, |s| s.parse().unwrap_or_else(|_| usage()));
+    let n: i32 = args.get(3).map_or(100_000_000, |s| s.parse().unwrap_or_else(|_| usage()));
     assert!(n > 0, "the loop tests at the bottom, so n must be positive");
     let engine = args.get(4).map_or("interp", String::as_str);
-    if !matches!(
-        engine,
-        "interp" | "jit1" | "jit2" | "jit3" | "jit4" | "jit" | "tier"
-    ) {
+    if !matches!(engine, "interp" | "jit1" | "jit2" | "jit3" | "jit4" | "jit" | "tier") {
         usage()
     }
     let nf = n as f64;
@@ -193,11 +186,7 @@ fn main() {
         std::fs::write(path, code.main_code()).expect("writing CLOISON_JIT_DUMP");
     }
 
-    assert_eq!(
-        result.as_number(),
-        Some(expected),
-        "{program}/{codegen}: got {result:?}"
-    );
+    assert_eq!(result.as_number(), Some(expected), "{program}/{codegen}: got {result:?}");
     println!(
         "{program}/{codegen}/{engine} n={n} result={result:?} time={:.3}s {:.2} ns/iter{}",
         elapsed.as_secs_f64(),

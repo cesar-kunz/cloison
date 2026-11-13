@@ -285,7 +285,15 @@ pub(crate) fn view_byte_length(o: *mut Object) -> Option<usize> {
 
 /// A view (`class` `TypedArray` of kind `k`, or `DataView`) of `len`
 /// elements of `b` from byte `offset` (`None`: tracking its length).
-pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b: *mut Object, offset: usize, len: Option<usize>) -> Result<Value> {
+pub(crate) fn make_view(
+    vm: &mut Vm,
+    class: Class,
+    proto: Value,
+    k: TypedKind,
+    b: *mut Object,
+    offset: usize,
+    len: Option<usize>,
+) -> Result<Value> {
     if class == Class::TypedArray {
         note_proto(vm, k as u8, proto);
     }
@@ -298,7 +306,8 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
         (*o).elems = (*b).elems.cast::<u8>().add(offset).cast();
         (*o).code = b.cast();
         *Object::aux(o) = len.map_or(TRACKING, |n| n as u32);
-        (*o).elems_len = if class == Class::TypedArray { ta_length(o) } else { view_byte_length(o) }.unwrap_or(0) as u32;
+        (*o).elems_len =
+            if class == Class::TypedArray { ta_length(o) } else { view_byte_length(o) }.unwrap_or(0) as u32;
         if is_immutable(b) {
             (*o).flags |= IMMUTABLE_VIEW;
         }
@@ -557,7 +566,9 @@ fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
         v => to_index(vm, v)?,
     };
     if is_detached(b) || is_immutable(b) {
-        return Err(Error::type_error("ArrayBuffer.prototype.transferToImmutable: the buffer is detached or immutable"));
+        return Err(Error::type_error(
+            "ArrayBuffer.prototype.transferToImmutable: the buffer is detached or immutable",
+        ));
     }
     let out = new_buffer_max(vm, n, None)?;
     let count = n.min(unsafe { (*b).elems_len } as usize);
@@ -747,7 +758,11 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
             };
             let sk = kind_of(fo);
             if sk.is_big() != k.is_big() {
-                return Err(Error::type_error(format!("Cannot mix BigInt and other types: {} from {}", k.name(), sk.name())));
+                return Err(Error::type_error(format!(
+                    "Cannot mix BigInt and other types: {} from {}",
+                    k.name(),
+                    sk.name()
+                )));
             }
             let out = allocate(vm, k, n)?;
             let o = as_object(out);
@@ -763,7 +778,11 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         Class::ArrayBuffer | Class::SharedArrayBuffer => {
             let offset = to_index(vm, arg(a, 1))?;
             if offset % k.size() != 0 {
-                return Err(Error::range_error(format!("start offset of {} should be a multiple of {}", k.name(), k.size())));
+                return Err(Error::range_error(format!(
+                    "start offset of {} should be a multiple of {}",
+                    k.name(),
+                    k.size()
+                )));
             }
             let length = arg(a, 2);
             let n = if length.is_undefined() { None } else { Some(to_index(vm, length)?) };
@@ -820,7 +839,10 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, n: Option
         }
         None => {
             if !bytes.is_multiple_of(size) || offset > bytes {
-                return Err(Error::range_error(format!("Invalid typed array length: byte length of {} should be a multiple of {size}", k.name())));
+                return Err(Error::range_error(format!(
+                    "Invalid typed array length: byte length of {} should be a multiple of {size}",
+                    k.name()
+                )));
             }
             Some((bytes - offset) / size)
         }
@@ -950,7 +972,10 @@ pub(crate) fn typed_to_string_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Resu
 fn callback(a: &[Value], what: &str) -> Result<Value> {
     let f = arg(a, 0);
     if !is_callable(f) {
-        return Err(Error::type_error(format!("{} is not a function (%TypedArray%.prototype.{what})", crate::vm::shown(f))));
+        return Err(Error::type_error(format!(
+            "{} is not a function (%TypedArray%.prototype.{what})",
+            crate::vm::shown(f)
+        )));
     }
     Ok(f)
 }
@@ -1642,10 +1667,9 @@ mod tests {
     /// (One test: each buffer reserves 2 GiB, never touched.)
     #[test]
     fn only_views_past_i32_max_leave_their_length_to_the_runtime() {
-        for (src, long) in [
-            ("new Uint8Array(new ArrayBuffer(2 ** 31), 1)", false),
-            ("new Uint8Array(new ArrayBuffer(2 ** 31))", true),
-        ] {
+        for (src, long) in
+            [("new Uint8Array(new ArrayBuffer(2 ** 31), 1)", false), ("new Uint8Array(new ArrayBuffer(2 ** 31))", true)]
+        {
             let mut vm = Vm::new();
             let v = vm.run(&crate::js::compile(src).unwrap()).unwrap();
             let flagged = unsafe { (*as_object(v)).flags } & RUNTIME_LENGTH != 0;

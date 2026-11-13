@@ -183,12 +183,13 @@ pub mod x86 {
             }
             let flow = i.flow_control();
             let direct = matches!(flow, FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch);
-            let pc_rel_field = i
-                .is_ip_rel_memory_operand()
-                .then(|| at + d.get_constant_offsets(&i).displacement_offset());
+            let pc_rel_field =
+                i.is_ip_rel_memory_operand().then(|| at + d.get_constant_offsets(&i).displacement_offset());
             let store = info.info(&i).used_memory().iter().any(|m| {
-                matches!(m.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
-                    && m.base() != Register::RSP
+                matches!(
+                    m.access(),
+                    OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+                ) && m.base() != Register::RSP
             });
             out.push(Insn {
                 at,
@@ -197,7 +198,10 @@ pub mod x86 {
                 target: (direct || flow == FlowControl::Call).then(|| i.near_branch_target() as i64),
                 ends_flow: matches!(
                     flow,
-                    FlowControl::UnconditionalBranch | FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Exception
+                    FlowControl::UnconditionalBranch
+                        | FlowControl::IndirectBranch
+                        | FlowControl::Return
+                        | FlowControl::Exception
                 ),
                 pc_rel_field,
                 store,
@@ -212,7 +216,8 @@ pub mod x86 {
     /// A `jmp rel32` or `jcc rel32` at `i` (its rel32 field the last four
     /// bytes): what a relocation can retarget.
     pub fn is_rel32_jump(code: &[u8], i: &Insn) -> bool {
-        (i.len == 5 && code[i.at] == 0xE9) || (i.len == 6 && code[i.at] == 0x0F && (0x80..=0x8F).contains(&code[i.at + 1]))
+        (i.len == 5 && code[i.at] == 0xE9)
+            || (i.len == 6 && code[i.at] == 0x0F && (0x80..=0x8F).contains(&code[i.at + 1]))
     }
 }
 
@@ -373,6 +378,9 @@ mod tests {
         // `ldr x0, <literal>`.
         fails(arm64(&[0x5800_0000, B], &[r(4, JUMP26, "cloison_continue")]), "without a relocation");
         // A continuation on an `add`.
-        fails(arm64(&[0x9100_0000, B], &[r(0, JUMP26, "cloison_continue"), r(4, JUMP26, "cloison_continue")]), "isn't a branch's target");
+        fails(
+            arm64(&[0x9100_0000, B], &[r(0, JUMP26, "cloison_continue"), r(4, JUMP26, "cloison_continue")]),
+            "isn't a branch's target",
+        );
     }
 }

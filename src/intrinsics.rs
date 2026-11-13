@@ -5,8 +5,8 @@
 
 use crate::interp::{call_function, to_string_units};
 use crate::js::ast::{
-    EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_LIVE_THIS, EVAL_NEW_TARGET,
-    EVAL_STRICT, EVAL_THIS,
+    EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_LIVE_THIS,
+    EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS,
 };
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::Desc;
@@ -127,10 +127,7 @@ fn dispose_run_async(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// The id of the intrinsic `name`.
 pub fn id(name: &str) -> u8 {
-    INTRINSICS
-        .iter()
-        .position(|(n, _)| *n == name)
-        .unwrap_or_else(|| panic!("no intrinsic {name}")) as u8
+    INTRINSICS.iter().position(|(n, _)| *n == name).unwrap_or_else(|| panic!("no intrinsic {name}")) as u8
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -184,9 +181,7 @@ fn spread(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if crate::symbol::append_dense(vm, arr, a[1]) {
         return Ok(arr);
     }
-    crate::collections::iterate(vm, a[1], |vm, v| {
-        crate::vm::array_push(vm, arr, &[v]).map(|_| ())
-    })?;
+    crate::collections::iterate(vm, a[1], |vm, v| crate::vm::array_push(vm, arr, &[v]).map(|_| ()))?;
     Ok(arr)
 }
 
@@ -268,7 +263,8 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         vm.new_target = nt;
     }
     let derived = std::mem::replace(&mut vm.derived_construct, if nt != f { f } else { Value::UNDEFINED });
-    let outer = std::mem::replace(&mut vm.native_new_target, if nt != f { (f, nt) } else { (Value::EMPTY, Value::EMPTY) });
+    let outer =
+        std::mem::replace(&mut vm.native_new_target, if nt != f { (f, nt) } else { (Value::EMPTY, Value::EMPTY) });
     let r = vm.construct_other(f, args);
     let r = if vm.conv_failed() { Err(vm.take_conv_error()) } else { r };
     vm.derived_construct = derived;
@@ -657,10 +653,7 @@ pub(crate) fn ordinary_set(vm: &mut Vm, start: Value, key: Key, v: Value, receiv
     match crate::proxy::get_own_property(vm, r, key)? {
         Some(d) if d.get.is_some() || d.set.is_some() || d.writable == Some(false) => Ok(false),
         Some(_) => {
-            let d = Desc {
-                value: Some(v),
-                ..Default::default()
-            };
+            let d = Desc { value: Some(v), ..Default::default() };
             crate::proxy::define_property(vm, r, key, &d)
         }
         None => crate::proxy::define_property(vm, r, key, &Desc::data(v, true, true, true)),
@@ -690,8 +683,7 @@ fn super_call(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 pub(crate) const DERIVED_RESULT: &str = "TypeError: Derived constructors may only return object or undefined";
-pub(crate) const DERIVED_THIS: &str =
-    "ReferenceError: Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
+pub(crate) const DERIVED_THIS: &str = "ReferenceError: Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
 
 /// What a derived class's constructor returns, `[v, this]`: `v` if an
 /// object, else `this` (initialized: `super()` called).
@@ -794,7 +786,11 @@ fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// An object pattern's source: `[v]`, not `null` or `undefined`.
 fn require_coercible(_: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[0].is_undefined() || a[0].is_null() {
-        return Err(Error::type_error(format!("Cannot destructure '{}' as it is {}.", crate::vm::shown(a[0]), crate::vm::shown(a[0]))));
+        return Err(Error::type_error(format!(
+            "Cannot destructure '{}' as it is {}.",
+            crate::vm::shown(a[0]),
+            crate::vm::shown(a[0])
+        )));
     }
     Ok(a[0])
 }
@@ -813,7 +809,9 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     };
     let out = object_value(vm.new_object(object_value(vm.object_prototype)));
     for key in crate::proxy::own_keys(vm, src)? {
-        if excluded.contains(&key) || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+        if excluded.contains(&key)
+            || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
+        {
             continue;
         }
         let v = vm.get_key(object_value(src), key)?;
@@ -867,8 +865,19 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
         None => {
             let source: Box<[u16]> = u.into();
             let text = crate::js::lex::Source::from_units(u);
-            let mut module = crate::js::compile_direct_eval_source(&text, strict, new_target, home, live_this, &chain.text(), global, &[]).map_err(eval_error)?;
-            let annex_b: std::rc::Rc<[crate::object::Atom]> = module.annex_b.iter().map(|n| vm.intern_name(n)).collect();
+            let mut module = crate::js::compile_direct_eval_source(
+                &text,
+                strict,
+                new_target,
+                home,
+                live_this,
+                &chain.text(),
+                global,
+                &[],
+            )
+            .map_err(eval_error)?;
+            let annex_b: std::rc::Rc<[crate::object::Atom]> =
+                module.annex_b.iter().map(|n| vm.intern_name(n)).collect();
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
@@ -901,14 +910,18 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     // A `var` by a block-scoped binding's name (but a catch parameter's)
     // between the function's scope and the `eval` is an error. (Not Annex
     // B's of a function in a block, not made then: see `eval_annex_b`.)
-    let inner: Vec<Value> = if target == decl && !declared.is_empty() { inner_scopes(chain, scopes) } else { Vec::new() };
+    let inner: Vec<Value> =
+        if target == decl && !declared.is_empty() { inner_scopes(chain, scopes) } else { Vec::new() };
     let blocked: Vec<_> =
         annex_b.iter().copied().filter(|&n| inner.iter().any(|&s| annex_b_blocked(vm, s, Key::Name(n)))).collect();
     for &n in declared.iter().filter(|n| !annex_b.contains(n)) {
         for &s in &inner {
             let kind = binding_kind(vm, s, Key::Name(n)).unwrap_or(0);
             if kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0 {
-                return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));
+                return Err(Error(
+                    format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)),
+                    None,
+                ));
             }
         }
     }
@@ -923,7 +936,10 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     };
     for &n in declared.iter().filter(|_| global_target) {
         if vm.lexical_declared.contains(&n) && !skipped(vm, n) {
-            return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));
+            return Err(Error(
+                format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)),
+                None,
+            ));
         }
     }
     let made: Vec<_> = declared.iter().copied().filter(|&n| !skipped(vm, n)).collect();
@@ -1007,14 +1023,26 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                     None => ("%none".into(), 0, "".into(), 0),
                 })
                 .collect();
-            let mut module = crate::js::compile_direct_eval_source(&text, strict, new_target, home, live_this, &chain.text(), false, &bound).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval_source(
+                &text,
+                strict,
+                new_target,
+                home,
+                live_this,
+                &chain.text(),
+                false,
+                &bound,
+            )
+            .map_err(eval_error)?;
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             // (Not Annex B's `var` of a function in a block by a
             // block-scoped binding's name, but a catch parameter's: see
             // `eval_annex_b`.)
             let blocked = |n: &str| {
                 module.annex_b.iter().any(|b| b == n)
-                    && bindings.iter().any(|(b, kind, ..)| b == n && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0)
+                    && bindings.iter().any(|(b, kind, ..)| {
+                        b == n && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
+                    })
             };
             let declared: std::rc::Rc<[crate::object::Atom]> =
                 module.declared.iter().filter(|n| !blocked(n)).map(|n| vm.intern_name(n)).collect();
@@ -1025,11 +1053,16 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             for &n in declared.iter().filter(|_| !own_strict) {
                 let name = vm.atom_name(n);
                 if params && name == "arguments" {
-                    return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
+                    return Err(Error(
+                        "SyntaxError: 'arguments' declared by eval in a parameter expression".into(),
+                        None,
+                    ));
                 }
-                if !module.annex_b.iter().any(|b| *b == name) && bindings.iter().any(|(b, kind, ..)| {
-                    b == name && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
-                }) {
+                if !module.annex_b.iter().any(|b| *b == name)
+                    && bindings.iter().any(|(b, kind, ..)| {
+                        b == name && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
+                    })
+                {
                     return Err(Error(format!("SyntaxError: Identifier '{name}' has already been declared"), None));
                 }
             }
@@ -1529,10 +1562,9 @@ fn private_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             }
             call_function(vm, g, o, &[])
         }
-        Some(Desc { get: None, set: Some(_), .. }) => Err(Error::type_error(format!(
-            "'{}' was defined without a getter",
-            crate::symbol::description_string(s)
-        ))),
+        Some(Desc { get: None, set: Some(_), .. }) => {
+            Err(Error::type_error(format!("'{}' was defined without a getter", crate::symbol::description_string(s))))
+        }
         Some(d) => Ok(d.value.unwrap_or(Value::UNDEFINED)),
         None => Err(Error::type_error(format!(
             "Cannot read private member {} from an object whose class did not declare it",

@@ -1,0 +1,5 @@
+# The width most of the code was written at, and rustfmt's "Max"
+# heuristics (a literal, call or chain on one line when it fits): the
+# settings that changed the least of it.
+max_width = 120
+use_small_heuristics = "Max"

@@ -10,12 +10,11 @@ use crate::jit::{HashMap, HashSet};
 use std::fmt;
 
 use crate::asm::Module;
-use crate::object::{Slots, 
-    ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Object, PROTOTYPE, READ_ONLY,
-    Shape,
+use crate::heap::Heap;
+use crate::object::{
+    ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Object, PROTOTYPE, READ_ONLY, Shape, Slots,
     as_object, field_fits, object_value,
 };
-use crate::heap::Heap;
 use crate::value::Value;
 
 /// A JS exception, or a feature not implemented yet: its message, and for
@@ -88,13 +87,8 @@ pub(crate) struct LookupEntry {
 }
 
 impl LookupEntry {
-    const EMPTY: LookupEntry = LookupEntry {
-        shape: std::ptr::null(),
-        name: 0,
-        epoch: 0,
-        holder: std::ptr::null_mut(),
-        slot: 0,
-    };
+    const EMPTY: LookupEntry =
+        LookupEntry { shape: std::ptr::null(), name: 0, epoch: 0, holder: std::ptr::null_mut(), slot: 0 };
 }
 
 use crate::layout::{MEGAS, MegaEntry, MegaStore, mega_index, mega_pair};
@@ -187,7 +181,8 @@ fn typed_length_index(s: *const Shape) -> usize {
 /// [`Vm::interp_megas`]' entry for `shape` and `name`.
 #[inline(always)]
 pub(crate) fn interp_mega_index(shape: *const Shape, name: u32) -> usize {
-    ((shape as u64 ^ (name as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - INTERP_MEGAS.trailing_zeros())) as usize
+    ((shape as u64 ^ (name as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - INTERP_MEGAS.trailing_zeros()))
+        as usize
 }
 
 /// An elements' type code (`Shape::elems_code`) that no value fits.
@@ -210,11 +205,7 @@ pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
         };
         if (*ic).shape.is_null() && ((*ic).loc != BYTES_LOC || (*ic).epoch != kind) {
             let epoch = if (*ic).loc != BYTES_LOC { kind } else { u32::MAX };
-            *ic = Ic {
-                loc: BYTES_LOC,
-                epoch,
-                ..Ic::EMPTY
-            };
+            *ic = Ic { loc: BYTES_LOC, epoch, ..Ic::EMPTY };
         }
     }
 }
@@ -326,11 +317,7 @@ fn shrink_root(root: *const Shape) -> u32 {
 /// a double (see `FieldType::Num`).
 #[inline(always)]
 pub(crate) fn as_field(ft: FieldType, v: Value) -> Value {
-    if ft == FieldType::Num && v.is_int32() {
-        Value::from_f64(v.as_i32_unchecked() as f64)
-    } else {
-        v
-    }
+    if ft == FieldType::Num && v.is_int32() { Value::from_f64(v.as_i32_unchecked() as f64) } else { v }
 }
 
 /// Cache `e` in the slot whose way 0 is at `ic`: in the way caching its
@@ -368,13 +355,7 @@ unsafe fn note_accessor(ic: *mut Ic, shape: *const Shape, holder: *mut Object, e
         if (*shape).dictionary || !(*ic).shape.is_null() || ours(&*ic) && (*ic).new_shape.is_null() {
             return;
         }
-        let e = Ic {
-            holder,
-            new_shape: shape,
-            loc: ACCESSOR_LOC,
-            epoch,
-            ..Ic::EMPTY
-        };
+        let e = Ic { holder, new_shape: shape, loc: ACCESSOR_LOC, epoch, ..Ic::EMPTY };
         if !ours(&*ic) {
             for k in 0..IC_WAYS {
                 *ic.add(k) = Ic::EMPTY;
@@ -406,13 +387,8 @@ unsafe fn global_way(code: &Code, ic: u32) {
 }
 
 impl Ic {
-    const EMPTY: Ic = Ic {
-        shape: std::ptr::null(),
-        holder: std::ptr::null_mut(),
-        new_shape: std::ptr::null(),
-        loc: 0,
-        epoch: 0,
-    };
+    const EMPTY: Ic =
+        Ic { shape: std::ptr::null(), holder: std::ptr::null_mut(), new_shape: std::ptr::null(), loc: 0, epoch: 0 };
 }
 
 /// Over the process: functions loaded with bytecode (compiled up front or
@@ -592,9 +568,7 @@ impl Code {
     pub fn ics(&self) -> &[UnsafeCell<[Ic; IC_WAYS]>] {
         unsafe { &*self.ics.get() }.get_or_init(|| {
             crate::gc::code_bytes(self.ic_names.len() * size_of::<[Ic; IC_WAYS]>());
-            (0..self.ic_names.len())
-                .map(|_| UnsafeCell::new([Ic::EMPTY; IC_WAYS]))
-                .collect()
+            (0..self.ic_names.len()).map(|_| UnsafeCell::new([Ic::EMPTY; IC_WAYS])).collect()
         })
     }
 
@@ -1720,42 +1694,20 @@ impl Vm {
         vm.function_call_fn = call;
         // The constructors, with `prototype` and `constructor` links.
         let g = vm.global;
-        for (name, v) in [("NaN", Value::from_f64(f64::NAN)), ("Infinity", Value::from_f64(f64::INFINITY)), ("undefined", Value::UNDEFINED)] {
+        for (name, v) in [
+            ("NaN", Value::from_f64(f64::NAN)),
+            ("Infinity", Value::from_f64(f64::INFINITY)),
+            ("undefined", Value::UNDEFINED),
+        ] {
             let a = vm.intern_name(name);
-            vm.add_property_with(
-                g,
-                a,
-                v,
-                READ_ONLY | DONT_ENUM | DONT_DELETE,
-            );
+            vm.add_property_with(g, a, v, READ_ONLY | DONT_ENUM | DONT_DELETE);
         }
         vm.number_prototype = vm.new_object_with(Class::Wrapper, op, 4);
         unsafe { (*vm.number_prototype).code = Value::from_i32(0).to_bits() as *const Code };
         let np = vm.number_prototype;
-        vm.define_native(
-            np,
-            "toFixed",
-            number_to_fixed,
-            1,
-            crate::jit::Ty::Any,
-            false,
-        );
-        vm.define_native(
-            np,
-            "toPrecision",
-            number_to_precision,
-            1,
-            crate::jit::Ty::Any,
-            false,
-        );
-        vm.define_native(
-            np,
-            "toString",
-            number_to_string_method,
-            1,
-            crate::jit::Ty::Any,
-            false,
-        );
+        vm.define_native(np, "toFixed", number_to_fixed, 1, crate::jit::Ty::Any, false);
+        vm.define_native(np, "toPrecision", number_to_precision, 1, crate::jit::Ty::Any, false);
+        vm.define_native(np, "toString", number_to_string_method, 1, crate::jit::Ty::Any, false);
         vm.define_native(ap, "indexOf", crate::array::array_index_of, 1, crate::jit::Ty::I32, false);
         let math = vm.new_object_with(Class::Plain, op, 16);
         let a = vm.intern_name("Math");
@@ -1770,12 +1722,7 @@ impl Vm {
             ("SQRT2", std::f64::consts::SQRT_2),
         ] {
             let a = vm.intern_name(name);
-            vm.add_property_with(
-                math,
-                a,
-                Value::from_f64(v),
-                READ_ONLY | DONT_ENUM | DONT_DELETE,
-            );
+            vm.add_property_with(math, a, Value::from_f64(v), READ_ONLY | DONT_ENUM | DONT_DELETE);
         }
         // Results compiled code takes for doubles (checked, and unboxed:
         // `1 / Math.sqrt(x)` divides doubles), for int32s (`Math.floor`'s
@@ -1811,23 +1758,14 @@ impl Vm {
         vm.date_prototype = vm.new_object(op);
         for (name, f, proto) in [
             ("Array", array_constructor as NativeFn, vm.array_prototype),
-            (
-                "Object",
-                object_constructor as NativeFn,
-                vm.object_prototype,
-            ),
+            ("Object", object_constructor as NativeFn, vm.object_prototype),
         ] {
             let c = vm.define_native(g, name, f, 1, crate::jit::Ty::Any, true);
             if name == "Array" {
                 vm.array_fn = c;
             }
             let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-            vm.add_property_with(
-                c,
-                a_p,
-                object_value(proto),
-                READ_ONLY | DONT_ENUM | DONT_DELETE,
-            );
+            vm.add_property_with(c, a_p, object_value(proto), READ_ONLY | DONT_ENUM | DONT_DELETE);
             // Not enumerable, as the builtins' properties.
             vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
         }
@@ -2160,8 +2098,7 @@ impl Vm {
         use std::sync::atomic::Ordering::Relaxed;
         let mut t = std::time::Instant::now();
         let live = |s: *const Shape| unsafe { (*s).pinned.get() || (*s).mark.load(Relaxed) >= from };
-        let (keep, dead): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.shapes).into_iter().partition(|s| live(&**s));
+        let (keep, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shapes).into_iter().partition(|s| live(&**s));
         self.shapes = keep;
         if !dead.is_empty() {
             self.interp_megas.fill(InterpMega::EMPTY);
@@ -2197,7 +2134,9 @@ impl Vm {
         // And the megamorphic store table's transitions (entry 0 holds the
         // prototype epoch's address).
         for e in self.mega_stores[1..].iter_mut() {
-            if e.shape != 0 && (!live(e.shape as *const Shape) || e.new_shape != 0 && !live(e.new_shape as *const Shape)) {
+            if e.shape != 0
+                && (!live(e.shape as *const Shape) || e.new_shape != 0 && !live(e.new_shape as *const Shape))
+            {
                 *e = MegaStore::EMPTY;
             }
         }
@@ -2279,11 +2218,7 @@ impl Vm {
                 }
             }
         }
-        let mut h = Held {
-            held: Default::default(),
-            work: Vec::new(),
-            tables: Default::default(),
-        };
+        let mut h = Held { held: Default::default(), work: Vec::new(), tables: Default::default() };
         if !crate::jit::shape_words(self, &mut |w| h.hold(w)) {
             self.heap.gc.shape_phases.zombies = crate::gc::lap(&mut t);
             return;
@@ -2324,8 +2259,9 @@ impl Vm {
             h.refs(unsafe { &*(a as *const Shape) });
         }
         let held = h.held;
-        let (keep, free): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.zombies).into_iter().partition(|z| held.contains(&(&**z as *const Shape as usize)));
+        let (keep, free): (Vec<_>, Vec<_>) = std::mem::take(&mut self.zombies)
+            .into_iter()
+            .partition(|z| held.contains(&(&**z as *const Shape as usize)));
         self.zombies = keep;
         let ph = &mut self.heap.gc.shape_phases;
         (ph.condemned, ph.zombies_left) = (free.len(), self.zombies.len());
@@ -2342,7 +2278,8 @@ impl Vm {
         use std::hash::{BuildHasher, BuildHasherDefault};
         let n = source.len();
         let ends = (&source[..n.min(64)], &source[n.saturating_sub(64)..]);
-        (n <= EVAL_CACHE_TEXT_MAX).then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one((n, ends, place)))
+        (n <= EVAL_CACHE_TEXT_MAX)
+            .then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one((n, ends, place)))
     }
 
     /// Push a direct `eval`'s scope objects on `eval_envs` (see
@@ -2371,9 +2308,11 @@ impl Vm {
         }
         self.eval_uses += 1;
         let (uses, realm) = (self.eval_uses, self.realm);
-        let e = self.eval_cache.get_mut(&hash?)?.iter_mut().find(|e| {
-            e.place == place && *e.source == *source && unsafe { (*e.code).realm } == realm
-        })?;
+        let e = self
+            .eval_cache
+            .get_mut(&hash?)?
+            .iter_mut()
+            .find(|e| e.place == place && *e.source == *source && unsafe { (*e.code).realm } == realm)?;
         e.used = uses;
         e.recent = true;
         Some(e)
@@ -2578,12 +2517,7 @@ impl Vm {
     /// share transitions; unique shapes get a fresh unique successor. Its
     /// slots extend `shape`'s table in place if `shape` has all of it (see
     /// `Slots::with`).
-    pub(crate) fn transition_with(
-        &mut self,
-        shape: *const Shape,
-        name: Atom,
-        attrs: u8,
-    ) -> *const Shape {
+    pub(crate) fn transition_with(&mut self, shape: *const Shape, name: Atom, attrs: u8) -> *const Shape {
         let s = unsafe { &*shape };
         if !s.unique
             && !s.fixed
@@ -2705,14 +2639,14 @@ impl Vm {
                 fixed: false,
                 transitions: Default::default(),
                 elem_transitions: Default::default(),
-            relied: Cell::new(false),
-            left: Cell::new(false),
-            lineage_relied: Cell::new(false),
-            parent: Self::lineage_parent(s),
-            mark: Default::default(),
-            traced: Cell::new(0),
-            pinned: Cell::new(false),
-            dictionary: false,
+                relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: Self::lineage_parent(s),
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
+                dictionary: false,
             };
             crate::object::set_shape(o, self.add_shape(u));
         }
@@ -2771,13 +2705,7 @@ impl Vm {
     }
 
     /// `add_property` with attributes `attrs`.
-    pub(crate) fn add_property_with(
-        &mut self,
-        o: *mut Object,
-        name: Atom,
-        value: Value,
-        attrs: u8,
-    ) -> u32 {
+    pub(crate) fn add_property_with(&mut self, o: *mut Object, name: Atom, value: Value, attrs: u8) -> u32 {
         let new = self.transition_with(unsafe { (*o).shape }, name, attrs);
         self.add_property_shaped(o, new, value)
     }
@@ -2979,12 +2907,11 @@ impl Vm {
     #[cold]
     #[inline(never)]
     pub(crate) fn int_fields_to_doubles(&mut self) {
-        use crate::heap::{cell_size, meta_load, meta_word, COLOR, GRANULE, YOUNG};
+        use crate::heap::{COLOR, GRANULE, YOUNG, cell_size, meta_load, meta_word};
         if self.int_fields.is_empty() {
             return;
         }
-        let cells: std::collections::HashSet<*const FieldCell> =
-            self.int_fields.drain(..).collect();
+        let cells: std::collections::HashSet<*const FieldCell> = self.int_fields.drain(..).collect();
         for &c in &cells {
             unsafe { (*c).set_ints(false) };
         }
@@ -3110,11 +3037,7 @@ impl Vm {
     /// transitions; unique ones get a fresh unique successor. Past
     /// [`MAX_ELEM_SHAPES`] objects' shapes, elements of objects of another
     /// are of any type.
-    pub(crate) fn elements_transition(
-        &mut self,
-        shape: *const Shape,
-        elems: FieldType,
-    ) -> *const Shape {
+    pub(crate) fn elements_transition(&mut self, shape: *const Shape, elems: FieldType) -> *const Shape {
         let s = unsafe { &*shape };
         // (A dictionary shape's elements are `Any`: none.)
         debug_assert!(!s.dictionary);
@@ -3265,7 +3188,8 @@ impl Vm {
         }
         let o = as_object(o);
         unsafe {
-            if (*o).class != Class::Plain || (*o).flags & PROTOTYPE != 0 || o == self.global || (*(*o).shape).dictionary {
+            if (*o).class != Class::Plain || (*o).flags & PROTOTYPE != 0 || o == self.global || (*(*o).shape).dictionary
+            {
                 return;
             }
             let new = (*o).shape;
@@ -3338,14 +3262,8 @@ impl Vm {
             (0, unsafe { Object::slot(h, loc) } as u64)
         };
         self.megas[0].addr = &raw const self.proto_epoch as u64;
-        self.megas[mega_index(shape, name.0)] = MegaEntry {
-            shape,
-            name: name.0,
-            epoch: self.proto_epoch,
-            off,
-            _pad: 0,
-            addr,
-        };
+        self.megas[mega_index(shape, name.0)] =
+            MegaEntry { shape, name: name.0, epoch: self.proto_epoch, off, _pad: 0, addr };
     }
 
     /// [`Vm::lookup`], without its cache.
@@ -3422,9 +3340,13 @@ impl Vm {
         // `interp::current_vm`, not `self`, and mustn't miss them.)
         let vm: *mut Vm = self;
         unsafe {
-            let _entered = Entered { vm, top: (*vm).native_top, limit: (*vm).native_limit, handles: (*vm).handles.len() };
+            let _entered =
+                Entered { vm, top: (*vm).native_top, limit: (*vm).native_limit, handles: (*vm).handles.len() };
             (*vm).unmovable += 1;
-            std::ptr::write_volatile(&raw mut (*vm).native_limit, (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK));
+            std::ptr::write_volatile(
+                &raw mut (*vm).native_limit,
+                (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK),
+            );
             std::ptr::write_volatile(&raw mut (*vm).native_top, (*vm).stack.as_mut_ptr());
             let r = f(&mut *vm);
             if (*vm).conv_failed() { Err((*vm).take_conv_error()) } else { r }
@@ -3451,9 +3373,7 @@ impl Vm {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
         unsafe {
-            if name == self.a_length
-                && matches!((*o).class, Class::Array | Class::String)
-            {
+            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
                 return Ok(Value::number(self.length_field(o) as f64));
             }
             if name == self.a_length || name == self.a_name {
@@ -3716,8 +3636,7 @@ impl Vm {
     /// what `o.name` finds: its getter-setter pair.
     fn accessor(&self, o: *mut Object, name: Atom) -> Option<Value> {
         let (h, slot) = self.lookup(o, name)?;
-        self.is_accessor(h, slot)
-            .then(|| unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })
+        self.is_accessor(h, slot).then(|| unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })
     }
 
     /// `this.name` through an accessor `pair`'s getter (`undefined`
@@ -3776,8 +3695,7 @@ impl Vm {
                 (g, st) = (*(*pair).elems, *(*pair).elems.add(1));
             }
             let pair = self.new_array();
-            crate::vm::array_push(self, pair, &[get.unwrap_or(g), set.unwrap_or(st)])
-                .expect("an array");
+            crate::vm::array_push(self, pair, &[get.unwrap_or(g), set.unwrap_or(st)]).expect("an array");
             self.define_property(o, name, Some(pair), attrs | ACCESSOR);
         }
     }
@@ -3968,15 +3886,10 @@ impl Vm {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
         unsafe {
-            if name == self.a_length
-                && matches!((*o).class, Class::Array | Class::String)
-            {
+            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
                 // Recorded for the JIT (`jit::Prop::Length`); no shape, so
                 // the interpreter's hit path never takes it.
-                *ic = Ic {
-                    loc: LENGTH_LOC,
-                    ..Ic::EMPTY
-                };
+                *ic = Ic { loc: LENGTH_LOC, ..Ic::EMPTY };
                 return Ok(Value::number(self.length_field(o) as f64));
             }
             if (name == self.a_length || name == self.a_name)
@@ -4053,7 +3966,10 @@ impl Vm {
                 // and the JIT's `get_length` take both.)
                 let w = &*ic;
                 if w.loc != LENGTH_LOC
-                    && !(w.loc == ACCESSOR_LOC && w.holder == h && w.new_shape == (*o).shape && w.epoch == self.proto_epoch)
+                    && !(w.loc == ACCESSOR_LOC
+                        && w.holder == h
+                        && w.new_shape == (*o).shape
+                        && w.epoch == self.proto_epoch)
                 {
                     self.heap.note(object_value(h));
                     note_accessor(ic, (*o).shape, h, self.proto_epoch);
@@ -4220,7 +4136,9 @@ impl Vm {
                             name == self.a_length && (*o).flags & crate::object::FN_LENGTH_DELETED == 0
                                 || name == self.a_name && (*o).flags & crate::object::FN_NAME_DELETED == 0
                         }
-                        Class::Wrapper => name == self.a_length && wrapped(object_value(o)).and_then(string_units).is_some(),
+                        Class::Wrapper => {
+                            name == self.a_length && wrapped(object_value(o)).and_then(string_units).is_some()
+                        }
                         _ => false,
                     };
                 if own {
@@ -4240,13 +4158,7 @@ impl Vm {
     /// given) with attributes `attrs`. An existing property keeps its value
     /// if none is given, and changes its attributes: `o` gets a shape of
     /// its own (no shared transition leads to it).
-    pub(crate) fn define_property(
-        &mut self,
-        o: *mut Object,
-        name: Atom,
-        value: Option<Value>,
-        attrs: u8,
-    ) {
+    pub(crate) fn define_property(&mut self, o: *mut Object, name: Atom, value: Option<Value>, attrs: u8) {
         unsafe {
             let s = &*(*o).shape;
             let Some(slot) = s.lookup(name) else {
@@ -4270,14 +4182,14 @@ impl Vm {
                     fixed: false,
                     transitions: Default::default(),
                     elem_transitions: Default::default(),
-            relied: Cell::new(false),
-            left: Cell::new(false),
-            lineage_relied: Cell::new(false),
-            parent: std::ptr::null(),
-            mark: Default::default(),
-            traced: Cell::new(0),
-            pinned: Cell::new(false),
-            dictionary: false,
+                    relied: Cell::new(false),
+                    left: Cell::new(false),
+                    lineage_relied: Cell::new(false),
+                    parent: std::ptr::null(),
+                    mark: Default::default(),
+                    traced: Cell::new(0),
+                    pinned: Cell::new(false),
+                    dictionary: false,
                 };
                 crate::object::set_shape(o, self.add_shape(u));
                 self.bump_code_epoch();
@@ -4387,10 +4299,7 @@ impl Vm {
         if !self.has_global(name)? {
             // (A script's `var`s are made before it runs: see
             // `global_declarations`.)
-            return Err(Error::reference_error(format!(
-                "{} is not defined",
-                self.atom_name(name)
-            )));
+            return Err(Error::reference_error(format!("{} is not defined", self.atom_name(name))));
         }
         unsafe { global_way(code, ic) };
         self.get_named_miss(code, ic, object_value(g))
@@ -4590,8 +4499,7 @@ impl Vm {
     /// `instanceof`).
     #[inline(always)]
     pub(crate) fn ordinary_has_instance(&mut self, v: Value, f: Value) -> Result<bool> {
-        let callable = f.is_cell()
-            && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
+        let callable = f.is_cell() && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
         if !callable {
             return Ok(false);
         }
@@ -4604,9 +4512,7 @@ impl Vm {
         }
         let p = self.get(f, self.a_prototype)?;
         if !crate::props::is_object(p) {
-            return Err(Error::type_error(
-                "Function has non-object prototype in instanceof check",
-            ));
+            return Err(Error::type_error("Function has non-object prototype in instanceof check"));
         }
         let mut o = as_object(v);
         loop {
@@ -4670,10 +4576,12 @@ impl Vm {
             || unsafe { (*o).class == Class::Wrapper }
                 && string_units(wrapped(object_value(o)).unwrap()).is_some_and(|u| (i as usize) < u.len())
             || crate::far::is_far(o) && crate::far::has(o, i)
-            || unsafe { (*o).flags & crate::object::SPARSE != 0 && {
-                let a = self.intern_name(&i.to_string());
-                (*(*o).shape).lookup(a).is_some()
-            } }
+            || unsafe {
+                (*o).flags & crate::object::SPARSE != 0 && {
+                    let a = self.intern_name(&i.to_string());
+                    (*(*o).shape).lookup(a).is_some()
+                }
+            }
     }
 
     /// `key in obj`: whether `obj` or its prototypes have the property or
@@ -4729,10 +4637,7 @@ impl Vm {
         self.check_own(key, "Vm::delete_property");
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
-                return Err(Error::type_error(format!(
-                    "Cannot convert {} to object",
-                    shown(obj)
-                )));
+                return Err(Error::type_error(format!("Cannot convert {} to object", shown(obj))));
             }
             return Ok(true);
         }
@@ -4778,8 +4683,7 @@ impl Vm {
         unsafe {
             let s = &*(*o).shape;
             let Some(slot) = s.lookup(name) else {
-                return !(name == self.a_length
-                    && matches!((*o).class, Class::Array | Class::String));
+                return !(name == self.a_length && matches!((*o).class, Class::Array | Class::String));
             };
             if !force && s.attrs()[slot as usize] & DONT_DELETE != 0 {
                 return false;
@@ -4819,10 +4723,7 @@ impl Vm {
                 return true;
             }
             let kept: Vec<u32> = (0..n).filter(|&k| k != slot).collect();
-            let values: Vec<Value> = kept
-                .iter()
-                .map(|&k| *Object::slot(o, s.location(k)))
-                .collect();
+            let values: Vec<Value> = kept.iter().map(|&k| *Object::slot(o, s.location(k))).collect();
             self.shape_left(s);
             for &cell in s.fields() {
                 self.field_made_mutable(&*cell);
@@ -5085,13 +4986,7 @@ impl Vm {
 
     /// `GetKeyed` miss: remember the receiver's shape (for the JIT: its
     /// elements' type), then `obj[key]`.
-    pub(crate) fn get_keyed_miss(
-        &mut self,
-        code: &Code,
-        ic: u32,
-        obj: Value,
-        key: Value,
-    ) -> Result<Value> {
+    pub(crate) fn get_keyed_miss(&mut self, code: &Code, ic: u32, obj: Value, key: Value) -> Result<Value> {
         code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         // A string's elements are code units, not values, and a typed
         // array's or buffer's bytes: recorded as such (`note_bytes`).
@@ -5110,13 +5005,7 @@ impl Vm {
         {
             let (ic, _) = code.ic(ic);
             unsafe {
-                install(
-                    ic,
-                    Ic {
-                        shape: (*as_object(obj)).shape,
-                        ..Ic::EMPTY
-                    },
-                );
+                install(ic, Ic { shape: (*as_object(obj)).shape, ..Ic::EMPTY });
             }
         }
         self.get_keyed(obj, key)
@@ -5131,9 +5020,7 @@ impl Vm {
         self.check_own(key, "Vm::get_keyed");
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
-                return Err(Error::type_error(format!(
-                    "Cannot read properties of {obj:?}"
-                )));
+                return Err(Error::type_error(format!("Cannot read properties of {obj:?}")));
             }
             // A number's or a boolean's properties are `Number.prototype`'s
             // or `Boolean.prototype`'s, the primitive the receiver (as
@@ -5307,9 +5194,7 @@ impl Vm {
         self.check_own(value, "Vm::set_keyed");
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
-                return Err(Error::type_error(format!(
-                    "Cannot set properties of {obj:?}"
-                )));
+                return Err(Error::type_error(format!("Cannot set properties of {obj:?}")));
             }
             if let Key::Name(a) = self.property_key(key) {
                 return self.set_primitive(obj, a, value);
@@ -5764,12 +5649,7 @@ impl Vm {
 
     /// A new string of `len` code units, with `words` words after its
     /// header (at least the units'), which `fill` writes from their start.
-    pub(crate) fn new_string_raw(
-        &mut self,
-        len: usize,
-        words: usize,
-        fill: impl FnOnce(*mut u16),
-    ) -> Value {
+    pub(crate) fn new_string_raw(&mut self, len: usize, words: usize, fill: impl FnOnce(*mut u16)) -> Value {
         // (Its callers' strings are short: a long one is a cons string.)
         debug_assert!(len <= MAX_STRING_LEN);
         unsafe {
@@ -5788,13 +5668,9 @@ impl Vm {
     /// A string cell with `words` words of units after its `code`, which
     /// records them (`Object::string_words`, see `heap::cell_size`).
     fn alloc_string(&mut self, words: usize) -> *mut Object {
-        let o = self
-            .heap
-            .alloc(crate::heap::object_bytes(1 + words))
-            .cast::<Object>();
+        let o = self.heap.alloc(crate::heap::object_bytes(1 + words)).cast::<Object>();
         unsafe {
-            o.cast::<[u64; crate::layout::HEADER_WORDS]>()
-                .write(crate::object::object_header(&*self.string_shape));
+            o.cast::<[u64; crate::layout::HEADER_WORDS]>().write(crate::object::object_header(&*self.string_shape));
             Object::set_string_words(o, words);
         }
         o
@@ -5973,24 +5849,13 @@ impl Vm {
     /// `CreateClosure` in frame `regs` of function `current`: the closure's
     /// upvalues (after its in-object slots: see [`Vm::upvalues`]) are open
     /// ones for `regs`' registers, or `current`'s own.
-    pub(crate) fn create_closure_in(
-        &mut self,
-        code: &Code,
-        i: u32,
-        regs: *mut Value,
-        current: *const Object,
-    ) -> Value {
+    pub(crate) fn create_closure_in(&mut self, code: &Code, i: u32, regs: *mut Value, current: *const Object) -> Value {
         self.closure_of(code.closures[i as usize], regs, current)
     }
 
     /// A new closure of `callee` in frame `regs` of function `current`
     /// (see [`Vm::create_closure_in`]).
-    pub(crate) fn closure_of(
-        &mut self,
-        callee: *const Code,
-        regs: *mut Value,
-        current: *const Object,
-    ) -> Value {
+    pub(crate) fn closure_of(&mut self, callee: *const Code, regs: *mut Value, current: *const Object) -> Value {
         unsafe {
             let shape = &*self.closure_shape(callee);
             let ups = &(*callee).upvalues;
@@ -6058,7 +5923,11 @@ impl Vm {
         // async one's, an `%AsyncGeneratorPrototype%` one.)
         let kind = unsafe { (*(*f).code).kind };
         if kind == 4 || kind == 6 {
-            let root = if kind == 6 { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
+            let root = if kind == 6 {
+                crate::symbol::Root::AsyncGeneratorPrototype
+            } else {
+                crate::symbol::Root::GeneratorPrototype
+            };
             let gp = self.symbol_roots.get(root as usize).copied();
             let proto = gp.map_or(Value::NULL, object_value);
             let p = self.new_object(proto);
@@ -6100,12 +5969,7 @@ impl Vm {
             return u;
         }
         let u = self.heap.alloc_upvalue().cast::<Upvalue>();
-        unsafe {
-            u.write(Upvalue {
-                at,
-                closed: Value::UNDEFINED,
-            })
-        };
+        unsafe { u.write(Upvalue { at, closed: Value::UNDEFINED }) };
         self.open_upvalues.insert(k, u);
         u
     }
@@ -6927,7 +6791,9 @@ impl Vm {
     /// error, and the function stays its block's (B.3.2.2, B.3.2.3; see
     /// `intrinsics::annex_b_skipped`).
     pub(crate) fn annex_b_skipped(&mut self, module: &Module, n: &str) -> bool {
-        if self.lexical_declared.is_empty() && Self::is_extensible(self.global) || !module.annex_b.iter().any(|b| b == n) {
+        if self.lexical_declared.is_empty() && Self::is_extensible(self.global)
+            || !module.annex_b.iter().any(|b| b == n)
+        {
             return false;
         }
         let a = self.intern_name(n);
@@ -7613,7 +7479,8 @@ impl Vm {
             f(Root::Object(&mut m.o));
             f(Root::Object(&mut m.scope.0));
         }
-        for v in [&mut self.bind_helper, &mut self.from_async_helper, &mut self.legacy_match.0, &mut self.legacy_input] {
+        for v in [&mut self.bind_helper, &mut self.from_async_helper, &mut self.legacy_match.0, &mut self.legacy_input]
+        {
             f(Root::Value(v));
         }
         for v in self.dispose_roots.iter_mut().chain(self.single_chars.iter_mut()) {
@@ -7803,11 +7670,7 @@ impl Vm {
     /// calls enter compiled code; `i64::MAX` disables the JIT.
     pub fn set_tier_back_edges(&mut self, n: i64) {
         self.frame_budget = n.max(1);
-        self.tier_calls = if n == i64::MAX {
-            i32::MAX
-        } else {
-            n.clamp(1, TIER_CALLS as i64) as i32
-        };
+        self.tier_calls = if n == i64::MAX { i32::MAX } else { n.clamp(1, TIER_CALLS as i64) as i32 };
     }
 
     /// How often `function`'s inline caches missed in the interpreter (for
@@ -7838,12 +7701,7 @@ impl Vm {
         // (Not a native of that name, `Set.prototype.add` say.)
         let code = self.codes.iter().find(|c| c.name == function && c.native.is_none())?;
         let jit = code.jit.borrow();
-        let names = jit
-            .as_ref()?
-            .last_code()?
-            .stencils()
-            .map(String::from)
-            .collect();
+        let names = jit.as_ref()?.last_code()?.stencils().map(String::from).collect();
         Some(names)
     }
 
@@ -7853,7 +7711,6 @@ impl Vm {
         unsafe { (*(*as_object(o)).shape).capacity.get() }
     }
 }
-
 
 /// What `load` needs of a function's code in one pass: whether it has a
 /// loop ([`Scan::has_loop`]), whether an interpreter fallback needs an
@@ -8010,11 +7867,7 @@ const COMPILE_SIZE_MAX: usize = 200_000;
 fn recursive_functions(module: &Module) -> Vec<bool> {
     use crate::bytecode::Op;
     let fs = &module.functions;
-    let by_name: HashMap<&str, usize> = fs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (f.name.as_str(), i))
-        .collect();
+    let by_name: HashMap<&str, usize> = fs.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
     // The inline-cache slots of `f`'s global loads that only feed a
     // property read.
     let property_bases = |f: &crate::asm::FunctionDef| {
@@ -8101,11 +7954,41 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
 fn is_leaf(f: NativeFn) -> bool {
     use crate::builtins as b;
     let math: [NativeFn; 35] = [
-        math_log, math_exp, math_sqrt, math_abs, math_floor, math_ceil, math_round, math_sin, math_cos, math_pow,
-        math_min, math_max, math_random, b::math_tan, b::math_atan, b::math_atan2, b::math_asin, b::math_acos,
-        b::math_imul, b::math_cbrt, b::math_clz32, b::math_cosh, b::math_sinh, b::math_tanh, b::math_acosh,
-        b::math_asinh, b::math_atanh, b::math_expm1, b::math_log1p, b::math_log2, b::math_log10, b::math_sign,
-        b::math_trunc, b::math_fround, b::math_hypot,
+        math_log,
+        math_exp,
+        math_sqrt,
+        math_abs,
+        math_floor,
+        math_ceil,
+        math_round,
+        math_sin,
+        math_cos,
+        math_pow,
+        math_min,
+        math_max,
+        math_random,
+        b::math_tan,
+        b::math_atan,
+        b::math_atan2,
+        b::math_asin,
+        b::math_acos,
+        b::math_imul,
+        b::math_cbrt,
+        b::math_clz32,
+        b::math_cosh,
+        b::math_sinh,
+        b::math_tanh,
+        b::math_acosh,
+        b::math_asinh,
+        b::math_atanh,
+        b::math_expm1,
+        b::math_log1p,
+        b::math_log2,
+        b::math_log10,
+        b::math_sign,
+        b::math_trunc,
+        b::math_fround,
+        b::math_hypot,
     ];
     math.iter().any(|&g| g as usize == f as usize)
 }
@@ -8114,8 +7997,7 @@ fn is_leaf(f: NativeFn) -> bool {
 /// plain object (there are no wrapper objects yet).
 /// Argument `i` as a number (ToNumber), `NaN` if missing.
 fn num_arg(args: &[Value], i: usize) -> f64 {
-    args.get(i)
-        .map_or(f64::NAN, |&v| crate::interp::to_number(v))
+    args.get(i).map_or(f64::NAN, |&v| crate::interp::to_number(v))
 }
 
 fn math_log(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -8223,8 +8105,7 @@ fn math_random(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// `this` as a number for `Number.prototype` methods.
 fn this_number(this: Value) -> Result<f64> {
     let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
-    n.as_number()
-        .ok_or_else(|| Error::type_error("Number.prototype method called on a non-number"))
+    n.as_number().ok_or_else(|| Error::type_error("Number.prototype method called on a non-number"))
 }
 
 /// `Number.prototype.toFixed(digits)`: rounded to `digits` (0 to 100)
@@ -8233,9 +8114,7 @@ fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let x = this_number(this)?;
     let f = to_integer_arg(vm, a.first().copied())?;
     if !(0.0..=100.0).contains(&f) {
-        return Err(Error::range_error(
-            "toFixed() digits argument must be between 0 and 100",
-        ));
+        return Err(Error::range_error("toFixed() digits argument must be between 0 and 100"));
     }
     let f = f as usize;
     let s = if !x.is_finite() || x.abs() >= 1e21 {
@@ -8251,11 +8130,7 @@ fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let (int, frac) = digits.split_at(digits.len() - f);
         // (The spec's sign: of x, even when it rounds to 0; -0 has none.)
         let sign = if x < 0.0 { "-" } else { "" };
-        if f == 0 {
-            format!("{sign}{int}")
-        } else {
-            format!("{sign}{int}.{frac}")
-        }
+        if f == 0 { format!("{sign}{int}") } else { format!("{sign}{int}.{frac}") }
     };
     let units: Vec<u16> = s.encode_utf16().collect();
     Ok(vm.new_string(&units))
@@ -8368,17 +8243,11 @@ fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 number_to_string(x)
             } else {
                 if !(1.0..=100.0).contains(&p) {
-                    return Err(Error::range_error(
-                        "toPrecision() argument must be between 1 and 100",
-                    ));
+                    return Err(Error::range_error("toPrecision() argument must be between 1 and 100"));
                 }
                 let p = p as usize;
                 if x == 0.0 {
-                    if p == 1 {
-                        "0".into()
-                    } else {
-                        format!("0.{}", "0".repeat(p - 1))
-                    }
+                    if p == 1 { "0".into() } else { format!("0.{}", "0".repeat(p - 1)) }
                 } else {
                     let (n, exp) = significant(x.abs(), p);
                     let sign = if x < 0.0 { "-" } else { "" };
@@ -8409,9 +8278,7 @@ pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> 
     if !(2.0..=36.0).contains(&radix) {
         return Err(Error::range_error("toString() radix must be between 2 and 36"));
     }
-    let units: Vec<u16> = crate::builtins::radix_string(this_number(this)?, radix as u32)
-        .encode_utf16()
-        .collect();
+    let units: Vec<u16> = crate::builtins::radix_string(this_number(this)?, radix as u32).encode_utf16().collect();
     Ok(vm.new_string(&units))
 }
 
@@ -8799,7 +8666,10 @@ unsafe fn flatten(o: *mut Object) {
         // written here: `gc::trace`). They need no shading: the marking's
         // barrier is on stores, not deletions, a half still reachable is
         // marked where it is.
-        use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Relaxed, Release}};
+        use std::sync::atomic::{
+            AtomicPtr, AtomicU64,
+            Ordering::{Relaxed, Release},
+        };
         (*(&raw mut (*o).props as *const AtomicU64)).store(0, Relaxed);
         (*(&raw mut (*o).code as *const AtomicU64)).store(0, Relaxed);
         (*(&raw mut (*o).elems as *const AtomicPtr<Value>)).store(buf.cast(), Release);
@@ -9127,7 +8997,8 @@ impl RunState {
     /// unwinding (see [`RunState`]).
     fn unwound(&self, vm: &mut Vm) {
         vm.eval_depth = self.eval_depth;
-        (vm.pending_args, vm.new_target, vm.native_new_target) = (self.pending_args, self.new_target, self.native_new_target);
+        (vm.pending_args, vm.new_target, vm.native_new_target) =
+            (self.pending_args, self.new_target, self.native_new_target);
         (vm.constructing, vm.callee) = (self.constructing, self.callee);
         vm.held_atoms.truncate(self.held.0);
         (vm.holding, vm.held_serial) = (self.held.1, self.held.2);
@@ -9432,7 +9303,9 @@ out.join();"#;
         let mut b = Vm::new();
         let s = cons(&mut a);
         let r = a.enter(|_| {
-            let r = catch_unwind(AssertUnwindSafe(|| b.enter(|_| Ok(Value::from_i32(string_units(s).unwrap().len() as i32)))));
+            let r = catch_unwind(AssertUnwindSafe(|| {
+                b.enter(|_| Ok(Value::from_i32(string_units(s).unwrap().len() as i32)))
+            }));
             Ok(Value::from_bool(r.is_err()))
         });
         assert_eq!(r.unwrap(), Value::TRUE);

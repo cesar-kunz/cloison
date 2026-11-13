@@ -8,7 +8,9 @@ use crate::layout::{store_word, swap_words};
 use crate::object::{Class, EXTERNAL, Object, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
-use crate::vm::{Error, Key, NativeFn, Result, Vm, array_push, check_string_len, is_string, push_string, string_len, string_units};
+use crate::vm::{
+    Error, Key, NativeFn, Result, Vm, array_push, check_string_len, is_string, push_string, string_len, string_units,
+};
 
 pub(crate) fn install(vm: &mut Vm) {
     let ap = vm.array_prototype;
@@ -192,10 +194,7 @@ fn this_object(vm: &mut Vm, this: Value) -> Result<(Value, f64)> {
 fn callback(a: &[Value], what: &str) -> Result<Value> {
     let f = arg(a, 0);
     if !is_callable(f) {
-        return Err(Error::type_error(format!(
-            "{} is not a function (Array.prototype.{what})",
-            crate::vm::shown(f)
-        )));
+        return Err(Error::type_error(format!("{} is not a function (Array.prototype.{what})", crate::vm::shown(f))));
     }
     Ok(f)
 }
@@ -265,7 +264,9 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
         }
         let ps = &*(*ap).shape;
         let Some(k) = ps.lookup(vm.a_constructor) else { return false };
-        if ps.attrs()[k as usize] & crate::object::ACCESSOR != 0 || *Object::slot(ap, ps.location(k)) != object_value(vm.array_fn) {
+        if ps.attrs()[k as usize] & crate::object::ACCESSOR != 0
+            || *Object::slot(ap, ps.location(k)) != object_value(vm.array_fn)
+        {
             return false;
         }
         let a = vm.array_fn;
@@ -278,7 +279,8 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
         let g = *(*pair).elems;
         g.is_cell() && {
             let g = as_object(g);
-            (*g).class == Class::Native && (*(*g).code).native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
+            (*g).class == Class::Native
+                && (*(*g).code).native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
         }
     }
 }
@@ -304,7 +306,15 @@ fn spreadable(vm: &mut Vm, v: Value) -> Result<bool> {
 
 /// FlattenIntoArray: `source`'s elements into `target` from `start`, to
 /// `depth` (mapped first by `f` with `that`, if given): the next index.
-fn flatten(vm: &mut Vm, target: Value, source: Value, len: f64, start: f64, depth: f64, f: Option<(Value, Value)>) -> Result<f64> {
+fn flatten(
+    vm: &mut Vm,
+    target: Value,
+    source: Value,
+    len: f64,
+    start: f64,
+    depth: f64,
+    f: Option<(Value, Value)>,
+) -> Result<f64> {
     // (Nested deeply, or in a cycle, as deep as `depth`: a RangeError.)
     crate::interp::check_native_stack(vm)?;
     let mut at = start;
@@ -704,7 +714,11 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // (The arguments' conversions and the species lookup may have run
     // code that changed the length: the fast path only over the one
     // measured. A species may return `o` itself: the copy then overlaps.)
-    if out != o && dense(vm, as_object(o)) && dense(vm, as_object(out)) && unsafe { (*as_object(o)).elems_len } as f64 == len {
+    if out != o
+        && dense(vm, as_object(o))
+        && dense(vm, as_object(out))
+        && unsafe { (*as_object(o)).elems_len } as f64 == len
+    {
         let obj = as_object(o);
         let oo = as_object(out);
         unsafe {

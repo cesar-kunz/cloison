@@ -17,10 +17,7 @@ fn run(src: &str) -> Result<Value, Error> {
         let r = vm.run(&m);
         results.push(r.as_ref().map(|&v| display(v)).map_err(Clone::clone));
         if budget == 1000 {
-            assert!(
-                results.windows(2).all(|w| w[0] == w[1]),
-                "interpreter, tier at 1, 2, 1000: {results:?}"
-            );
+            assert!(results.windows(2).all(|w| w[0] == w[1]), "interpreter, tier at 1, 2, 1000: {results:?}");
             return r;
         }
     }
@@ -50,12 +47,7 @@ fn with_main(rest: &str) -> String {
 
 #[test]
 fn globals_and_reference_errors() {
-    assert_eq!(
-        ok(
-            "script\n LdaSmi 4\n StaGlobal x\n LdaSmi 5\n StaGlobal x\n LdaGlobal x\n Return\nend\n"
-        ),
-        "5"
-    );
+    assert_eq!(ok("script\n LdaSmi 4\n StaGlobal x\n LdaSmi 5\n StaGlobal x\n LdaGlobal x\n Return\nend\n"), "5");
     let e = run("script\n LdaGlobal nope\n Return\nend\n").unwrap_err();
     assert_eq!(e.0, "ReferenceError: nope is not defined");
 }
@@ -93,10 +85,7 @@ fn missing_properties_are_undefined() {
 #[test]
 fn reading_a_property_of_undefined_is_a_type_error() {
     let e = run("script\n LdaUndefined\n Star r1\n GetNamed r1, x\n Return\nend\n").unwrap_err();
-    assert_eq!(
-        e.0,
-        "TypeError: Cannot read properties of undefined (reading 'x')"
-    );
+    assert_eq!(e.0, "TypeError: Cannot read properties of undefined (reading 'x')");
 }
 
 /// `function K() {}`, `K.prototype.m = function () { return 1; }`, then a
@@ -281,23 +270,18 @@ fn recursion_uses_the_vm_stack() {
 fn unbounded_recursion_is_a_range_error() {
     // `main() + 1`: not a tail call, which compiled code would make a
     // loop (unbounded, that runs forever).
-    let src = with_main(
-        "function main()\n LdaGlobal main\n Star r1\n CallUndefined r1, r2, 0\n AddSmi 1\n Return\nend\n",
-    );
+    let src =
+        with_main("function main()\n LdaGlobal main\n Star r1\n CallUndefined r1, r2, 0\n AddSmi 1\n Return\nend\n");
     let e = run(&src).unwrap_err();
     assert_eq!(e.0, "RangeError: Maximum call stack size exceeded");
 }
 
 #[test]
 fn calling_a_non_function_is_a_type_error() {
-    let e =
-        run("script\n LdaSmi 3\n Star r1\n CallUndefined r1, r2, 0\n Return\nend\n").unwrap_err();
+    let e = run("script\n LdaSmi 3\n Star r1\n CallUndefined r1, r2, 0\n Return\nend\n").unwrap_err();
     assert!(e.0.starts_with("TypeError: 3 is not a function"), "{e}");
     let e = run("script\n LdaNull\n Star r1\n Construct r1, r2, 0\n Return\nend\n").unwrap_err();
-    assert!(
-        e.0.starts_with("TypeError: null is not a constructor"),
-        "{e}"
-    );
+    assert!(e.0.starts_with("TypeError: null is not a constructor"), "{e}");
 }
 
 #[test]
@@ -352,15 +336,8 @@ fn loose_equality_and_truthiness() {
         let src = format!("script\n {a}\n Star r1\n {b}\n {op} r1\n Return\nend\n");
         assert_eq!(ok(&src), want.to_string(), "{a} == {b}");
     }
-    for (v, truthy) in [
-        ("LdaSmi 0", false),
-        ("LdaSmi -3", true),
-        ("LdaNull", false),
-        ("CreateArray 0", true),
-    ] {
-        let src = format!(
-            "script\n {v}\n JumpIfToBooleanTrue t\n LdaFalse\n Return\nt: LdaTrue\n Return\nend\n"
-        );
+    for (v, truthy) in [("LdaSmi 0", false), ("LdaSmi -3", true), ("LdaNull", false), ("CreateArray 0", true)] {
+        let src = format!("script\n {v}\n JumpIfToBooleanTrue t\n LdaFalse\n Return\nt: LdaTrue\n Return\nend\n");
         assert_eq!(ok(&src), truthy.to_string(), "{v}");
     }
 }
@@ -369,20 +346,11 @@ fn loose_equality_and_truthiness() {
 fn modulo_and_bitwise_edge_cases() {
     let one = |body: &str| ok(&format!("script\n{body}\n Return\nend\n"));
     assert_eq!(one(" LdaSmi -7\n ModSmi 3"), "-1");
-    assert_eq!(
-        display(run("script\n LdaSmi -6\n ModSmi 3\n Return\nend\n").unwrap()),
-        "0"
-    );
+    assert_eq!(display(run("script\n LdaSmi -6\n ModSmi 3\n Return\nend\n").unwrap()), "0");
     let v = run("script\n LdaSmi -6\n ModSmi 3\n Return\nend\n").unwrap();
-    assert!(
-        v.is_double() && v.as_f64_unchecked().is_sign_negative(),
-        "-6 % 3 is -0"
-    );
+    assert!(v.is_double() && v.as_f64_unchecked().is_sign_negative(), "-6 % 3 is -0");
     assert_eq!(one(" LdaSmi 7\n ModSmi 0"), "NaN");
-    assert_eq!(
-        one(" LdaSmi 2147483647\n AddSmi 1\n BitOrSmi 0"),
-        "-2147483648"
-    );
+    assert_eq!(one(" LdaSmi 2147483647\n AddSmi 1\n BitOrSmi 0"), "-2147483648");
     assert_eq!(one(" LdaUndefined\n BitAndSmi 7"), "0");
     assert_eq!(one(" LdaSmi 13\n BitAndSmi 6"), "4");
 }
@@ -1441,10 +1409,7 @@ call:   CallUndefined r2, r3, 1
 end
 ";
     let e = run(src).unwrap_err();
-    assert_eq!(
-        e.0,
-        "TypeError: Cannot read properties of undefined (reading 'x')"
-    );
+    assert_eq!(e.0, "TypeError: Cannot read properties of undefined (reading 'x')");
 }
 
 #[test]
@@ -1527,10 +1492,7 @@ end
     let (v, s) = jit(src);
     assert_eq!(v, "2002");
     // `new Box` inlined (its `this` allocated in the stencil), and `push`.
-    assert!(
-        s.iter().any(|n| n.starts_with("guard_word+create_object")),
-        "{s:?}"
-    );
+    assert!(s.iter().any(|n| n.starts_with("guard_word+create_object")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("array_push")), "{s:?}");
 }
 
@@ -1828,10 +1790,7 @@ call:   CallUndefined r2, r3, 1
 end
 ";
     let e = run(src).unwrap_err();
-    assert_eq!(
-        e.0,
-        "TypeError: Cannot read properties of undefined (reading 'x')"
-    );
+    assert_eq!(e.0, "TypeError: Cannot read properties of undefined (reading 'x')");
 }
 
 // ---- Direct calls between compiled functions ----
@@ -1843,9 +1802,7 @@ end
 /// `function name(k) { calls++; s = k; for (i = 0; i < 10; i++) s += i;
 /// return s + 64 × step }`, padded with 64 `AddSmi step`.
 fn padded(name: &str, step: i32) -> String {
-    let pad: String = (0..64)
-        .map(|_| format!("        AddSmi {step}\n"))
-        .collect();
+    let pad: String = (0..64).map(|_| format!("        AddSmi {step}\n")).collect();
     format!(
         "function {name}(k)\n        LdaGlobal calls\n        Inc\n        StaGlobal calls\n\
          \x20       Ldar r1\n        Star r3\n        LdaSmi 0\n        Star r2\n\
@@ -1860,11 +1817,7 @@ fn padded(name: &str, step: i32) -> String {
 /// r5 holds 2147483600 and r6 the function `f2` (or `f1`, without one), so
 /// that hooks change no inline cache the compiled loop depends on.
 fn direct_program(n: i32, hook: &str, functions: &str) -> String {
-    let second = if functions.contains("function f2(") {
-        "f2"
-    } else {
-        "f1"
-    };
+    let second = if functions.contains("function f2(") { "f2" } else { "f1" };
     format!(
         "script\n        LdaSmi 0\n        StaGlobal calls\n\
          \x20       CreateClosure f1\n        StaGlobal f\n        CreateClosure {second}\n        StaGlobal g\n\
@@ -1907,11 +1860,7 @@ fn direct_calls_returning_doubles() {
     let expected: u64 = 500 * (2 * 2147483600 + 109) + 500;
     let (v, s) = jit(&src);
     assert_eq!(v, expected.to_string());
-    assert!(
-        s.iter()
-            .any(|n| n.replace("_code", "") == "call_direct+check_acc_num+unbox_num_acc"),
-        "{s:?}"
-    );
+    assert!(s.iter().any(|n| n.replace("_code", "") == "call_direct+check_acc_num+unbox_num_acc"), "{s:?}");
 }
 
 /// A script whose `main` loops 500 times over `total += m.call(o, i).x`
@@ -1991,10 +1940,7 @@ end
 fn direct_calls_returning_objects() {
     let (v, s) = jit(&object_program(""));
     assert_eq!(v, (500 * 5 + 500).to_string());
-    assert!(
-        s.iter().any(|n| n == "call_direct+check_acc_shape"),
-        "{s:?}"
-    );
+    assert!(s.iter().any(|n| n == "call_direct+check_acc_shape"), "{s:?}");
     // `x` is out of line: arrays have no in-object slots.
     assert!(s.iter().any(|n| n.starts_with("get_oop_nc_")), "{s:?}");
 }
@@ -2188,14 +2134,8 @@ fn runtime_call_results_are_predicted() {
     assert!(s.iter().any(|n| n == "ctor_check"), "{s:?}");
     assert!(!s.iter().any(|n| n.contains("create_object")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("array_push")), "{s:?}");
-    assert!(
-        s.iter().filter(|n| n.starts_with("add_ii_") || n.starts_with("add_into_")).count() >= 2,
-        "{s:?}"
-    );
-    let two = src.replace(
-        "        Call r6, r7, 1\n",
-        "        Ldar r1\n        Star r9\n        Call r6, r7, 2\n",
-    );
+    assert!(s.iter().filter(|n| n.starts_with("add_ii_") || n.starts_with("add_into_")).count() >= 2, "{s:?}");
+    let two = src.replace("        Call r6, r7, 1\n", "        Ldar r1\n        Star r9\n        Call r6, r7, 2\n");
     // Σ i + Σ 2 (i + 1).
     let (v, s) = jit(&two);
     assert_eq!(v, (299 * 300 / 2 + 300 * 301).to_string());
@@ -2227,9 +2167,8 @@ fn exits_in_direct_constructors() {
 /// the shape `Box`'s version was bound for, and goes through the runtime.
 #[test]
 fn direct_constructors_whose_root_changes() {
-    let mut body = String::from(
-        "        Ldar r1\n        SetNamed r0, v\n        Ldar r1\n        JumpIfLessSmi 200, done\n",
-    );
+    let mut body =
+        String::from("        Ldar r1\n        SetNamed r0, v\n        Ldar r1\n        JumpIfLessSmi 200, done\n");
     for p in ["a", "b", "c", "d", "e"] {
         body += &format!("        LdaSmi 0\n        SetNamed r0, {p}\n");
     }
@@ -2461,10 +2400,7 @@ end
         )
     };
     // Inlined (returning nothing), and called directly (returning `this`).
-    for (ret, stencil) in [
-        ("LdaUndefined", "guard_word+create_object"),
-        ("Ldar r0", "construct_direct"),
-    ] {
+    for (ret, stencil) in [("LdaUndefined", "guard_word+create_object"), ("Ldar r0", "construct_direct")] {
         let (v, s) = jit(&src(ret));
         // Σ i + (i + 1) + 2 (i + 2) = 2n(n - 1) + 5n.
         assert_eq!(v, (2 * 20000 * 19999 + 5 * 20000).to_string());
@@ -2644,11 +2580,7 @@ end
     vm.set_tier_back_edges(2);
     assert_eq!(display(vm.run(&m).unwrap()), "700");
     let s = vm.jit_stencils("F").unwrap_or_default();
-    assert!(
-        s.iter()
-            .any(|n| n.starts_with("star_") || n.starts_with("spill_")),
-        "{s:?}"
-    );
+    assert!(s.iter().any(|n| n.starts_with("star_") || n.starts_with("spill_")), "{s:?}");
     assert!(!s.iter().any(|n| n == "bail"), "{s:?}");
 }
 
@@ -2739,9 +2671,7 @@ fn small_callees_past_the_inlining_depth() {
              \x20       Star r3\n        CallUndefined r2, r3, 1\n        AddSmi 1\n        Return\nend\n"
         )
     };
-    let leaf = |name: &str| {
-        format!("function {name}(k)\n        Ldar r1\n        AddSmi 1\n        Return\nend\n")
-    };
+    let leaf = |name: &str| format!("function {name}(k)\n        Ldar r1\n        AddSmi 1\n        Return\nend\n");
     let program = |c: String, extra: u64| {
         let src = format!(
             "script\n        CreateClosure a\n        StaGlobal a\n        CreateClosure b\n\
@@ -2882,10 +2812,7 @@ fn tail_sum_program(n: i32) -> String {
 fn self_tail_calls_are_loops() {
     let (v, s) = jit_function(&tail_sum_program(10000), "sum");
     assert_eq!(v, (10000 * 10001 / 2).to_string());
-    assert!(
-        s.iter().any(|n| n.starts_with("check_tail_callee_")),
-        "{s:?}"
-    );
+    assert!(s.iter().any(|n| n.starts_with("check_tail_callee_")), "{s:?}");
     assert!(!s.iter().any(|n| n.starts_with("call")), "{s:?}");
 }
 
@@ -2942,10 +2869,7 @@ end
 ";
     let (v, s) = jit_function(src, "f");
     assert_eq!(v, "300");
-    assert!(
-        s.iter().any(|n| n.starts_with("check_tail_callee_")),
-        "{s:?}"
-    );
+    assert!(s.iter().any(|n| n.starts_with("check_tail_callee_")), "{s:?}");
 }
 
 /// `F` tail-calls itself, and is compiled by plain calls; at the end it
@@ -2997,10 +2921,7 @@ end
 ";
     let (v, s) = jit_function(src, "F");
     assert_eq!(v, "false");
-    assert!(
-        s.iter().any(|n| n.starts_with("check_tail_callee_")),
-        "{s:?}"
-    );
+    assert!(s.iter().any(|n| n.starts_with("check_tail_callee_")), "{s:?}");
 }
 
 /// `fib` split over `f` and `g`, which call each other (`pad` after their
@@ -3032,10 +2953,7 @@ fn mutual_program(n: i32, pad: usize) -> String {
 fn mutual_recursion_inlined() {
     let (v, s) = jit_function(&mutual_program(20, 0), "f");
     assert_eq!(v, "6765");
-    let typed = s
-        .iter()
-        .filter(|n| *n == "call_direct+check_acc_int")
-        .count();
+    let typed = s.iter().filter(|n| *n == "call_direct+check_acc_int").count();
     assert!(typed >= 2, "{s:?}");
 }
 
@@ -3055,10 +2973,7 @@ fn mutual_recursion_direct() {
     assert_eq!(expected, "6765");
     for name in ["f", "g"] {
         let s = vm.jit_stencils(name).unwrap_or_default();
-        let typed = s
-            .iter()
-            .filter(|n| *n == "call_direct+check_acc_int")
-            .count();
+        let typed = s.iter().filter(|n| *n == "call_direct+check_acc_int").count();
         assert_eq!(typed, 2, "{name}: {s:?}");
         assert_eq!(vm.jit_bound_direct_calls(name), 2, "{name}");
     }
@@ -3072,16 +2987,7 @@ fn exits_in_direct_callees_finish_in_the_interpreter() {
     let hook = "        Ldar r1\n        TestEqualSmi 300\n        JumpIfFalse call\n\
                 \x20       Ldar r5\n        Star r4\n";
     let src = direct_program(500, hook, &padded("f1", 1));
-    let expected: u64 = (0..500u64)
-        .map(|i| {
-            if i == 300 {
-                2147483600 + 109
-            } else {
-                (i & 7) + 109
-            }
-        })
-        .sum::<u64>()
-        + 500;
+    let expected: u64 = (0..500u64).map(|i| if i == 300 { 2147483600 + 109 } else { (i & 7) + 109 }).sum::<u64>() + 500;
     let (v, s) = jit(&src);
     assert_eq!(v, expected.to_string());
     // The call's result was a double then, failing the check that it was
@@ -3098,10 +3004,7 @@ fn direct_calls_check_the_callee() {
                 \x20       Ldar r6\n        Star r3\n";
     let functions = padded("f1", 1) + &padded("f2", 2);
     let src = direct_program(500, hook, &functions);
-    let expected: u64 = (0..500u64)
-        .map(|i| (i & 7) + 45 + if i < 300 { 64 } else { 128 })
-        .sum::<u64>()
-        + 500;
+    let expected: u64 = (0..500u64).map(|i| (i & 7) + 45 + if i < 300 { 64 } else { 128 }).sum::<u64>() + 500;
     assert_eq!(jit(&src).0, expected.to_string());
 }
 
@@ -3119,10 +3022,7 @@ fn errors_in_direct_callees() {
                 \x20       LdaUndefined\n        Star r4\n";
     let src = direct_program(500, hook, &f1);
     let e = run(&src).unwrap_err();
-    assert_eq!(
-        e.0,
-        "TypeError: Cannot read properties of undefined (reading 'x')"
-    );
+    assert_eq!(e.0, "TypeError: Cannot read properties of undefined (reading 'x')");
 }
 
 #[test]

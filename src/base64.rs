@@ -335,6 +335,7 @@ fn to_hex(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let bytes = bytes_of(vm, uint8_array(this)?)?;
     crate::vm::check_string_len(2 * bytes.len())?;
     let digits = b"0123456789abcdef";
-    let out: Vec<u16> = bytes.iter().flat_map(|&b| [digits[(b >> 4) as usize] as u16, digits[(b & 15) as usize] as u16]).collect();
+    let out: Vec<u16> =
+        bytes.iter().flat_map(|&b| [digits[(b >> 4) as usize] as u16, digits[(b & 15) as usize] as u16]).collect();
     Ok(vm.new_string(&out))
 }

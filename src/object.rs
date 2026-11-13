@@ -364,11 +364,7 @@ impl Object {
     #[inline(always)]
     pub unsafe fn inline_cap(this: *const Object) -> usize {
         unsafe {
-            if (*this).class == Class::TypedArray {
-                0
-            } else {
-                (*this).kind as usize | ((*this).cap_hi as usize) << 8
-            }
+            if (*this).class == Class::TypedArray { 0 } else { (*this).kind as usize | ((*this).cap_hi as usize) << 8 }
         }
     }
 
@@ -442,10 +438,17 @@ impl Object {
     /// `this` must be a string.
     #[inline(always)]
     pub unsafe fn string_words(this: *const Object) -> usize {
-        use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed}};
+        use std::sync::atomic::{
+            AtomicPtr, AtomicU64,
+            Ordering::{Acquire, Relaxed},
+        };
         unsafe {
             let elems = (*(&raw const (*this).elems as *const AtomicPtr<Value>)).load(Acquire);
-            if elems.is_null() { 0 } else { (*(&raw const (*this).code as *const AtomicU64)).load(Relaxed) as u32 as usize }
+            if elems.is_null() {
+                0
+            } else {
+                (*(&raw const (*this).code as *const AtomicU64)).load(Relaxed) as u32 as usize
+            }
         }
     }
 
@@ -501,13 +504,7 @@ impl Object {
     /// `this` must be a live object and `loc` a location in its shape.
     #[inline(always)]
     pub unsafe fn slot(this: *mut Object, loc: i32) -> *mut Value {
-        unsafe {
-            if loc >= 0 {
-                this.cast::<u8>().add(loc as usize).cast()
-            } else {
-                (*this).props.add(!loc as usize)
-            }
-        }
+        unsafe { if loc >= 0 { this.cast::<u8>().add(loc as usize).cast() } else { (*this).props.add(!loc as usize) } }
     }
 
     /// In-object slot `i`.
@@ -1136,7 +1133,8 @@ impl SlotTable {
     fn layout(cap: u32) -> (std::alloc::Layout, usize, usize) {
         use std::alloc::Layout;
         let n = cap as usize;
-        let (l, keys) = Layout::array::<*const FieldCell>(n).unwrap().extend(Layout::array::<Atom>(n).unwrap()).unwrap();
+        let (l, keys) =
+            Layout::array::<*const FieldCell>(n).unwrap().extend(Layout::array::<Atom>(n).unwrap()).unwrap();
         let (l, attrs) = l.extend(Layout::array::<u8>(n).unwrap()).unwrap();
         (l, keys, attrs)
     }

@@ -43,7 +43,15 @@ fn ccc(c: u32) -> u8 {
     if c < 0x300 {
         return 0;
     }
-    match CCC.binary_search_by(|&(a, b, _)| if b < c { std::cmp::Ordering::Less } else if a > c { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }) {
+    match CCC.binary_search_by(|&(a, b, _)| {
+        if b < c {
+            std::cmp::Ordering::Less
+        } else if a > c {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }) {
         Ok(i) => CCC[i].2,
         Err(_) => 0,
     }
@@ -78,7 +86,10 @@ fn compose(a: u32, b: u32) -> Option<u32> {
     if (L_BASE..L_BASE + L_COUNT).contains(&a) && (V_BASE..V_BASE + V_COUNT).contains(&b) {
         return Some(S_BASE + ((a - L_BASE) * V_COUNT + (b - V_BASE)) * T_COUNT);
     }
-    if (S_BASE..S_BASE + S_COUNT).contains(&a) && (a - S_BASE).is_multiple_of(T_COUNT) && (T_BASE + 1..T_BASE + T_COUNT).contains(&b) {
+    if (S_BASE..S_BASE + S_COUNT).contains(&a)
+        && (a - S_BASE).is_multiple_of(T_COUNT)
+        && (T_BASE + 1..T_BASE + T_COUNT).contains(&b)
+    {
         return Some(a + (b - T_BASE));
     }
     COMPOSE.binary_search_by_key(&(a, b), |e| (e.0, e.1)).ok().map(|i| COMPOSE[i].2)

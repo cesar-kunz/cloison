@@ -11,7 +11,16 @@ use super::*;
 /// The ISO date of a Temporal object of kind `K` (a ZonedDateTime's in
 /// its time zone).
 fn date_of(vm: &Vm, this: Value, k: usize) -> Result<IsoDate> {
-    let kind = [Kind::Instant, Kind::Zoned, Kind::DateTime, Kind::Date, Kind::Time, Kind::YearMonth, Kind::MonthDay, Kind::Duration][k];
+    let kind = [
+        Kind::Instant,
+        Kind::Zoned,
+        Kind::DateTime,
+        Kind::Date,
+        Kind::Time,
+        Kind::YearMonth,
+        Kind::MonthDay,
+        Kind::Duration,
+    ][k];
     Ok(match this_slots(this, kind)? {
         Slots::Date(d) | Slots::YearMonth(d) | Slots::MonthDay(d) => d,
         Slots::DateTime(dt) => dt.date,
@@ -797,7 +806,10 @@ fn year_month_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) ->
     if i.date[2] != 0.0 || i.date[3] != 0.0 || i.time != 0 {
         return Err(range("only years and months can be added to Temporal.PlainYearMonth"));
     }
-    let start = fields::date_from_fields(&fields::Fields { day: Some(1.0), ..fields::date_fields(d, true, false) }, Overflow::Constrain)?;
+    let start = fields::date_from_fields(
+        &fields::Fields { day: Some(1.0), ..fields::date_fields(d, true, false) },
+        Overflow::Constrain,
+    )?;
     let added = fields::date_add(start, &i.date, ov)?;
     let f = fields::date_fields(added, true, false);
     let r = fields::year_month_from_fields(&f, ov)?;
@@ -817,7 +829,8 @@ fn year_month_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> 
     let d = this_year_month(this)?;
     let other = fields::to_year_month(vm, arg(a, 0), Value::UNDEFINED)?;
     let o = options_object(vm, arg(a, 1))?;
-    let s = duration::difference_settings(vm, since, o, Group::Date, &[Unit::Week, Unit::Day], Unit::Month, Unit::Year)?;
+    let s =
+        duration::difference_settings(vm, since, o, Group::Date, &[Unit::Week, Unit::Day], Unit::Month, Unit::Year)?;
     if d == other {
         return Ok(duration::create_duration(vm, [0.0; 10]));
     }
@@ -830,7 +843,8 @@ fn year_month_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> 
     if s.smallest != Unit::Month || s.increment != 1 {
         let start = DateTime { date: this_date, time: Time::MIDNIGHT };
         let end = DateTime { date: other_date, time: Time::MIDNIGHT };
-        internal = duration::round_relative_plain(vm, internal, start, end, s.largest, s.increment, s.smallest, s.mode)?;
+        internal =
+            duration::round_relative_plain(vm, internal, start, end, s.largest, s.increment, s.smallest, s.mode)?;
     }
     let r = duration::from_internal(&internal, Unit::Day)?;
     Ok(since_until(vm, r, since))
@@ -1021,7 +1035,11 @@ pub(crate) fn month_day_spec() -> ClassSpec {
         ctor: month_day_ctor,
         length: 2,
         statics: &[("from", month_day_from as NativeFn, 1)],
-        getters: &[("calendarId", date_getter::<MD, 15>), ("monthCode", date_getter::<MD, 2>), ("day", date_getter::<MD, 3>)],
+        getters: &[
+            ("calendarId", date_getter::<MD, 15>),
+            ("monthCode", date_getter::<MD, 2>),
+            ("day", date_getter::<MD, 3>),
+        ],
         methods: &[
             ("with", month_day_with as NativeFn, 1),
             ("equals", month_day_equals, 1),

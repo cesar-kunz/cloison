@@ -120,7 +120,8 @@ impl Density {
     /// Whether a far array of length `n` with `present` elements should be
     /// dense again.
     pub fn goes_dense(&self, present: usize, n: usize) -> bool {
-        n <= MAX_ELEMENTS && (present as f64 >= self.back * n as f64 || (n - present.min(n)).saturating_mul(8) <= self.waste)
+        n <= MAX_ELEMENTS
+            && (present as f64 >= self.back * n as f64 || (n - present.min(n)).saturating_mul(8) <= self.waste)
     }
 }
 

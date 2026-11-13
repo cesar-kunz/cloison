@@ -192,9 +192,7 @@ pub struct Arena<T> {
 
 impl<T> Default for Arena<T> {
     fn default() -> Self {
-        Arena {
-            chunks: Default::default(),
-        }
+        Arena { chunks: Default::default() }
     }
 }
 

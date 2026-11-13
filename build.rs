@@ -66,10 +66,8 @@ fn main() {
     // to 158 bytes of mostly 6-byte `jcc`s, cost it 2.5%).
     if arch == "x86_64" {
         let relaxed_path = out_dir.join("stencils-relaxed.o");
-        let relaxed = extract(
-            &compile(&rustc, &target, &relaxed_path, &[tsan, &["-Cllvm-args=-mc-relax-all"]].concat()),
-            &arch,
-        );
+        let relaxed =
+            extract(&compile(&rustc, &target, &relaxed_path, &[tsan, &["-Cllvm-args=-mc-relax-all"]].concat()), &arch);
         let mut relaxed: std::collections::HashMap<String, Extracted> =
             relaxed.into_iter().map(|e| (e.name.clone(), e)).collect();
         for e in &mut extracted {
@@ -82,11 +80,7 @@ fn main() {
             }
         }
     }
-    assert!(
-        !extracted.is_empty(),
-        "no {PREFIX}* symbols in {}",
-        obj_path.display()
-    );
+    assert!(!extracted.is_empty(), "no {PREFIX}* symbols in {}", obj_path.display());
     let violations: Vec<String> = extracted
         .iter()
         .flat_map(|e| {
@@ -95,16 +89,10 @@ fn main() {
                 .iter()
                 .map(|r| verify::Reloc { offset: r.offset as usize, r_type: r.r_type, symbol: &r.symbol })
                 .collect();
-            verify::check(&e.name, &arch, &e.code, &relocs)
-                .into_iter()
-                .map(move |v| format!("  {}: {v}", e.name))
+            verify::check(&e.name, &arch, &e.code, &relocs).into_iter().map(move |v| format!("  {}: {v}", e.name))
         })
         .collect();
-    assert!(
-        violations.is_empty(),
-        "stencils the JIT can't copy as they are:\n{}",
-        violations.join("\n")
-    );
+    assert!(violations.is_empty(), "stencils the JIT can't copy as they are:\n{}", violations.join("\n"));
 
     let mut entries = match arch.as_str() {
         "aarch64" => compact_arm64(extracted),
@@ -115,7 +103,6 @@ fn main() {
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     fs::write(out_dir.join("stencils.rs"), emit(&entries, &arch)).unwrap();
 }
-
 
 /// Rerun this script when a file the stencils' compile read changes:
 /// `SOURCE` and the runtime's sources it takes with `#[path]` (`value.rs`,
@@ -135,18 +122,14 @@ fn rerun_if_deps_changed(dep_info: &std::path::Path) {
 /// codegen options; returns its bytes.
 fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]) -> Vec<u8> {
     let mut cmd = Command::new(rustc);
-    cmd.args([
-        "--edition=2024",
-        "--crate-type=lib",
-        "--crate-name=cloison_stencils",
-    ])
-    .args(["-Copt-level=3", "-Cpanic=abort", "-Ccodegen-units=1"])
-    .args(["-Crelocation-model=static", "-Ccode-model=small"])
-    // Cargo doesn't show a build script's compiler warnings: as errors,
-    // they can't pile up unseen (the nightly is pinned, so new lints come
-    // with a deliberate bump). Edition 2024 warns of an unsafe operation
-    // outside an `unsafe` block in an `unsafe fn`.
-    .arg("-Dwarnings");
+    cmd.args(["--edition=2024", "--crate-type=lib", "--crate-name=cloison_stencils"])
+        .args(["-Copt-level=3", "-Cpanic=abort", "-Ccodegen-units=1"])
+        .args(["-Crelocation-model=static", "-Ccode-model=small"])
+        // Cargo doesn't show a build script's compiler warnings: as errors,
+        // they can't pile up unseen (the nightly is pinned, so new lints come
+        // with a deliberate bump). Edition 2024 warns of an unsafe operation
+        // outside an `unsafe` block in an `unsafe fn`.
+        .arg("-Dwarnings");
     // Darwin's default CPU is the host's (`apple-m1`), whose scheduling
     // model orders instructions differently; `generic` is Linux's default,
     // so the stencils come out the same bytes on both.
@@ -156,11 +139,7 @@ fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]
     let status = cmd
         .args(extra)
         .args(["--target", target])
-        .arg(format!(
-            "--emit=obj={},dep-info={}",
-            obj_path.display(),
-            obj_path.with_extension("d").display()
-        ))
+        .arg(format!("--emit=obj={},dep-info={}", obj_path.display(), obj_path.with_extension("d").display()))
         .arg(SOURCE)
         .status()
         .expect("failed to run rustc for the stencils");
@@ -174,10 +153,9 @@ fn ends_with_continue(e: &Extracted) -> bool {
     let n = e.code.len();
     match e.code.len() {
         0..5 => false,
-        _ if e.code[n - 5] == 0xE9 => e
-            .relocs
-            .iter()
-            .any(|r| r.offset == (n - 4) as u64 && r.symbol == "cloison_continue"),
+        _ if e.code[n - 5] == 0xE9 => {
+            e.relocs.iter().any(|r| r.offset == (n - 4) as u64 && r.symbol == "cloison_continue")
+        }
         _ => false,
     }
 }
@@ -192,16 +170,10 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
         if macho { n.strip_prefix('_').unwrap_or(n) } else { n }
     }
 
-    let text: Vec<_> = file
-        .symbols()
-        .filter(|s| s.kind() == SymbolKind::Text && s.is_definition())
-        .collect();
+    let text: Vec<_> = file.symbols().filter(|s| s.kind() == SymbolKind::Text && s.is_definition()).collect();
     // Mach-O symbols have no size: a function ends where the next one in
     // its section starts.
-    let mut starts: Vec<(usize, u64)> = text
-        .iter()
-        .map(|s| (s.section_index().unwrap().0, s.address()))
-        .collect();
+    let mut starts: Vec<(usize, u64)> = text.iter().map(|s| (s.section_index().unwrap().0, s.address())).collect();
     starts.sort_unstable();
     let end_of = |sym: &object::Symbol| -> u64 {
         if sym.size() != 0 {
@@ -215,10 +187,8 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
             .unwrap_or_else(|| file.section_by_index(sec).unwrap().size())
     };
 
-    let mut symbols: Vec<_> = text
-        .iter()
-        .filter_map(|s| Some((plain(macho, s.name().ok()?).strip_prefix(PREFIX)?.to_owned(), s)))
-        .collect();
+    let mut symbols: Vec<_> =
+        text.iter().filter_map(|s| Some((plain(macho, s.name().ok()?).strip_prefix(PREFIX)?.to_owned(), s))).collect();
     symbols.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut extracted: Vec<Extracted> = Vec::new();
@@ -255,9 +225,12 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
                     let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
                     if i & 0x3B00_0000 == 0x3900_0000 {
                         // Load/store, unsigned offset: size in bits 31:30.
-                        [R_AARCH64_LDST8_ABS_LO12_NC, R_AARCH64_LDST16_ABS_LO12_NC,
-                            R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC]
-                            [(i >> 30) as usize]
+                        [
+                            R_AARCH64_LDST8_ABS_LO12_NC,
+                            R_AARCH64_LDST16_ABS_LO12_NC,
+                            R_AARCH64_LDST32_ABS_LO12_NC,
+                            R_AARCH64_LDST64_ABS_LO12_NC,
+                        ][(i >> 30) as usize]
                     } else if i & 0x7F80_0000 == 0x1100_0000 {
                         R_AARCH64_ADD_ABS_LO12_NC
                     } else {
@@ -289,11 +262,7 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
             relocs.push(Reloc {
                 offset: offset - start,
                 r_type,
-                symbol: if target_name.starts_with(PREFIX) {
-                    "@slow".into()
-                } else {
-                    target_name.to_owned()
-                },
+                symbol: if target_name.starts_with(PREFIX) { "@slow".into() } else { target_name.to_owned() },
                 addend: reloc.addend(),
             });
         }
@@ -348,22 +317,13 @@ struct Entry {
 impl Entry {
     fn concrete(e: Extracted) -> Entry {
         let members = vec![(e.name.clone(), fnv1a(&e.code))];
-        Entry {
-            name: e.name,
-            code: e.code,
-            relocs: e.relocs,
-            fields: Vec::new(),
-            covers: Vec::new(),
-            members,
-        }
+        Entry { name: e.name, code: e.code, relocs: e.relocs, fields: Vec::new(), covers: Vec::new(), members }
     }
 }
 
 /// FNV-1a, 64-bit. Must match `fnv1a` in the tests of `src/jit.rs`.
 fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
-    })
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
 }
 
 /// Write `$OUT_DIR/stencils.rs`.
@@ -377,7 +337,11 @@ fn emit(entries: &[Entry], arch: &str) -> String {
         .collect();
     rt_names.sort();
     rt_names.dedup();
-    writeln!(out, "/// Runtime functions, indexed by `Sym::Rt`.\npub(crate) static RT_NAMES: &[&str] = &{rt_names:?};\n").unwrap();
+    writeln!(
+        out,
+        "/// Runtime functions, indexed by `Sym::Rt`.\npub(crate) static RT_NAMES: &[&str] = &{rt_names:?};\n"
+    )
+    .unwrap();
     // Every stencil by name, with the entry it is copied from and the
     // registers patched into a template's fields: `NAMES`, and an
     // open-addressing table (linear probing, at most 2/3 full) of `NAMES`
@@ -413,8 +377,7 @@ fn emit(entries: &[Entry], arch: &str) -> String {
     writeln!(out, "/// Stencils by name: `NAMES` index + 1 at `fnv1a(name)`, linear probing (0: empty).\npub(crate) static BY_NAME: [u16; {size}] = {table:?};\n").unwrap();
     // Each stencil's `__slow` helper, if it has one: an explicit
     // stencil's may be a template's member, and the other way around.
-    let index: std::collections::HashMap<&str, usize> =
-        names.iter().enumerate().map(|(k, n)| (n.0, k)).collect();
+    let index: std::collections::HashMap<&str, usize> = names.iter().enumerate().map(|(k, n)| (n.0, k)).collect();
     out.push_str("/// Every stencil's name, its `STENCILS` index, the registers of a template's parameters, and its `__slow` helper's `NAMES` index + 1 (0: none).\n");
     out.push_str("pub(crate) static NAMES: &[(&str, u16, [u8; 2], u16)] = &[\n");
     for (name, i, regs) in &names {
@@ -435,26 +398,14 @@ fn emit(entries: &[Entry], arch: &str) -> String {
                 "cloison_jump_target" => "Sym::JumpTarget".to_string(),
                 "cloison_exit" => "Sym::Exit".to_string(),
                 "@slow" => "Sym::Slow".to_string(),
-                rt => format!(
-                    "Sym::Rt({})",
-                    rt_names.iter().position(|n| *n == rt).unwrap()
-                ),
+                rt => format!("Sym::Rt({})", rt_names.iter().position(|n| *n == rt).unwrap()),
             };
-            write!(
-                relocs,
-                "R({}, {}, {symbol}, {}), ",
-                r.offset, r.r_type, r.addend
-            )
-            .unwrap();
+            write!(relocs, "R({}, {}, {symbol}, {}), ", r.offset, r.r_type, r.addend).unwrap();
         }
         let template = if e.covers.is_empty() {
             "None".to_string()
         } else {
-            let fields: Vec<String> = e
-                .fields
-                .iter()
-                .map(|(o, sh, p)| format!("({o}, {sh}, {p})"))
-                .collect();
+            let fields: Vec<String> = e.fields.iter().map(|(o, sh, p)| format!("({o}, {sh}, {p})")).collect();
             format!("Some(&Template {{ fields: &[{}] }})", fields.join(", "))
         };
         writeln!(
@@ -551,10 +502,7 @@ fn compact_arm64(stencils: Vec<Extracted>) -> Vec<Entry> {
         }
         let n_params = rest[0].0.len();
         while !rest.is_empty() {
-            let t = rest
-                .iter()
-                .position(|(ps, _)| distinct(&regs(ps)))
-                .unwrap_or(0);
+            let t = rest.iter().position(|(ps, _)| distinct(&regs(ps))).unwrap_or(0);
             let (tps, template) = rest.swap_remove(t);
             let (tregs, len) = (regs(&tps), template.code.len());
             let mut fields: Vec<(usize, u32, usize)> = Vec::new();
@@ -587,10 +535,9 @@ fn compact_arm64(stencils: Vec<Extracted>) -> Vec<Entry> {
                 }
                 code
             };
-            let (cluster, others): (Vec<Member>, Vec<Member>) =
-                std::mem::take(&mut rest).into_iter().partition(|(ps, e)| {
-                    e.code == rebuild(&regs(ps)) && same_relocs(&e.relocs, &template.relocs)
-                });
+            let (cluster, others): (Vec<Member>, Vec<Member>) = std::mem::take(&mut rest)
+                .into_iter()
+                .partition(|(ps, e)| e.code == rebuild(&regs(ps)) && same_relocs(&e.relocs, &template.relocs));
             rest = others;
             if cluster.is_empty() || witness_missing(n_params, &fields) {
                 entries.push(Entry::concrete(template));
@@ -598,17 +545,9 @@ fn compact_arm64(stencils: Vec<Extracted>) -> Vec<Entry> {
                 continue;
             }
             let mut covers: Vec<Vec<u8>> = vec![tps.iter().map(|p| p.1).collect()];
-            covers.extend(
-                cluster
-                    .iter()
-                    .map(|(ps, _)| ps.iter().map(|p| p.1).collect()),
-            );
+            covers.extend(cluster.iter().map(|(ps, _)| ps.iter().map(|p| p.1).collect()));
             let mut members = vec![(template.name.clone(), fnv1a(&template.code))];
-            members.extend(
-                cluster
-                    .iter()
-                    .map(|(_, e)| (e.name.clone(), fnv1a(&e.code))),
-            );
+            members.extend(cluster.iter().map(|(_, e)| (e.name.clone(), fnv1a(&e.code))));
             entries.push(Entry {
                 name: key.clone(),
                 code: template.code,
@@ -625,9 +564,9 @@ fn compact_arm64(stencils: Vec<Extracted>) -> Vec<Entry> {
 /// Whether two stencils have the same relocations.
 fn same_relocs(a: &[Reloc], b: &[Reloc]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| {
-            (x.offset, x.r_type, &x.symbol, x.addend) == (y.offset, y.r_type, &y.symbol, y.addend)
-        })
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| (x.offset, x.r_type, &x.symbol, x.addend) == (y.offset, y.r_type, &y.symbol, y.addend))
 }
 
 /// The x86-64 register of a slot parameter, as (xmm, hardware number):
@@ -659,9 +598,7 @@ fn x86_renumber(r: iced_x86::Register, n: u32) -> Option<iced_x86::Register> {
     use iced_x86::Register;
     let high = [Register::AH, Register::CH, Register::DH, Register::BH];
     let (xmm, _) = x86_reg_id(r)?;
-    Register::values().find(|&q| {
-        !high.contains(&q) && x86_reg_id(q) == Some((xmm, n)) && q.size() == r.size()
-    })
+    Register::values().find(|&q| !high.contains(&q) && x86_reg_id(q) == Some((xmm, n)) && q.size() == r.size())
 }
 
 /// x86-64: the 3-bit fields (byte offset, shift 0 or 3, parameter) that
@@ -683,12 +620,8 @@ fn x86_fields(code: &[u8], relocs: &[Reloc], params: &[(bool, u32)]) -> Option<V
     while d.can_decode() {
         let i = d.decode();
         let (at, len) = (i.ip() as usize, i.len());
-        let used: Vec<(bool, u32)> = info
-            .info(&i)
-            .used_registers()
-            .iter()
-            .filter_map(|u| x86_reg_id(u.register()))
-            .collect();
+        let used: Vec<(bool, u32)> =
+            info.info(&i).used_registers().iter().filter_map(|u| x86_reg_id(u.register())).collect();
         let mut explicit: Vec<(bool, u32)> = (0..i.op_count())
             .filter(|&k| i.op_kind(k) == OpKind::Register)
             .filter_map(|k| x86_reg_id(i.op_register(k)))
@@ -755,11 +688,7 @@ fn x86_fields(code: &[u8], relocs: &[Reloc], params: &[(bool, u32)]) -> Option<V
                 m.len() == len && m.eq_all_bits(&want)
             })?;
             fields.extend(
-                cands
-                    .iter()
-                    .enumerate()
-                    .filter(|&(j, _)| found >> j & 1 != 0)
-                    .map(|(_, &(k, sh))| (at + k, sh, p)),
+                cands.iter().enumerate().filter(|&(j, _)| found >> j & 1 != 0).map(|(_, &(k, sh))| (at + k, sh, p)),
             );
         }
     }
@@ -794,9 +723,7 @@ fn compact_x86(stencils: Vec<Extracted>) -> Vec<Entry> {
         while !rest.is_empty() {
             let (tps, template) = rest.swap_remove(0);
             let tregs = regs(&tps);
-            let fields = distinct(&tregs)
-                .then(|| x86_fields(&template.code, &template.relocs, &tregs))
-                .flatten();
+            let fields = distinct(&tregs).then(|| x86_fields(&template.code, &template.relocs, &tregs)).flatten();
             let Some(fields) = fields else {
                 entries.push(Entry::concrete(template));
                 continue;
@@ -875,12 +802,8 @@ const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 /// the ELF build extracts.
 fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
     const HOLES: [&str; 4] = ["cloison_hole_imm", "cloison_hole_reg", "cloison_hole_imm64", "cloison_hole_imm64b"];
-    const MOVW: [u32; 4] = [
-        R_AARCH64_MOVW_UABS_G0_NC,
-        R_AARCH64_MOVW_UABS_G1_NC,
-        R_AARCH64_MOVW_UABS_G2_NC,
-        R_AARCH64_MOVW_UABS_G3,
-    ];
+    const MOVW: [u32; 4] =
+        [R_AARCH64_MOVW_UABS_G0_NC, R_AARCH64_MOVW_UABS_G1_NC, R_AARCH64_MOVW_UABS_G2_NC, R_AARCH64_MOVW_UABS_G3];
     for off in (0..code.len()).step_by(4) {
         let i = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
         let imm = (i >> 5) & 0xFFFF;
@@ -928,10 +851,7 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
             return;
         }
         let stub = (n - 4) as u64;
-        let Some(stub_reloc) = relocs
-            .iter()
-            .position(|r| r.offset == stub && r.r_type == R_AARCH64_JUMP26)
-        else {
+        let Some(stub_reloc) = relocs.iter().position(|r| r.offset == stub && r.r_type == R_AARCH64_JUMP26) else {
             return;
         };
         // Don't fold the hot path's own `b cloison_continue`.
@@ -944,16 +864,11 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
             let i = insn(code, at);
             let (kind, disp) = if i & 0xFF00_0010 == 0x5400_0000 || i & 0x7E00_0000 == 0x3400_0000 {
                 // b.cond, cbz/cbnz: imm19 at [23:5]
-                (
-                    R_AARCH64_CONDBR19,
-                    (((i >> 5) & 0x7FFFF) as i64) << 45 >> 43,
-                )
+                (R_AARCH64_CONDBR19, (((i >> 5) & 0x7FFFF) as i64) << 45 >> 43)
             } else if i & 0x7E00_0000 == 0x3600_0000 {
                 // tbz/tbnz: imm14 at [18:5]
                 (R_AARCH64_TSTBR14, (((i >> 5) & 0x3FFF) as i64) << 50 >> 48)
-            } else if i & 0xFC00_0000 == 0x1400_0000
-                && !relocs.iter().any(|r| r.offset == at as u64)
-            {
+            } else if i & 0xFC00_0000 == 0x1400_0000 && !relocs.iter().any(|r| r.offset == at as u64) {
                 // b with a local target: imm26 at [25:0]
                 (R_AARCH64_JUMP26, ((i & 0x03FF_FFFF) as i64) << 38 >> 36)
             } else {
@@ -978,12 +893,7 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         }
         let target = relocs.remove(stub_reloc);
         for (at, kind) in users {
-            relocs.push(Reloc {
-                offset: at,
-                r_type: kind,
-                symbol: target.symbol.clone(),
-                addend: target.addend,
-            });
+            relocs.push(Reloc { offset: at, r_type: kind, symbol: target.symbol.clone(), addend: target.addend });
         }
         code.truncate(n - 4);
         let _ = name;
@@ -1024,12 +934,7 @@ fn retarget_arm64_jumps(code: &mut [u8], relocs: &mut Vec<Reloc>) {
                 _ => R_AARCH64_JUMP26,
             };
             code[at..at + 4].copy_from_slice(&(i & !(mask << shift)).to_le_bytes());
-            relocs.push(Reloc {
-                offset: at as u64,
-                r_type,
-                symbol: symbol.clone(),
-                addend,
-            });
+            relocs.push(Reloc { offset: at as u64, r_type, symbol: symbol.clone(), addend });
         }
     }
 }
@@ -1238,9 +1143,8 @@ fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         if !(is_rel32_jump(code, stub) && code[stub.at] == 0xE9) {
             return;
         }
-        let Some(sr) = relocs
-            .iter()
-            .position(|r| r.offset == (stub.at + 1) as u64 && pc32(r) && r.symbol != "cloison_continue")
+        let Some(sr) =
+            relocs.iter().position(|r| r.offset == (stub.at + 1) as u64 && pc32(r) && r.symbol != "cloison_continue")
         else {
             return;
         };
@@ -1256,10 +1160,7 @@ fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         // Every local jump to the stub, each of which must have a rel32
         // field to take the relocation (a short one can't reach a symbol).
         let local = |i: &verify::Insn| !relocs.iter().any(|r| (i.at..i.at + i.len).contains(&(r.offset as usize)));
-        let users: Vec<&verify::Insn> = insns
-            .iter()
-            .filter(|i| local(i) && i.target == Some(stub.at as i64))
-            .collect();
+        let users: Vec<&verify::Insn> = insns.iter().filter(|i| local(i) && i.target == Some(stub.at as i64)).collect();
         if users.is_empty() || !users.iter().all(|i| is_rel32_jump(code, i)) {
             return;
         }

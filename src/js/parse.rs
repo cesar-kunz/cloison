@@ -588,7 +588,9 @@ impl<'a> Parser<'_, 'a, '_> {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` (escaped) is a reserved word")));
         }
         let f = &self.functions[self.current];
-        if s == "yield" && (self.strict() || f.generator) || s == "await" && (f.is_async || self.in_static_block() || self.module.is_some()) {
+        if s == "yield" && (self.strict() || f.generator)
+            || s == "await" && (f.is_async || self.in_static_block() || self.module.is_some())
+        {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` as an identifier here")));
         }
         Ok(())
@@ -700,10 +702,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let c = self.class(Some(name.clone()), pos)?;
                 let end = self.pos();
                 let binding = self.declare(&name, LET, end);
-                let e = Expr {
-                    kind: ExprKind::Class(Box::new(c)),
-                    pos,
-                };
+                let e = Expr { kind: ExprKind::Class(Box::new(c)), pos };
                 StmtKind::Lexical(false, vec![(binding, Some(e))])
             }
             // (No debugger to stop in.)
@@ -713,7 +712,9 @@ impl<'a> Parser<'_, 'a, '_> {
                 StmtKind::Empty
             }
             // (`import(…)` and `import.meta` are expressions.)
-            Tok::Keyword(k @ ("import" | "export")) if k == "export" || !matches!(self.peek_at(1), Tok::Punct("(" | ".")) => {
+            Tok::Keyword(k @ ("import" | "export"))
+                if k == "export" || !matches!(self.peek_at(1), Tok::Punct("(" | ".")) =>
+            {
                 return self.err(format!("`{k}` declaration not at a module's top level"));
             }
             Tok::Keyword("with") => {
@@ -762,11 +763,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let c = self.expression(false)?;
                 self.expect(")")?;
                 let then = self.if_branch()?;
-                let other = if self.eat("else") {
-                    Some(self.if_branch()?)
-                } else {
-                    None
-                };
+                let other = if self.eat("else") { Some(self.if_branch()?) } else { None };
                 StmtKind::If(c, then, other)
             }
             Tok::Keyword("for") => {
@@ -813,15 +810,9 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Keyword("return") => {
                 self.advance();
                 if self.current == 0 || self.module_top() {
-                    return Err(Error::new(
-                        pos as usize,
-                        "`return` outside a function".into(),
-                    ));
+                    return Err(Error::new(pos as usize, "`return` outside a function".into()));
                 }
-                let e = if self.is(";")
-                    || self.is("}")
-                    || *self.peek() == Tok::Eof
-                    || self.toks[self.i].newline_before
+                let e = if self.is(";") || self.is("}") || *self.peek() == Tok::Eof || self.toks[self.i].newline_before
                 {
                     None
                 } else {
@@ -837,11 +828,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     _ => None,
                 };
                 self.semicolon()?;
-                if k == "break" {
-                    StmtKind::Break(label)
-                } else {
-                    StmtKind::Continue(label)
-                }
+                if k == "break" { StmtKind::Break(label) } else { StmtKind::Continue(label) }
             }
             Tok::Keyword("try") => {
                 self.advance();
@@ -870,7 +857,8 @@ impl<'a> Parser<'_, 'a, '_> {
                             self.frames.last_mut().unwrap().catch = false;
                             let mut names = Vec::new();
                             let mut pat = self.binding_pattern(&mut names)?;
-                            let map: Vec<(Name, Name)> = names.iter().map(|n| (n.clone(), self.declare(n, LET, 0))).collect();
+                            let map: Vec<(Name, Name)> =
+                                names.iter().map(|n| (n.clone(), self.declare(n, LET, 0))).collect();
                             rename_pattern(&mut pat, &map);
                             let k = self.classes;
                             self.classes += 1;
@@ -882,7 +870,10 @@ impl<'a> Parser<'_, 'a, '_> {
                             let mut decls: Vec<(Name, Option<Expr<'a>>)> =
                                 map.into_iter().map(|(_, r)| (r, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
                             let value = expr(self.arena, Expr { kind: ExprKind::Ident(e.clone()), pos });
-                            decls.push(("".into(), Some(Expr { kind: ExprKind::Destructure(Box::new(pat), value, 2), pos })));
+                            decls.push((
+                                "".into(),
+                                Some(Expr { kind: ExprKind::Destructure(Box::new(pat), value, 2), pos }),
+                            ));
                             body.insert(0, Stmt { kind: StmtKind::Lexical(false, decls), pos });
                             return Ok((e, body));
                         }
@@ -965,10 +956,7 @@ impl<'a> Parser<'_, 'a, '_> {
         self.push_scope(self.i, false, false);
         let r = self.statement();
         self.frames.pop();
-        let block = Stmt {
-            kind: StmtKind::Block(vec![r?]),
-            pos,
-        };
+        let block = Stmt { kind: StmtKind::Block(vec![r?]), pos };
         Ok(stmt(self.arena, block))
     }
 
@@ -1068,13 +1056,22 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// `using` declarations' initializers, each value added to the
     /// resources of capability `state` as it is bound.
-    fn using_inits(&self, decls: Vec<(Name, Option<Expr<'a>>)>, state: &Name, is_await: bool) -> Vec<(Name, Option<Expr<'a>>)> {
+    fn using_inits(
+        &self,
+        decls: Vec<(Name, Option<Expr<'a>>)>,
+        state: &Name,
+        is_await: bool,
+    ) -> Vec<(Name, Option<Expr<'a>>)> {
         decls
             .into_iter()
             .map(|(n, init)| {
                 let init = init.map(|e| {
                     let pos = e.pos;
-                    let args = vec![Expr { kind: ExprKind::Ident(state.clone()), pos }, e, Expr { kind: ExprKind::Bool(is_await), pos }];
+                    let args = vec![
+                        Expr { kind: ExprKind::Ident(state.clone()), pos },
+                        e,
+                        Expr { kind: ExprKind::Bool(is_await), pos },
+                    ];
                     Expr { kind: ExprKind::Intrinsic("dispose_add", args), pos }
                 });
                 (n, init)
@@ -1120,12 +1117,18 @@ impl<'a> Parser<'_, 'a, '_> {
         let assign = |p: &Self, n: &Name, v: Expr<'a>| Stmt {
             kind: StmtKind::Lexical(
                 false,
-                vec![("".into(), Some(Expr { kind: ExprKind::Assign(None, expr(p.arena, id(n)), expr(p.arena, v)), pos }))],
+                vec![(
+                    "".into(),
+                    Some(Expr { kind: ExprKind::Assign(None, expr(p.arena, id(n)), expr(p.arena, v)), pos }),
+                )],
             ),
             pos,
         };
         let state = Expr { kind: ExprKind::Intrinsic("dispose_new", Vec::new()), pos };
-        let init = vec![assign(self, &names.state, state), assign(self, &names.has, Expr { kind: ExprKind::Bool(false), pos })];
+        let init = vec![
+            assign(self, &names.state, state),
+            assign(self, &names.has, Expr { kind: ExprKind::Bool(false), pos }),
+        ];
         let catch = vec![
             assign(self, &names.has, Expr { kind: ExprKind::Bool(true), pos }),
             assign(self, &names.error, id(&names.caught)),
@@ -1134,7 +1137,10 @@ impl<'a> Parser<'_, 'a, '_> {
         let finally = if is_await {
             let run = Expr { kind: ExprKind::Intrinsic("dispose_run_async", args), pos };
             let wait = Stmt {
-                kind: StmtKind::Lexical(false, vec![("".into(), Some(Expr { kind: ExprKind::Await(expr(self.arena, id(&names.pending))), pos }))]),
+                kind: StmtKind::Lexical(
+                    false,
+                    vec![("".into(), Some(Expr { kind: ExprKind::Await(expr(self.arena, id(&names.pending))), pos }))],
+                ),
                 pos,
             };
             vec![
@@ -1142,7 +1148,13 @@ impl<'a> Parser<'_, 'a, '_> {
                 Stmt { kind: StmtKind::If(id(&names.pending), stmt(self.arena, wait), None), pos },
             ]
         } else {
-            vec![Stmt { kind: StmtKind::Lexical(false, vec![("".into(), Some(Expr { kind: ExprKind::Intrinsic("dispose_run", args), pos }))]), pos }]
+            vec![Stmt {
+                kind: StmtKind::Lexical(
+                    false,
+                    vec![("".into(), Some(Expr { kind: ExprKind::Intrinsic("dispose_run", args), pos }))],
+                ),
+                pos,
+            }]
         };
         let mut out = init;
         out.push(Stmt { kind: StmtKind::Try(body, Some((names.caught, catch)), Some(finally)), pos });
@@ -1177,7 +1189,10 @@ impl<'a> Parser<'_, 'a, '_> {
                 Expr { kind: ExprKind::Bool(is_await), pos },
             ];
             let first = Stmt {
-                kind: StmtKind::Lexical(false, vec![("".into(), Some(Expr { kind: ExprKind::Intrinsic("dispose_add", args), pos }))]),
+                kind: StmtKind::Lexical(
+                    false,
+                    vec![("".into(), Some(Expr { kind: ExprKind::Intrinsic("dispose_add", args), pos }))],
+                ),
                 pos,
             };
             let lowered = self.lower_using(vec![first, body], names, is_await, pos);
@@ -1276,7 +1291,8 @@ impl<'a> Parser<'_, 'a, '_> {
                     return self.for_of_pattern(if constant { 3 } else { 2 }, p);
                 }
                 if self.eat("in") {
-                    let names: Vec<Name> = decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect();
+                    let names: Vec<Name> =
+                        decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect();
                     return self.for_in_target(ForInTarget::Pattern(p, Some(constant), names));
                 }
             }
@@ -1290,13 +1306,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.head_tdz(std::slice::from_ref(&name));
                 self.expect(")")?;
                 let body = stmt(self.arena, self.sub_statement()?);
-                return Ok(StmtKind::ForIn {
-                    var: false,
-                    fresh: true,
-                    name,
-                    object: expr(self.arena, object),
-                    body,
-                });
+                return Ok(StmtKind::ForIn { var: false, fresh: true, name, object: expr(self.arena, object), body });
             }
             if constant && decls.iter().any(|d| d.1.is_none()) {
                 return self.err("missing initializer in a `const` declaration");
@@ -1309,7 +1319,8 @@ impl<'a> Parser<'_, 'a, '_> {
                     return self.for_of_pattern(1, p);
                 }
                 if self.eat("in") {
-                    let names: Vec<Name> = decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect();
+                    let names: Vec<Name> =
+                        decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect();
                     return self.for_in_target(ForInTarget::Pattern(p, None, names));
                 }
             }
@@ -1324,7 +1335,8 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(ForInit::Var(decls))
         } else {
             let e = self.expression(true)?;
-            if (matches!(e.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) || self.call_target(&e))
+            if (matches!(e.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..))
+                || self.call_target(&e))
                 && self.is_of()
             {
                 return self.for_of_rest(0, e.kind);
@@ -1334,7 +1346,8 @@ impl<'a> Parser<'_, 'a, '_> {
                 let p = self.to_pattern(e)?;
                 return self.for_of_pattern(0, p);
             }
-            if (matches!(e.kind, ExprKind::Member(..) | ExprKind::Index(..)) || self.call_target(&e)) && self.eat("in") {
+            if (matches!(e.kind, ExprKind::Member(..) | ExprKind::Index(..)) || self.call_target(&e)) && self.eat("in")
+            {
                 return self.for_in_target(ForInTarget::Expr(e));
             }
             if matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(..)) && self.eat("in") {
@@ -1351,17 +1364,9 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(ForInit::Expr(expr(self.arena, e)))
         };
         self.expect(";")?;
-        let test = if self.is(";") {
-            None
-        } else {
-            Some(self.expression(false)?)
-        };
+        let test = if self.is(";") { None } else { Some(self.expression(false)?) };
         self.expect(";")?;
-        let update = if self.is(")") {
-            None
-        } else {
-            Some(self.expression(false)?)
-        };
+        let update = if self.is(")") { None } else { Some(self.expression(false)?) };
         self.expect(")")?;
         let body = stmt(self.arena, self.sub_statement()?);
         Ok(StmtKind::For {
@@ -1385,12 +1390,17 @@ impl<'a> Parser<'_, 'a, '_> {
         let body = self.sub_statement()?;
         let key = expr(self.arena, Expr { kind: ExprKind::Ident(h.clone()), pos });
         let first = match target {
-            ForInTarget::Expr(t) => Stmt {
-                kind: StmtKind::Expr(Expr { kind: ExprKind::Assign(None, expr(self.arena, t), key), pos }),
-                pos,
-            },
+            ForInTarget::Expr(t) => {
+                Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Assign(None, expr(self.arena, t), key), pos }), pos }
+            }
             ForInTarget::Pattern(p, lexical, names) => {
-                let mode = if lexical.is_some() { 2 } else if names.is_empty() { 0 } else { 1 };
+                let mode = if lexical.is_some() {
+                    2
+                } else if names.is_empty() {
+                    0
+                } else {
+                    1
+                };
                 let mut decls: Vec<(Name, Option<Expr<'a>>)> =
                     names.into_iter().map(|n| (n, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
                 let d = Expr { kind: ExprKind::Destructure(Box::new(p), key, mode), pos };
@@ -1408,13 +1418,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         };
         let body = stmt(self.arena, Stmt { kind: StmtKind::Block(vec![first, body]), pos });
-        Ok(StmtKind::ForIn {
-            var: false,
-            fresh: false,
-            name: h,
-            object: expr(self.arena, object),
-            body,
-        })
+        Ok(StmtKind::ForIn { var: false, fresh: false, name: h, object: expr(self.arena, object), body })
     }
 
     /// A `for` head's block-scoped names (and `pending_head`'s): not
@@ -1462,21 +1466,19 @@ impl<'a> Parser<'_, 'a, '_> {
         self.pending_head = names;
         let r = self.for_of_rest(kind, ExprKind::Null)?;
         let StmtKind::ForOf { kind, target, iterable, body, .. } = r else { unreachable!() };
-        Ok(StmtKind::ForOf {
-            kind,
-            target,
-            pattern: Some(Box::new(p)),
-            iterable,
-            body,
-            is_await: false,
-        })
+        Ok(StmtKind::ForOf { kind, target, pattern: Some(Box::new(p)), iterable, body, is_await: false })
     }
 
     /// A declarator with a pattern (`[a, b] = e`): its names (as
     /// `Bound`), then the destructuring (under the name ""). `lexical`:
     /// the names declared so, renamed. In a `for` head (`no_in`) it may
     /// have no initializer: the pattern waits in `pending_pattern`.
-    fn pattern_declarator(&mut self, lexical: Option<u8>, no_in: bool, decls: &mut Vec<(Name, Option<Expr<'a>>)>) -> R<()> {
+    fn pattern_declarator(
+        &mut self,
+        lexical: Option<u8>,
+        no_in: bool,
+        decls: &mut Vec<(Name, Option<Expr<'a>>)>,
+    ) -> R<()> {
         let pos = self.pos();
         let mut names = Vec::new();
         let mut pat = self.binding_pattern(&mut names)?;
@@ -1573,7 +1575,8 @@ impl<'a> Parser<'_, 'a, '_> {
                     self.expect("}")?;
                     break;
                 }
-                let shorthand = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Punct("," | "}" | "="));
+                let shorthand =
+                    matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Punct("," | "}" | "="));
                 let (key, p) = if shorthand {
                     let n = self.ident()?;
                     names.push(n.clone());
@@ -1636,7 +1639,9 @@ impl<'a> Parser<'_, 'a, '_> {
                 let mut rest = None;
                 for (i, (k, v)) in ps.iter().enumerate() {
                     if let ExprKind::Spread(t) = &v.kind {
-                        if i + 1 < ps.len() || !matches!(t.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) {
+                        if i + 1 < ps.len()
+                            || !matches!(t.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..))
+                        {
                             return bad();
                         }
                         rest = Some(Box::new(self.to_pattern(t)?));
@@ -1648,7 +1653,9 @@ impl<'a> Parser<'_, 'a, '_> {
                     };
                     match &v.kind {
                         ExprKind::Assign(None, t, d) => props.push((key, self.to_pattern(t)?, Some(*d))),
-                        ExprKind::Accessor(..) | ExprKind::Function(_) if !matches!(v.kind, ExprKind::Function(_)) => return bad(),
+                        ExprKind::Accessor(..) | ExprKind::Function(_) if !matches!(v.kind, ExprKind::Function(_)) => {
+                            return bad();
+                        }
                         _ => props.push((key, self.to_pattern(v)?, None)),
                     }
                 }
@@ -1662,13 +1669,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let object = self.expression(false)?;
         self.expect(")")?;
         let body = stmt(self.arena, self.sub_statement()?);
-        Ok(StmtKind::ForIn {
-            var,
-            fresh: false,
-            name,
-            object: expr(self.arena, object),
-            body,
-        })
+        Ok(StmtKind::ForIn { var, fresh: false, name, object: expr(self.arena, object), body })
     }
 
     fn switch_rest(&mut self) -> R<StmtKind<'a>> {
@@ -1771,7 +1772,7 @@ impl<'a> Parser<'_, 'a, '_> {
             is_async: false,
             uses_new_target: false,
             hidden: Vec::new(),
-        text: None,
+            text: None,
             home,
             ctor_var,
             free: None,
@@ -2098,7 +2099,7 @@ impl<'a> Parser<'_, 'a, '_> {
             is_async: std::mem::take(&mut self.pending_async),
             uses_new_target: false,
             hidden: Vec::new(),
-        text: None,
+            text: None,
             home: None,
             ctor_var: None,
             free: None,
@@ -2153,12 +2154,7 @@ impl<'a> Parser<'_, 'a, '_> {
             body
         } else {
             let p = self.pos();
-            self.assignment(false).map(|e| {
-                vec![Stmt {
-                    kind: StmtKind::Return(Some(e)),
-                    pos: p,
-                }]
-            })
+            self.assignment(false).map(|e| vec![Stmt { kind: StmtKind::Return(Some(e)), pos: p }])
         };
         self.current = outer;
         let end = self.toks[self.i - 1].pos + 1;
@@ -2246,7 +2242,9 @@ impl<'a> Parser<'_, 'a, '_> {
                 var_level = None;
             }
             match &t.tok {
-                Tok::Eof | Tok::Punct("=>" | "...") | Tok::Keyword("const" | "class" | "with" | "import" | "export" | "super") => return None,
+                Tok::Eof
+                | Tok::Punct("=>" | "...")
+                | Tok::Keyword("const" | "class" | "with" | "import" | "export" | "super") => return None,
                 Tok::Ident(n) if &**n == "let" || n.starts_with('#') => return None,
                 Tok::Keyword("new") if self.toks[self.i + 1].tok == Tok::Punct(".") => return None,
                 Tok::Punct("(") => {
@@ -2256,14 +2254,18 @@ impl<'a> Parser<'_, 'a, '_> {
                     let named = match name {
                         Tok::Punct("]") => true,
                         Tok::Keyword("function") => false,
-                        Tok::Ident(_) | Tok::Keyword(_) | Tok::Str(_) | Tok::Num(_) | Tok::BigInt(_) => method_name(self.toks, self.i - 1),
+                        Tok::Ident(_) | Tok::Keyword(_) | Tok::Str(_) | Tok::Num(_) | Tok::BigInt(_) => {
+                            method_name(self.toks, self.i - 1)
+                        }
                         _ => false,
                     };
                     if named {
                         if let Some((params, body)) = header(self.toks, self.i) {
                             // (Perhaps a call and a block after it, or an
                             // `if` or `for`: its names referred to here too.)
-                            if self.toks[body - 1].newline_before || matches!(name, Tok::Keyword("if" | "for" | "while" | "switch")) {
+                            if self.toks[body - 1].newline_before
+                                || matches!(name, Tok::Keyword("if" | "for" | "while" | "switch"))
+                            {
                                 frames.last_mut().unwrap().refs.extend_from_slice(&params);
                             }
                             level += 1;
@@ -2319,7 +2321,9 @@ impl<'a> Parser<'_, 'a, '_> {
                     }
                 }
                 Tok::Punct(";") | Tok::Keyword("in") if var_level == Some(level) => var_level = None,
-                Tok::Keyword("var") | Tok::Punct(",") if matches!(t.tok, Tok::Keyword("var")) || var_level == Some(level) => {
+                Tok::Keyword("var") | Tok::Punct(",")
+                    if matches!(t.tok, Tok::Keyword("var")) || var_level == Some(level) =>
+                {
                     let next = &self.toks[self.i + 1];
                     if let Tok::Ident(n) = &next.tok
                         && (matches!(t.tok, Tok::Keyword("var")) || !next.newline_before)
@@ -2397,10 +2401,7 @@ impl<'a> Parser<'_, 'a, '_> {
             let pos = self.pos();
             self.advance();
             let r = self.assignment(no_in)?;
-            e = Expr {
-                kind: ExprKind::Comma(expr(self.arena, e), expr(self.arena, r)),
-                pos,
-            };
+            e = Expr { kind: ExprKind::Comma(expr(self.arena, e), expr(self.arena, r)), pos };
         }
         Ok(e)
     }
@@ -2424,10 +2425,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let e = self.assignment(no_in)?;
                 Some(expr(self.arena, e))
             };
-            return Ok(Expr {
-                kind: ExprKind::Yield(arg, delegate),
-                pos,
-            });
+            return Ok(Expr { kind: ExprKind::Yield(arg, delegate), pos });
         }
         let target = self.conditional(no_in)?;
         if let Tok::Punct(p @ ("&&=" | "||=" | "??=")) = self.peek() {
@@ -2471,10 +2469,7 @@ impl<'a> Parser<'_, 'a, '_> {
             let t = expr(self.arena, target);
             let p = self.to_pattern(t)?;
             let value = self.assignment(no_in)?;
-            return Ok(Expr {
-                kind: ExprKind::Destructure(Box::new(p), expr(self.arena, value), 0),
-                pos,
-            });
+            return Ok(Expr { kind: ExprKind::Destructure(Box::new(p), expr(self.arena, value), 0), pos });
         }
         // (A call too in sloppy code, Annex B: a `ReferenceError` when run.)
         if !matches!(
@@ -2503,10 +2498,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 _ => {}
             }
         }
-        Ok(Expr {
-            kind: ExprKind::Assign(op, expr(self.arena, target), expr(self.arena, value)),
-            pos,
-        })
+        Ok(Expr { kind: ExprKind::Assign(op, expr(self.arena, target), expr(self.arena, value)), pos })
     }
 
     fn conditional(&mut self, no_in: bool) -> R<Expr<'a>> {
@@ -2519,10 +2511,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let a = self.assignment(false)?;
         self.expect(":")?;
         let b = self.assignment(no_in)?;
-        Ok(Expr {
-            kind: ExprKind::Cond(expr(self.arena, c), expr(self.arena, a), expr(self.arena, b)),
-            pos,
-        })
+        Ok(Expr { kind: ExprKind::Cond(expr(self.arena, c), expr(self.arena, a), expr(self.arena, b)), pos })
     }
 
     /// Binary operators binding tighter than `min`.
@@ -2541,11 +2530,7 @@ impl<'a> Parser<'_, 'a, '_> {
             let pos = self.pos();
             self.advance();
             // `**` is right-associative.
-            let rmin = if matches!(op, Bin::Op(BinOp::Exp)) {
-                prec - 1
-            } else {
-                prec
-            };
+            let rmin = if matches!(op, Bin::Op(BinOp::Exp)) { prec - 1 } else { prec };
             let r = self.binary(rmin, no_in)?;
             // `#x in o`: whether `o` has the private name.
             if let (Bin::Op(BinOp::In), ExprKind::Ident(n)) = (&op, &l.kind)
@@ -2574,10 +2559,7 @@ impl<'a> Parser<'_, 'a, '_> {
             self.advance();
             self.note_await();
             let e = self.unary()?;
-            return Ok(Expr {
-                kind: ExprKind::Await(expr(self.arena, e)),
-                pos,
-            });
+            return Ok(Expr { kind: ExprKind::Await(expr(self.arena, e)), pos });
         }
         let op = match self.peek() {
             Tok::Punct("!") => UnOp::Not,
@@ -2592,10 +2574,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.advance();
                 let target = self.unary()?;
                 self.check_update_target(&target)?;
-                return Ok(Expr {
-                    kind: ExprKind::Update(expr(self.arena, target), d, true),
-                    pos,
-                });
+                return Ok(Expr { kind: ExprKind::Update(expr(self.arena, target), d, true), pos });
             }
             _ => return self.postfix(),
         };
@@ -2610,10 +2589,7 @@ impl<'a> Parser<'_, 'a, '_> {
         if self.is("**") {
             return self.err("parenthesize a unary operand of `**`");
         }
-        Ok(Expr {
-            kind: ExprKind::Unary(op, expr(self.arena, e)),
-            pos,
-        })
+        Ok(Expr { kind: ExprKind::Unary(op, expr(self.arena, e)), pos })
     }
 
     /// Whether `e` is a call sloppy code may assign to (Annex B).
@@ -2625,10 +2601,7 @@ impl<'a> Parser<'_, 'a, '_> {
         match e.kind {
             ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..) | ExprKind::SuperMember(..) => Ok(()),
             _ if self.call_target(e) => Ok(()),
-            _ => Err(Error::new(
-                e.pos as usize,
-                "invalid increment target".into(),
-            )),
+            _ => Err(Error::new(e.pos as usize, "invalid increment target".into())),
         }
     }
 
@@ -2642,21 +2615,14 @@ impl<'a> Parser<'_, 'a, '_> {
             let pos = self.pos();
             self.check_update_target(&e)?;
             self.advance();
-            return Ok(Expr {
-                kind: ExprKind::Update(expr(self.arena, e), d, false),
-                pos,
-            });
+            return Ok(Expr { kind: ExprKind::Update(expr(self.arena, e), d, false), pos });
         }
         Ok(e)
     }
 
     /// Member accesses and calls.
     fn call(&mut self) -> R<Expr<'a>> {
-        let mut e = if self.is("new") {
-            self.new_expr()?
-        } else {
-            self.primary()?
-        };
+        let mut e = if self.is("new") { self.new_expr()? } else { self.primary()? };
         if self.arrow_end == self.i {
             return Ok(e);
         }
@@ -2742,25 +2708,20 @@ impl<'a> Parser<'_, 'a, '_> {
                         let end = self.toks[self.i - 1].pos;
                         // (In an arrow, the function's `arguments` and
                         // `new.target` it sees too.)
-                        let extra: &[&str] = if k != self.current && function { &["arguments", "%newtarget"] } else { &[] };
+                        let extra: &[&str] =
+                            if k != self.current && function { &["arguments", "%newtarget"] } else { &[] };
                         let f = self.eval_bindings(&visible, extra, end);
                         visible.push(Expr { kind: ExprKind::Function(f), pos });
                         args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
                     }
                 }
-                e = Expr {
-                    kind: ExprKind::Call(expr(self.arena, e), args),
-                    pos,
-                };
+                e = Expr { kind: ExprKind::Call(expr(self.arena, e), args), pos };
             } else if matches!(self.peek(), Tok::Template(t) if t.head) {
                 let Tok::Template(part) = self.bump() else { unreachable!() };
                 let (parts, subs) = self.template_rest(part)?;
                 let mut args = vec![Expr { kind: ExprKind::TemplateObject(parts), pos }];
                 args.extend(subs);
-                e = Expr {
-                    kind: ExprKind::Call(expr(self.arena, e), args),
-                    pos,
-                };
+                e = Expr { kind: ExprKind::Call(expr(self.arena, e), args), pos };
             } else if !self.member_suffix(&mut e)? {
                 if chain {
                     let pos = e.pos;
@@ -2807,24 +2768,18 @@ impl<'a> Parser<'_, 'a, '_> {
             if k != 0 {
                 self.functions[k].uses_new_target = true;
             }
-            let mut e = Expr {
-                kind: ExprKind::Ident("%newtarget".into()),
-                pos,
-            };
+            let mut e = Expr { kind: ExprKind::Ident("%newtarget".into()), pos };
             while self.member_suffix(&mut e)? {}
             return Ok(e);
         }
         if self.is("import")
             && (self.peek_at(1) == &Tok::Punct("(")
-                || self.peek_at(1) == &Tok::Punct(".") && matches!(self.peek_at(2), Tok::Ident(n) if &**n == "defer" || &**n == "source"))
+                || self.peek_at(1) == &Tok::Punct(".")
+                    && matches!(self.peek_at(2), Tok::Ident(n) if &**n == "defer" || &**n == "source"))
         {
             return self.err("`new import(…)`");
         }
-        let mut c = if self.is("new") {
-            self.new_expr()?
-        } else {
-            self.primary()?
-        };
+        let mut c = if self.is("new") { self.new_expr()? } else { self.primary()? };
         // (A tagged template is a member expression too: `new tag`x``.)
         loop {
             if matches!(self.peek(), Tok::Template(t) if t.head) {
@@ -2841,15 +2796,8 @@ impl<'a> Parser<'_, 'a, '_> {
         if self.is("?.") {
             return self.err("an optional chain in `new`");
         }
-        let args = if self.eat("(") {
-            self.arguments()?
-        } else {
-            Vec::new()
-        };
-        Ok(Expr {
-            kind: ExprKind::New(expr(self.arena, c), args),
-            pos,
-        })
+        let args = if self.eat("(") { self.arguments()? } else { Vec::new() };
+        Ok(Expr { kind: ExprKind::New(expr(self.arena, c), args), pos })
     }
 
     /// After `(`: arguments up to and including `)`.
@@ -2905,9 +2853,16 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Str(s) => ExprKind::Str(s.into()),
             // `import.defer(specifier, options)`, `import.source(…)`: as
             // `import()`, a deferred namespace or a module source.
-            Tok::Keyword("import") if self.is(".") && (matches!(self.peek_at(1), Tok::Ident(n) if &**n == "defer" || &**n == "source")) => {
+            Tok::Keyword("import")
+                if self.is(".")
+                    && (matches!(self.peek_at(1), Tok::Ident(n) if &**n == "defer" || &**n == "source")) =>
+            {
                 self.advance();
-                let phase = if self.is_word("defer") { 1.0 } else if self.is_word("source") { 2.0 } else {
+                let phase = if self.is_word("defer") {
+                    1.0
+                } else if self.is_word("source") {
+                    2.0
+                } else {
                     return self.err("an escaped `defer` or `source` after `import.`");
                 };
                 self.advance();
@@ -2938,11 +2893,12 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Ident(s) if self.is("=>") && !self.toks[self.i].newline_before => {
                 ExprKind::Function(self.arrow(Some(s), pos)?)
             }
-            Tok::Ident(s) if &*s == "async" && !self.toks[self.i - 1].escaped && !self.toks[self.i].newline_before && {
-                matches!(self.peek(), Tok::Keyword("function"))
-                    || matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == &Tok::Punct("=>")
-                    || self.is("(") && self.toks[self.i].arrow
-            } =>
+            Tok::Ident(s)
+                if &*s == "async" && !self.toks[self.i - 1].escaped && !self.toks[self.i].newline_before && {
+                    matches!(self.peek(), Tok::Keyword("function"))
+                        || matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == &Tok::Punct("=>")
+                        || self.is("(") && self.toks[self.i].arrow
+                } =>
             {
                 if self.eat("function") {
                     self.pending_async = true;
@@ -3179,10 +3135,42 @@ impl<'a> Parser<'_, 'a, '_> {
 fn is_reserved_word(s: &str) -> bool {
     matches!(
         s,
-        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger" | "default" | "delete" | "do"
-            | "else" | "enum" | "export" | "extends" | "false" | "finally" | "for" | "function" | "if" | "import"
-            | "in" | "instanceof" | "new" | "null" | "return" | "super" | "switch" | "this" | "throw" | "true"
-            | "try" | "typeof" | "var" | "void" | "while" | "with"
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
     )
 }
 
@@ -3288,14 +3276,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 names.push((n.clone(), r));
             }
         }
-        self.frames.push(Frame {
-            key,
-            names,
-            switch,
-            body,
-            vars: false,
-            catch: false,
-        });
+        self.frames.push(Frame { key, names, switch, body, vars: false, catch: false });
     }
 
     /// The `var`s and functions a function with parameter defaults declares
@@ -3349,14 +3330,7 @@ impl<'a> Parser<'_, 'a, '_> {
             return None;
         }
         // (A `var`s frame: the body's scope, inside it, is the function's.)
-        self.frames.push(Frame {
-            key: usize::MAX - 1,
-            names,
-            switch: false,
-            body: false,
-            vars: true,
-            catch: false,
-        });
+        self.frames.push(Frame { key: usize::MAX - 1, names, switch: false, body: false, vars: true, catch: false });
         Some(copies)
     }
 
@@ -3390,14 +3364,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             None => Vec::new(),
         };
-        self.frames.push(Frame {
-            key,
-            names,
-            switch: false,
-            body: false,
-            vars: true,
-            catch: false,
-        });
+        self.frames.push(Frame { key, names, switch: false, body: false, vars: true, catch: false });
     }
 
     /// Past a `{`: a block's statements, in its own scope (a function's
@@ -3424,7 +3391,8 @@ impl<'a> Parser<'_, 'a, '_> {
                 n == name && !(k == BLOCK_FUNCTION && kind == BLOCK_FUNCTION && !strict) && k != CATCH && kind != CATCH
             }) && self.redeclared.is_none()
             {
-                self.redeclared = Some((self.toks[self.i.saturating_sub(1)].pos, format!("`{name}` has already been declared")));
+                self.redeclared =
+                    Some((self.toks[self.i.saturating_sub(1)].pos, format!("`{name}` has already been declared")));
             }
             decls.push((name.clone(), kind));
             // (Its name, for `Parser::note_catch_ref`.)
@@ -3521,7 +3489,9 @@ impl<'a> Parser<'_, 'a, '_> {
                 // steps 3.d and 11, B.3.4.)
                 if seen.contains(orig) {
                     if !outer && !frame.catch {
-                        let at = out.chunks(3).position(|t: &[Expr<'a>]| matches!(&t[0].kind, ExprKind::Str(o) if o == &**orig));
+                        let at = out
+                            .chunks(3)
+                            .position(|t: &[Expr<'a>]| matches!(&t[0].kind, ExprKind::Str(o) if o == &**orig));
                         if let Some(e) = at.and_then(|i| out.get_mut(3 * i + 2))
                             && let ExprKind::Num(k) = e.kind
                         {
@@ -3531,8 +3501,18 @@ impl<'a> Parser<'_, 'a, '_> {
                     continue;
                 }
                 seen.push(orig.clone());
-                let constant = self.table.decls.get(&frame.key).is_some_and(|ds| ds.iter().any(|(n, k)| n == orig && (*k == CONST || *k == IMPORT)));
-                let kind = (if frame.catch { EVAL_CATCH } else if constant { EVAL_CONST } else { 0 }) | if outer { EVAL_OUTER } else { 0 };
+                let constant = self
+                    .table
+                    .decls
+                    .get(&frame.key)
+                    .is_some_and(|ds| ds.iter().any(|(n, k)| n == orig && (*k == CONST || *k == IMPORT)));
+                let kind = (if frame.catch {
+                    EVAL_CATCH
+                } else if constant {
+                    EVAL_CONST
+                } else {
+                    0
+                }) | if outer { EVAL_OUTER } else { 0 };
                 out.push(Expr { kind: ExprKind::Str(orig.to_string()), pos });
                 out.push(Expr { kind: ExprKind::Ident(renamed.clone()), pos });
                 out.push(Expr { kind: ExprKind::Num(kind as f64), pos });
@@ -3612,9 +3592,7 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// Whether `let`, the current token, starts a declaration.
     fn let_ahead(&self, n: &Name) -> bool {
-        &**n == "let"
-            && !self.toks[self.i].escaped
-            && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Punct("[" | "{"))
+        &**n == "let" && !self.toks[self.i].escaped && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Punct("[" | "{"))
     }
 
     /// Past `let` or `const`: the declarations (renamed), with their
@@ -3653,8 +3631,6 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         }
     }
-
-
 
     /// An object literal's (or a class's) property key: a name, a string,
     /// a number, or `[e]`.
@@ -3713,11 +3689,7 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     fn class_rest(&mut self, name: Option<Name>, pos: Pos) -> R<Class<'a>> {
-        let heritage = if self.eat("extends") {
-            Some(self.call()?)
-        } else {
-            None
-        };
+        let heritage = if self.eat("extends") { Some(self.call()?) } else { None };
         let k = self.classes;
         self.classes += 1;
         let home: Name = format!("%proto{k}").into();
@@ -3791,7 +3763,8 @@ impl<'a> Parser<'_, 'a, '_> {
                     }
                     // (A getter and a setter may share one.)
                     let clash = declared.iter().any(|(d, k, st)| {
-                        d == n && !(*st == is_static && (*k, kind) == (1, 2) || *st == is_static && (*k, kind) == (2, 1))
+                        d == n
+                            && !(*st == is_static && (*k, kind) == (1, 2) || *st == is_static && (*k, kind) == (2, 1))
                     });
                     if clash || declared.iter().filter(|(d, ..)| d == n).count() > 1 {
                         return self.err(format!("private name `{n}` declared twice"));
@@ -3920,13 +3893,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 None => None,
             };
-            members.push(ClassMember {
-                key,
-                kind,
-                is_static,
-                function: f,
-                var,
-            });
+            members.push(ClassMember { key, kind, is_static, function: f, var });
         }
         self.privates.pop();
         let end = self.toks[self.i - 1].pos;
@@ -3972,17 +3939,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             None => None,
         };
-        Ok(Class {
-            inner,
-            heritage,
-            constructor,
-            members,
-            home,
-            home_static,
-            privates,
-            fields,
-            statics,
-        })
+        Ok(Class { inner, heritage, constructor, members, home, home_static, privates, fields, statics })
     }
 
     /// The private names (`#x`) the class body at `self.i` (its `{`)
@@ -4150,7 +4107,8 @@ impl<'a> Parser<'_, 'a, '_> {
         let mut body = std::mem::take(&mut self.functions[index].body);
         if let Some(names) = scope.names {
             // (Its functions out of the `try`: made before it runs.)
-            let (mut fns, rest): (Vec<_>, Vec<_>) = body.into_iter().partition(|s| matches!(s.kind, StmtKind::Function(_)));
+            let (mut fns, rest): (Vec<_>, Vec<_>) =
+                body.into_iter().partition(|s| matches!(s.kind, StmtKind::Function(_)));
             fns.extend(self.lower_using(rest, names, scope.is_await, pos));
             body = fns;
         }
@@ -4291,12 +4249,17 @@ impl<'a> Parser<'_, 'a, '_> {
         }
         // `import defer * as ns from "m"`, `import source x from "m"` (a
         // binding named `defer` or `source` otherwise).
-        let word_at = |p: &Self, k: usize, w: &str| matches!(p.peek_at(k), Tok::Ident(n) if &**n == w) && !p.toks[p.i + k].escaped;
-        let ident_at = |p: &Self, k: usize| matches!(p.peek_at(k), Tok::Ident(_) | Tok::Keyword("yield" | "await" | "let" | "static"));
+        let word_at = |p: &Self, k: usize, w: &str| {
+            matches!(p.peek_at(k), Tok::Ident(n) if &**n == w) && !p.toks[p.i + k].escaped
+        };
+        let ident_at = |p: &Self, k: usize| {
+            matches!(p.peek_at(k), Tok::Ident(_) | Tok::Keyword("yield" | "await" | "let" | "static"))
+        };
         let phase = if self.is_word("defer") && self.peek_at(1) == &Tok::Punct("*") {
             self.advance();
             Phase::Defer
-        } else if self.is_word("source") && ident_at(self, 1) && (!word_at(self, 1, "from") || word_at(self, 2, "from")) {
+        } else if self.is_word("source") && ident_at(self, 1) && (!word_at(self, 1, "from") || word_at(self, 2, "from"))
+        {
             self.advance();
             Phase::Source
         } else {
@@ -4313,7 +4276,12 @@ impl<'a> Parser<'_, 'a, '_> {
         // (What is imported; the binding.)
         let mut bindings: Vec<(ImportName, Name)> = Vec::new();
         let mut more = true;
-        if phase == Phase::Evaluation && (matches!(self.peek(), Tok::Ident(_)) && !self.is_word("from") || self.is_word("from") && self.peek_at(1) != &Tok::Punct("'") && matches!(self.peek_at(1), Tok::Punct(",") | Tok::Ident(_))) {
+        if phase == Phase::Evaluation
+            && (matches!(self.peek(), Tok::Ident(_)) && !self.is_word("from")
+                || self.is_word("from")
+                    && self.peek_at(1) != &Tok::Punct("'")
+                    && matches!(self.peek_at(1), Tok::Punct(",") | Tok::Ident(_)))
+        {
             bindings.push((ImportName::Name("default".into()), self.binding_ident()?));
             more = self.eat(",");
         }
@@ -4450,12 +4418,24 @@ impl<'a> Parser<'_, 'a, '_> {
                             if !is_reserved_word(&n)
                                 && !matches!(
                                     &*n,
-                                    "implements" | "interface" | "package" | "private" | "protected" | "public" | "static" | "await"
+                                    "implements"
+                                        | "interface"
+                                        | "package"
+                                        | "private"
+                                        | "protected"
+                                        | "public"
+                                        | "static"
+                                        | "await"
                                 ) =>
                         {
                             n
                         }
-                        _ => return Err(Error::new(at as usize, "exported without `from`: not a variable's name".into())),
+                        _ => {
+                            return Err(Error::new(
+                                at as usize,
+                                "exported without `from`: not a variable's name".into(),
+                            ));
+                        }
                     };
                     self.export_name(&exported, at)?;
                     let local = self.resolve(&n).unwrap_or(n.clone());
@@ -4478,7 +4458,9 @@ impl<'a> Parser<'_, 'a, '_> {
         }
         let s = self.statement()?;
         let names: Vec<Name> = match &s.kind {
-            StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect(),
+            StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => {
+                ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect()
+            }
             StmtKind::Function(i) => {
                 let f = &self.functions[*i];
                 f.binding.clone().or(f.name.clone()).into_iter().collect()
@@ -4558,7 +4540,8 @@ impl<'a> Parser<'_, 'a, '_> {
     /// each of a variable it declares (an import's re-exported).
     fn check_module(&mut self, index: usize) -> R<()> {
         let vars = var_declared_names(&self.functions, index);
-        let lexical: Vec<Name> = self.table.decls.get(&MODULE_SCOPE).map_or_else(Vec::new, |ds| ds.iter().map(|(n, _)| n.clone()).collect());
+        let lexical: Vec<Name> =
+            self.table.decls.get(&MODULE_SCOPE).map_or_else(Vec::new, |ds| ds.iter().map(|(n, _)| n.clone()).collect());
         let mut fns: Vec<Name> = Vec::new();
         for s in &self.functions[index].body {
             if let StmtKind::Function(i) = &s.kind {
@@ -4641,17 +4624,21 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// A class's implicit constructor: `constructor() {}`, or a derived
     /// class's `constructor(...args) { super(...args); }`.
-    fn default_constructor(&mut self, name: Option<Name>, class_kind: u8, home: &Name, home_static: &Name, end: Pos) -> usize {
+    fn default_constructor(
+        &mut self,
+        name: Option<Name>,
+        class_kind: u8,
+        home: &Name,
+        home_static: &Name,
+        end: Pos,
+    ) -> usize {
         let derived = class_kind == 3;
         let mut body = Vec::new();
         if derived {
             let args = expr(self.arena, Expr { kind: ExprKind::Ident("args".into()), pos: end });
             let spread = Expr { kind: ExprKind::Spread(args), pos: end };
             body.push(Stmt {
-                kind: StmtKind::Expr(Expr {
-                    kind: ExprKind::SuperCall(home_static.clone(), vec![spread]),
-                    pos: end,
-                }),
+                kind: StmtKind::Expr(Expr { kind: ExprKind::SuperCall(home_static.clone(), vec![spread]), pos: end }),
                 pos: end,
             });
         }
@@ -4687,7 +4674,7 @@ impl<'a> Parser<'_, 'a, '_> {
             is_async: false,
             uses_new_target: true,
             hidden: Vec::new(),
-        text: None,
+            text: None,
             home: Some(home.clone()),
             ctor_var: Some(home_static.clone()),
             free: None,
@@ -4712,10 +4699,7 @@ impl<'a> Parser<'_, 'a, '_> {
             self.super_fns.push((ctor.clone(), self.current));
             self.advance();
             let args = self.arguments()?;
-            return Ok(Expr {
-                kind: ExprKind::SuperCall(ctor, args),
-                pos,
-            });
+            return Ok(Expr { kind: ExprKind::SuperCall(ctor, args), pos });
         }
         let Some(home) = self.functions[k].home.clone() else {
             return self.err("`super` outside a method");
@@ -4723,10 +4707,7 @@ impl<'a> Parser<'_, 'a, '_> {
         self.home_uses += 1;
         let key = if self.eat(".") {
             let n = self.property_name()?;
-            Expr {
-                kind: ExprKind::Str(n.to_string()),
-                pos,
-            }
+            Expr { kind: ExprKind::Str(n.to_string()), pos }
         } else if self.eat("[") {
             let e = self.expression(false)?;
             self.expect("]")?;
@@ -4743,10 +4724,7 @@ impl<'a> Parser<'_, 'a, '_> {
             ExprKind::This
         };
         let this = expr(self.arena, Expr { kind: this, pos });
-        Ok(Expr {
-            kind: ExprKind::SuperMember(home, expr(self.arena, key), this),
-            pos,
-        })
+        Ok(Expr { kind: ExprKind::SuperMember(home, expr(self.arena, key), this), pos })
     }
 
     /// A template literal's pieces from its first (`first`), and its
@@ -4836,25 +4814,12 @@ fn var_names_of(fs: &[Function], f: usize, functions: bool) -> Vec<Name> {
 fn declared_in(s: &Stmt, fs: &[Function], out: &mut Vec<Name>, functions: bool) {
     let walk = |s: &Stmt, out: &mut Vec<Name>| declared_in(s, fs, out, functions);
     match &s.kind {
-        StmtKind::Var(ds)
-        | StmtKind::For {
-            init: Some(ForInit::Var(ds)),
-            ..
-        } => out.extend(ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone())),
+        StmtKind::Var(ds) | StmtKind::For { init: Some(ForInit::Var(ds)), .. } => {
+            out.extend(ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()))
+        }
         StmtKind::ForIn { var: true, name, .. } => out.push(name.clone()),
-        StmtKind::ForOf {
-            kind: 1,
-            pattern: Some(p),
-            ..
-        } => p.names(out),
-        StmtKind::ForOf {
-            kind: 1,
-            target: Expr {
-                kind: ExprKind::Ident(name),
-                ..
-            },
-            ..
-        } => out.push(name.clone()),
+        StmtKind::ForOf { kind: 1, pattern: Some(p), .. } => p.names(out),
+        StmtKind::ForOf { kind: 1, target: Expr { kind: ExprKind::Ident(name), .. }, .. } => out.push(name.clone()),
         StmtKind::Function(i) if functions => out.extend(fs[*i].name.clone()),
         _ => {}
     }
@@ -4874,11 +4839,9 @@ fn declared_in(s: &Stmt, fs: &[Function], out: &mut Vec<Name>, functions: bool) 
         | StmtKind::Labeled(_, body) => walk(body, out),
         StmtKind::Block(b) => b.iter().for_each(|s| walk(s, out)),
         StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| walk(s, out)),
-        StmtKind::Try(b, c, fin) => b
-            .iter()
-            .chain(c.iter().flat_map(|(_, c)| c))
-            .chain(fin.iter().flatten())
-            .for_each(|s| walk(s, out)),
+        StmtKind::Try(b, c, fin) => {
+            b.iter().chain(c.iter().flat_map(|(_, c)| c)).chain(fin.iter().flatten()).for_each(|s| walk(s, out))
+        }
         _ => {}
     }
 }
@@ -4909,13 +4872,7 @@ fn var_declared_names(fs: &[Function], f: usize) -> Vec<Name> {
 }
 
 fn take<'a>(e: &mut Expr<'a>) -> Expr<'a> {
-    std::mem::replace(
-        e,
-        Expr {
-            kind: ExprKind::Null,
-            pos: 0,
-        },
-    )
+    std::mem::replace(e, Expr { kind: ExprKind::Null, pos: 0 })
 }
 
 enum Bin {
@@ -5018,28 +4975,15 @@ mod tests {
                 }
                 ExprKind::Member(o, n) => format!("{}.{n}", s(o)),
                 ExprKind::Index(o, k) => format!("{}[{}]", s(o), s(k)),
-                ExprKind::Call(f, a) => format!(
-                    "{}({})",
-                    s(f),
-                    a.iter().map(s).collect::<Vec<_>>().join(", ")
-                ),
-                ExprKind::New(f, a) => format!(
-                    "new {}({})",
-                    s(f),
-                    a.iter().map(s).collect::<Vec<_>>().join(", ")
-                ),
+                ExprKind::Call(f, a) => format!("{}({})", s(f), a.iter().map(s).collect::<Vec<_>>().join(", ")),
+                ExprKind::New(f, a) => format!("new {}({})", s(f), a.iter().map(s).collect::<Vec<_>>().join(", ")),
                 ExprKind::Comma(a, b) => format!("({}, {})", s(a), s(b)),
                 k => format!("{k:?}"),
             }
         }
         let p = program(src);
         match &p.functions[0].body[..] {
-            [
-                Stmt {
-                    kind: StmtKind::Expr(e),
-                    ..
-                },
-            ] => s(e),
+            [Stmt { kind: StmtKind::Expr(e), .. }] => s(e),
             b => panic!("{b:?}"),
         }
     }
@@ -5047,14 +4991,8 @@ mod tests {
     #[test]
     fn binds_operators_by_precedence_and_associativity() {
         assert_eq!(show("a + b * c - d"), "((a + (b * c)) - d)");
-        assert_eq!(
-            show("a = b += c ? d : e || f && g"),
-            "(a = (b += (c ? d : (e || (f && g)))))"
-        );
-        assert_eq!(
-            show("a < b == c < d & e | f ^ g"),
-            "((((a < b) == (c < d)) & e) | (f ^ g))"
-        );
+        assert_eq!(show("a = b += c ? d : e || f && g"), "(a = (b += (c ? d : (e || (f && g)))))");
+        assert_eq!(show("a < b == c < d & e | f ^ g"), "((((a < b) == (c < d)) & e) | (f ^ g))");
         assert_eq!(show("a ** b ** c"), "(a ** (b ** c))");
         assert_eq!(show("-a.b++ + !c"), "((Neg (upd1post a.b)) + (Not c))");
         assert_eq!(show("a, b = c"), "(a, (b = c))");
@@ -5074,10 +5012,7 @@ mod tests {
         let p = program("a = 1\nb = 2\nreturn_ = a\n++b");
         assert_eq!(p.functions[0].body.len(), 4);
         let p = program("function f() { return\n1 }");
-        assert!(matches!(
-            p.functions[1].body[0].kind,
-            StmtKind::Return(None)
-        ));
+        assert!(matches!(p.functions[1].body[0].kind, StmtKind::Return(None)));
         assert!(error("a b").contains("unexpected `b`"));
     }
 
@@ -5088,10 +5023,7 @@ mod tests {
              C.prototype.m = function () { return { k: function () {} }; };",
         );
         let names: Vec<_> = p.functions.iter().map(|f| f.name.as_deref()).collect();
-        assert_eq!(
-            names,
-            [None, Some("f"), Some("g"), Some("h"), Some("m"), Some("k")]
-        );
+        assert_eq!(names, [None, Some("f"), Some("g"), Some("h"), Some("m"), Some("k")]);
         let parents: Vec<_> = p.functions.iter().map(|f| f.parent).collect();
         assert_eq!(parents, [None, Some(0), Some(1), Some(1), Some(0), Some(4)]);
         assert_eq!(p.functions[1].params, ["a".into(), "b".into()]);
@@ -5100,13 +5032,9 @@ mod tests {
 
     #[test]
     fn separates_for_in_from_for() {
-        let p = program(
-            "for (var i = 0, n = ('a' in o); i < 1; i++) ; for (var p in o) ; for (q in o) ;",
-        );
+        let p = program("for (var i = 0, n = ('a' in o); i < 1; i++) ; for (var p in o) ; for (q in o) ;");
         let b = &p.functions[0].body;
-        assert!(
-            matches!(&b[0].kind, StmtKind::For { init: Some(ForInit::Var(d)), .. } if d.len() == 2)
-        );
+        assert!(matches!(&b[0].kind, StmtKind::For { init: Some(ForInit::Var(d)), .. } if d.len() == 2));
         assert!(matches!(&b[1].kind, StmtKind::ForIn { var: true, name, .. } if &**name == "p"));
         assert!(matches!(&b[2].kind, StmtKind::ForIn { var: false, .. }));
     }

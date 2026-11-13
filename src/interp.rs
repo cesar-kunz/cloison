@@ -90,14 +90,8 @@ use crate::object::{Class, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
 use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, is_string, string_len, string_units};
 
-pub type Handler = extern "rust-preserve-none" fn(
-    *const u8,
-    Value,
-    *mut Value,
-    NumberTag,
-    &'static Table,
-    &'static Table,
-) -> Value;
+pub type Handler =
+    extern "rust-preserve-none" fn(*const u8, Value, *mut Value, NumberTag, &'static Table, &'static Table) -> Value;
 
 /// Whether int32 results continue in the `I32` accumulator state. Without
 /// it, they're boxed and every handler runs in `ANY`, as before. That
@@ -2786,27 +2780,9 @@ macro_rules! shift_smi {
     };
 }
 
-shift_smi!(
-    ShiftLeftSmi,
-    op_shl_smi,
-    i32_shl_smi,
-    slow_shl_smi,
-    |a, k| Some(a << k)
-);
-shift_smi!(
-    ShiftRightSmi,
-    op_sar_smi,
-    i32_sar_smi,
-    slow_sar_smi,
-    |a, k| Some(a >> k)
-);
-shift_smi!(
-    ShiftRightLogicalSmi,
-    op_shr_smi,
-    i32_shr_smi,
-    slow_shr_smi,
-    |a, k| { i32::try_from(a as u32 >> k).ok() }
-);
+shift_smi!(ShiftLeftSmi, op_shl_smi, i32_shl_smi, slow_shl_smi, |a, k| Some(a << k));
+shift_smi!(ShiftRightSmi, op_sar_smi, i32_sar_smi, slow_sar_smi, |a, k| Some(a >> k));
+shift_smi!(ShiftRightLogicalSmi, op_shr_smi, i32_shr_smi, slow_shr_smi, |a, k| { i32::try_from(a as u32 >> k).ok() });
 
 // ---- `bytecode::PAIRS` ----
 
@@ -3075,7 +3051,9 @@ fn strict_fast(tag: NumberTag, a: Value, b: Value) -> Option<bool> {
         return Some(true);
     }
     // Two cells are equal only as strings or BigInts.
-    if a.is_cell() && b.is_cell() && unsafe { (*as_object(a)).class == (*as_object(b)).class }
+    if a.is_cell()
+        && b.is_cell()
+        && unsafe { (*as_object(a)).class == (*as_object(b)).class }
         && matches!(unsafe { (*as_object(a)).class }, Class::String | Class::BigInt)
     {
         return None;
@@ -3779,11 +3757,7 @@ pub(crate) fn to_boolean(v: Value) -> bool {
 /// ToInt32 of any value (ToNumber first).
 #[inline]
 fn int32_of(v: Value) -> i32 {
-    if v.is_int32() {
-        v.as_i32_unchecked()
-    } else {
-        to_int32(to_number(v))
-    }
+    if v.is_int32() { v.as_i32_unchecked() } else { to_int32(to_number(v)) }
 }
 
 pub(crate) fn to_int32(d: f64) -> i32 {
@@ -3979,11 +3953,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 };
             }
         }
-        let order = if hint == STRING {
-            [vm.a_to_string, vm.a_value_of]
-        } else {
-            [vm.a_value_of, vm.a_to_string]
-        };
+        let order = if hint == STRING { [vm.a_to_string, vm.a_value_of] } else { [vm.a_value_of, vm.a_to_string] };
         for name in order {
             let m = match vm.get(v, name) {
                 Ok(m) => m,
@@ -4041,8 +4011,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
         // (Neither gave a primitive: a TypeError, frame top or not, as a
         // redo would find the same; unless one is pending, to throw it.)
         if !vm.conv_redo {
-            vm.conv_error
-                .get_or_insert_with(|| Error::type_error("Cannot convert object to primitive value"));
+            vm.conv_error.get_or_insert_with(|| Error::type_error("Cannot convert object to primitive value"));
             vm.conv_thrown = true;
         }
         Value::UNDEFINED
@@ -4054,8 +4023,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
 fn symbol_conversion(to: &str) {
     unsafe {
         let vm = &mut *current_vm();
-        vm.conv_error
-            .get_or_insert_with(|| Error::type_error(format!("Cannot convert a Symbol value to a {to}")));
+        vm.conv_error.get_or_insert_with(|| Error::type_error(format!("Cannot convert a Symbol value to a {to}")));
         vm.conv_thrown = true;
     }
 }
@@ -4127,17 +4095,11 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
         if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
             return f64::NAN;
         }
-        return digits.chars().fold(0.0, |acc, c| {
-            acc * radix as f64 + c.to_digit(radix).unwrap() as f64
-        });
+        return digits.chars().fold(0.0, |acc, c| acc * radix as f64 + c.to_digit(radix).unwrap() as f64);
     }
     let unsigned = t.strip_prefix(['+', '-']).unwrap_or(t);
     if unsigned == "Infinity" {
-        return if t.starts_with('-') {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        };
+        return if t.starts_with('-') { f64::NEG_INFINITY } else { f64::INFINITY };
     }
     // A StrDecimalLiteral: digits, an optional fraction, an exponent.
     let b = unsigned.as_bytes();
@@ -4859,11 +4821,7 @@ pub(crate) unsafe fn frame_callee(regs: *mut Value) -> *mut Object {
     unsafe { header(regs, FUNC) }
 }
 
-pub(crate) unsafe fn frame_args(
-    vm: &mut Vm,
-    regs: *mut Value,
-    spread: &mut Vec<Value>,
-) -> (*const Value, usize) {
+pub(crate) unsafe fn frame_args(vm: &mut Vm, regs: *mut Value, spread: &mut Vec<Value>) -> (*const Value, usize) {
     unsafe {
         let ret: *const u8 = header(regs, RET_PC);
         let caller: *mut Value = header(regs, CALLER);
@@ -4884,9 +4842,7 @@ pub(crate) unsafe fn frame_args(
                 (spread.as_ptr(), spread.len())
             }
             // The caller's own arguments, passed on.
-            Some(Op::CallApplyArguments) if unwrap_apply(vm, fv, this).is_some() => {
-                frame_args(vm, caller, spread)
-            }
+            Some(Op::CallApplyArguments) if unwrap_apply(vm, fv, this).is_some() => frame_args(vm, caller, spread),
             Some(Op::Call | Op::CallApplyArguments) => (caller.add(w + 1).cast_const(), n),
             _ => (caller.add(w).cast_const(), n),
         }
@@ -4899,10 +4855,8 @@ pub(crate) unsafe fn frame_args(
 pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
     unsafe {
         let is = |v: Value, c: Class| v.is_cell() && (*as_object(v)).class == c;
-        (is(f, Class::Native)
-            && (*as_object(f)).code == (*vm).function_apply
-            && is(this, Class::Function))
-        .then(|| as_object(this))
+        (is(f, Class::Native) && (*as_object(f)).code == (*vm).function_apply && is(this, Class::Function))
+            .then(|| as_object(this))
     }
 }
 
@@ -4934,10 +4888,8 @@ unsafe fn box_this(vm: *mut Vm, this: Value) -> Value {
 pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
     unsafe {
         let is = |v: Value, c: Class| v.is_cell() && (*as_object(v)).class == c;
-        (is(f, Class::Native)
-            && (*as_object(f)).code == (*vm).function_call
-            && is(this, Class::Function))
-        .then(|| as_object(this))
+        (is(f, Class::Native) && (*as_object(f)).code == (*vm).function_call && is(this, Class::Function))
+            .then(|| as_object(this))
     }
 }
 
@@ -5082,11 +5034,7 @@ unsafe fn push_frame(
         set_header(new, FUNC, fo);
         // Sloppy mode: a primitive `this` is boxed (a string, a symbol or a
         // bigint is a cell).
-        *new = if (*callee).strict || crate::props::is_object(this) {
-            this
-        } else {
-            sloppy_this(vm, this)
-        };
+        *new = if (*callee).strict || crate::props::is_object(this) { this } else { sloppy_this(vm, this) };
         // Scalar loops: counts are small, and vectorized ones would bloat
         // the handler with prologues and remainders.
         let k = argc.min((*callee).nparams as usize);
@@ -5104,7 +5052,12 @@ unsafe fn push_frame(
 
 /// After a store that did nothing as it can't happen (`Vm::store_failed`):
 /// in strict code, a `TypeError` naming the property (`name`).
-fn strict_store_check(vm: &mut Vm, code: &Code, r: crate::vm::Result<()>, name: impl FnOnce(&Vm) -> String) -> crate::vm::Result<()> {
+fn strict_store_check(
+    vm: &mut Vm,
+    code: &Code,
+    r: crate::vm::Result<()>,
+    name: impl FnOnce(&Vm) -> String,
+) -> crate::vm::Result<()> {
     if r.is_ok() && std::mem::take(&mut vm.store_failed) && code.strict {
         return Err(Error::type_error(format!("Cannot assign to read only property '{}' of object", name(vm))));
     }
@@ -5114,10 +5067,7 @@ fn strict_store_check(vm: &mut Vm, code: &Code, r: crate::vm::Result<()>, name: 
 #[cold]
 #[inline(never)]
 fn stack_overflow(regs: *mut Value) -> Value {
-    throw(
-        unsafe { frame_vm(regs) },
-        Error::range_error("Maximum call stack size exceeded"),
-    )
+    throw(unsafe { frame_vm(regs) }, Error::range_error("Maximum call stack size exceeded"))
 }
 
 /// End the run with `e`: record it in the VM and return the `EMPTY` marker
@@ -5157,11 +5107,7 @@ fn construct_this(regs: *mut Value, f: *mut Object) -> Value {
 /// a field typed `Num` (2), an int32 as a double (see `FieldType::Num`).
 #[inline(always)]
 fn as_named(tag: NumberTag, want: u64, v: Value) -> Value {
-    if want == 2 && tag.is_int32(v) {
-        Value::from_f64(v.as_i32_unchecked() as f64)
-    } else {
-        v
-    }
+    if want == 2 && tag.is_int32(v) { Value::from_f64(v.as_i32_unchecked() as f64) } else { v }
 }
 
 /// Whether `v` fits the field type a store's inline cache holds (encoded by
@@ -5231,13 +5177,7 @@ pub enum Run {
 /// operand `< frame.regs().len()`, every jump landing on an instruction
 /// boundary, and every path ending in `Return`: `js::compile`'s code, or
 /// code `asm::verify` accepts.
-pub unsafe fn run_frame(
-    code: &[u8],
-    pc: usize,
-    acc: Value,
-    frame: &mut Frame,
-    budget: i64,
-) -> (Run, i64) {
+pub unsafe fn run_frame(code: &[u8], pc: usize, acc: Value, frame: &mut Frame, budget: i64) -> (Run, i64) {
     frame.set_budget(budget.max(1));
     let pc = unsafe { code.as_ptr().add(pc) };
     // Launder the tables (and, in `NumberTag::new`, the tag) so LLVM can't
@@ -5254,13 +5194,7 @@ pub unsafe fn run_frame(
     }
     let target = frame.slots[HEADER - OSR_PC].to_bits() as usize;
     let acc = frame.slots[HEADER - OSR_ACC];
-    (
-        Run::Osr {
-            pc: target - code.as_ptr() as usize,
-            acc,
-        },
-        left,
-    )
+    (Run::Osr { pc: target - code.as_ptr() as usize, acc }, left)
 }
 
 /// Run `code` over the register file `regs` and return the accumulator at
@@ -5356,10 +5290,7 @@ unsafe fn drive_js(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value, unw
                 return v;
             }
             let regs = std::mem::replace(&mut vm.osr_regs, std::ptr::null_mut());
-            assert!(
-                !regs.is_null(),
-                "EMPTY without an error or a tier-up request"
-            );
+            assert!(!regs.is_null(), "EMPTY without an error or a tier-up request");
             let code = &*frame_code(regs);
             let start = code.bytecode.as_ptr();
             let target = (*regs.sub(OSR_PC)).to_bits() as usize - start as usize;
@@ -5369,11 +5300,7 @@ unsafe fn drive_js(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value, unw
             *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
             vm.safepoint(regs);
             let resume = match crate::jit::vm_run(vm, code, regs, target, acc) {
-                VmRun::NotCompiled | VmRun::Interpret => Resume {
-                    regs,
-                    pc: start.add(target),
-                    acc,
-                },
+                VmRun::NotCompiled | VmRun::Interpret => Resume { regs, pc: start.add(target), acc },
                 VmRun::Exit(r) => r,
                 VmRun::Returned(v) => match finish_return(regs, v) {
                     Ok(r) => r,
@@ -5396,20 +5323,12 @@ unsafe fn drive_js(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value, unw
 /// to native code.
 unsafe fn finish_return(regs: *mut Value, v: Value) -> Result<Resume, Value> {
     unsafe {
-        let v = if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
-            construct_result(regs, v)
-        } else {
-            v
-        };
+        let v = if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 { construct_result(regs, v) } else { v };
         let ret: *const u8 = header(regs, RET_PC);
         if ret.is_null() {
             return Err(v);
         }
-        Ok(Resume {
-            regs: header(regs, CALLER),
-            pc: ret,
-            acc: v,
-        })
+        Ok(Resume { regs: header(regs, CALLER), pc: ret, acc: v })
     }
 }
 
@@ -5464,12 +5383,7 @@ fn enter_compiled(regs: *mut Value) -> Entered {
     unsafe {
         let vm = &mut *frame_vm(regs);
         let code = &*frame_code(regs);
-        let done = |kind, acc| Entered {
-            kind,
-            regs,
-            pc: std::ptr::null(),
-            acc,
-        };
+        let done = |kind, acc| Entered { kind, regs, pc: std::ptr::null(), acc };
         // Several realms: no compiled code; a call into another realm runs
         // its frame there, to its end (see `realm`).
         if !vm.realms.is_empty() {
@@ -5497,26 +5411,12 @@ fn enter_compiled(regs: *mut Value) -> Entered {
             }
             VmRun::Interpret => done(ENTER_INTERPRET, Value::UNDEFINED),
             VmRun::Returned(v) => {
-                let v = if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
-                    construct_result(regs, v)
-                } else {
-                    v
-                };
+                let v = if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 { construct_result(regs, v) } else { v };
                 done(ENTER_RETURNED, v)
             }
             // (Unwinding from where it left: its handlers catch it.)
-            VmRun::Exit(r) if vm.error.is_some() => Entered {
-                kind: ENTER_UNWIND,
-                regs: r.regs,
-                pc: r.pc,
-                acc: r.acc,
-            },
-            VmRun::Exit(r) => Entered {
-                kind: ENTER_RESUME,
-                regs: r.regs,
-                pc: r.pc,
-                acc: r.acc,
-            },
+            VmRun::Exit(r) if vm.error.is_some() => Entered { kind: ENTER_UNWIND, regs: r.regs, pc: r.pc, acc: r.acc },
+            VmRun::Exit(r) => Entered { kind: ENTER_RESUME, regs: r.regs, pc: r.pc, acc: r.acc },
         }
     }
 }
@@ -5677,7 +5577,8 @@ pub(crate) unsafe fn call_from_jit(
             // `f.apply(that, list)`: call `f` with `list`'s elements.
             if op == Op::Call
                 && let Some(fo) = unwrap_apply(vm, fv, this)
-                && let Some(s) = crate::builtins::apply_list_fast(if argc < 2 { Value::UNDEFINED } else { *args.add(1) })
+                && let Some(s) =
+                    crate::builtins::apply_list_fast(if argc < 2 { Value::UNDEFINED } else { *args.add(1) })
             {
                 spread = s;
                 fv = object_value(fo);
@@ -5685,30 +5586,30 @@ pub(crate) unsafe fn call_from_jit(
                 args = spread.as_ptr().cast_mut();
                 argc = spread.len();
             } else {
-            match unwrap_call(vm, fv, this) {
-                Some(fo) if op == Op::Call => {
-                    fv = object_value(fo);
-                    this = if argc == 0 { Value::UNDEFINED } else { *args };
-                    args = args.add(1);
-                    argc = argc.saturating_sub(1);
-                }
-                _ => {
-                    // (Past every register the compiled code uses.)
-                    let saved = vm.native_top;
-                    vm.native_top = regs.add(frame - HEADER);
-                    let r = if op == Op::Construct {
-                        vm.construct_other(fv, std::slice::from_raw_parts(args, argc))
-                    } else {
-                        vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
-                    };
-                    vm.native_top = saved;
-                    if vm.conv_thrown {
-                        let e = vm.take_conv_error();
-                        return throw(vm, e);
+                match unwrap_call(vm, fv, this) {
+                    Some(fo) if op == Op::Call => {
+                        fv = object_value(fo);
+                        this = if argc == 0 { Value::UNDEFINED } else { *args };
+                        args = args.add(1);
+                        argc = argc.saturating_sub(1);
                     }
-                    return r.unwrap_or_else(|e| throw(vm, e));
+                    _ => {
+                        // (Past every register the compiled code uses.)
+                        let saved = vm.native_top;
+                        vm.native_top = regs.add(frame - HEADER);
+                        let r = if op == Op::Construct {
+                            vm.construct_other(fv, std::slice::from_raw_parts(args, argc))
+                        } else {
+                            vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
+                        };
+                        vm.native_top = saved;
+                        if vm.conv_thrown {
+                            let e = vm.take_conv_error();
+                            return throw(vm, e);
+                        }
+                        return r.unwrap_or_else(|e| throw(vm, e));
+                    }
                 }
-            }
             }
         }
         let fo = as_object(fv);
@@ -5770,11 +5671,7 @@ unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags
 /// [`run_new_frame`]'s body.
 unsafe fn run_new_frame_js(vm: &mut Vm, callee: *const Code, new: *mut Value, flags: u64) -> Value {
     unsafe {
-        let mut start = Resume {
-            regs: new,
-            pc: (*callee).bytecode.as_ptr(),
-            acc: Value::UNDEFINED,
-        };
+        let mut start = Resume { regs: new, pc: (*callee).bytecode.as_ptr(), acc: Value::UNDEFINED };
         if !vm.realms.is_empty() {
             (*callee).calls_left.set(0);
             return run_in_realm(vm, &*callee, new, start);
@@ -5794,11 +5691,7 @@ unsafe fn run_new_frame_js(vm: &mut Vm, callee: *const Code, new: *mut Value, fl
                 VmRun::NotCompiled => not_compiled(&*callee),
                 VmRun::Interpret => {}
                 VmRun::Returned(v) => {
-                    return if flags == CONSTRUCT {
-                        construct_result(new, v)
-                    } else {
-                        v
-                    };
+                    return if flags == CONSTRUCT { construct_result(new, v) } else { v };
                 }
                 VmRun::Exit(r) if vm.error.is_some() => {
                     return drive_from(vm, r.pc, r.acc, r.regs, true);

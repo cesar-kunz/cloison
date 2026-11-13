@@ -567,7 +567,16 @@ fn nudge_to_calendar_unit(
 
 /// NudgeToZonedTime.
 #[allow(clippy::too_many_arguments)]
-fn nudge_to_zoned_time(vm: &Vm, sign: i64, d: &Internal, dt: DateTime, z: u32, increment: i64, unit: Unit, mode: RoundingMode) -> Result<Nudge> {
+fn nudge_to_zoned_time(
+    vm: &Vm,
+    sign: i64,
+    d: &Internal,
+    dt: DateTime,
+    z: u32,
+    increment: i64,
+    unit: Unit,
+    mode: RoundingMode,
+) -> Result<Nudge> {
     let start = fields::date_add(dt.date, &d.date, Overflow::Constrain)?;
     let end = iso::add_days(start, sign);
     let start_ns = epoch_ns_for(vm, z, DateTime { date: start, time: dt.time }, Disambiguation::Compatible)?;
@@ -591,7 +600,14 @@ fn nudge_to_zoned_time(vm: &Vm, sign: i64, d: &Internal, dt: DateTime, z: u32, i
 }
 
 /// NudgeToDayOrTime.
-fn nudge_to_day_or_time(d: &Internal, dest: i128, largest: Unit, increment: i64, smallest: Unit, mode: RoundingMode) -> Result<Nudge> {
+fn nudge_to_day_or_time(
+    d: &Internal,
+    dest: i128,
+    largest: Unit,
+    increment: i64,
+    smallest: Unit,
+    mode: RoundingMode,
+) -> Result<Nudge> {
     let time = checked(d.time + d.date[3] as i128 * iso::NS_PER_DAY)?;
     let rounded = checked(iso::round_to_increment(time, smallest.nanos() * increment as i128, mode))?;
     let diff = rounded - time;
@@ -611,7 +627,16 @@ fn nudge_to_day_or_time(d: &Internal, dest: i128, largest: Unit, increment: i64,
 /// BubbleRelativeDuration: units below `largest` that reached a whole
 /// larger unit carried into it.
 #[allow(clippy::too_many_arguments)]
-fn bubble(vm: &Vm, sign: i64, d: Internal, nudged: i128, dt: DateTime, z: Option<u32>, largest: Unit, smallest: Unit) -> Result<Internal> {
+fn bubble(
+    vm: &Vm,
+    sign: i64,
+    d: Internal,
+    nudged: i128,
+    dt: DateTime,
+    z: Option<u32>,
+    largest: Unit,
+    smallest: Unit,
+) -> Result<Internal> {
     if smallest == largest {
         return Ok(d);
     }
@@ -672,7 +697,15 @@ fn round_relative(
 }
 
 /// TotalRelativeDuration.
-fn total_relative(vm: &Vm, d: Internal, origin: i128, dest: i128, dt: DateTime, z: Option<u32>, unit: Unit) -> Result<f64> {
+fn total_relative(
+    vm: &Vm,
+    d: Internal,
+    origin: i128,
+    dest: i128,
+    dt: DateTime,
+    z: Option<u32>,
+    unit: Unit,
+) -> Result<f64> {
     if unit.is_calendar() || (z.is_some() && unit == Unit::Day) {
         let sign = if internal_sign(&d) < 0 { -1 } else { 1 };
         let (_, total) = nudge_to_calendar_unit(vm, sign, &d, origin, dest, dt, z, 1, unit, RoundingMode::Trunc)?;
@@ -718,7 +751,18 @@ pub(crate) fn round_relative_plain(
     smallest: Unit,
     mode: RoundingMode,
 ) -> Result<Internal> {
-    round_relative(vm, d, iso::utc_epoch_ns(start), iso::utc_epoch_ns(end), start, None, largest, increment, smallest, mode)
+    round_relative(
+        vm,
+        d,
+        iso::utc_epoch_ns(start),
+        iso::utc_epoch_ns(end),
+        start,
+        None,
+        largest,
+        increment,
+        smallest,
+        mode,
+    )
 }
 
 /// DifferencePlainDateTimeWithTotal.
@@ -736,7 +780,13 @@ pub(crate) fn difference_plain_total(vm: &Vm, a: DateTime, b: DateTime, unit: Un
 }
 
 /// DifferenceInstant.
-pub(crate) fn difference_instant(ns1: i128, ns2: i128, increment: i64, smallest: Unit, mode: RoundingMode) -> Result<Internal> {
+pub(crate) fn difference_instant(
+    ns1: i128,
+    ns2: i128,
+    increment: i64,
+    smallest: Unit,
+    mode: RoundingMode,
+) -> Result<Internal> {
     let t = round_time_duration(ns2 - ns1, increment, smallest, mode)?;
     Ok(combine(ZERO_DATE, t))
 }
@@ -824,7 +874,11 @@ pub(crate) fn difference_settings(
         _ => default,
     };
     if largest.larger(smallest) != largest {
-        return Err(range(format!("largestUnit {} cannot be smaller than smallestUnit {}", largest.name(), smallest.name())));
+        return Err(range(format!(
+            "largestUnit {} cannot be smaller than smallestUnit {}",
+            largest.name(),
+            smallest.name()
+        )));
     }
     if let Some(max) = max_increment(smallest) {
         validate_increment(increment, max, false)?;
@@ -967,7 +1021,11 @@ fn duration_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(range("at least one of smallestUnit or largestUnit is required"));
     }
     if largest.larger(smallest) != largest {
-        return Err(range(format!("largestUnit {} cannot be smaller than smallestUnit {}", largest.name(), smallest.name())));
+        return Err(range(format!(
+            "largestUnit {} cannot be smaller than smallestUnit {}",
+            largest.name(),
+            smallest.name()
+        )));
     }
     if let Some(max) = max_increment(smallest) {
         validate_increment(increment, max, false)?;
@@ -991,7 +1049,15 @@ fn duration_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             let dd = adjust(&i.date, days as f64, None, None)?;
             let target = fields::date_add(date, &dd, Overflow::Constrain)?;
             let start = DateTime { date, time: Time::MIDNIGHT };
-            let diff = difference_plain_rounded(vm, start, DateTime { date: target, time }, largest, increment, smallest, mode)?;
+            let diff = difference_plain_rounded(
+                vm,
+                start,
+                DateTime { date: target, time },
+                largest,
+                increment,
+                smallest,
+                mode,
+            )?;
             from_internal(&diff, largest)?
         }
         Relative::None => {

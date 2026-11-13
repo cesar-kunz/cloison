@@ -593,12 +593,8 @@ impl Op {
             Op::JumpIfGreaterSmiLoop => Op::JumpIfGreaterSmi,
             Op::JumpIfGreaterEqualSmiLoop => Op::JumpIfGreaterEqualSmi,
             Op::TestGreaterThanJumpIfTrue | Op::TestGreaterThanJumpIfFalse => Op::TestGreaterThan,
-            Op::TestLessThanOrEqualJumpIfTrue | Op::TestLessThanOrEqualJumpIfFalse => {
-                Op::TestLessThanOrEqual
-            }
-            Op::TestGreaterThanOrEqualJumpIfTrue | Op::TestGreaterThanOrEqualJumpIfFalse => {
-                Op::TestGreaterThanOrEqual
-            }
+            Op::TestLessThanOrEqualJumpIfTrue | Op::TestLessThanOrEqualJumpIfFalse => Op::TestLessThanOrEqual,
+            Op::TestGreaterThanOrEqualJumpIfTrue | Op::TestGreaterThanOrEqualJumpIfFalse => Op::TestGreaterThanOrEqual,
             Op::TestStrictEqualJumpIfTrue | Op::TestStrictEqualJumpIfFalse => Op::TestStrictEqual,
             Op::TestUndefinedJumpIfTrue | Op::TestUndefinedJumpIfFalse => Op::TestUndefined,
             Op::TestNullJumpIfTrue | Op::TestNullJumpIfFalse => Op::TestNull,
@@ -699,10 +695,7 @@ pub fn quicken(code: &mut [u8]) {
             let after = next + Op::Star.size();
             let chain = after < code.len() && Op::from_u8(code[after]).map(Op::plain) == Some(Op::GetNamed);
             code[pc] = if chain { Op::GetNamedStarGetNamed } else { Op::GetNamedStar } as u8;
-        } else if op == Op::Star
-            && next < code.len()
-            && code[next] == Op::GetNamed as u8
-        {
+        } else if op == Op::Star && next < code.len() && code[next] == Op::GetNamed as u8 {
             let after = next + Op::GetNamed.size();
             let star = after < code.len() && Op::from_u8(code[after]).map(Op::plain) == Some(Op::Star);
             code[pc] = if star { Op::StarGetNamedStar } else { Op::StarGetNamed } as u8;
@@ -867,11 +860,7 @@ impl Assembler {
     }
     /// `op`, or its loop form if `l` is already bound (a backward jump).
     fn jump_op(&self, op: Op, l: Label) -> Op {
-        if self.labels[l.0].is_some() {
-            op.looping()
-        } else {
-            op
-        }
+        if self.labels[l.0].is_some() { op.looping() } else { op }
     }
 
     pub fn jump_if_less(&mut self, r: u8, l: Label) -> &mut Self {
@@ -904,12 +893,7 @@ impl Assembler {
     /// compare-and-jumps (`JumpIfLess`, `JumpIfGreaterEqualSmi`, …) have one.
     pub fn emit(&mut self, op: Op, args: &[Arg]) -> &mut Self {
         let kinds = op.operands();
-        assert_eq!(
-            kinds.len(),
-            args.len(),
-            "{op:?} takes {} operands",
-            kinds.len()
-        );
+        assert_eq!(kinds.len(), args.len(), "{op:?} takes {} operands", kinds.len());
         let start = self.code.len();
         let mut op = op.plain();
         for a in args {
@@ -1033,10 +1017,16 @@ mod tests {
         // In place: the same register only. `Star; Ldar`, but not before
         // an in-place `++` (it'd run its `Ldar` as a plain one).
         for (op, r) in [
-            (Op::Ldar, Some(2)), (Op::Dec, None), (Op::Star, Some(2)),
+            (Op::Ldar, Some(2)),
+            (Op::Dec, None),
+            (Op::Star, Some(2)),
             (Op::Star, Some(3)),
-            (Op::Ldar, Some(2)), (Op::Inc, None), (Op::Star, Some(2)),
-            (Op::Ldar, Some(3)), (Op::Dec, None), (Op::Star, Some(4)),
+            (Op::Ldar, Some(2)),
+            (Op::Inc, None),
+            (Op::Star, Some(2)),
+            (Op::Ldar, Some(3)),
+            (Op::Dec, None),
+            (Op::Star, Some(4)),
             (Op::Return, None),
         ] {
             let args: Vec<Arg> = r.map(Arg::Reg).into_iter().collect();
@@ -1046,7 +1036,13 @@ mod tests {
         let mut q = plain.clone();
         super::quicken(&mut q);
         let at = plain.len() - 18;
-        let changed = [(0, Op::TestLessThanJumpIfFalse), (at, Op::LdarDecStar), (at + 5, Op::StarLdarIncStar), (at + 7, Op::LdarIncStar), (at + 10, Op::StarLdar)];
+        let changed = [
+            (0, Op::TestLessThanJumpIfFalse),
+            (at, Op::LdarDecStar),
+            (at + 5, Op::StarLdarIncStar),
+            (at + 7, Op::LdarIncStar),
+            (at + 10, Op::StarLdar),
+        ];
         let mut want = plain.clone();
         for (k, op) in changed {
             want[k] = op as u8;

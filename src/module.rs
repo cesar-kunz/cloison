@@ -156,7 +156,9 @@ impl Modules {
     pub(crate) fn root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
         use crate::gc::Root;
         for r in &mut self.records {
-            for v in [&mut r.env, &mut r.namespace, &mut r.deferred, &mut r.source_object, &mut r.generator, &mut r.meta] {
+            for v in
+                [&mut r.env, &mut r.namespace, &mut r.deferred, &mut r.source_object, &mut r.generator, &mut r.meta]
+            {
                 f(Root::Value(v));
             }
             if let Some(e) = &mut r.error {
@@ -223,7 +225,20 @@ fn template(vm: &mut Vm, t: Template) -> *mut Object {
             (import_done, 0),
             (defer_done, 0),
         ];
-        let names = ["get", "set", "has", "deleteProperty", "defineProperty", "getOwnPropertyDescriptor", "ownKeys", "", "", "", "", ""];
+        let names = [
+            "get",
+            "set",
+            "has",
+            "deleteProperty",
+            "defineProperty",
+            "getOwnPropertyDescriptor",
+            "ownKeys",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ];
         for ((f, n), name) in fs.into_iter().zip(names) {
             let o = vm.native_function(name, f, n, any, false);
             // (Every realm's: they run in their caller's.)
@@ -542,7 +557,15 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     vm.define_own_property(target, Key::Name(a_tag), &Desc::data(tag, false, false, false))?;
     vm.prevent_extensions(target);
     let handler = vm.new_object(Value::NULL);
-    let traps = [Template::Get, Template::Set, Template::Has, Template::Delete, Template::Define, Template::GetOwn, Template::OwnKeys];
+    let traps = [
+        Template::Get,
+        Template::Set,
+        Template::Has,
+        Template::Delete,
+        Template::Define,
+        Template::GetOwn,
+        Template::OwnKeys,
+    ];
     let trap_names = ["get", "set", "has", "deleteProperty", "defineProperty", "getOwnPropertyDescriptor", "ownKeys"];
     for (t, n) in traps.into_iter().zip(trap_names) {
         let f = closure(vm, t, &[Value::from_i32(m as i32), Value::from_bool(deferred)]);
@@ -701,7 +724,8 @@ fn ns_own_keys(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let m = ns_module(vm)?;
     let deferred = slot(vm.callee, 1) == Value::TRUE;
     let then: Vec<u16> = "then".encode_utf16().collect();
-    let names: Vec<Vec<u16>> = rec(vm, m).exports.iter().map(|(n, _)| n.clone()).filter(|n| !deferred || *n != then).collect();
+    let names: Vec<Vec<u16>> =
+        rec(vm, m).exports.iter().map(|(n, _)| n.clone()).filter(|n| !deferred || *n != then).collect();
     let out = vm.new_array();
     vm.handle_scope(|vm| {
         vm.handles.push(out);
@@ -779,10 +803,16 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
             ImportName::Source => Resolution::Source(dep),
             ImportName::Name(n) => match (resolve_export(vm, dep, n, &mut Vec::new()), re_exports_ok(vm)?).0 {
                 Some(Resolution::Ambiguous) => {
-                    return Err(syntax(format!("{path}: the requested module '{}' has an ambiguous export '{n}'", rec(vm, dep).path)));
+                    return Err(syntax(format!(
+                        "{path}: the requested module '{}' has an ambiguous export '{n}'",
+                        rec(vm, dep).path
+                    )));
                 }
                 None => {
-                    return Err(syntax(format!("{path}: the requested module '{}' provides no export named '{n}'", rec(vm, dep).path)));
+                    return Err(syntax(format!(
+                        "{path}: the requested module '{}' provides no export named '{n}'",
+                        rec(vm, dep).path
+                    )));
                 }
                 Some(res) => res,
             },
@@ -806,7 +836,11 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
         }
     }
     let module = crate::js::compile_module(&rec(vm, m).source, m as i32, &links).map_err(|e| {
-        if e.contains("unsupported") { Error::unsupported(format!("{path}:{e}")) } else { syntax(format!("{path}:{e}")) }
+        if e.contains("unsupported") {
+            Error::unsupported(format!("{path}:{e}"))
+        } else {
+            syntax(format!("{path}:{e}"))
+        }
     })?;
     let code = vm.load(module);
     vm.handle_scope(|vm| {
@@ -1202,7 +1236,13 @@ pub(crate) fn import_now(vm: &mut Vm, specifier: Value) -> Result<(usize, Value)
     Ok((m, p))
 }
 
-pub(crate) fn dynamic_import(vm: &mut Vm, specifier: Value, options: Value, referrer: Value, phase: Value) -> Result<Value> {
+pub(crate) fn dynamic_import(
+    vm: &mut Vm,
+    specifier: Value,
+    options: Value,
+    referrer: Value,
+    phase: Value,
+) -> Result<Value> {
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
     match import_request(vm, specifier, options) {
         Ok((spec, ty)) => {

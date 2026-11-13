@@ -102,11 +102,7 @@ impl Value {
     /// Box a double as a double, even if it is integral.
     #[inline(always)]
     pub fn from_f64(d: f64) -> Self {
-        let bits = if d.is_nan() {
-            Self::CANONICAL_NAN
-        } else {
-            d.to_bits()
-        };
+        let bits = if d.is_nan() { Self::CANONICAL_NAN } else { d.to_bits() };
         Value(bits.wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
     }
 
@@ -128,11 +124,7 @@ impl Value {
     #[inline]
     pub fn number(d: f64) -> Self {
         let i = d as i32;
-        if i as f64 == d && !(i == 0 && d.is_sign_negative()) {
-            Self::from_i32(i)
-        } else {
-            Self::from_f64(d)
-        }
+        if i as f64 == d && !(i == 0 && d.is_sign_negative()) { Self::from_i32(i) } else { Self::from_f64(d) }
     }
 
     #[inline(always)]
@@ -335,15 +327,7 @@ mod tests {
 
     #[test]
     fn doubles_round_trip() {
-        for d in [
-            0.5,
-            -0.0,
-            1e300,
-            -1e-300,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::MIN_POSITIVE,
-        ] {
+        for d in [0.5, -0.0, 1e300, -1e-300, f64::INFINITY, f64::NEG_INFINITY, f64::MIN_POSITIVE] {
             let v = Value::from_f64(d);
             assert!(v.is_double() && !v.is_int32() && !v.is_cell(), "{d}");
             assert_eq!(v.as_f64_unchecked().to_bits(), d.to_bits());
@@ -352,12 +336,7 @@ mod tests {
 
     #[test]
     fn impure_nans_are_canonicalised() {
-        for bits in [
-            0x7FF8_0000_0000_0000,
-            0xFFF8_0000_0000_0000,
-            0xFFFF_FFFF_FFFF_FFFF,
-            0x7FF0_0000_0000_0001,
-        ] {
+        for bits in [0x7FF8_0000_0000_0000, 0xFFF8_0000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF, 0x7FF0_0000_0000_0001] {
             let v = Value::from_f64(f64::from_bits(bits));
             assert!(v.is_double(), "{bits:#x} -> {:#x}", v.to_bits());
             assert!(v.as_f64_unchecked().is_nan());
@@ -395,13 +374,7 @@ mod tests {
 
     #[test]
     fn immediates() {
-        for v in [
-            Value::NULL,
-            Value::TRUE,
-            Value::FALSE,
-            Value::UNDEFINED,
-            Value::EMPTY,
-        ] {
+        for v in [Value::NULL, Value::TRUE, Value::FALSE, Value::UNDEFINED, Value::EMPTY] {
             assert!(!v.is_number() && !v.is_cell(), "{v:?}");
         }
         assert!(Value::TRUE.is_bool() && Value::FALSE.is_bool() && !Value::NULL.is_bool());
@@ -410,10 +383,7 @@ mod tests {
 
     #[test]
     fn tag_is_minus_double_offset() {
-        assert_eq!(
-            Value::NUMBER_TAG.wrapping_add(Value::DOUBLE_ENCODE_OFFSET),
-            0
-        );
+        assert_eq!(Value::NUMBER_TAG.wrapping_add(Value::DOUBLE_ENCODE_OFFSET), 0);
         let tag = NumberTag::new();
         for d in [0.5, -0.0, 1e300, f64::INFINITY, f64::NEG_INFINITY] {
             let v = Value::from_f64(d);

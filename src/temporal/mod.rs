@@ -13,12 +13,12 @@
 //! implementation's) order of observable steps: property reads, option
 //! reads, conversions.
 
-pub(crate) mod iso;
-pub(crate) mod parse;
-pub(crate) mod tz;
 mod duration;
 mod fields;
+pub(crate) mod iso;
+pub(crate) mod parse;
 mod plain;
+pub(crate) mod tz;
 mod zoned;
 
 use std::collections::HashMap;
@@ -130,11 +130,23 @@ pub(crate) fn create(vm: &mut Vm, slots: Slots) -> Value {
 fn this_slots(this: Value, kind: Kind) -> Result<Slots> {
     match slots(this) {
         Some(s) if s.kind() == kind => Ok(s),
-        _ => Err(Error::type_error(format!("Temporal.{} method called on an incompatible receiver", NAMES[kind as usize]))),
+        _ => Err(Error::type_error(format!(
+            "Temporal.{} method called on an incompatible receiver",
+            NAMES[kind as usize]
+        ))),
     }
 }
 
-const NAMES: [&str; 8] = ["Instant", "ZonedDateTime", "PlainDateTime", "PlainDate", "PlainTime", "PlainYearMonth", "PlainMonthDay", "Duration"];
+const NAMES: [&str; 8] = [
+    "Instant",
+    "ZonedDateTime",
+    "PlainDateTime",
+    "PlainDate",
+    "PlainTime",
+    "PlainYearMonth",
+    "PlainMonthDay",
+    "Duration",
+];
 
 pub(crate) fn arg(a: &[Value], i: usize) -> Value {
     a.get(i).copied().unwrap_or(Value::UNDEFINED)
@@ -237,13 +249,22 @@ pub(crate) fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
 
 /// GetOption of a string among `allowed`: its index, or `fallback` if
 /// undefined (`None`: required, a RangeError).
-pub(crate) fn option(vm: &mut Vm, options: Value, name: &str, allowed: &[&str], fallback: Option<usize>) -> Result<usize> {
+pub(crate) fn option(
+    vm: &mut Vm,
+    options: Value,
+    name: &str,
+    allowed: &[&str],
+    fallback: Option<usize>,
+) -> Result<usize> {
     let v = get(vm, options, name)?;
     if v.is_undefined() {
         return fallback.ok_or_else(|| range(format!("{name} option is required")));
     }
     let s = to_rust_string(vm, v)?;
-    allowed.iter().position(|&a| a == s).ok_or_else(|| range(format!("{name} must be one of {}, not {s}", allowed.join(", "))))
+    allowed
+        .iter()
+        .position(|&a| a == s)
+        .ok_or_else(|| range(format!("{name} must be one of {}, not {s}", allowed.join(", "))))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -426,11 +447,7 @@ pub(crate) fn calendar_annotation(show: usize) -> &'static str {
 
 /// CanonicalizeCalendar: the ISO calendar is the only one.
 pub(crate) fn canonicalize_calendar(id: &str) -> Result<()> {
-    if id.eq_ignore_ascii_case("iso8601") {
-        Ok(())
-    } else {
-        Err(range(format!("invalid calendar identifier {id}")))
-    }
+    if id.eq_ignore_ascii_case("iso8601") { Ok(()) } else { Err(range(format!("invalid calendar identifier {id}"))) }
 }
 
 /// ToTemporalCalendarIdentifier.
@@ -535,10 +552,13 @@ pub(crate) fn possible_epoch_ns(vm: &Vm, z: u32, dt: DateTime) -> Result<Vec<i12
     // (An offset zone's UTC date in range, as CheckISODaysRange has it; a
     // named zone's exact times checked below.)
     let utc_date = match zone.kind {
-        tz::ZoneKind::Offset(m) => iso::balance_date_time(dt.date, dt.time.nanos() as i128 - m as i128 * 60_000_000_000).date,
+        tz::ZoneKind::Offset(m) => {
+            iso::balance_date_time(dt.date, dt.time.nanos() as i128 - m as i128 * 60_000_000_000).date
+        }
         tz::ZoneKind::Named(..) => dt.date,
     };
-    if !iso::days_in_range(utc_date) && (matches!(zone.kind, tz::ZoneKind::Offset(_)) || utc_date.year.abs() > 300_000) {
+    if !iso::days_in_range(utc_date) && (matches!(zone.kind, tz::ZoneKind::Offset(_)) || utc_date.year.abs() > 300_000)
+    {
         return Err(range("date/time value is outside of supported range"));
     }
     let out = zone.possible(dt);
@@ -662,12 +682,20 @@ pub(crate) fn check_date_time(dt: DateTime) -> Result<DateTime> {
 
 /// RejectDateRange (a valid date, and within the limits at noon).
 pub(crate) fn check_date(d: IsoDate) -> Result<IsoDate> {
-    if iso::date_within_limits(d) { Ok(d) } else { Err(range(format!("{} is outside of supported range", iso::date_string(d)))) }
+    if iso::date_within_limits(d) {
+        Ok(d)
+    } else {
+        Err(range(format!("{} is outside of supported range", iso::date_string(d))))
+    }
 }
 
 /// RejectYearMonthRange.
 pub(crate) fn check_year_month(d: IsoDate) -> Result<IsoDate> {
-    if iso::year_month_within_limits(d.year, d.month as i64) { Ok(d) } else { Err(range("year-month is outside of supported range")) }
+    if iso::year_month_within_limits(d.year, d.month as i64) {
+        Ok(d)
+    } else {
+        Err(range("year-month is outside of supported range"))
+    }
 }
 
 /// RejectISODate of numbers (any): an `IsoDate`.

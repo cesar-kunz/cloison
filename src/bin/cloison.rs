@@ -38,7 +38,10 @@ extern "C" fn on_segv(_: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let pc = (*(*(ctx as *mut libc::ucontext_t)).uc_mcontext).__ss.__pc as usize;
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let pc = { let _ = ctx; 0usize };
+        let pc = {
+            let _ = ctx;
+            0usize
+        };
         eprintln!("SIGSEGV at {addr:#x}, pc {pc:#x}");
         eprintln!("{}", std::backtrace::Backtrace::force_capture());
         libc::_exit(139);
@@ -95,7 +98,9 @@ fn main() -> ExitCode {
         [p] => (false, p),
         [flag, p] if flag == "--dump" => (true, p),
         _ => {
-            eprintln!("usage: cloison [--dump] FILE.js|FILE.asm\n       cloison [--prelude SCRIPT] [--module] [--no-block] [--array-density D[,D'[,W[,P]]]] FILE");
+            eprintln!(
+                "usage: cloison [--dump] FILE.js|FILE.asm\n       cloison [--prelude SCRIPT] [--module] [--no-block] [--array-density D[,D'[,W[,P]]]] FILE"
+            );
             return ExitCode::from(2);
         }
     };
@@ -113,11 +118,7 @@ fn main() -> ExitCode {
     vm.set_can_block(!no_block);
     vm.set_script_path(path);
     let start = std::time::Instant::now();
-    let module = if path.ends_with(".js") {
-        cloison::js::compile(&src)
-    } else {
-        cloison::asm::parse(&src)
-    };
+    let module = if path.ends_with(".js") { cloison::js::compile(&src) } else { cloison::asm::parse(&src) };
     let module = match module {
         Ok(m) => m,
         Err(e) => {
@@ -156,9 +157,7 @@ fn main() -> ExitCode {
             let _ = writeln!(std::io::stdout(), "{}", cloison::vm::display(v));
             // `CLOISON_JIT_TIME`: the JIT's lowering and compiling time.
             if std::env::var_os("CLOISON_JIT_TIME").is_some() {
-                let ms = |a: &std::sync::atomic::AtomicU64| {
-                    a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
-                };
+                let ms = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
                 eprintln!(
                     "lower {:.3} ms, compile {:.3} ms",
                     ms(&cloison::jit::LOWER_NS),

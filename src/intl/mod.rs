@@ -214,7 +214,11 @@ struct Resolved {
 /// ResolveLocale (best fit is lookup): `keys` are the relevant extension
 /// keys, each with its values the data supports (the first the default;
 /// `None` for null) and what the options asked for it.
-fn resolve_locale(vm: &mut Vm, requested: &[String], keys: &[(&str, &[Option<&str>], Option<String>)]) -> Result<Resolved> {
+fn resolve_locale(
+    vm: &mut Vm,
+    requested: &[String],
+    keys: &[(&str, &[Option<&str>], Option<String>)],
+) -> Result<Resolved> {
     let mut found = None;
     for locale in requested {
         let (bare, ext) = split_extension(locale);

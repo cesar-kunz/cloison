@@ -23,7 +23,8 @@ fn epoch_ms(ns: i128) -> Value {
 
 /// The current exact time.
 fn system_ns() -> i128 {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0);
+    let d =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0);
     d.clamp(iso::NS_MIN, iso::NS_MAX)
 }
 
@@ -308,7 +309,8 @@ fn zoned_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut base = fields::date_fields(dt.date, true, true);
     base.time = dt.time.fields().map(|v| Some(v as f64));
     base.offset = Some(iso::offset_string(off));
-    let which: Vec<Field> = fields::DATE_FIELDS.iter().chain(fields::TIME_FIELDS).copied().chain([Field::Offset]).collect();
+    let which: Vec<Field> =
+        fields::DATE_FIELDS.iter().chain(fields::TIME_FIELDS).copied().chain([Field::Offset]).collect();
     let partial = fields::prepare(vm, item, &which, Required::Partial)?;
     let merged = fields::merge(&base, &partial);
     let o = options_object(vm, arg(a, 1))?;
@@ -379,7 +381,9 @@ fn zoned_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Resul
         duration::from_internal(&i, s.largest)?
     } else {
         if !zone(vm, z).equals(zone(vm, oz)) {
-            return Err(range("when calculating difference between time zones, largestUnit must be 'hours' or smaller"));
+            return Err(range(
+                "when calculating difference between time zones, largestUnit must be 'hours' or smaller",
+            ));
         }
         if ns == other {
             return Ok(duration::create_duration(vm, [0.0; 10]));
@@ -450,7 +454,16 @@ fn zoned_equals(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// TemporalZonedDateTimeToString.
 #[allow(clippy::too_many_arguments)]
-fn zoned_string(vm: &Vm, ns: i128, z: u32, precision: iso::Precision, show_calendar: usize, show_tz: usize, show_offset: bool, rounding: Option<(i64, Unit, RoundingMode)>) -> String {
+fn zoned_string(
+    vm: &Vm,
+    ns: i128,
+    z: u32,
+    precision: iso::Precision,
+    show_calendar: usize,
+    show_tz: usize,
+    show_offset: bool,
+    rounding: Option<(i64, Unit, RoundingMode)>,
+) -> String {
     let ns = match rounding {
         Some((increment, unit, mode)) => iso::round_as_if_positive(ns, unit.nanos() * increment as i128, mode),
         None => ns,

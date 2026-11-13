@@ -385,7 +385,8 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 let Some(v) = step_value(vm, it, next)? else {
                     // (`chunks`' last, or with "allow-partial" a partial
                     // window, then done.)
-                    let partial = if kind == CHUNKS { true } else { count != 0.0 && len < f.as_number().unwrap_or(0.0) };
+                    let partial =
+                        if kind == CHUNKS { true } else { count != 0.0 && len < f.as_number().unwrap_or(0.0) };
                     if len > 0.0 && partial {
                         set(vm, state, INNER_NEXT, Value::TRUE)?;
                         return copy(vm, buffer, 0.0).map(Some);
@@ -428,7 +429,8 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 if i >= vm.length_of(f)? / 2.0 {
                     return Ok(None);
                 }
-                let (m, iterable) = (vm.get_keyed(f, Value::number(2.0 * i))?, vm.get_keyed(f, Value::number(2.0 * i + 1.0))?);
+                let (m, iterable) =
+                    (vm.get_keyed(f, Value::number(2.0 * i))?, vm.get_keyed(f, Value::number(2.0 * i + 1.0))?);
                 i += 1.0;
                 set(vm, state, COUNT, Value::number(i))?;
                 let inner = call_function(vm, m, iterable, &[])?;
@@ -660,7 +662,9 @@ fn to_array(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 fn for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let f = arg(a, 0);
-    each(vm, this, Some(f), "forEach", |vm, v, k| call_function(vm, f, Value::UNDEFINED, &[v, Value::number(k)]).map(|_| None))?;
+    each(vm, this, Some(f), "forEach", |vm, v, k| {
+        call_function(vm, f, Value::UNDEFINED, &[v, Value::number(k)]).map(|_| None)
+    })?;
     Ok(Value::UNDEFINED)
 }
 
@@ -684,7 +688,6 @@ fn every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(search(vm, this, a, true, "find")?.unwrap_or(Value::UNDEFINED))
 }
-
 
 /// A copy of array `a` from index `from` on (`CreateArrayFromList`).
 fn copy(vm: &mut Vm, a: Value, from: f64) -> Result<Value> {
@@ -1074,7 +1077,8 @@ fn zip_results(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                             return close_all(vm, state, Err(mismatch())).map(|()| None);
                         }
                         for k in 1..n {
-                            let (it, next) = (vm.get_keyed(iters, Value::from_i32(k))?, vm.get_keyed(nexts, Value::from_i32(k))?);
+                            let (it, next) =
+                                (vm.get_keyed(iters, Value::from_i32(k))?, vm.get_keyed(nexts, Value::from_i32(k))?);
                             match step_result(vm, it, next) {
                                 Err(e) => {
                                     shut(vm, k)?;

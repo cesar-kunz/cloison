@@ -265,7 +265,9 @@ fn annotations(p: &mut P, allow_tz: bool) -> R<(Option<String>, Option<String>)>
         let k0 = p.i;
         let is_key = {
             let mut j = p.i;
-            while j < p.s.len() && (p.s[j].is_ascii_lowercase() || p.s[j].is_ascii_digit() || matches!(p.s[j], b'_' | b'-')) {
+            while j < p.s.len()
+                && (p.s[j].is_ascii_lowercase() || p.s[j].is_ascii_digit() || matches!(p.s[j], b'_' | b'-'))
+            {
                 j += 1;
             }
             j < p.s.len() && p.s[j] == b'=' && j > k0

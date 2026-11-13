@@ -54,12 +54,7 @@ fn parse(text: &str) -> Result<(Expect, &str), String> {
 /// A JSON string's value.
 fn unjson(s: &str) -> Result<String, String> {
     let bad = || format!("not a JSON string: {s}");
-    let mut chars = s
-        .trim_end()
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .ok_or_else(bad)?
-        .chars();
+    let mut chars = s.trim_end().strip_prefix('"').and_then(|s| s.strip_suffix('"')).ok_or_else(bad)?.chars();
     let mut out = String::new();
     let hex4 = |chars: &mut std::str::Chars| -> Option<u32> {
         u32::from_str_radix(&chars.by_ref().take(4).collect::<String>(), 16).ok()
@@ -110,9 +105,7 @@ fn run(src: &str) -> Result<Result<String, String>, String> {
         match &result {
             None => result = Some(r),
             Some(first) if *first != r => {
-                return Err(format!(
-                    "tiering up after {budget} back edges gives {r:?}, without {first:?}"
-                ));
+                return Err(format!("tiering up after {budget} back edges gives {r:?}, without {first:?}"));
             }
             Some(_) => {}
         }
@@ -124,9 +117,7 @@ fn check(path: &Path) -> Result<(), Failed> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let (expect, src) = parse(&text)?;
     let got = match expect {
-        Expect::CompileError(_) => Err(cloison::js::compile(src)
-            .err()
-            .unwrap_or_else(|| "(compiles)".into())),
+        Expect::CompileError(_) => Err(cloison::js::compile(src).err().unwrap_or_else(|| "(compiles)".into())),
         _ => run(src)?,
     };
     let ok = match (&expect, &got) {
@@ -169,12 +160,7 @@ fn main() {
     let trials = paths
         .into_iter()
         .map(|p| {
-            let name = p
-                .strip_prefix(&dir)
-                .unwrap()
-                .with_extension("")
-                .to_string_lossy()
-                .into_owned();
+            let name = p.strip_prefix(&dir).unwrap().with_extension("").to_string_lossy().into_owned();
             Trial::test(name, move || check(&p))
         })
         .collect();

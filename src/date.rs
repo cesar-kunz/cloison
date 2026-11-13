@@ -26,10 +26,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
     vm.add_property_with(c, a_p, object_value(dp), READ_ONLY | DONT_ENUM | DONT_DELETE);
     vm.add_property_with(dp, a_c, object_value(c), DONT_ENUM);
-    vm.define_natives(
-        c,
-        &[("now", date_now as NativeFn, 0), ("parse", date_parse, 1), ("UTC", date_utc, 7)],
-    );
+    vm.define_natives(c, &[("now", date_now as NativeFn, 0), ("parse", date_parse, 1), ("UTC", date_utc, 7)]);
     vm.define_natives(
         dp,
         &[
@@ -543,15 +540,8 @@ fn set_fields(vm: &mut Vm, this: Value, a: &[Value], first: usize, n: usize, loc
         t
     };
     let (month, date) = month_and_date(t);
-    let mut f = [
-        year_from_time(t),
-        month,
-        date,
-        hour_from_time(t),
-        min_from_time(t),
-        sec_from_time(t),
-        ms_from_time(t),
-    ];
+    let mut f =
+        [year_from_time(t), month, date, hour_from_time(t), min_from_time(t), sec_from_time(t), ms_from_time(t)];
     f[first..first + k].copy_from_slice(&given[first..first + k]);
     let d = make_date(make_day(f[0], f[1], f[2]), make_time(f[3], f[4], f[5], f[6]));
     let u = time_clip(if local { utc(d) } else { d });
@@ -604,8 +594,7 @@ fn set_year(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 // ---- Strings ----
 
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS: [&str; 12] =
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /// A year, at least four digits, with a sign if negative.
 fn year_string(y: f64) -> String {
@@ -615,13 +604,7 @@ fn year_string(y: f64) -> String {
 /// `DateString(t)`: `Tue Oct 15 2026`.
 fn date_part(t: f64) -> String {
     let (m, d) = month_and_date(t);
-    format!(
-        "{} {} {:02} {}",
-        DAYS[week_day(t) as usize],
-        MONTHS[m as usize],
-        d,
-        year_string(year_from_time(t))
-    )
+    format!("{} {} {:02} {}", DAYS[week_day(t) as usize], MONTHS[m as usize], d, year_string(year_from_time(t)))
 }
 
 /// `TimeString(t)`: `12:34:56 GMT`.
@@ -633,12 +616,7 @@ fn time_part(t: f64) -> String {
 fn zone_part(tv: f64) -> String {
     let (off, name) = local_tza(tv);
     let minutes = (off / MS_PER_MINUTE).abs().round();
-    let s = format!(
-        "{}{:02}{:02}",
-        if off < 0.0 { "-" } else { "+" },
-        (minutes / 60.0).floor(),
-        minutes % 60.0
-    );
+    let s = format!("{}{:02}{:02}", if off < 0.0 { "-" } else { "+" }, (minutes / 60.0).floor(), minutes % 60.0);
     if name.is_empty() { s } else { format!("{s} ({name})") }
 }
 
@@ -825,8 +803,8 @@ fn parse_iso(s: &str) -> Option<f64> {
                     return None;
                 }
                 let frac = &b[start..i.min(start + 3)];
-                ms = frac.iter().fold(0.0, |acc, &c| acc * 10.0 + (c - b'0') as f64)
-                    * 10f64.powi(3 - frac.len() as i32);
+                ms =
+                    frac.iter().fold(0.0, |acc, &c| acc * 10.0 + (c - b'0') as f64) * 10f64.powi(3 - frac.len() as i32);
             }
         }
         if eat(b, &mut i, b'Z') {

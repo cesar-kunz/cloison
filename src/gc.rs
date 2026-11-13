@@ -288,9 +288,8 @@ pub struct Gc {
 impl Gc {
     pub(crate) fn new() -> Gc {
         let env = |k| std::env::var_os(k).is_some();
-        let verify = std::env::var("CLOISON_GC_VERIFY")
-            .ok()
-            .map_or(0, |s| s.parse::<usize>().unwrap_or(256).max(1) << 10);
+        let verify =
+            std::env::var("CLOISON_GC_VERIFY").ok().map_or(0, |s| s.parse::<usize>().unwrap_or(256).max(1) << 10);
         Gc {
             codes_from: 0,
             codes_before: 0,
@@ -791,7 +790,9 @@ unsafe fn mark_function_code(p: usize, w: u64) {
             Class::RegExp => {
                 // `RegExp.prototype.compile` may be replacing it, with
                 // Release (`builtins::regexp_compile`).
-                let code = std::sync::atomic::AtomicPtr::from_ptr((&raw const (*o).code).cast_mut().cast::<*mut crate::regexp::Regex>());
+                let code = std::sync::atomic::AtomicPtr::from_ptr(
+                    (&raw const (*o).code).cast_mut().cast::<*mut crate::regexp::Regex>(),
+                );
                 let re = code.load(std::sync::atomic::Ordering::Acquire);
                 if !re.is_null() {
                     mark_regexp(re);
@@ -917,7 +918,8 @@ fn too_soon(
     last_end: Option<std::time::Instant>,
     took: std::time::Duration,
 ) -> bool {
-    last_start.is_some_and(|t| now.duration_since(t) < p.interval) || last_end.is_some_and(|t| now.duration_since(t) < p.spacing * took)
+    last_start.is_some_and(|t| now.duration_since(t) < p.interval)
+        || last_end.is_some_and(|t| now.duration_since(t) < p.spacing * took)
 }
 
 pub(crate) fn policy() -> &'static Policy {
@@ -1175,7 +1177,6 @@ impl Visit for Marking<'_> {
             }
         }
     }
-
 }
 
 /// Card scanning: the references on dirty cards pass through a ring,
@@ -1248,7 +1249,9 @@ impl Visit for CardMarking {
             let (new, shade) = match mode.kind {
                 Kind::Minor if b == YOUNG => (mode.color, false),
                 Kind::MinorShade if b == YOUNG => (mode.color, false),
-                Kind::MinorShade if b & COLOR != 0 && b & COLOR != mode.color => ((b & (END | EVAC)) | mode.color, true),
+                Kind::MinorShade if b & COLOR != 0 && b & COLOR != mode.color => {
+                    ((b & (END | EVAC)) | mode.color, true)
+                }
                 Kind::Full if b & COLOR != mode.color => ((b & (END | EVAC)) | mode.color, false),
                 _ => return,
             };
@@ -1261,7 +1264,6 @@ impl Visit for CardMarking {
             }
         }
     }
-
 }
 
 /// A heap shared by the card-scanning threads, which only read it (but
@@ -1302,7 +1304,11 @@ impl Marking<'_> {
     /// deep as the tree.
     unsafe fn drain_to(&mut self, stop: &dyn Fn() -> bool, after: usize) -> usize {
         unsafe {
-            if self.cand.map != 0 { self.drain_to_in::<true>(stop, after) } else { self.drain_to_in::<false>(stop, after) }
+            if self.cand.map != 0 {
+                self.drain_to_in::<true>(stop, after)
+            } else {
+                self.drain_to_in::<false>(stop, after)
+            }
         }
     }
 
@@ -1372,14 +1378,22 @@ impl Marking<'_> {
                 }
                 if slots > SLICE_SLOTS {
                     let to = (from + SLICE_SLOTS).min(slots);
-                    if R { trace_with(&mut Rec(self), p, w, p + 8 + 8 * from, p + 8 + 8 * to) } else { trace_with(self, p, w, p + 8 + 8 * from, p + 8 + 8 * to) };
+                    if R {
+                        trace_with(&mut Rec(self), p, w, p + 8 + 8 * from, p + 8 + 8 * to)
+                    } else {
+                        trace_with(self, p, w, p + 8 + 8 * from, p + 8 + 8 * to)
+                    };
                     if to < slots {
                         self.stack.push(to);
                         self.stack.push(p | 1);
                     }
                     work += SLICE_SLOTS / 32;
                 } else {
-                    if R { trace_with(&mut Rec(self), p, w, 0, usize::MAX) } else { trace_with(self, p, w, 0, usize::MAX) };
+                    if R {
+                        trace_with(&mut Rec(self), p, w, 0, usize::MAX)
+                    } else {
+                        trace_with(self, p, w, 0, usize::MAX)
+                    };
                     work += 1;
                 }
                 if work >= 256 {
@@ -1564,15 +1578,27 @@ unsafe fn trace_shared<const R: bool>(
                     }
                     let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                     if slots > SLICE_SLOTS {
-                        if R { trace(&mut Rec(&mut cm), p, p + 8, p + 8 + 8 * SLICE_SLOTS) } else { trace(&mut cm, p, p + 8, p + 8 + 8 * SLICE_SLOTS) };
+                        if R {
+                            trace(&mut Rec(&mut cm), p, p + 8, p + 8 + 8 * SLICE_SLOTS)
+                        } else {
+                            trace(&mut cm, p, p + 8, p + 8 + 8 * SLICE_SLOTS)
+                        };
                         slices.push((p, SLICE_SLOTS));
                     } else {
-                        if R { trace(&mut Rec(&mut cm), p, 0, usize::MAX) } else { trace(&mut cm, p, 0, usize::MAX) };
+                        if R {
+                            trace(&mut Rec(&mut cm), p, 0, usize::MAX)
+                        } else {
+                            trace(&mut cm, p, 0, usize::MAX)
+                        };
                     }
                 } else if let Some((p, from)) = slices.pop() {
                     let slots = (*(p as *const u64) >> 32) as usize;
                     let to = (from + SLICE_SLOTS).min(slots);
-                    if R { trace(&mut Rec(&mut cm), p, p + 8 + 8 * from, p + 8 + 8 * to) } else { trace(&mut cm, p, p + 8 + 8 * from, p + 8 + 8 * to) };
+                    if R {
+                        trace(&mut Rec(&mut cm), p, p + 8 + 8 * from, p + 8 + 8 * to)
+                    } else {
+                        trace(&mut cm, p, p + 8 + 8 * from, p + 8 + 8 * to)
+                    };
                     if to < slots {
                         slices.push((p, to));
                     }
@@ -1724,7 +1750,10 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
         let code = &raw const (*o).code as usize;
         match (*o).class {
             Class::String => {
-                use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed}};
+                use std::sync::atomic::{
+                    AtomicPtr, AtomicU64,
+                    Ordering::{Acquire, Relaxed},
+                };
                 // The mutator may be making it flat (`vm::flatten`): it
                 // drops the halves (null), then publishes `elems`
                 // (Release), and may then cache the string's atom in
@@ -1740,7 +1769,10 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
                 if e.is_null() {
                     // A cons string: its halves.
                     if within(props) {
-                        v.slot_read(props as *mut Value, Value::from_bits((*(props as *const AtomicU64)).load(Relaxed)));
+                        v.slot_read(
+                            props as *mut Value,
+                            Value::from_bits((*(props as *const AtomicU64)).load(Relaxed)),
+                        );
                     }
                     if within(code) {
                         v.slot_read(code as *mut Value, Value::from_bits((*(code as *const AtomicU64)).load(Relaxed)));
@@ -1945,10 +1977,7 @@ impl Marker {
             .name("cloison-marker".into())
             .spawn(move || marker_loop(&s))
             .expect("the marker thread");
-        Marker {
-            shared,
-            thread: Some(thread),
-        }
+        Marker { shared, thread: Some(thread) }
     }
 
     /// Stop the marker and wait until it has: its work back in `work`.
@@ -2032,7 +2061,9 @@ impl Shared {
 /// Out of work: the mutator's next safepoint is the final pause.
 fn ask_final(st: &mut MarkerState) {
     (st.run, st.done) = (false, true);
-    unsafe { (*(st.request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed) };
+    unsafe {
+        (*(st.request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed)
+    };
 }
 
 /// The marker thread. A panic in it (a bug) is recorded and the mutator
@@ -2098,12 +2129,7 @@ fn marker_work(sh: &Shared) {
             (st.color, st.heap, st.shapes, st.cand)
         };
         let mut m = Marking {
-            mode: Mode {
-                color,
-                kind: Kind::Old,
-                check: false,
-                shapes,
-            },
+            mode: Mode { color, kind: Kind::Old, check: false, shapes },
             stack: &mut stack,
             shade: &mut shade,
             heap,
@@ -2264,8 +2290,8 @@ impl Vm {
             if self.heap.gc.evacuate != Evacuate::Off {
                 let gc = &self.heap.gc;
                 let now = std::time::Instant::now();
-                let early = gc.evacuate != Evacuate::All
-                    && too_soon(policy(), now, gc.cycle_start, gc.evac_end, gc.evac_took);
+                let early =
+                    gc.evacuate != Evacuate::All && too_soon(policy(), now, gc.cycle_start, gc.evac_end, gc.evac_took);
                 self.heap.gc.cycle_start = Some(now);
                 if self.heap.gc.evac_wait > 0 || early {
                     self.heap.gc.evac_wait = self.heap.gc.evac_wait.saturating_sub(1);
@@ -2445,9 +2471,7 @@ impl Vm {
         self.heap.gc.count += 1;
         if full {
             self.heap.gc.marking = false;
-            let concurrent = self.heap.gc.marker.as_ref().map_or(0, |mk| {
-                std::mem::take(&mut mk.shared.state().marked)
-            });
+            let concurrent = self.heap.gc.marker.as_ref().map_or(0, |mk| std::mem::take(&mut mk.shared.state().marked));
             // The blocks the sweep left in use (partly free ones too),
             // and room to grow by what was live, times `GROWTH - 1`: what
             // this pause and the marker marked. (Not what the cycle's start
@@ -2916,9 +2940,8 @@ impl Vm {
     fn condemn_codes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
-        let (mut live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
-            .into_iter()
-            .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
+        let (mut live, dead): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.codes).into_iter().partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
         // (A function freed is nested only in functions no marking found
         // live, which can't make a closure of it again; but the JIT's
         // analysis of a variable walks a pinned one's nested functions,
@@ -3011,7 +3034,11 @@ impl Vm {
         unsafe {
             let stack = self.stack.as_ptr() as usize;
             let top = self.vm_stack_top(sp, regs);
-            (sp..self.heap.gc.stack_base).step_by(8).chain((stack..top).step_by(8)).map(|a| *(a as *const usize)).collect()
+            (sp..self.heap.gc.stack_base)
+                .step_by(8)
+                .chain((stack..top).step_by(8))
+                .map(|a| *(a as *const usize))
+                .collect()
         }
     }
 
@@ -3250,9 +3277,12 @@ impl Vm {
                     // (A string's `props` is no property storage: a cons
                     // string's left half, or a slice's parent.)
                     if !(*o).props.is_null() && (*o).class != Class::String {
-                        props_unused += 8 * (crate::object::Object::props_cap(o) as usize).saturating_sub(used.saturating_sub(inline));
+                        props_unused += 8
+                            * (crate::object::Object::props_cap(o) as usize)
+                                .saturating_sub(used.saturating_sub(inline));
                     }
-                    if !(*o).elems.is_null() && !matches!(
+                    if !(*o).elems.is_null()
+                        && !matches!(
                             (*o).class,
                             Class::String
                                 | Class::TypedArray
@@ -3261,8 +3291,10 @@ impl Vm {
                                 | Class::SharedArrayBuffer
                                 | Class::BigInt
                                 | Class::Temporal
-                        ) {
-                        elems_unused += 8 * (crate::object::Object::elems_cap(o) as usize).saturating_sub((*o).elems_len as usize);
+                        )
+                    {
+                        elems_unused +=
+                            8 * (crate::object::Object::elems_cap(o) as usize).saturating_sub((*o).elems_len as usize);
                     }
                     format!("{:?}", (*o).class)
                 }
@@ -3352,11 +3384,7 @@ impl Vm {
                 );
             }
         };
-        let mut r = Reach {
-            seen: Default::default(),
-            stack: Vec::new(),
-            color,
-        };
+        let mut r = Reach { seen: Default::default(), stack: Vec::new(), color };
         unsafe {
             self.each_root(sp, regs, &mut |p| r.cell(p));
             while let Some(p) = r.stack.pop() {
@@ -3427,9 +3455,10 @@ impl Vm {
         let mode = self.heap.gc.evacuate;
         // The candidates' cells marked.
         let threads = self.heap.gc.threads;
-        let cells_in: Vec<(usize, usize)> =
-            in_parallel(threads, candidates, 64, |bs| bs.iter().flat_map(|&b| unsafe { marked_cells(b, color) }).collect::<Vec<_>>())
-                .concat();
+        let cells_in: Vec<(usize, usize)> = in_parallel(threads, candidates, 64, |bs| {
+            bs.iter().flat_map(|&b| unsafe { marked_cells(b, color) }).collect::<Vec<_>>()
+        })
+        .concat();
         let t_live = t0.elapsed().as_secs_f64() * 1e3;
         // What moving them all would give back: the blocks they are in,
         // but their bytes. Little (the candidates' cells died since the
@@ -3719,7 +3748,12 @@ impl Vm {
             }
             // A call being made.
             fw.object(&mut self.callee);
-            for v in [&mut self.new_target, &mut self.native_new_target.0, &mut self.native_new_target.1, &mut self.derived_construct] {
+            for v in [
+                &mut self.new_target,
+                &mut self.native_new_target.0,
+                &mut self.native_new_target.1,
+                &mut self.derived_construct,
+            ] {
                 fw.value(v);
             }
             for env in self.eval_envs.iter_mut() {
@@ -3784,7 +3818,10 @@ impl Vm {
         struct Check(usize, usize, usize);
         impl Check {
             fn moved(&self, q: usize) -> bool {
-                q >= self.0 && q < self.1 && q.is_multiple_of(GRANULE) && unsafe { *crate::heap::meta(q) } & FORWARDED != 0
+                q >= self.0
+                    && q < self.1
+                    && q.is_multiple_of(GRANULE)
+                    && unsafe { *crate::heap::meta(q) } & FORWARDED != 0
             }
         }
         impl Visit for Check {
@@ -3855,7 +3892,8 @@ impl Vm {
     fn choose_candidates_for(&mut self, share: usize, live_bytes: Option<usize>) {
         use crate::heap::BLOCK;
         // (Live bytes by block: what the sweep didn't free.)
-        let mut live: Vec<(usize, usize)> = self.heap.swept_free.iter().map(|&(b, free)| (BLOCK - free.min(BLOCK), b)).collect();
+        let mut live: Vec<(usize, usize)> =
+            self.heap.swept_free.iter().map(|&(b, free)| (BLOCK - free.min(BLOCK), b)).collect();
         let chosen: Vec<usize> = if self.heap.gc.evacuate == Evacuate::All {
             self.heap.gc.evacuate_parity ^= true;
             let parity = self.heap.gc.evacuate_parity as usize;
@@ -3985,7 +4023,8 @@ impl Vm {
     fn prune_regexps(&mut self, mode: Mode, words: &[usize]) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
-        let live = |v: u64| !Value::from_bits(v).is_cell() || unsafe { *crate::heap::meta(v as usize) } & COLOR == mode.color;
+        let live =
+            |v: u64| !Value::from_bits(v).is_cell() || unsafe { *crate::heap::meta(v as usize) } & COLOR == mode.color;
         let size = std::mem::size_of::<crate::regexp::Regex>();
         let mut unmarked: Vec<usize> = self
             .regexps
@@ -4003,8 +4042,9 @@ impl Vm {
                 (w < unmarked[i] + size).then_some(unmarked[i])
             })
             .collect();
-        self.regexps
-            .retain(|_, re| re.mark.load(Relaxed) >= from || held.contains(&(&**re as *const crate::regexp::Regex as usize)));
+        self.regexps.retain(|_, re| {
+            re.mark.load(Relaxed) >= from || held.contains(&(&**re as *const crate::regexp::Regex as usize))
+        });
         let kept: crate::jit::HashSet<*const crate::regexp::Regex> =
             self.regexps.values().map(|re| &**re as *const crate::regexp::Regex).collect();
         self.regexp_literals.retain(|&(p, f), re| live(p) && live(f) && kept.contains(re));
@@ -4027,7 +4067,8 @@ impl Vm {
         }
         impl Reach {
             fn reach(&mut self, p: usize) {
-                let marked = is_cell_in(self.range, p) && unsafe { *crate::heap::meta(p) } & (YOUNG | COLOR) == self.color;
+                let marked =
+                    is_cell_in(self.range, p) && unsafe { *crate::heap::meta(p) } & (YOUNG | COLOR) == self.color;
                 if marked && self.seen.insert(p) {
                     self.work.push(p);
                 }
@@ -4062,7 +4103,9 @@ impl Vm {
                 // The weak collections' entries of keys reached.
                 let mut more = false;
                 for &t in &self.weak_tables {
-                    if !r.seen.contains(&(t as usize)) || !matches!((*t).class, Class::WeakMap | Class::FinalizationRegistry) {
+                    if !r.seen.contains(&(t as usize))
+                        || !matches!((*t).class, Class::WeakMap | Class::FinalizationRegistry)
+                    {
                         continue;
                     }
                     let e = Value::from_bits((*t).code as u64);
@@ -4151,8 +4194,15 @@ impl Vm {
                     break;
                 };
                 let w = unsafe { *(b as *const u64) };
-                let kind = if w & 1 == 0 { format!("{:?}", unsafe { (*(b as *const Object)).class }) } else { format!("header {:#x}", w & 7) };
-                eprintln!("  {target:#x} is referred to by {b:#x} {kind}, {}reached", if r.seen.contains(&b) { "" } else { "not " });
+                let kind = if w & 1 == 0 {
+                    format!("{:?}", unsafe { (*(b as *const Object)).class })
+                } else {
+                    format!("header {:#x}", w & 7)
+                };
+                eprintln!(
+                    "  {target:#x} is referred to by {b:#x} {kind}, {}reached",
+                    if r.seen.contains(&b) { "" } else { "not " }
+                );
                 if r.seen.contains(&b) {
                     break;
                 }
@@ -4175,17 +4225,34 @@ impl Vm {
         let v = p as u64;
         for s in self.shapes().chain(self.zombies.iter().map(|z| &**z)) {
             if s.proto.to_bits() == v {
-                eprintln!("    the prototype of shape {:p}: mark {} (from {from}), pinned {}, unique {}, zombie {}", s, s.mark.load(Relaxed), s.pinned.get(), s.unique, s.is_zombie());
+                eprintln!(
+                    "    the prototype of shape {:p}: mark {} (from {from}), pinned {}, unique {}, zombie {}",
+                    s,
+                    s.mark.load(Relaxed),
+                    s.pinned.get(),
+                    s.unique,
+                    s.is_zombie()
+                );
             }
         }
         for (k, c) in self.codes().chain(self.condemned.iter().map(|c| &**c)).enumerate() {
             if c.constants.iter().any(|x| x.to_bits() == v) {
-                eprintln!("    a constant of code {k} {}: mark {}, pinned {}", c.name, c.mark.load(Relaxed), c.pinned.get());
+                eprintln!(
+                    "    a constant of code {k} {}: mark {}, pinned {}",
+                    c.name,
+                    c.mark.load(Relaxed),
+                    c.pinned.get()
+                );
             }
             for ways in c.made_ics().iter() {
                 for ic in unsafe { (*ways.get()).iter() } {
                     if ic.holder as u64 == v {
-                        eprintln!("    an inline cache's holder in code {k} {}: mark {}, pinned {}", c.name, c.mark.load(Relaxed), c.pinned.get());
+                        eprintln!(
+                            "    an inline cache's holder in code {k} {}: mark {}, pinned {}",
+                            c.name,
+                            c.mark.load(Relaxed),
+                            c.pinned.get()
+                        );
                     }
                 }
             }
@@ -4470,7 +4537,8 @@ impl Heap {
                 let (mode, range) = (m.mode, m.heap);
                 let work = move || {
                     let heap = heap;
-                    let mut cm = CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new(), cand, rec: Vec::new() };
+                    let mut cm =
+                        CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new(), cand, rec: Vec::new() };
                     let mut refs = CardRefs::new(&mut cm);
                     loop {
                         let i = next.fetch_add(RUNS_PER_TAKE, std::sync::atomic::Ordering::Relaxed);
@@ -5023,7 +5091,8 @@ mod tests {
             let g = vm.global;
             vm.define_native(g, "fail_marker", fail_marker, 0, crate::jit::Ty::Any, false);
             let e = vm.run(&module).unwrap_err().0;
-            let expected = "Error: the VM is poisoned: the collector's marker thread panicked: a marker panic for the tests";
+            let expected =
+                "Error: the VM is poisoned: the collector's marker thread panicked: a marker panic for the tests";
             assert_eq!(e, expected, "jit: {jit}");
             assert!(vm.poisoned());
             assert_eq!(vm.run(&crate::js::compile("1").unwrap()).unwrap_err().0, expected);

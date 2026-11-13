@@ -34,14 +34,7 @@ pub(crate) struct Piece {
 
 impl Piece {
     pub(crate) fn new(name: &'static str, jump: To) -> Piece {
-        Piece {
-            name,
-            imm: 0,
-            imm64: Imm64::Value(0),
-            imm64b: 0,
-            cont: To::Next,
-            jump,
-        }
+        Piece { name, imm: 0, imm64: Imm64::Value(0), imm64b: 0, cont: To::Next, jump }
     }
 }
 

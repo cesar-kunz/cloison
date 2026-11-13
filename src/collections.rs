@@ -55,7 +55,8 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.collection_prototypes.push(p);
     }
     let protos = vm.collection_prototypes.clone();
-    let ctors: [(&str, NativeFn); 4] = [("Map", map_ctor), ("Set", set_ctor), ("WeakMap", weak_map_ctor), ("WeakSet", weak_set_ctor)];
+    let ctors: [(&str, NativeFn); 4] =
+        [("Map", map_ctor), ("Set", set_ctor), ("WeakMap", weak_map_ctor), ("WeakSet", weak_set_ctor)];
     for (k, (name, f)) in ctors.into_iter().enumerate() {
         let c = vm.define_native(g, name, f, 0, any, true);
         link_constructor(vm, c, protos[k]);
@@ -126,7 +127,10 @@ pub(crate) fn install(vm: &mut Vm) {
     let fr = vm.define_native(g, "FinalizationRegistry", finalization_ctor, 1, any, true);
     let frp = protos[Proto::FinalizationRegistry as usize];
     link_constructor(vm, fr, frp);
-    vm.define_natives(frp, &[("register", finalization_register as NativeFn, 2), ("unregister", finalization_unregister, 1)]);
+    vm.define_natives(
+        frp,
+        &[("register", finalization_register as NativeFn, 2), ("unregister", finalization_unregister, 1)],
+    );
     vm.define_native(protos[Proto::MapIterator as usize], "next", iterator_next, 0, any, false);
     vm.define_native(protos[Proto::SetIterator as usize], "next", iterator_next, 0, any, false);
 
@@ -163,7 +167,9 @@ pub(crate) fn install(vm: &mut Vm) {
         view_set::<10>,
     ];
     let names: Vec<(String, NativeFn, u32)> = (0..VIEW_TYPES.len())
-        .flat_map(|t| [(format!("get{}", VIEW_TYPES[t].0), GETS[t], 1), (format!("set{}", VIEW_TYPES[t].0), SETS[t], 2)])
+        .flat_map(|t| {
+            [(format!("get{}", VIEW_TYPES[t].0), GETS[t], 1), (format!("set{}", VIEW_TYPES[t].0), SETS[t], 2)]
+        })
         .collect();
     let fs: Vec<(&str, NativeFn, u32)> = names.iter().map(|(n, f, k)| (n.as_str(), *f, *k)).collect();
     vm.define_natives(dp, &fs);
@@ -260,7 +266,10 @@ pub(crate) fn hashed_by_address(k: Value) -> bool {
 /// The keys of collection `o` that are hashed by their address (for
 /// `CLOISON_GC_FRAG`: they could not move).
 pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
-    if !matches!(unsafe { (*o).class }, Class::Map | Class::Set | Class::WeakMap | Class::WeakSet | Class::FinalizationRegistry) {
+    if !matches!(
+        unsafe { (*o).class },
+        Class::Map | Class::Set | Class::WeakMap | Class::WeakSet | Class::FinalizationRegistry
+    ) {
         return;
     }
     let e = Value::from_bits(unsafe { (*o).code } as u64);
@@ -549,12 +558,19 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     let a_adder = vm.intern_name(if pairs { "set" } else { "add" });
     let adder = vm.get(o, a_adder)?;
     if !is_callable(adder) {
-        return Err(Error::type_error(format!("'{}' returned for property '{}' of object '#<{name}>' is not a function", crate::vm::shown(adder), if pairs { "set" } else { "add" })));
+        return Err(Error::type_error(format!(
+            "'{}' returned for property '{}' of object '#<{name}>' is not a function",
+            crate::vm::shown(adder),
+            if pairs { "set" } else { "add" }
+        )));
     }
     iterate(vm, iterable, |vm, item| {
         if pairs {
             if !is_object(item) {
-                return Err(Error::type_error(format!("Iterator value {} is not an entry object", crate::vm::shown(item))));
+                return Err(Error::type_error(format!(
+                    "Iterator value {} is not an entry object",
+                    crate::vm::shown(item)
+                )));
             }
             let k = vm.get_keyed(item, Value::from_i32(0))?;
             let v = vm.get_keyed(item, Value::from_i32(1))?;
@@ -1060,7 +1076,11 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
     crate::typed::writable_view(o)?;
     let i = to_index(vm, arg(a, 0))?;
     let is_big = T == 8 || T == 9;
-    let big = if is_big { crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?) } else { 0 };
+    let big = if is_big {
+        crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?)
+    } else {
+        0
+    };
     let d = if is_big { 0.0 } else { to_number(arg(a, 1)) };
     if vm.conv_thrown {
         return Err(vm.take_conv_error());
@@ -1167,7 +1187,11 @@ fn record_keys(vm: &mut Vm, rec: &SetRecord, f: impl FnMut(&mut Vm, Value) -> Re
 }
 
 /// [`record_keys`] of an iterator already got (`record_iterator`).
-fn each_key(vm: &mut Vm, (it, next): (Value, Value), mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
+fn each_key(
+    vm: &mut Vm,
+    (it, next): (Value, Value),
+    mut f: impl FnMut(&mut Vm, Value) -> Result<bool>,
+) -> Result<bool> {
     let (a_done, a_value) = (vm.intern_name("done"), vm.a_value);
     loop {
         let r = call_function(vm, next, it, &[])?;

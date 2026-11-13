@@ -120,14 +120,21 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
     let p = vm.get(object_value(f), a_prototype)?;
     // (An async generator function's: kind 6, see `vm::Code::kind`.)
     let is_async = unsafe { (*(*f).code).kind } == 6;
-    let root = if is_async { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
+    let root =
+        if is_async { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
     let proto = if crate::props::is_object(p) { p } else { object_value(vm.symbol_roots[root as usize]) };
     let code = unsafe { (*f).code };
     let n = cells_for(unsafe { (*code).kind }) + unsafe { (*code).nregs } as usize;
     let queue = if is_async { vm.new_array() } else { Value::UNDEFINED };
     let g = vm.new_object_with(Class::Generator, proto, 0);
     let st = vm.heap.alloc_values(n);
-    let mut cells = vec![Value::from_i32(SUSPENDED_START), Value::UNDEFINED, Value::from_i32(0), object_value(f), Value::from_i32(NEXT)];
+    let mut cells = vec![
+        Value::from_i32(SUSPENDED_START),
+        Value::UNDEFINED,
+        Value::from_i32(0),
+        object_value(f),
+        Value::from_i32(NEXT),
+    ];
     if is_async {
         cells.extend([queue, Value::FALSE, Value::FALSE, Value::TRUE]);
     }
@@ -523,4 +530,3 @@ pub(crate) fn install(vm: &mut Vm) {
         }
     }
 }
-

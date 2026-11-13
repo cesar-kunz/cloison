@@ -330,8 +330,22 @@ pub(crate) fn install(vm: &mut Vm) {
     // doesn't find (ES2015 on).
     let u = vm.new_object(Value::NULL);
     for name in [
-        "at", "copyWithin", "entries", "fill", "find", "findIndex", "findLast", "findLastIndex", "flat", "flatMap",
-        "includes", "keys", "toReversed", "toSorted", "toSpliced", "values",
+        "at",
+        "copyWithin",
+        "entries",
+        "fill",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "flat",
+        "flatMap",
+        "includes",
+        "keys",
+        "toReversed",
+        "toSorted",
+        "toSpliced",
+        "values",
     ] {
         let a = vm.intern_name(name);
         vm.add_property_with(u, a, Value::TRUE, 0);
@@ -349,9 +363,16 @@ pub(crate) fn install(vm: &mut Vm) {
     let d = Desc::data(object_value(f), false, false, true);
     let _ = vm.define_own_property(sp, Key::Name(tp), &d);
     to_string_tag(vm, sp, "Symbol");
-    let object_ctor = { let a = vm.intern_name("Object"); vm.get(object_value(g), a) }.unwrap_or(Value::UNDEFINED);
+    let object_ctor = {
+        let a = vm.intern_name("Object");
+        vm.get(object_value(g), a)
+    }
+    .unwrap_or(Value::UNDEFINED);
     if object_ctor.is_cell() {
-        vm.define_natives(as_object(object_ctor), &[("getOwnPropertySymbols", get_own_property_symbols as NativeFn, 1)]);
+        vm.define_natives(
+            as_object(object_ctor),
+            &[("getOwnPropertySymbols", get_own_property_symbols as NativeFn, 1)],
+        );
     }
 
     // `@@species` getters: the constructor itself.
@@ -414,12 +435,20 @@ pub(crate) fn install(vm: &mut Vm) {
     to_string_tag(vm, cp[Proto::WeakRef as usize], "WeakRef");
     to_string_tag(vm, cp[Proto::FinalizationRegistry as usize], "FinalizationRegistry");
     to_string_tag(vm, cp[Proto::DataView as usize], "DataView");
-    let math = { let a = vm.intern_name("Math"); vm.get(object_value(g), a) }.unwrap_or(Value::UNDEFINED);
+    let math = {
+        let a = vm.intern_name("Math");
+        vm.get(object_value(g), a)
+    }
+    .unwrap_or(Value::UNDEFINED);
     if is_object(math) {
         to_string_tag(vm, as_object(math), "Math");
     }
     for name in ["JSON", "Reflect"] {
-        let o = { let a = vm.intern_name(name); vm.get(object_value(g), a) }.unwrap_or(Value::UNDEFINED);
+        let o = {
+            let a = vm.intern_name(name);
+            vm.get(object_value(g), a)
+        }
+        .unwrap_or(Value::UNDEFINED);
         if is_object(o) {
             to_string_tag(vm, as_object(o), name);
         }
@@ -561,7 +590,11 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
         // (Its record made seq-cst: 23.1.5.1.)
         match crate::typed::ta_length_seq_cst(vm, o) {
             Some(n) => n as f64,
-            None => return Err(Error::type_error("Cannot perform %ArrayIteratorPrototype%.next on a detached or out of bounds typed array")),
+            None => {
+                return Err(Error::type_error(
+                    "Cannot perform %ArrayIteratorPrototype%.next on a detached or out of bounds typed array",
+                ));
+            }
         }
     } else {
         vm.length_of(target)?
@@ -595,7 +628,8 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
         return iter_result(vm, Value::UNDEFINED, true);
     }
     let c = u[i];
-    let n = if (0xD800..0xDC00).contains(&c) && u.get(i + 1).is_some_and(|d| (0xDC00..0xE000).contains(d)) { 2 } else { 1 };
+    let n =
+        if (0xD800..0xDC00).contains(&c) && u.get(i + 1).is_some_and(|d| (0xDC00..0xE000).contains(d)) { 2 } else { 1 };
     let piece: Vec<u16> = u[i..i + n].to_vec();
     vm.set_keyed(state, Value::from_i32(1), Value::from_i32((i + n) as i32))?;
     let s = vm.new_string(&piece);
@@ -664,7 +698,9 @@ pub(crate) fn sync_done(r: Value) -> bool {
 
 pub(crate) fn set_sync_done(r: Value, done: bool) {
     // (Not a cell: no barrier.)
-    unsafe { crate::layout::store_word(crate::object::Object::inline(crate::object::as_object(r), 2), Value::from_bool(done)) }
+    unsafe {
+        crate::layout::store_word(crate::object::Object::inline(crate::object::as_object(r), 2), Value::from_bool(done))
+    }
 }
 
 /// Mark a [`sync_record`]'s last step's promise one of an iterator
@@ -695,7 +731,10 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     }
     // (The builtin array iterator's step, its result object unobservable:
     // fresh, its own data properties read back at once.)
-    if is_native(vm, next, array_iterator_next) && it.is_cell() && unsafe { (*as_object(it)).class } == Class::ArrayIterator {
+    if is_native(vm, next, array_iterator_next)
+        && it.is_cell()
+        && unsafe { (*as_object(it)).class } == Class::ArrayIterator
+    {
         return array_step(vm, it);
     }
     let r = call_function(vm, next, it, &[])?;
@@ -769,7 +808,6 @@ pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Result<Option<Vec<u16>>> {
     let t = vm.get(o, a)?;
     Ok(string_units(t).map(|u| u.to_vec()))
 }
-
 
 /// Whether `f` is the current realm's native `n` (by its code's
 /// function pointer, and its code's realm). What a fast path stands in
@@ -851,14 +889,15 @@ fn protector_again(vm: &mut Vm) -> u8 {
     let mut bits = 0;
     // (`is_native`: the current realm's own builtins, factories and
     // `next`s alike.)
-    let builtins = |vm: &mut Vm, proto: *mut Object, method: Option<NativeFn>, it_proto: *mut Object, next: NativeFn| {
-        let m = rely(vm, proto, vm.a_sym_iterator);
-        let ok = match method {
-            Some(f) => m.is_some_and(|m| is_native(vm, m, f)),
-            None => m == Some(values),
+    let builtins =
+        |vm: &mut Vm, proto: *mut Object, method: Option<NativeFn>, it_proto: *mut Object, next: NativeFn| {
+            let m = rely(vm, proto, vm.a_sym_iterator);
+            let ok = match method {
+                Some(f) => m.is_some_and(|m| is_native(vm, m, f)),
+                None => m == Some(values),
+            };
+            ok && rely(vm, it_proto, vm.a_next).is_some_and(|n| is_native(vm, n, next))
         };
-        ok && rely(vm, it_proto, vm.a_next).is_some_and(|n| is_native(vm, n, next))
-    };
     if builtins(vm, vm.array_prototype, None, aip, array_iterator_next) {
         bits |= ITER_ARRAY;
     }
@@ -986,7 +1025,10 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
     }
     let (d, s) = (as_object(dst), as_object(src));
     unsafe {
-        if (*d).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 || crate::far::is_far(d) || crate::far::is_far(s) {
+        if (*d).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0
+            || crate::far::is_far(d)
+            || crate::far::is_far(s)
+        {
             return false;
         }
         let n = (*s).elems_len as usize;
@@ -1133,7 +1175,8 @@ mod tests {
             vm.set_keyed(a, Value::number(k), Value::from_i32(x)).unwrap();
         }
         let mut st = [a, Value::number(top - 1.0)];
-        let got: Vec<u64> = (0..3).map(|_| unsafe { iterator_next(&mut vm, st.as_mut_ptr()).unwrap() }.to_bits()).collect();
+        let got: Vec<u64> =
+            (0..3).map(|_| unsafe { iterator_next(&mut vm, st.as_mut_ptr()).unwrap() }.to_bits()).collect();
         assert_eq!(got, [Value::from_i32(1).to_bits(), Value::from_i32(2).to_bits(), Value::HOLE.to_bits()]);
         assert!(st[0].is_undefined(), "done");
     }

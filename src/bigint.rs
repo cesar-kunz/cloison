@@ -660,7 +660,11 @@ pub(crate) fn binary(op: BinOp, a: Value, b: Value) -> Value {
                 throw(Error::range_error("Exponent must be non-negative"));
                 return Value::UNDEFINED;
             }
-            let e = if y.mag.len() > 2 { u64::MAX } else { y.mag.first().copied().unwrap_or(0) as u64 | (*y.mag.get(1).unwrap_or(&0) as u64) << 32 };
+            let e = if y.mag.len() > 2 {
+                u64::MAX
+            } else {
+                y.mag.first().copied().unwrap_or(0) as u64 | (*y.mag.get(1).unwrap_or(&0) as u64) << 32
+            };
             match x.pow(e) {
                 Some(r) => r,
                 None => {
@@ -788,10 +792,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.bigint_prototype = proto;
     let c = vm.define_native(g, "BigInt", bigint_fn, 1, any, true);
     crate::builtins::link_constructor(vm, c, proto);
-    vm.define_natives(
-        c,
-        &[("asIntN", bigint_as_int_n as crate::vm::NativeFn, 2), ("asUintN", bigint_as_uint_n, 2)],
-    );
+    vm.define_natives(c, &[("asIntN", bigint_as_int_n as crate::vm::NativeFn, 2), ("asUintN", bigint_as_uint_n, 2)]);
     vm.define_natives(
         proto,
         &[

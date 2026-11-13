@@ -86,9 +86,8 @@ fn every_microbenchmark_parses() {
 #[test]
 fn listings_are_what_the_front_end_emits() {
     for f in files("bench/bytecode", "asm") {
-        let js = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("bench/micro")
-            .join(f.with_extension("js").file_name().unwrap());
+        let js =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/micro").join(f.with_extension("js").file_name().unwrap());
         let want = cloison::asm::parse(&std::fs::read_to_string(&f).unwrap()).unwrap();
         let got = cloison::js::compile(&std::fs::read_to_string(&js).unwrap())
             .unwrap_or_else(|e| panic!("{}:{e}", js.display()));
@@ -108,14 +107,13 @@ fn listings_are_what_the_front_end_emits() {
 
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
-    "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
-    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
-    "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "50", "51",
-    "52", "53", "54", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "80",
-    "81", "82", "83", "84", "85", "86", "87", "90", "91", "92", "93", "94", "100", "101", "102",
-    "103", "104", "105", "106", "107", "108", "109", "110", "111", "112", "113", "114", "115",
-    "116", "117", "118", "119", "120", "121", "122", "123", "124", "125", "126", "127", "128",
-    "129", "130", "131", "132", "133", "134", "135",
+    "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19",
+    "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38",
+    "39", "40", "41", "42", "43", "44", "45", "46", "50", "51", "52", "53", "54", "60", "61", "62", "63", "64", "65",
+    "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "85", "86", "87", "90", "91", "92", "93", "94",
+    "100", "101", "102", "103", "104", "105", "106", "107", "108", "109", "110", "111", "112", "113", "114", "115",
+    "116", "117", "118", "119", "120", "121", "122", "123", "124", "125", "126", "127", "128", "129", "130", "131",
+    "132", "133", "134", "135",
 ];
 
 /// A benchmark's number: its name up to the first `-`.
@@ -129,11 +127,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
     for f in files("bench/micro", "js") {
         let src = std::fs::read_to_string(&f).unwrap();
         let name = f.file_name().unwrap().to_str().unwrap();
-        let expect = src
-            .lines()
-            .find_map(|l| l.strip_prefix("// expect: "))
-            .unwrap()
-            .trim();
+        let expect = src.lines().find_map(|l| l.strip_prefix("// expect: ")).unwrap().trim();
         let Ok(module) = cloison::js::compile(&src) else {
             continue;
         };
@@ -147,10 +141,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
             }
             Err(e) => {
                 let e = e.to_string();
-                assert!(
-                    e.contains("is not a function") || e.contains("is not defined"),
-                    "{name}: {e}"
-                );
+                assert!(e.contains("is not a function") || e.contains("is not defined"), "{name}: {e}");
             }
         }
     }
@@ -162,10 +153,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
         let name = f.file_name().unwrap().to_str().unwrap();
         if RUNNING.contains(&number(name)) {
             let src = std::fs::read_to_string(&f).unwrap();
-            let expect = src
-                .lines()
-                .find_map(|l| l.strip_prefix("// expect: "))
-                .unwrap();
+            let expect = src.lines().find_map(|l| l.strip_prefix("// expect: ")).unwrap();
             assert_eq!(value(&src), expect.trim(), "{name}");
         }
     }
@@ -183,11 +171,7 @@ fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();
-        let expect = src
-            .lines()
-            .find_map(|l| l.strip_prefix("// expect: "))
-            .unwrap()
-            .trim();
+        let expect = src.lines().find_map(|l| l.strip_prefix("// expect: ")).unwrap().trim();
         let module = cloison::js::compile(&src).unwrap();
         for budget in [1, 3] {
             let mut vm = Vm::new();
@@ -209,11 +193,7 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();
-        let expect = src
-            .lines()
-            .find_map(|l| l.strip_prefix("// expect: "))
-            .unwrap()
-            .trim();
+        let expect = src.lines().find_map(|l| l.strip_prefix("// expect: ")).unwrap().trim();
         let module = cloison::js::compile(&src).unwrap();
         for budget in [1, 1000] {
             let mut vm = Vm::new();
@@ -274,10 +254,7 @@ var A = (ret) => ({ [Symbol.asyncIterator]() { return { next() { return { value:
 var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
 q.then(() => { globalThis.out = log.join(", "); });
 "#;
-    assert_eq!(
-        out_after_jobs(src),
-        "t0, d 4, f ok, t1, a TypeError, b boom, c 4, e TypeError, t2, g ok, t3, t4, t5"
-    );
+    assert_eq!(out_after_jobs(src), "t0, d 4, f ok, t1, a TypeError, b boom, c 4, e TypeError, t2, g ok, t3, t4, t5");
 }
 
 /// What a `for await` step throws (`next()` throwing, rejecting or giving
@@ -728,7 +705,11 @@ fn text_entry_points_keep_their_signatures() {
     assert!(cloison::js::compile_script_lazy(text).unwrap_err().starts_with("1:16:"));
     assert!(cloison::js::compile_indirect_eval(text).unwrap_err().starts_with("1:16:"));
     assert!(cloison::js::compile_strict_eval("'\u{FDD0}'; x x").unwrap_err().starts_with("1:8:"));
-    assert!(cloison::js::compile_direct_eval(text, false, false, false, false, "", true, &[]).unwrap_err().starts_with("1:16:"));
+    assert!(
+        cloison::js::compile_direct_eval(text, false, false, false, false, "", true, &[])
+            .unwrap_err()
+            .starts_with("1:16:")
+    );
     let arena = cloison::js::ast::Arenas::default();
     let e = cloison::js::parse::parse_source(text, &arena, false).err().unwrap();
     assert_eq!(e.pos, text.rfind('s').unwrap());
@@ -751,7 +732,11 @@ fn public_parsers_give_offsets_in_the_text() {
         );
         let check = |p: &cloison::js::ast::Program, top: bool| {
             let f = p.functions.iter().find(|g| g.name.as_deref() == Some("f")).expect("f");
-            assert_eq!(&text[f.pos as usize..f.end as usize], format!("function f(x) {{ return '{ch}' + x }}"), "{text}");
+            assert_eq!(
+                &text[f.pos as usize..f.end as usize],
+                format!("function f(x) {{ return '{ch}' + x }}"),
+                "{text}"
+            );
             assert_eq!(&text[f.params_pos as usize..f.end as usize], format!("(x) {{ return '{ch}' + x }}"));
             let m = p.functions.iter().find(|g| g.name.as_deref() == Some("m")).expect("m");
             assert_eq!(&text[m.params_pos as usize..m.end as usize], format!("() {{ return /{ch}/ }}"));
@@ -767,13 +752,19 @@ fn public_parsers_give_offsets_in_the_text() {
         let arena = Arenas::default();
         check(&parse::parse_source(&text, &arena, true).unwrap(), true);
         let arena = Arenas::default();
-        check(&parse::parse_source_as(&text, &arena, false, Some((false, "", false, true, false, false, false))).unwrap(), true);
+        check(
+            &parse::parse_source_as(&text, &arena, false, Some((false, "", false, true, false, false, false))).unwrap(),
+            true,
+        );
         let arena = Arenas::default();
         check(&parse::parse_module(&text, &arena, 0).unwrap(), false);
         // And the code made of it: `toString` the text, compiled now or
         // lazily (from `eval`).
         let fs = format!("function f(x) {{ return '{ch}' + x }}");
-        let js = format!("{text}\n[f.toString() === {fs:?}, C.prototype.m.toString() === {:?}, f(1).length].join()", format!("m() {{ return /{ch}/ }}"));
+        let js = format!(
+            "{text}\n[f.toString() === {fs:?}, C.prototype.m.toString() === {:?}, f(1).length].join()",
+            format!("m() {{ return /{ch}/ }}")
+        );
         assert_eq!(value(&js), format!("true,true,{}", ch.len_utf16() + 1));
         let e = format!(
             "var g = eval({:?}); [g.toString() === {fs:?}, g(1).length, eval({:?}).toString() === {fs:?}].join()",
@@ -792,7 +783,9 @@ fn public_parsers_give_offsets_in_the_text() {
 fn generate_lazy_takes_text() {
     use cloison::js::{ast::Arenas, codegen, parse};
     for ch in ['\u{F0000}', '\u{F0800}', '\u{FDD0}'] {
-        let f = format!("function f() {{ return ['{ch}', /{ch}/u.source, `{ch}`, String.raw`{ch}`].map(s => s.codePointAt(0)).join() }}");
+        let f = format!(
+            "function f() {{ return ['{ch}', /{ch}/u.source, `{ch}`, String.raw`{ch}`].map(s => s.codePointAt(0)).join() }}"
+        );
         let text = format!("var a = '{ch}'; {f}\n[f(), f.toString() === {f:?}, a.codePointAt(0)].join(' ')");
         let arena = Arenas::default();
         let p = parse::parse_source(&text, &arena, true).unwrap();
@@ -871,14 +864,8 @@ fn expressions() {
     );
     // A left operand used as a register is copied when the right one
     // assigns it.
-    assert_eq!(
-        value("function f() { var x = 1; return x + (x = 10); } f();"),
-        "11"
-    );
-    assert_eq!(
-        value("function f() { var x = 1; x += (x = 10); return x; } f();"),
-        "11"
-    );
+    assert_eq!(value("function f() { var x = 1; return x + (x = 10); } f();"), "11");
+    assert_eq!(value("function f() { var x = 1; x += (x = 10); return x; } f();"), "11");
     // Nested functions that capture nothing, function expressions,
     // methods and `undefined`.
     assert_eq!(
@@ -1022,10 +1009,7 @@ fn group2_operators_agree_with_node() {
         ("overflow()", "751619269850"),
         ("negzero()", "4214"),
         ("shifts()", "128836055850"),
-        (
-            "rel([1, 2, 3, 5 / 2, nan, 0 * -1, 0], [2, 0, 5 / 2, nan])",
-            "3400",
-        ),
+        ("rel([1, 2, 3, 5 / 2, nan, 0 * -1, 0], [2, 0, 5 / 2, nan])", "3400"),
         ("loops(1000)", "417668"),
         ("nulls()", "433260"),
     ] {
@@ -1440,12 +1424,7 @@ fn polymorphic_accesses_agree_with_node() {
         assert_eq!(value(&format!("{POLY}\n{call};")), want, "{call}");
     }
     // All in one run: the caches carry over.
-    assert_eq!(
-        value(&format!(
-            "{POLY}\nrun(2, 300) + run(3, 300) + run(4, 300) + run(5, 300);"
-        )),
-        "9152700"
-    );
+    assert_eq!(value(&format!("{POLY}\nrun(2, 300) + run(3, 300) + run(4, 300) + run(5, 300);")), "9152700");
 }
 
 /// Polymorphic calls, inlined: two to five callees with different
@@ -1514,10 +1493,7 @@ fn polymorphic_calls_agree_with_node() {
         ("run(5, 2000)", "36876000"),
         ("later()", "44157750"),
         ("fresh()", "4501500"),
-        (
-            "run(2, 300) + run(4, 300) + run(5, 300) + later()",
-            "47476350",
-        ),
+        ("run(2, 300) + run(4, 300) + run(5, 300) + later()", "47476350"),
     ] {
         assert_eq!(value(&format!("{POLY_CALLS}\n{call};")), want, "{call}");
     }
@@ -1579,12 +1555,9 @@ function mixed() {
 
 #[test]
 fn arrays_and_constructors_agree_with_node() {
-    for (call, want) in [
-        ("stores()", "2262261.5"),
-        ("stack()", "2847651"),
-        ("ctors()", "913365704"),
-        ("mixed()", "19005"),
-    ] {
+    for (call, want) in
+        [("stores()", "2262261.5"), ("stack()", "2847651"), ("ctors()", "913365704"), ("mixed()", "19005")]
+    {
         assert_eq!(value(&format!("{ARRAYS}\n{call};")), want, "{call}");
     }
 }
@@ -1741,10 +1714,7 @@ function main(kinds) {
 
 #[test]
 fn arrays_first_filled_with_several_classes_agree_with_node() {
-    assert_eq!(
-        value(&format!("{MIXED_ARRAYS}\nmain(3) + main(5);")),
-        "426748383"
-    );
+    assert_eq!(value(&format!("{MIXED_ARRAYS}\nmain(3) + main(5);")), "426748383");
 }
 
 /// Tests of values known where they are (see `fold_constant_tests`):
@@ -2295,8 +2265,13 @@ for (var j = 0; j < 30; j++) r = r + hot4(1000);
 
 #[test]
 fn changed_constants_agree_with_node() {
-    assert_eq!(value(&format!("{CHANGED_CONSTANTS}
-r;")), "9420847");
+    assert_eq!(
+        value(&format!(
+            "{CHANGED_CONSTANTS}
+r;"
+        )),
+        "9420847"
+    );
 }
 
 /// More of them: a keyed store, stores in a callee (inlined or not, which
@@ -2326,8 +2301,13 @@ for (var j = 0; j < 5; j++) r = r + hot8(1000);
 
 #[test]
 fn more_changed_constants_agree_with_node() {
-    assert_eq!(value(&format!("{CHANGED_CONSTANTS_2}
-r;")), "13721319");
+    assert_eq!(
+        value(&format!(
+            "{CHANGED_CONSTANTS_2}
+r;"
+        )),
+        "13721319"
+    );
 }
 
 /// Methods shadowed by own properties while compiled code calls them in a
@@ -2389,8 +2369,13 @@ for (var j = 0; j < 20; j++) r = r + hot4(new S(j), 1000, "get");
 
 #[test]
 fn shadowed_methods_agree_with_node() {
-    assert_eq!(value(&format!("{SHADOWED_METHODS}
-r;")), "2110380");
+    assert_eq!(
+        value(&format!(
+            "{SHADOWED_METHODS}
+r;"
+        )),
+        "2110380"
+    );
 }
 
 /// Loads of constant fields moved out of a loop inlined into its caller
@@ -2428,8 +2413,13 @@ for (var j = 0; j < 4000; j++) {
 
 #[test]
 fn hoisted_loads_agree_with_node() {
-    assert_eq!(value(&format!("{HOISTED_LOADS}
-r;")), "1447227");
+    assert_eq!(
+        value(&format!(
+            "{HOISTED_LOADS}
+r;"
+        )),
+        "1447227"
+    );
 }
 
 /// Loads moved out of nested loops of one function (`hoist_loads`), which
@@ -2470,8 +2460,13 @@ for (var z = 0; z < 40; z++) {
 
 #[test]
 fn loads_hoisted_from_nested_loops_agree_with_node() {
-    assert_eq!(value(&format!("{HOISTED_FROM_NESTED_LOOPS}
-r;")), "542668");
+    assert_eq!(
+        value(&format!(
+            "{HOISTED_FROM_NESTED_LOOPS}
+r;"
+        )),
+        "542668"
+    );
 }
 
 /// `this` in sloppy mode (cloison has no strict mode): the global object in a
@@ -2674,10 +2669,7 @@ function accessors() {
 
 #[test]
 fn accessors_agree_with_node() {
-    assert_eq!(
-        value(&format!("{ACCESSORS}\naccessors();")),
-        "4922724:_key,f,_v,v,nested:3:truefalse"
-    );
+    assert_eq!(value(&format!("{ACCESSORS}\naccessors();")), "4922724:_key,f,_v,v,nested:3:truefalse");
 }
 
 /// Typed arrays and buffers read and written by compiled loops (elements
@@ -2717,7 +2709,8 @@ fn typed_arrays_and_callbacks_agree_with_node() {
 /// object, also read by a nested function. The expected value is Node's.
 #[test]
 fn many_variables_agree_with_node() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/octane/many-variables.js.txt")).unwrap();
+    let src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/octane/many-variables.js.txt")).unwrap();
     assert_eq!(value(&src), "2001571,4543976");
 }
 
@@ -3091,7 +3084,10 @@ return r + "|" + f(0.5, 1) + "|" + f(-1, -1);
 #[test]
 fn upvalues_and_negation_agree_with_node() {
     assert_eq!(value(&format!("{UPVALUES}\nupvalues();")), "1051500,441000,442000,119400000,400000,125085000");
-    assert_eq!(value(&format!("{UPVALUES}\nnegation();")), "-397800000;1000;-Infinity,2147483648,-3,-5,-10|-2000500;166.66666666667243;-Infinity,2147483648,-3,-5,-10|1996000;-333.33333333334485;Infinity,2147483648,-3,-5,-10");
+    assert_eq!(
+        value(&format!("{UPVALUES}\nnegation();")),
+        "-397800000;1000;-Infinity,2147483648,-3,-5,-10|-2000500;166.66666666667243;-Infinity,2147483648,-3,-5,-10|1996000;-333.33333333334485;Infinity,2147483648,-3,-5,-10"
+    );
 }
 
 /// Typed arrays in globals past the global object's in-object slots (as
@@ -3196,7 +3192,10 @@ return r.join(",");
 
 #[test]
 fn untyped_shifts_agree_with_node() {
-    assert_eq!(value(&format!("{UNTYPED_SHIFTS}\nuntypedShifts();")), "10899,-1251851505,-1251851529,116577075,116576975,116581250,116576750,116576850,499.5:499.75");
+    assert_eq!(
+        value(&format!("{UNTYPED_SHIFTS}\nuntypedShifts();")),
+        "10899,-1251851505,-1251851529,116577075,116576975,116581250,116576750,116576850,499.5:499.75"
+    );
 }
 
 #[test]
@@ -3399,7 +3398,8 @@ fn intrinsics_in_compiled_loops_throw_and_return_as_interpreted() {
     // Each loop compiled, with intrinsics (spread, templates, `**`,
     // destructuring, classes, private names) in it, some of them throwing
     // at times; the same values as interpreted.
-    let src = "class A { #p = 1; constructor(x) { this.x = x; } get d() { return this.x * 2; } pget(o) { return o.#p; } }
+    let src =
+        "class A { #p = 1; constructor(x) { this.x = x; } get d() { return this.x * 2; } pget(o) { return o.#p; } }
 class B extends A { constructor(x) { super(x); this.y = x + 1; } m() { return super.d + this.y; } }
 function h(a, b, c) { return a + b + c; }
 function f(n) {
@@ -4003,10 +4003,7 @@ var made = Function("p", "q", "function sq(v) { return v * v; } return sq(p) + q
 var bad = (0, eval)("(function () { return 1; })");
 direct + "|" + made + "|" + bad();
 "#;
-    assert_eq!(
-        value(src),
-        "3:6:1:4:10:number,2,3628800,5,3:1/2/3,caught in,localAB,6,5,function|13|1"
-    );
+    assert_eq!(value(src), "3:6:1:4:10:number,2,3628800,5,3:1/2/3,caught in,localAB,6,5,function|13|1");
     // Bodies only skimmed: the names they may use from outside, a few
     // more than they do (ASI ending a `var`, accessors, keys and labels
     // as outer variables, `catch`'s, hoisting). Node's values.
@@ -4033,10 +4030,7 @@ var src = [
 ].join("\n");
 (0, eval)(src);
 "#;
-    assert_eq!(
-        value(skimmed),
-        "8,2,3:0,pq0,1:9:9,4,4,outer,55,3,1234,2:1,6,2:1,6,3,3"
-    );
+    assert_eq!(value(skimmed), "8,2,3:0,pq0,1:9:9,4,4,outer,55,3,1234,2:1,6,2:1,6,3,3");
     // A direct `eval` in a body sees the variables around it, though
     // nothing else there names them: reads, writes (not a global's), in
     // a nested function or an accessor, `(eval)`. SpiderMonkey's values.
@@ -4072,14 +4066,18 @@ var src = [
     // A skimmed body's syntax error is thrown at its first call (Node
     // throws at the `eval`).
     assert_eq!(
-        value("var f = (0, eval)('var g = function () { return 1 + ; }; g'); \
-               var r; try { f(); } catch (e) { r = String(e).indexOf('SyntaxError') >= 0; } r;"),
+        value(
+            "var f = (0, eval)('var g = function () { return 1 + ; }; g'); \
+               var r; try { f(); } catch (e) { r = String(e).indexOf('SyntaxError') >= 0; } r;"
+        ),
         "true"
     );
     // What only the code generator rejects is thrown at the call.
     assert_eq!(
-        value("var f = (0, eval)('(function () { return function () { while (1) { continue x; } }; })')(); \
-               var r; try { f(); } catch (e) { r = String(e).indexOf('no target') >= 0; } r;"),
+        value(
+            "var f = (0, eval)('(function () { return function () { while (1) { continue x; } }; })')(); \
+               var r; try { f(); } catch (e) { r = String(e).indexOf('no target') >= 0; } r;"
+        ),
         "true"
     );
 }
@@ -4522,7 +4520,10 @@ s + " " + rdu(a, 8);
     assert_eq!(display(vm.run(&m).unwrap()), "84000 8000");
     for f in ["rdu", "wru"] {
         let stencils = vm.jit_stencils(f).expect("compiled");
-        assert!(stencils.iter().any(|s| s.starts_with("tget_u16_d") || s.starts_with("tset_b16_i_d")), "{f}: {stencils:?}");
+        assert!(
+            stencils.iter().any(|s| s.starts_with("tget_u16_d") || s.starts_with("tset_b16_i_d")),
+            "{f}: {stencils:?}"
+        );
     }
     // Lengths: 0 once the buffer is detached, a resizable buffer's views'
     // as it resizes.
@@ -4612,7 +4613,10 @@ k().catch(e => out.push("destructure " + e.name));
     let second = cloison::js::compile("out.join(' | ')").unwrap();
     let mut vm = Vm::new();
     vm.run(&first).unwrap();
-    assert_eq!(vm.run(&second).map(display).unwrap(), "promise | sync gen | rejected param | g 3 | destructure TypeError");
+    assert_eq!(
+        vm.run(&second).map(display).unwrap(),
+        "promise | sync gen | rejected param | g 3 | destructure TypeError"
+    );
 }
 
 /// A `WeakMap`'s and a `WeakSet`'s entries go once their keys are
@@ -5029,9 +5033,18 @@ out.push(later(), this, typeof arguments, import.meta === import.meta, Object.ge
 globalThis.result = out.join();
 "#,
             ),
-            ("counter.mjs", "export let count = 1; export function inc() { count++; }\nimport { early } from './cycle.mjs';\nexport function later() { return early; }"),
-            ("cycle.mjs", "import { count } from './counter.mjs';\nexport let early = 'cycle';\ntry { count; } catch (e) { early = e.name; }"),
-            ("reexports.mjs", "export * from './counter.mjs';\nexport { count as renamed } from './counter.mjs';\nexport * as ns from './counter.mjs';\nexport default function () { return 'fn'; }"),
+            (
+                "counter.mjs",
+                "export let count = 1; export function inc() { count++; }\nimport { early } from './cycle.mjs';\nexport function later() { return early; }",
+            ),
+            (
+                "cycle.mjs",
+                "import { count } from './counter.mjs';\nexport let early = 'cycle';\ntry { count; } catch (e) { early = e.name; }",
+            ),
+            (
+                "reexports.mjs",
+                "export * from './counter.mjs';\nexport { count as renamed } from './counter.mjs';\nexport * as ns from './counter.mjs';\nexport default function () { return 'fn'; }",
+            ),
             ("cls.mjs", "export default class {}"),
             ("value.mjs", "export default 6 * 7;"),
         ],
@@ -5053,7 +5066,10 @@ fn modules_with_eval_export_lexicals() {
     let dir = module_dir(
         "eval",
         &[
-            ("main.mjs", "import { a, b, C, d, v, setA, out } from './m.mjs';\nconst r = [a, b, typeof C, d, v];\nsetA();\nglobalThis.result = r.concat(a, d, out).join();"),
+            (
+                "main.mjs",
+                "import { a, b, C, d, v, setA, out } from './m.mjs';\nconst r = [a, b, typeof C, d, v];\nsetA();\nglobalThis.result = r.concat(a, d, out).join();",
+            ),
             (
                 "m.mjs",
                 "const out = [];\nconst f = (s) => { try { return eval(s); } catch (e) { return e.name; } };\nout.push(f('typeof a'));\n\
@@ -5091,7 +5107,13 @@ fn modules_eval_in_arrows() {
          r.push(t(() => eval('arguments')), t(() => eval('new.target')));\n\
          globalThis.result = r.join();"
     );
-    let dir = module_dir("eval-arrows", &[("main.mjs", &main), ("top.mjs", "eval('');\ntry { (() => eval('new.target'))(); } catch (e) { globalThis.result = e.name; }")]);
+    let dir = module_dir(
+        "eval-arrows",
+        &[
+            ("main.mjs", &main),
+            ("top.mjs", "eval('');\ntry { (() => eval('new.target'))(); } catch (e) { globalThis.result = e.name; }"),
+        ],
+    );
     let want = "79,SyntaxError,SyntaxError,SyntaxError,SyntaxError,undefined,undefined,ReferenceError,undefined,\
                 F/F/2,//0,undefined,global,SyntaxError";
     for budget in [i64::MAX, 1, 1000] {
@@ -5189,7 +5211,11 @@ fn modules_eval_sees_many_imports() {
         let lib = format!("{lib}export function bump2() {{ x1 = 10; }}");
         let dir = module_dir(
             &format!("eval-imports-{n}"),
-            &[("main.mjs", &main), ("lib.mjs", &lib), ("bump.mjs", "import { bump2 } from './lib.mjs';\nexport const bump = bump2;")],
+            &[
+                ("main.mjs", &main),
+                ("lib.mjs", &lib),
+                ("bump.mjs", "import { bump2 } from './lib.mjs';\nexport const bump = bump2;"),
+            ],
         );
         assert_eq!(run_module(&dir, "main.mjs").unwrap(), format!("{},TypeError,10", n - 1), "{n} imports");
     }
@@ -5203,9 +5229,15 @@ fn modules_await_and_import() {
     let dir = module_dir(
         "await",
         &[
-            ("main.mjs", "import { log } from './log.mjs';\nimport './a.mjs';\nimport './b.mjs';\nlog.push('main');\nconst ns = await import('./a.mjs');\nconst again = await import('./a.mjs');\nimport data from './data.json' with { type: 'json' };\nlog.push(ns === again, ns.a, data.list.length);\ntry { await import('./missing-export.mjs'); } catch (e) { log.push(e.name); }\nglobalThis.result = log.join();"),
+            (
+                "main.mjs",
+                "import { log } from './log.mjs';\nimport './a.mjs';\nimport './b.mjs';\nlog.push('main');\nconst ns = await import('./a.mjs');\nconst again = await import('./a.mjs');\nimport data from './data.json' with { type: 'json' };\nlog.push(ns === again, ns.a, data.list.length);\ntry { await import('./missing-export.mjs'); } catch (e) { log.push(e.name); }\nglobalThis.result = log.join();",
+            ),
             ("log.mjs", "export const log = [];"),
-            ("a.mjs", "import { log } from './log.mjs';\nlog.push('a start');\nawait null;\nlog.push('a end');\nexport const a = 'A';"),
+            (
+                "a.mjs",
+                "import { log } from './log.mjs';\nlog.push('a start');\nawait null;\nlog.push('a end');\nexport const a = 'A';",
+            ),
             ("b.mjs", "import { log } from './log.mjs';\nlog.push('b');"),
             ("data.json", "{ \"list\": [1, 2, 3] }"),
             ("missing-export.mjs", "import { nothing } from './log.mjs';"),
@@ -5289,7 +5321,12 @@ fn module_early_errors() {
             ("arguments.mjs", "globalThis.result = typeof arguments; await 0;"),
         ],
     );
-    for (f, what) in [("dup.mjs", "twice"), ("undeclared.mjs", "not declared"), ("unresolved.mjs", "no export"), ("lex.mjs", "already")] {
+    for (f, what) in [
+        ("dup.mjs", "twice"),
+        ("undeclared.mjs", "not declared"),
+        ("unresolved.mjs", "no export"),
+        ("lex.mjs", "already"),
+    ] {
         let e = run_module(&dir, f).unwrap_err();
         assert!(e.starts_with("early: SyntaxError") && e.contains(what), "{f}: {e}");
     }
@@ -5428,9 +5465,14 @@ fn views_see_another_agents_grow() {
 #[test]
 fn views_see_a_grow_through_a_critical_section() {
     let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-    for (i, what) in ["Atomics.wait(ia, 0, 0, 0)", "Atomics.waitAsync(ia, 0, 0, 0).value", "Atomics.notify(ia, 0)", "await Atomics.waitAsync(ia, 0, 0, 1).value"]
-        .iter()
-        .enumerate()
+    for (i, what) in [
+        "Atomics.wait(ia, 0, 0, 0)",
+        "Atomics.waitAsync(ia, 0, 0, 0).value",
+        "Atomics.notify(ia, 0)",
+        "await Atomics.waitAsync(ia, 0, 0, 1).value",
+    ]
+    .iter()
+    .enumerate()
     {
         let src = format!(
             r#"
@@ -5463,7 +5505,11 @@ fn views_see_a_grow_through_a_critical_section() {
 #[test]
 fn views_see_grows_before_a_grown_length_read() {
     let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-    for seen in ["sab2.byteLength !== 16", "sab2.slice(0).byteLength !== 16", "(() => { try { sab2.grow(16); } catch (e) { return true; } })()"] {
+    for seen in [
+        "sab2.byteLength !== 16",
+        "sab2.slice(0).byteLength !== 16",
+        "(() => { try { sab2.grow(16); } catch (e) { return true; } })()",
+    ] {
         let src = format!(
             r#"
             $262.agent.start(`var first; $262.agent.receiveBroadcast(function (sab) {{
@@ -5566,7 +5612,10 @@ fn modules_deferred_and_source_phase() {
     let dir = module_dir(
         "defer",
         &[
-            ("main.mjs", "import defer * as ns from './dep.mjs';\nconst log = globalThis.log = [];\nlog.push(ns[Symbol.toStringTag], ns.then === undefined, String(globalThis.ran));\nlog.push(ns.x, String(globalThis.ran));\nconst again = await import.defer('./dep.mjs');\nlog.push(again === ns);\ntry { await import.source('./dep.mjs'); } catch (e) { log.push(e.name); }\nglobalThis.result = log.join();"),
+            (
+                "main.mjs",
+                "import defer * as ns from './dep.mjs';\nconst log = globalThis.log = [];\nlog.push(ns[Symbol.toStringTag], ns.then === undefined, String(globalThis.ran));\nlog.push(ns.x, String(globalThis.ran));\nconst again = await import.defer('./dep.mjs');\nlog.push(again === ns);\ntry { await import.source('./dep.mjs'); } catch (e) { log.push(e.name); }\nglobalThis.result = log.join();",
+            ),
             ("dep.mjs", "globalThis.ran = true; export const x = 1;"),
             ("source.mjs", "import source s from './dep.mjs';"),
         ],
@@ -5674,7 +5723,10 @@ fn modules_that_are_not_regular_files_throw() {
 /// closed at once, before the check that it is no regular file).
 #[test]
 fn modules_that_are_fifos_are_not_opened() {
-    let dir = module_dir("fifo-writer", &[("main.mjs", "try { await import('./fifo'); } catch (e) { globalThis.result = e.message; }")]);
+    let dir = module_dir(
+        "fifo-writer",
+        &[("main.mjs", "try { await import('./fifo'); } catch (e) { globalThis.result = e.message; }")],
+    );
     let fifo = dir.join("fifo");
     let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
@@ -5708,7 +5760,8 @@ fn deep_module_graphs_load_or_throw_a_range_error() {
     let n = 20000;
     let mut files: Vec<(String, String)> = (0..n)
         .map(|i| {
-            let text = if i + 1 < n { format!("export * from './{}.mjs';\n", i + 1) } else { "export const x = 1;\n".into() };
+            let text =
+                if i + 1 < n { format!("export * from './{}.mjs';\n", i + 1) } else { "export const x = 1;\n".into() };
             (format!("{i}.mjs"), text)
         })
         .collect();
@@ -5740,9 +5793,13 @@ fn agents_end_with_their_vm() {
     }
     // Another VM's broadcast doesn't reach this one's agent.
     let mut a = Vm::new();
-    a.run(&cloison::js::compile(
-        "$262.agent.start('$262.agent.receiveBroadcast(function () { $262.agent.report(1); })'); 1",
-    ).unwrap()).unwrap();
+    a.run(
+        &cloison::js::compile(
+            "$262.agent.start('$262.agent.receiveBroadcast(function () { $262.agent.report(1); })'); 1",
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let mut b = Vm::new();
     b.run(&cloison::js::compile("$262.agent.broadcast(new SharedArrayBuffer(8)); 1").unwrap()).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -5842,7 +5899,10 @@ for (var i = 0; i < 20000; i++) s += hot(i);
 r.push(s);
 r.join(" ");
 "#;
-    assert_eq!(value(src), r#"[2,1] [1,1] 1 5 ["function",1] ["number",1] [2,1] ReferenceError [2,1] [2,1] [2,1] [7,1] [2,1,2] [2,1] [3,1] ["number","number"] 3 [11,10] 599970000"#);
+    assert_eq!(
+        value(src),
+        r#"[2,1] [1,1] 1 5 ["function",1] ["number",1] [2,1] ReferenceError [2,1] [2,1] [2,1] [7,1] [2,1,2] [2,1] [3,1] ["number","number"] 3 [11,10] 599970000"#
+    );
 }
 
 #[test]
@@ -5871,7 +5931,10 @@ r.push(JSON.stringify(Object.getOwnPropertyDescriptor(globalThis, "e1")), delete
 try { e1; r.push("read"); } catch (e) { r.push(e.name); }
 r.join(" ");
 "#;
-    assert_eq!(value(src), r#"true {"writable":true,"enumerable":true,"configurable":false} true true false function {"value":1,"writable":true,"enumerable":true,"configurable":false} 199990000 {"value":2,"writable":true,"enumerable":true,"configurable":true} true false ReferenceError"#);
+    assert_eq!(
+        value(src),
+        r#"true {"writable":true,"enumerable":true,"configurable":false} true true false function {"value":1,"writable":true,"enumerable":true,"configurable":false} 199990000 {"value":2,"writable":true,"enumerable":true,"configurable":true} true false ReferenceError"#
+    );
 }
 
 #[test]
@@ -6062,7 +6125,8 @@ out.join(" ")
          TypeError ReferenceError undefined 4"
     );
     let mut vm = Vm::new();
-    let src = r#"function f() { let l = 3; return eval("l * 2"); } var s = 0; for (var i = 0; i < 5000; i++) s += f(); s"#;
+    let src =
+        r#"function f() { let l = 3; return eval("l * 2"); } var s = 0; for (var i = 0; i < 5000; i++) s += f(); s"#;
     let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("30000"));
     let shapes = vm.memory_stats()[0];
@@ -6133,8 +6197,10 @@ fn direct_evals_kept_code_is_freed() {
         "function f(x, k) {{ return eval('(function (y) {{ return y + ' + k + '; }})(x)'); }}\n\
          var s = 0; for (var k = 0; k < 1000; k++) for (var i = 0; i < 20; i++) s += f(i, k);\n{tail}"
     );
-    let none = format!("function f(x, k) {{ return x + k; }}\n\
-         var s = 0; for (var k = 0; k < 1000; k++) for (var i = 0; i < 20; i++) s += f(i, k);\n{tail}");
+    let none = format!(
+        "function f(x, k) {{ return x + k; }}\n\
+         var s = 0; for (var k = 0; k < 1000; k++) for (var i = 0; i < 20; i++) s += f(i, k);\n{tail}"
+    );
     let (kept, base) = (codes(&evals), codes(&none));
     assert!(kept <= base + 8, "{kept} codes kept, {base} without the evals");
 }
@@ -6198,7 +6264,12 @@ af().then(v => { out.push(v); globalThis.result = out.join("|"); });
     let mut vm = Vm::new();
     vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
-    assert_eq!(r.as_deref(), Ok("TypeError|ReferenceError|ReferenceError|6;8;11;4,14,24;402;11;number|0,1,2,3,4/5|6,number,undefined|6000|36000|84"));
+    assert_eq!(
+        r.as_deref(),
+        Ok(
+            "TypeError|ReferenceError|ReferenceError|6;8;11;4,14,24;402;11;number|0,1,2,3,4/5|6,number,undefined|6000|36000|84"
+        )
+    );
 }
 
 #[test]
@@ -6234,7 +6305,12 @@ Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then
     let mut vm = Vm::new();
     vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
-    assert_eq!(r.as_deref(), Ok("a1:start|a2:start|a1:start|arrow|p1|a1:1|a2:caught x|a1:1|m true|p2|a1:2|a2 rejected TypeError|a1:2|fa 1|ag 1|p3|a1 done r1|a4|then called|fa 2|a3:7|ag 2|a4 done 7|n=1000"));
+    assert_eq!(
+        r.as_deref(),
+        Ok(
+            "a1:start|a2:start|a1:start|arrow|p1|a1:1|a2:caught x|a1:1|m true|p2|a1:2|a2 rejected TypeError|a1:2|fa 1|ag 1|p3|a1 done r1|a4|then called|fa 2|a3:7|ag 2|a4 done 7|n=1000"
+        )
+    );
 }
 
 #[test]
@@ -6936,7 +7012,13 @@ out.join(" | ");
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         let r = vm.run(&module).map(display).map_err(|e| e.to_string());
-        assert_eq!(r.as_deref(), Ok("null | null | false | 4 c c | 1 0 | efg,f,g | true | TypeError | TypeError | false | undefined | true | null"), "tier at {budget}");
+        assert_eq!(
+            r.as_deref(),
+            Ok(
+                "null | null | false | 4 c c | 1 0 | efg,f,g | true | TypeError | TypeError | false | undefined | true | null"
+            ),
+            "tier at {budget}"
+        );
     }
 }
 
@@ -7476,7 +7558,10 @@ fn tagged_templates_shared_by_a_module_run_again_stay() {
         "var fs = globalThis.fs || (globalThis.fs = []); fs.push(function () { return (s => s)`x`; }); fs[fs.length - 1]();",
     )
     .unwrap();
-    let drop = cloison::js::compile("var saved = fs[2](); var same = fs[0]() === saved && fs[1]() === saved; fs[0] = fs[1] = null;").unwrap();
+    let drop = cloison::js::compile(
+        "var saved = fs[2](); var same = fs[0]() === saved && fs[1]() === saved; fs[0] = fs[1] = null;",
+    )
+    .unwrap();
     let gc = cloison::js::compile("$262.gc(); $262.gc();").unwrap();
     let check = cloison::js::compile("same + ' ' + (fs[2]() === saved)").unwrap();
     let mut vm = Vm::new();
@@ -7502,7 +7587,8 @@ fn tagged_templates_held_outlive_their_codes() {
     let module = cloison::js::compile("globalThis.f = function (tag) { return tag`hello`; };").unwrap();
     let save = cloison::js::compile("var saved = f(s => s); f = undefined;").unwrap();
     let gc = cloison::js::compile("$262.gc(); $262.gc();").unwrap();
-    let check = cloison::js::compile("f(s => s) === saved && Object.isFrozen(saved) && saved.raw[0] === 'hello'").unwrap();
+    let check =
+        cloison::js::compile("f(s => s) === saved && Object.isFrozen(saved) && saved.raw[0] === 'hello'").unwrap();
     let other = cloison::js::compile("var g = function () { return 1; }; g();").unwrap();
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
@@ -7736,7 +7822,10 @@ fn long_tagged_templates_make_their_arrays_once() {
     // A long tagged template's strings go to `template_object` in two
     // arrays: made only when the site has no strings array yet, after
     // `[site]` alone found none.
-    let src = format!("function tag(s) {{ return s; }} function k() {{ return tag`{}`; }} var a = k(); a === k() && a.length + a.raw[1]", "${0}\\x".repeat(300));
+    let src = format!(
+        "function tag(s) {{ return s; }} function k() {{ return tag`{}`; }} var a = k(); a === k() && a.length + a.raw[1]",
+        "${0}\\x".repeat(300)
+    );
     assert_eq!(value(&src), "301\\x");
     let text = cloison::asm::disassemble(&cloison::js::compile(&src).unwrap());
     // (`tag`'s argument array before: `[site]`, a jump past the arrays.)
@@ -7919,7 +8008,9 @@ fn globals_survive_clones_drops_and_moving_collections() {
         for round in 0..30 {
             let a = run(
                 &mut vm,
-                &format!("(function () {{ var a = []; for (var i = 0; i < 40; i++) a.push({{n: {round} * 100 + i, s: 'v' + i}}); return a; }})()"),
+                &format!(
+                    "(function () {{ var a = []; for (var i = 0; i < 40; i++) a.push({{n: {round} * 100 + i, s: 'v' + i}}); return a; }})()"
+                ),
             );
             for i in 0..40 {
                 let v = vm.get_keyed(a, cloison::value::Value::from_i32(i)).unwrap();
@@ -8225,10 +8316,7 @@ function ch2(a) { var o = {}; o?.[a = 31]; return arguments[0]; } out.push(ch2(1
 function cm(a) { a ||= (arguments[0] = 32); return arguments[0] + "," + a; } out.push(cm(0));
 out.join(" ")
 "#;
-    assert_eq!(
-        value(src),
-        "7 7 8 9 9 2 8 4 11 12 13 14 15 16 17 2 19 20 1 22 23 24 1 26 27 28 29 1 31 32,32"
-    );
+    assert_eq!(value(src), "7 7 8 9 9 2 8 4 11 12 13 14 15 16 17 2 19 20 1 22 23 24 1 26 27 28 29 1 31 32,32");
     let src = r#"var log = [];
 async function h1(a) { await 0; a ||= 33; return arguments[0]; }
 async function h2(a) { await 0; arguments[0] ??= 34; await 0; return a; }
@@ -8279,10 +8367,7 @@ function* g2(a) { yield 0; [arguments[0]] = [29]; yield a; } var i2 = g2(0); i2.
 function* g3(a) { yield 0; for ([a] of [[30]]); yield arguments[0]; } var i3 = g3(0); i3.next(); out.push(i3.next().value);
 out.join(" ")
 "#;
-    assert_eq!(
-        value(src),
-        "7 k 8 9 10 11 12 13 14 15 16 17 18 19 20 21 z 22 23,0 25,25 26 number27 28 29 30"
-    );
+    assert_eq!(value(src), "7 k 8 9 10 11 12 13 14 15 16 17 18 19 20 21 z 22 23,0 25,25 26 number27 28 29 30");
     let src = r#"async function h1(a) { await 0; for (arguments[0] of [31]); return a; }
 async function h2(a) { await 0; ({ a } = { a: 32 }); return arguments[0]; }
 async function* h3(a) { yield 0; for (arguments[0] in { w: 1 }); yield a; }
@@ -8325,7 +8410,10 @@ fn a_function_indexes_more_than_65536_caches_constants_and_closures() {
         ),
         // Property stores, in a function.
         (
-            format!("function h(){{var o = {{}};\n{}return o;}}\nvar o = h();\n", each(&|i| format!("o.p{i} = {i};\n"))),
+            format!(
+                "function h(){{var o = {{}};\n{}return o;}}\nvar o = h();\n",
+                each(&|i| format!("o.p{i} = {i};\n"))
+            ),
             format!("o.p{last} + o.p100"),
             last + 100,
         ),
@@ -8541,4 +8629,3 @@ out.join();
         "4,own"
     );
 }
-

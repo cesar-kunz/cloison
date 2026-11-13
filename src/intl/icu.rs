@@ -12,9 +12,9 @@
 use std::cmp::Ordering;
 use std::sync::OnceLock;
 
+use icu_collator::CollatorPreferences;
 use icu_collator::options::{AlternateHandling, CaseLevel, CollatorOptions, Strength};
 use icu_collator::preferences::{CollationCaseFirst, CollationNumericOrdering};
-use icu_collator::CollatorPreferences;
 use icu_locale_core::Locale;
 use icu_provider_blob::BlobDataProvider;
 
@@ -26,7 +26,8 @@ fn provider() -> Result<&'static BlobDataProvider, String> {
     static DATA: OnceLock<Result<BlobDataProvider, String>> = OnceLock::new();
     DATA.get_or_init(|| {
         let path = std::env::var("CLOISON_INTL_DATA").unwrap_or_else(|_| DEFAULT_DATA.into());
-        let bytes = std::fs::read(&path).map_err(|e| format!("Intl's locale data ({path}): {e} (set CLOISON_INTL_DATA)"))?;
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("Intl's locale data ({path}): {e} (set CLOISON_INTL_DATA)"))?;
         let blob: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         BlobDataProvider::try_new_from_static_blob(blob).map_err(|e| format!("Intl's locale data ({path}): {e}"))
     })
@@ -77,7 +78,8 @@ impl Collator {
     pub(crate) fn new(key: &CollatorKey) -> Result<Collator, String> {
         let locale = Locale::try_from_str(&key.locale).map_err(|e| format!("{}: {e}", key.locale))?;
         let mut prefs = CollatorPreferences::from(&locale);
-        prefs.numeric_ordering = Some(if key.numeric { CollationNumericOrdering::True } else { CollationNumericOrdering::False });
+        prefs.numeric_ordering =
+            Some(if key.numeric { CollationNumericOrdering::True } else { CollationNumericOrdering::False });
         prefs.case_first = Some(match key.case_first {
             CaseFirst::False => CollationCaseFirst::False,
             CaseFirst::Lower => CollationCaseFirst::Lower,
@@ -96,7 +98,9 @@ impl Collator {
         if key.ignore_punctuation {
             options.alternate_handling = Some(AlternateHandling::Shifted);
         }
-        icu_collator::Collator::try_new_with_buffer_provider(provider()?, prefs, options).map(Collator).map_err(|e| format!("{}: {e}", key.locale))
+        icu_collator::Collator::try_new_with_buffer_provider(provider()?, prefs, options)
+            .map(Collator)
+            .map_err(|e| format!("{}: {e}", key.locale))
     }
 
     pub(crate) fn compare(&self, a: &[u16], b: &[u16]) -> Ordering {

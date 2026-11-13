@@ -630,7 +630,10 @@ fn cap_resolve(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
         return resolve_promise(vm, as_object(cap.promise), v);
     }
     if !is_callable(cap.resolve) {
-        debug_assert!(is_class(cap.resolve, Class::Plain), "a capability's resolve neither a function nor a sync record");
+        debug_assert!(
+            is_class(cap.resolve, Class::Plain),
+            "a capability's resolve neither a function nor a sync record"
+        );
         return resolve_iter_result(vm, as_object(cap.promise), v, cap.resolve);
     }
     call_function(vm, cap.resolve, Value::UNDEFINED, &[v]).map(drop)
@@ -921,10 +924,11 @@ fn promise_try(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let c = this_constructor(this, "Promise.try")?;
     let cap = new_capability(vm, c)?;
     match call_function(vm, arg(a, 0), Value::UNDEFINED, a.get(1..).unwrap_or(&[])) {
-        Ok(v) if is_class(v, Class::Promise) && {
-            let a_constructor = vm.intern_name("constructor");
-            vm.get(v, a_constructor)? == c
-        } =>
+        Ok(v)
+            if is_class(v, Class::Promise) && {
+                let a_constructor = vm.intern_name("constructor");
+                vm.get(v, a_constructor)? == c
+            } =>
         {
             return Ok(v);
         }
@@ -984,7 +988,8 @@ fn perform_combine(vm: &mut Vm, c: Value, cap: &Cap, iterable: Value, kind: Comb
             }
             Combinator::AllSettled => {
                 array_push(vm, values, &[Value::UNDEFINED])?;
-                let data = [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED];
+                let data =
+                    [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED];
                 let f = closure(vm, Root::SettledFulfill, &data);
                 let mut data = data;
                 data[6] = f;
@@ -1078,7 +1083,8 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
         array_push(vm, keys, &[k])?;
         array_push(vm, values, &[Value::UNDEFINED])?;
         let next_promise = call_function(vm, promise_resolve, c, &[value])?;
-        let data = [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED, keys];
+        let data =
+            [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED, keys];
         let (on_fulfilled, on_rejected) = if settled {
             let f = closure(vm, Root::SettledFulfill, &data);
             let mut data = data;

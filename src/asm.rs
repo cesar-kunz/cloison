@@ -298,11 +298,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                 if blocks.iter().any(|b| b.name == name) {
                     return Err(format!("line {n}: {name} defined twice"));
                 }
-                open = Some(Block {
-                    name,
-                    params,
-                    lines: Vec::new(),
-                });
+                open = Some(Block { name, params, lines: Vec::new() });
             }
             Some(b) if line == "end" => {
                 let _ = b;
@@ -314,11 +310,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
     if let Some(b) = open {
         return Err(format!("{} has no `end`", b.name));
     }
-    let index: HashMap<&str, usize> = blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.name.as_str(), i))
-        .collect();
+    let index: HashMap<&str, usize> = blocks.iter().enumerate().map(|(i, b)| (b.name.as_str(), i)).collect();
     let script = *index.get("<script>").ok_or("no `script` block")?;
 
     // Pass 2: assemble each block.
@@ -330,15 +322,8 @@ pub fn parse(src: &str) -> Result<Checked, String> {
         let mut closures: Vec<usize> = Vec::new();
         let mut constants: Vec<Constant> = Vec::new();
         let mut nregs = 1 + b.params as usize;
-        fn label(
-            labels: &mut HashMap<String, (Label, bool)>,
-            a: &mut Assembler,
-            name: &str,
-        ) -> Label {
-            labels
-                .entry(name.to_string())
-                .or_insert_with(|| (a.label(), false))
-                .0
+        fn label(labels: &mut HashMap<String, (Label, bool)>, a: &mut Assembler, name: &str) -> Label {
+            labels.entry(name.to_string()).or_insert_with(|| (a.label(), false)).0
         }
         for &(n, line) in &b.lines {
             let err = |m: String| format!("line {n}: {m}");
@@ -361,8 +346,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                 }
             }
             let (mnemonic, operands) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            let op = Op::from_name(mnemonic)
-                .ok_or_else(|| err(format!("unknown opcode `{mnemonic}`")))?;
+            let op = Op::from_name(mnemonic).ok_or_else(|| err(format!("unknown opcode `{mnemonic}`")))?;
             // (A function read here has no upvalues: one indexed would be
             // past the closure's.)
             if matches!(op, Op::LdaUpvalue | Op::StaUpvalue) {
@@ -372,11 +356,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
             let toks: Vec<&str> = if op.operands() == [Operand::Const] {
                 vec![operands.trim()]
             } else {
-                operands
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .collect()
+                operands.split(',').map(str::trim).filter(|t| !t.is_empty()).collect()
             };
             let kinds = op.operands();
             let written = kinds.iter().filter(|&&k| k != Operand::AutoIc).count();
@@ -390,8 +370,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                     // Keyed accesses' caches are named after no property.
                     ics.push("[]".into());
                     args.push(Arg::Index(
-                        u32::try_from(ics.len() - 1)
-                            .map_err(|_| err("too many inline caches".into()))?,
+                        u32::try_from(ics.len() - 1).map_err(|_| err("too many inline caches".into()))?,
                     ));
                     continue;
                 }
@@ -405,14 +384,8 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                         nregs = nregs.max(r as usize + 1);
                         Arg::Reg(r)
                     }
-                    Operand::Imm => Arg::Imm(
-                        t.parse()
-                            .map_err(|_| err(format!("expected an integer, got `{t}`")))?,
-                    ),
-                    Operand::Count => Arg::Count(
-                        t.parse()
-                            .map_err(|_| err(format!("expected a count, got `{t}`")))?,
-                    ),
+                    Operand::Imm => Arg::Imm(t.parse().map_err(|_| err(format!("expected an integer, got `{t}`")))?),
+                    Operand::Count => Arg::Count(t.parse().map_err(|_| err(format!("expected a count, got `{t}`")))?),
                     Operand::Off => {
                         if !is_ident(t) {
                             return Err(err(format!("expected a label, got `{t}`")));
@@ -424,15 +397,11 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                             return Err(err(format!("expected a property name, got `{t}`")));
                         }
                         ics.push(t.into());
-                        Arg::Index(
-                            u32::try_from(ics.len() - 1)
-                                .map_err(|_| err("too many inline caches".into()))?,
-                        )
+                        Arg::Index(u32::try_from(ics.len() - 1).map_err(|_| err("too many inline caches".into()))?)
                     }
                     Operand::AutoIc => unreachable!(),
                     Operand::Const => {
-                        let c = Constant::parse(t)
-                            .ok_or_else(|| err(format!("expected a constant, got `{t}`")))?;
+                        let c = Constant::parse(t).ok_or_else(|| err(format!("expected a constant, got `{t}`")))?;
                         let i = match constants.iter().position(|x| x.text() == c.text()) {
                             Some(i) => i,
                             None => {
@@ -443,9 +412,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                         Arg::Index(u32::try_from(i).map_err(|_| err("too many constants".into()))?)
                     }
                     Operand::Fn => {
-                        let f = *index
-                            .get(t)
-                            .ok_or_else(|| err(format!("no function `{t}`")))?;
+                        let f = *index.get(t).ok_or_else(|| err(format!("no function `{t}`")))?;
                         let i = closures.iter().position(|&c| c == f).unwrap_or_else(|| {
                             closures.push(f);
                             closures.len() - 1
@@ -644,7 +611,9 @@ pub fn verify(m: &Module) -> Result<(), String> {
                     return err(at, format!("{op:?} is the front end's only"));
                 }
                 // The script's frame has no callee, nor arguments.
-                Op::LdaCallee | Op::CreateArguments | Op::CreateMappedArguments | Op::CallApplyArguments if i == m.script => {
+                Op::LdaCallee | Op::CreateArguments | Op::CreateMappedArguments | Op::CallApplyArguments
+                    if i == m.script =>
+                {
                     return err(at, format!("{op:?} outside a function"));
                 }
                 Op::LdaUpvalue | Op::StaUpvalue if vals[0] as usize >= f.upvalues.len() => {
@@ -669,7 +638,10 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 if crate::bytecode::in_place(code, at) != Some(op) {
                     return err(at, format!("{op:?} not followed by its own"));
                 }
-            } else if matches!(op, Op::GetNamedStar | Op::GetNamedStarGetNamed | Op::StarGetNamed | Op::StarGetNamedStar) {
+            } else if matches!(
+                op,
+                Op::GetNamedStar | Op::GetNamedStarGetNamed | Op::StarGetNamed | Op::StarGetNamedStar
+            ) {
                 let plain_at = |k: usize| code.get(k).and_then(|&b| Op::from_u8(b)).map(Op::plain);
                 let next = at + op.size();
                 let want: &[Op] = match op {
@@ -789,11 +761,7 @@ pub fn disassemble(m: &Module) -> String {
         let mut pc = 0;
         while pc < code.len() {
             let (op, next) = decode(pc);
-            let head = if targets.binary_search(&pc).is_ok() {
-                format!("{}:", label(pc))
-            } else {
-                String::new()
-            };
+            let head = if targets.binary_search(&pc).is_ok() { format!("{}:", label(pc)) } else { String::new() };
             let mut args = Vec::new();
             let mut at = pc + 1;
             for &k in op.operands() {
@@ -801,8 +769,7 @@ pub fn disassemble(m: &Module) -> String {
                 match k {
                     Operand::Reg => args.push(format!("r{}", code[at])),
                     Operand::Count => args.push(code[at].to_string()),
-                    Operand::Imm => args
-                        .push(i32::from_le_bytes(code[at..at + 4].try_into().unwrap()).to_string()),
+                    Operand::Imm => args.push(i32::from_le_bytes(code[at..at + 4].try_into().unwrap()).to_string()),
                     Operand::Off => {
                         let off = i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
                         args.push(label((pc as i64 + off as i64) as usize));
@@ -836,11 +803,7 @@ fn parse_signature(s: &str) -> Option<(String, u32)> {
     if !is_ident(name) {
         return None;
     }
-    let names: Vec<&str> = params
-        .split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
+    let names: Vec<&str> = params.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
     if !names.iter().all(|p| is_ident(p)) {
         return None;
     }
@@ -905,11 +868,7 @@ mod tests {
         let f = &m.functions[0];
         assert_eq!(
             f.constants,
-            [
-                Constant::String("a, b; \"c\" é".into()),
-                Constant::Number(2.5),
-                Constant::Number(-0.0),
-            ]
+            [Constant::String("a, b; \"c\" é".into()), Constant::Number(2.5), Constant::Number(-0.0),]
         );
         let back = parse(&disassemble(&m)).unwrap();
         assert_eq!(back.functions[0].constants, f.constants);
@@ -946,20 +905,24 @@ mod tests {
         assert!(bad(&|f| f.code = vec![Op::Jump as u8, 2, 0, 0, 0, Op::Return as u8]).contains("not an instruction"));
         assert!(bad(&|f| f.code = vec![Op::Ldar as u8, 9, Op::Return as u8]).contains("register"));
         // `Call r0, r0, 5`'s window past the frame.
-        assert!(bad(&|f| {
-            f.code = vec![Op::Call as u8, 0, 0, 5, 0, 0, 0, 0, Op::Return as u8];
-            f.ics.push("".into());
-        })
-        .contains("register"));
+        assert!(
+            bad(&|f| {
+                f.code = vec![Op::Call as u8, 0, 0, 5, 0, 0, 0, 0, Op::Return as u8];
+                f.ics.push("".into());
+            })
+            .contains("register")
+        );
         assert!(bad(&|f| f.code = vec![Op::LdaConstant as u8, 0, 0, 0, 0, Op::Return as u8]).contains("constant"));
         assert!(bad(&|f| f.code = vec![Op::TestNullJumpIfTrue as u8, Op::Return as u8]).contains("its jump"));
         // A superinstruction's operands are checked as its first
         // instruction's: no upvalue 0 here.
-        assert!(bad(&|f| {
-            f.nregs = 1;
-            f.code = vec![Op::LdaUpvalueStar as u8, 0, Op::Star as u8, 0, Op::Return as u8];
-        })
-        .contains("upvalue 0 out of range"));
+        assert!(
+            bad(&|f| {
+                f.nregs = 1;
+                f.code = vec![Op::LdaUpvalueStar as u8, 0, Op::Star as u8, 0, Op::Return as u8];
+            })
+            .contains("upvalue 0 out of range")
+        );
         assert!(bad(&|f| f.kind = 4).contains("generator"));
         assert!(bad(&|f| f.handlers.push((0, 6, 3))).contains("handler"));
         // What only a function's frame has.
@@ -970,40 +933,69 @@ mod tests {
         ] {
             assert!(bad(&|f| f.code = code.clone()).contains("outside a function"));
         }
-        assert!(bad(&|f| {
-            f.nregs = 4;
-            f.code = vec![Op::CallApplyArguments as u8, 1, 1, 0, 0, 0, 0, 0, Op::Return as u8];
-            f.ics.push("".into());
-        })
-        .contains("outside a function"));
+        assert!(
+            bad(&|f| {
+                f.nregs = 4;
+                f.code = vec![Op::CallApplyArguments as u8, 1, 1, 0, 0, 0, 0, 0, Op::Return as u8];
+                f.ics.push("".into());
+            })
+            .contains("outside a function")
+        );
         // Two instructions of one cache slot: a store reading a literal's
         // cached shape as a transition.
-        assert!(bad(&|f| {
-            f.nregs = 2;
-            f.code = vec![Op::CreateObject as u8, 0, 0, 0, 0, 0, Op::Star as u8, 1, Op::SetNamed as u8, 1, 0, 0, 0, 0, Op::Return as u8];
-            f.ics.push("x".into());
-        })
-        .contains("another instruction's"));
+        assert!(
+            bad(&|f| {
+                f.nregs = 2;
+                f.code = vec![
+                    Op::CreateObject as u8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Op::Star as u8,
+                    1,
+                    Op::SetNamed as u8,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Op::Return as u8,
+                ];
+                f.ics.push("x".into());
+            })
+            .contains("another instruction's")
+        );
         // Intrinsics take what the front end passes them (`define_field`
         // an object), and the hole is no value for other instructions.
-        assert!(bad(&|f| {
-            f.nregs = 4;
-            f.code = vec![Op::Intrinsic as u8, 7, 1, 3, Op::Return as u8];
-        })
-        .contains("front end's only"));
-        assert!(bad(&|f| f.code = vec![Op::LdaHole as u8, Op::ToNumber as u8, Op::Return as u8]).contains("front end's only"));
+        assert!(
+            bad(&|f| {
+                f.nregs = 4;
+                f.code = vec![Op::Intrinsic as u8, 7, 1, 3, Op::Return as u8];
+            })
+            .contains("front end's only")
+        );
+        assert!(
+            bad(&|f| f.code = vec![Op::LdaHole as u8, Op::ToNumber as u8, Op::Return as u8])
+                .contains("front end's only")
+        );
         // (A global scope's binding the module doesn't declare.)
-        assert!(bad(&|f| {
-            f.code = vec![Op::LdaUndefined as u8, Op::InitGlobal as u8, 0, 0, 0, 0, Op::Return as u8];
-            f.ics.push("x".into());
-        })
-        .contains("front end's only"));
+        assert!(
+            bad(&|f| {
+                f.code = vec![Op::LdaUndefined as u8, Op::InitGlobal as u8, 0, 0, 0, 0, Op::Return as u8];
+                f.ics.push("x".into());
+            })
+            .contains("front end's only")
+        );
         // Calls fill `nparams` registers: not wrapped around to fit one.
-        assert!(bad(&|f| {
-            f.nparams = u32::MAX;
-            f.nregs = 1;
-        })
-        .contains("registers for"));
+        assert!(
+            bad(&|f| {
+                f.nparams = u32::MAX;
+                f.nregs = 1;
+            })
+            .contains("registers for")
+        );
     }
     /// A compiled module edited is checked again before it can be run
     /// (it couldn't be edited in place: [`Checked`] derefs read-only).

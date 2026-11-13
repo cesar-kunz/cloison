@@ -245,7 +245,8 @@ fn generate_from<'p>(
         match emit[i] {
             Emit::Skip => {}
             Emit::Compile => {
-                let mut f = Gen::new(p, &decls, &overflow[i], &overflow, &boxed, &scopes, &names, i, lazy.is_some()).function()?;
+                let mut f = Gen::new(p, &decls, &overflow[i], &overflow, &boxed, &scopes, &names, i, lazy.is_some())
+                    .function()?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
                 if i != 0 {
@@ -296,11 +297,7 @@ fn generate_from<'p>(
         }
     }
     let declared = if root == 0 && !p.eval_locals {
-        explicit_declarations(p, 0)
-            .iter()
-            .filter(|n| !p.lexicals.contains_key(**n))
-            .map(|s| s.to_string())
-            .collect()
+        explicit_declarations(p, 0).iter().filter(|n| !p.lexicals.contains_key(**n)).map(|s| s.to_string()).collect()
     } else {
         Vec::new()
     };
@@ -340,15 +337,7 @@ fn generate_from<'p>(
     } else {
         Vec::new()
     };
-    let module = Module {
-        lexical,
-        constants,
-        annex_b,
-        functions,
-        script: 0,
-        declared,
-        function_names,
-    };
+    let module = Module { lexical, constants, annex_b, functions, script: 0, declared, function_names };
     Ok((module, std::mem::take(&mut scopes.upvalues[root])))
 }
 
@@ -438,10 +427,10 @@ const ENV: &str = "%env";
 /// a scope object of its own (an async function's, a generator's): the
 /// two can't share `ENV`.
 const OUTER_ENVS: [&str; 32] = [
-    "%env^0", "%env^1", "%env^2", "%env^3", "%env^4", "%env^5", "%env^6", "%env^7", "%env^8", "%env^9",
-    "%env^10", "%env^11", "%env^12", "%env^13", "%env^14", "%env^15", "%env^16", "%env^17", "%env^18",
-    "%env^19", "%env^20", "%env^21", "%env^22", "%env^23", "%env^24", "%env^25", "%env^26", "%env^27",
-    "%env^28", "%env^29", "%env^30", "%env^31",
+    "%env^0", "%env^1", "%env^2", "%env^3", "%env^4", "%env^5", "%env^6", "%env^7", "%env^8", "%env^9", "%env^10",
+    "%env^11", "%env^12", "%env^13", "%env^14", "%env^15", "%env^16", "%env^17", "%env^18", "%env^19", "%env^20",
+    "%env^21", "%env^22", "%env^23", "%env^24", "%env^25", "%env^26", "%env^27", "%env^28", "%env^29", "%env^30",
+    "%env^31",
 ];
 
 /// How many functions enclose function `i`.
@@ -1006,7 +995,9 @@ fn pattern_assigns(p: &Pattern, name: &str) -> bool {
         }
         Pattern::Object(ps, rest) => {
             ps.iter().any(|(k, p, d)| {
-                matches!(k, PatKey::Computed(k) if assigns(k, name)) || pattern_assigns(p, name) || d.is_some_and(|d| assigns(d, name))
+                matches!(k, PatKey::Computed(k) if assigns(k, name))
+                    || pattern_assigns(p, name)
+                    || d.is_some_and(|d| assigns(d, name))
             }) || rest.as_ref().is_some_and(|r| pattern_assigns(r, name))
         }
     }
@@ -1054,10 +1045,7 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
             StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => {
                 ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out))
             }
-            StmtKind::Function(_)
-            | StmtKind::Empty
-            | StmtKind::Break(_)
-            | StmtKind::Continue(_) => {}
+            StmtKind::Function(_) | StmtKind::Empty | StmtKind::Break(_) | StmtKind::Continue(_) => {}
             StmtKind::Expr(e) | StmtKind::Throw(e) => expr_refs(e, out),
             StmtKind::Return(e) => e.iter().for_each(|e| expr_refs(e, out)),
             StmtKind::If(c, a, b) => {
@@ -1065,12 +1053,7 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 stmt(a, out);
                 b.iter().for_each(|b| stmt(b, out));
             }
-            StmtKind::For {
-                init,
-                test,
-                update,
-                body,
-            } => {
+            StmtKind::For { init, test, update, body } => {
                 match init {
                     Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => {
                         ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out))
@@ -1081,9 +1064,7 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 test.iter().chain(update).for_each(|e| expr_refs(e, out));
                 stmt(body, out);
             }
-            StmtKind::ForOf {
-                target, iterable, body, pattern, ..
-            } => {
+            StmtKind::ForOf { target, iterable, body, pattern, .. } => {
                 if let Some(p) = pattern {
                     pattern_refs(p, out, fw);
                 }
@@ -1091,9 +1072,7 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 expr_refs(iterable, out);
                 stmt(body, out);
             }
-            StmtKind::ForIn {
-                name, object, body, ..
-            } => {
+            StmtKind::ForIn { name, object, body, .. } => {
                 if !fw {
                     out.push(name);
                 }
@@ -1177,15 +1156,10 @@ fn declarations_with<'a>(p: &'a Program<'_>, f: usize, annex_b: bool) -> Vec<&'a
         match &s.kind {
             StmtKind::Var(ds)
             | StmtKind::Lexical(_, ds)
-            | StmtKind::For {
-                init: Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)),
-                ..
-            } => ds.iter().filter(|(n, _)| !n.is_empty()).for_each(|(n, _)| add(n, out)),
-            StmtKind::ForOf {
-                kind: 1..=3,
-                pattern: Some(pat),
-                ..
-            } => {
+            | StmtKind::For { init: Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)), .. } => {
+                ds.iter().filter(|(n, _)| !n.is_empty()).for_each(|(n, _)| add(n, out))
+            }
+            StmtKind::ForOf { kind: 1..=3, pattern: Some(pat), .. } => {
                 let mut ns = Vec::new();
                 pat.names(&mut ns);
                 for n in ns {
@@ -1207,14 +1181,7 @@ fn declarations_with<'a>(p: &'a Program<'_>, f: usize, annex_b: bool) -> Vec<&'a
                 }
             }
             StmtKind::ForIn { var, fresh, name, .. } if *var || *fresh => add(name, out),
-            StmtKind::ForOf {
-                kind: 1..=3,
-                target: Expr {
-                    kind: ExprKind::Ident(name),
-                    ..
-                },
-                ..
-            } => add(name, out),
+            StmtKind::ForOf { kind: 1..=3, target: Expr { kind: ExprKind::Ident(name), .. }, .. } => add(name, out),
             StmtKind::Try(_, Some((name, _)), _) if p.lexicals.contains_key(name) => add(name, out),
             _ => {}
         }
@@ -1234,10 +1201,7 @@ fn declarations_with<'a>(p: &'a Program<'_>, f: usize, annex_b: bool) -> Vec<&'a
             | StmtKind::DoWhile(body, _)
             | StmtKind::Labeled(_, body) => stmt(body, p, annex_b, out),
             StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, annex_b, out)),
-            StmtKind::Switch(_, cases) => cases
-                .iter()
-                .flat_map(|(_, b)| b)
-                .for_each(|s| stmt(s, p, annex_b, out)),
+            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| stmt(s, p, annex_b, out)),
             StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, p, annex_b, out)),
             _ => {}
         }
@@ -1321,9 +1285,7 @@ fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
             None => return false,
         }
     };
-    (0..p.functions.len())
-        .any(|g| within(g) && references(&p.functions[g]).contains(&name))
-        .then_some(name)
+    (0..p.functions.len()).any(|g| within(g) && references(&p.functions[g]).contains(&name)).then_some(name)
 }
 
 /// Whether function `f`'s code may see its `arguments` and parameters
@@ -1410,7 +1372,11 @@ fn alias_expr(e: &Expr, p: &Program, f: &Function) -> bool {
         Update(t, ..) => target_aliases(StoreTarget::Expr(t), p, f),
         Destructure(pat, v, _) => target_aliases(StoreTarget::Pattern(pat), p, f) || alias_expr(v, p, f),
         Unary(UnOp::Delete, t) if element(t) => true,
-        Call(c, args) if args.first().is_some_and(is_arguments) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) => true,
+        Call(c, args)
+            if args.first().is_some_and(is_arguments) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) =>
+        {
+            true
+        }
         // (Class bodies, whose computed keys aren't children: taken to
         // store.)
         Class(_) => true,
@@ -1453,11 +1419,9 @@ fn stores_parameter(p: &Program, f: &Function) -> bool {
 fn stores_parameter_in(p: &Program, body: &[Stmt], f: &Function) -> bool {
     fn stmt(s: &Stmt, p: &Program, f: &Function) -> bool {
         let here = match &s.kind {
-            StmtKind::Var(ds)
-            | StmtKind::For {
-                init: Some(ForInit::Var(ds)),
-                ..
-            } => ds.iter().any(|(n, e)| e.is_some() && target_aliases(StoreTarget::Name(n), p, f)),
+            StmtKind::Var(ds) | StmtKind::For { init: Some(ForInit::Var(ds)), .. } => {
+                ds.iter().any(|(n, e)| e.is_some() && target_aliases(StoreTarget::Name(n), p, f))
+            }
             // (A target other than a name is an assignment in the body:
             // `Parser::for_in_target`.)
             StmtKind::ForIn { fresh: false, name, .. } => target_aliases(StoreTarget::Name(name), p, f),
@@ -1540,7 +1504,9 @@ fn arguments_escape(p: &Program, f: &Function) -> bool {
             Assign(_, t, v) | LogicalAssign(_, t, v) if element_of_args(t).is_some() => {
                 expr(element_of_args(t).unwrap(), p) || expr(v, p)
             }
-            Update(t, ..) | Unary(UnOp::Delete, t) if element_of_args(t).is_some() => expr(element_of_args(t).unwrap(), p),
+            Update(t, ..) | Unary(UnOp::Delete, t) if element_of_args(t).is_some() => {
+                expr(element_of_args(t).unwrap(), p)
+            }
             // (A method of it, a tagged template's tag: `this` is it.)
             Call(c, _) | New(c, _) if matches!(&c.kind, Member(o, _) | Index(o, _) if is_args(o)) => true,
             Function(i) if p.functions[*i].arrow => arrow_reads(p, &p.functions[*i]),
@@ -1564,7 +1530,14 @@ fn may_delete(body: &Stmt) -> bool {
     fn expr(e: &Expr) -> bool {
         use ExprKind::*;
         match &e.kind {
-            Unary(UnOp::Delete, _) | Call(..) | New(..) | SuperCall(..) | Yield(..) | Await(..) | Spread(_) | Destructure(..)
+            Unary(UnOp::Delete, _)
+            | Call(..)
+            | New(..)
+            | SuperCall(..)
+            | Yield(..)
+            | Await(..)
+            | Spread(_)
+            | Destructure(..)
             | Intrinsic(..) => true,
             _ => {
                 let mut sub = Vec::new();
@@ -1630,7 +1603,9 @@ fn for_each_expr<'a>(body: &'a [Stmt<'a>], f: &mut dyn FnMut(&'a Expr<'a>)) {
             }
             StmtKind::For { init, test, update, body } => {
                 match init {
-                    Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => ds.iter().flat_map(|(_, e)| e).for_each(&mut *f),
+                    Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => {
+                        ds.iter().flat_map(|(_, e)| e).for_each(&mut *f)
+                    }
                     Some(ForInit::Expr(e)) => f(e),
                     None => {}
                 }
@@ -1735,9 +1710,7 @@ fn try_blocks<'a>(
     c: &'a Option<(Name, Vec<Stmt>)>,
     f: &'a Option<Vec<Stmt>>,
 ) -> impl Iterator<Item = &'a Stmt<'a>> {
-    b.iter()
-        .chain(c.iter().flat_map(|(_, c)| c))
-        .chain(f.iter().flatten())
+    b.iter().chain(c.iter().flat_map(|(_, c)| c)).chain(f.iter().flatten())
 }
 
 /// An int32 literal (`-0` is not one), or an int32 an expression of them
@@ -1816,9 +1789,9 @@ fn assigns(e: &Expr, name: &str) -> bool {
             p.names(&mut ns);
             ns.iter().any(|n| &**n == name) || assigns(v, name) || pattern_assigns(p, name)
         }
-        Object(ps, _) => ps
-            .iter()
-            .any(|(k, e)| matches!(k, PropKey::Computed(k) if assigns(k, name)) || assigns(e, name)),
+        Object(ps, _) => {
+            ps.iter().any(|(k, e)| matches!(k, PropKey::Computed(k) if assigns(k, name)) || assigns(e, name))
+        }
         Member(o, _) | Spread(o) | Chain(o) | Optional(o) => assigns(o, name),
         Unary(_, x) => assigns(x, name),
         Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Nullish(a, b) | Comma(a, b) => {
@@ -1834,10 +1807,7 @@ fn is_boolean(e: &Expr) -> bool {
     use BinOp::*;
     match &e.kind {
         ExprKind::Bool(_) | ExprKind::Unary(UnOp::Not, _) => true,
-        ExprKind::Binary(op, ..) => matches!(
-            op,
-            Lt | Gt | Le | Ge | Eq | Ne | StrictEq | StrictNe | In | Instanceof
-        ),
+        ExprKind::Binary(op, ..) => matches!(op, Lt | Gt | Le | Ge | Eq | Ne | StrictEq | StrictNe | In | Instanceof),
         _ => false,
     }
 }
@@ -2503,13 +2473,7 @@ impl<'a> Gen<'a> {
                 // The script's completion value (printed by `cloison`) is its
                 // last expression statement's.
                 match body.split_last() {
-                    Some((
-                        Stmt {
-                            kind: StmtKind::Expr(e),
-                            ..
-                        },
-                        rest,
-                    )) => {
+                    Some((Stmt { kind: StmtKind::Expr(e), .. }, rest)) => {
                         for s in rest {
                             self.stmt(s)?;
                         }
@@ -2628,11 +2592,7 @@ impl<'a> Gen<'a> {
             };
             match &s.kind {
                 StmtKind::Var(ds) => decl(ds),
-                StmtKind::For {
-                    init: Some(ForInit::Var(ds)),
-                    body,
-                    ..
-                } => {
+                StmtKind::For { init: Some(ForInit::Var(ds)), body, .. } => {
                     decl(ds);
                     walk(body, init, bare, p);
                 }
@@ -2651,9 +2611,7 @@ impl<'a> Gen<'a> {
                     }
                     walk(body, init, bare, p);
                 }
-                StmtKind::ForIn {
-                    var, name, body, ..
-                } => {
+                StmtKind::ForIn { var, name, body, .. } => {
                     if *var {
                         init.push(name);
                     }
@@ -2679,25 +2637,16 @@ impl<'a> Gen<'a> {
                 | StmtKind::With(_, _, body)
                 | StmtKind::Labeled(_, body) => walk(body, init, bare, p),
                 StmtKind::Block(b) => b.iter().for_each(|s| walk(s, init, bare, p)),
-                StmtKind::Switch(_, cases) => cases
-                    .iter()
-                    .flat_map(|(_, b)| b)
-                    .for_each(|s| walk(s, init, bare, p)),
+                StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| walk(s, init, bare, p)),
                 StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| walk(s, init, bare, p)),
                 _ => {}
             }
         }
         let (mut init, mut bare) = (Vec::new(), Vec::new());
-        self.f
-            .body
-            .iter()
-            .for_each(|s| walk(s, &mut init, &mut bare, self.p));
+        self.f.body.iter().for_each(|s| walk(s, &mut init, &mut bare, self.p));
         let mut fns = Vec::new();
         self.f.body.iter().for_each(|s| hoisted(s, &mut fns));
-        let fns: Vec<&str> = fns
-            .iter()
-            .map(|&i| self.p.functions[i].name.as_deref().unwrap())
-            .collect();
+        let fns: Vec<&str> = fns.iter().map(|&i| self.p.functions[i].name.as_deref().unwrap()).collect();
         let mut out: Vec<&str> = Vec::new();
         for n in bare {
             if !init.contains(&n) && !fns.contains(&n) && !out.contains(&n) {
@@ -2725,18 +2674,8 @@ impl<'a> Gen<'a> {
         }
         self.asm.emit(op, args);
         match (op, args) {
-            (Op::Ldar, &[Arg::Reg(r)]) => {
-                self.acc = Acc {
-                    regs: RegBits::one(r),
-                    smi: None,
-                }
-            }
-            (Op::LdaSmi, &[Arg::Imm(k)]) => {
-                self.acc = Acc {
-                    regs: RegBits::default(),
-                    smi: Some(k),
-                }
-            }
+            (Op::Ldar, &[Arg::Reg(r)]) => self.acc = Acc { regs: RegBits::one(r), smi: None },
+            (Op::LdaSmi, &[Arg::Imm(k)]) => self.acc = Acc { regs: RegBits::default(), smi: Some(k) },
             (Op::Star, &[Arg::Reg(r)]) => self.acc.regs.insert(r),
             (Op::Mov, &[Arg::Reg(a), Arg::Reg(b)]) => {
                 self.acc.regs.remove(b);
@@ -3323,12 +3262,7 @@ impl<'a> Gen<'a> {
 
     fn label(&mut self) -> L {
         let label = self.asm.label();
-        self.labels.push(LabelInfo {
-            label,
-            used: false,
-            bound: false,
-            backward: false,
-        });
+        self.labels.push(LabelInfo { label, used: false, bound: false, backward: false });
         L(self.labels.len() - 1)
     }
 
@@ -3671,7 +3605,9 @@ impl<'a> Gen<'a> {
                 if self.overflows[k].contains(&name) {
                     let ups = &self.scopes.upvalues[self.index];
                     let outer = OUTER_ENVS.get(depth(self.p, k));
-                    if let Some(u) = ups.iter().position(|n| Some(n) == outer).or_else(|| ups.iter().position(|&n| n == ENV)) {
+                    if let Some(u) =
+                        ups.iter().position(|n| Some(n) == outer).or_else(|| ups.iter().position(|&n| n == ENV))
+                    {
                         return Ok(Var::ScopeUpvalue(upvalue(u, pos)?));
                     }
                 }
@@ -3685,10 +3621,7 @@ impl<'a> Gen<'a> {
             }
             f = self.p.functions[k].parent;
         }
-        if let Some(k) = self.scopes.upvalues[self.index]
-            .iter()
-            .position(|&n| n == name)
-        {
+        if let Some(k) = self.scopes.upvalues[self.index].iter().position(|&n| n == name) {
             let k = upvalue(k, pos)?;
             if let Some(kind) = bound_kind(self.p, name) {
                 return Ok(if kind & EVAL_BOXED != 0 { Var::BoundBox(k) } else { Var::Bound(k) });
@@ -3701,25 +3634,15 @@ impl<'a> Gen<'a> {
                 break;
             }
             let func = &self.p.functions[i];
-            if func.binds_name
-                && func.name.as_deref() == Some(name)
-                && !self.decls[i].contains(&name)
-            {
+            if func.binds_name && func.name.as_deref() == Some(name) && !self.decls[i].contains(&name) {
                 return unsupported(pos, format!("`{name}`, a function expression's own name"));
             }
             if i != self.index && self.decls[i].contains(&name) {
-                return unsupported(
-                    pos,
-                    format!("`{name}` captured from an enclosing function (closures)"),
-                );
+                return unsupported(pos, format!("`{name}` captured from an enclosing function (closures)"));
             }
             f = self.p.functions[i].parent;
         }
-        Ok(if name == "undefined" {
-            Var::Undefined
-        } else {
-            Var::Global
-        })
+        Ok(if name == "undefined" { Var::Undefined } else { Var::Global })
     }
 
     /// The register of a local variable, or of `this`.
@@ -3727,7 +3650,9 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::This if self.f.class_kind != 3 && !self.eval_this() => Some(0),
             // (In a `with`, a name may be the object's.)
-            ExprKind::Ident(n) if !self.in_with(n) && !self.needs_check(n, e.pos) && !self.boxed[self.index].contains(&&**n) => {
+            ExprKind::Ident(n)
+                if !self.in_with(n) && !self.needs_check(n, e.pos) && !self.boxed[self.index].contains(&&**n) =>
+            {
                 self.locals.get(&**n).copied()
             }
             _ => None,
@@ -3761,10 +3686,7 @@ impl<'a> Gen<'a> {
         let internal = internal_name(name);
         for (i, w) in withs.iter().enumerate().rev().filter(|&(i, w)| i >= skip && !(internal && w.starts_with("%w"))) {
             let next = self.label();
-            self.value_inner(&Expr {
-                kind: ExprKind::Ident(w.clone()),
-                pos,
-            })?;
+            self.value_inner(&Expr { kind: ExprKind::Ident(w.clone()), pos })?;
             self.star(r);
             // (A `with`'s object, unlike an `eval`'s scope, leaves out what
             // its `Symbol.unscopables` names: `[k, r]`.)
@@ -3814,10 +3736,7 @@ impl<'a> Gen<'a> {
                     g.global(Op::LdaGlobalInsideTypeof, name);
                     return Ok(());
                 }
-                g.value_inner(&Expr {
-                    kind: ExprKind::Ident(name.into()),
-                    pos,
-                })
+                g.value_inner(&Expr { kind: ExprKind::Ident(name.into()), pos })
             },
         )?;
         self.bind(end);
@@ -3945,10 +3864,7 @@ impl<'a> Gen<'a> {
                 Ok(())
             },
             &mut |g| {
-                g.value_inner(&Expr {
-                    kind: ExprKind::Ident(name.into()),
-                    pos,
-                })?;
+                g.value_inner(&Expr { kind: ExprKind::Ident(name.into()), pos })?;
                 apply(g)?;
                 g.store_var(name, pos)
             },
@@ -4030,10 +3946,7 @@ impl<'a> Gen<'a> {
                 Ok(())
             },
             &mut |g| {
-                g.value_inner(&Expr {
-                    kind: ExprKind::Ident(name.into()),
-                    pos,
-                })?;
+                g.value_inner(&Expr { kind: ExprKind::Ident(name.into()), pos })?;
                 g.star(c);
                 g.plain_with_call(spread, method, w);
                 Ok(())
@@ -4110,7 +4023,9 @@ impl<'a> Gen<'a> {
             }
             return Ok(());
         }
-        if !self.p.lexicals.is_empty() && let Some(l) = self.p.lexicals.get(name) {
+        if !self.p.lexicals.is_empty()
+            && let Some(l) = self.p.lexicals.get(name)
+        {
             if l.constant {
                 // (The global scope's checks at its load: see
                 // `needs_check`.)
@@ -4476,62 +4391,62 @@ impl<'a> Gen<'a> {
     fn load_raw(&mut self, n: &str, pos: Pos) -> R<()> {
         let e = &Expr { kind: ExprKind::Null, pos };
         match self.resolve(n, e.pos)? {
-                Var::Reg(r) => self.ldar(r),
-                Var::Upvalue(k) => {
-                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
-                }
-                Var::Bound(k) => {
-                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
-                    let c = self.const_str(original(n));
-                    self.emit(Op::CheckHole, &[Arg::Index(c)]);
-                }
-                Var::BoundBox(k) => {
+            Var::Reg(r) => self.ldar(r),
+            Var::Upvalue(k) => {
+                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+            }
+            Var::Bound(k) => {
+                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                let c = self.const_str(original(n));
+                self.emit(Op::CheckHole, &[Arg::Index(c)]);
+            }
+            Var::BoundBox(k) => {
+                let mark = self.temp;
+                let b = self.alloc(e.pos)?;
+                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.star(b);
+                self.named(Op::GetNamed, b, bound_box_key(self.p, n));
+                let c = self.const_str(original(n));
+                self.emit(Op::CheckHole, &[Arg::Index(c)]);
+                self.temp = mark;
+            }
+            Var::Scope(env) => self.named(Op::GetNamed, env, &self.env_key(n)),
+            Var::ScopeUpvalue(k) => {
+                let mark = self.temp;
+                let env = self.alloc(e.pos)?;
+                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.star(env);
+                self.named(Op::GetNamed, env, &self.env_key(n));
+                self.temp = mark;
+            }
+            Var::Undefined => self.emit(Op::LdaUndefined, &[]),
+            Var::Global => self.global(Op::LdaGlobal, n),
+            // Its holder's property, live (a hole until its module
+            // sets it: `load_var` checks), or the holder itself (a
+            // namespace). (Past `IMPORT_PARAMS`, the holder is an
+            // element of the array that parameter is.)
+            Var::Import => {
+                let imp = &self.p.imports[n];
+                let (holder, slot, prop) = (imp.holder.clone(), imp.slot, imp.prop.clone());
+                self.load_raw(&holder, pos)?;
+                if let Some(slot) = slot {
                     let mark = self.temp;
-                    let b = self.alloc(e.pos)?;
-                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
-                    self.star(b);
-                    self.named(Op::GetNamed, b, bound_box_key(self.p, n));
-                    let c = self.const_str(original(n));
-                    self.emit(Op::CheckHole, &[Arg::Index(c)]);
+                    let a = self.alloc(pos)?;
+                    self.star(a);
+                    self.lda_smi(slot as i32);
+                    let ic = self.auto_ic("[]keyed");
+                    self.emit(Op::GetKeyed, &[Arg::Reg(a), ic]);
                     self.temp = mark;
                 }
-                Var::Scope(env) => self.named(Op::GetNamed, env, &self.env_key(n)),
-                Var::ScopeUpvalue(k) => {
+                if let Some(prop) = prop {
                     let mark = self.temp;
-                    let env = self.alloc(e.pos)?;
-                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                    let env = self.alloc(pos)?;
                     self.star(env);
-                    self.named(Op::GetNamed, env, &self.env_key(n));
+                    self.named(Op::GetNamed, env, &prop);
                     self.temp = mark;
-                }
-                Var::Undefined => self.emit(Op::LdaUndefined, &[]),
-                Var::Global => self.global(Op::LdaGlobal, n),
-                // Its holder's property, live (a hole until its module
-                // sets it: `load_var` checks), or the holder itself (a
-                // namespace). (Past `IMPORT_PARAMS`, the holder is an
-                // element of the array that parameter is.)
-                Var::Import => {
-                    let imp = &self.p.imports[n];
-                    let (holder, slot, prop) = (imp.holder.clone(), imp.slot, imp.prop.clone());
-                    self.load_raw(&holder, pos)?;
-                    if let Some(slot) = slot {
-                        let mark = self.temp;
-                        let a = self.alloc(pos)?;
-                        self.star(a);
-                        self.lda_smi(slot as i32);
-                        let ic = self.auto_ic("[]keyed");
-                        self.emit(Op::GetKeyed, &[Arg::Reg(a), ic]);
-                        self.temp = mark;
-                    }
-                    if let Some(prop) = prop {
-                        let mark = self.temp;
-                        let env = self.alloc(pos)?;
-                        self.star(env);
-                        self.named(Op::GetNamed, env, &prop);
-                        self.temp = mark;
-                    }
                 }
             }
+        }
         Ok(())
     }
 
@@ -4712,15 +4627,8 @@ impl<'a> Gen<'a> {
                 // An index key is an element (`o[1]` reads it), defined
                 // like a computed key's (not `o[k] = v`, which reaches a
                 // prototype's setter for it).
-                let index = |k: &str| {
-                    k.parse::<u32>()
-                        .ok()
-                        .filter(|&i| i != u32::MAX && i.to_string() == k)
-                };
-                let named = props
-                    .iter()
-                    .filter(|(k, _)| matches!(k, PropKey::Name(k) if index(k).is_none()))
-                    .count();
+                let index = |k: &str| k.parse::<u32>().ok().filter(|&i| i != u32::MAX && i.to_string() == k);
+                let named = props.iter().filter(|(k, _)| matches!(k, PropKey::Name(k) if index(k).is_none())).count();
                 let cap = named.min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
                 let ic = self.auto_ic(&format!("[]{}", cap));
                 self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
@@ -5121,9 +5029,7 @@ impl<'a> Gen<'a> {
 
     fn assign(&mut self, op: Option<BinOp>, t: &Expr, v: &Expr, pos: Pos) -> R<()> {
         match &t.kind {
-            ExprKind::Ident(n) if op.is_some() && self.in_with(n) => {
-                self.with_compound(n, op.unwrap(), v, pos)
-            }
+            ExprKind::Ident(n) if op.is_some() && self.in_with(n) => self.with_compound(n, op.unwrap(), v, pos),
             ExprKind::Ident(n) if self.in_with(n) => self.with_assign(n, v, pos),
             ExprKind::Ident(n) => {
                 match (op, self.resolve(n, t.pos)?) {
@@ -5239,11 +5145,7 @@ impl<'a> Gen<'a> {
 
     fn update(&mut self, t: &Expr, d: i8, postfix: bool, pos: Pos) -> R<()> {
         let mark = self.temp;
-        let old = if postfix {
-            Some(self.alloc(pos)?)
-        } else {
-            None
-        };
+        let old = if postfix { Some(self.alloc(pos)?) } else { None };
         let step = |g: &mut Self| {
             if let Some(o) = old {
                 g.emit(Op::ToNumeric, &[]);
@@ -5282,10 +5184,7 @@ impl<'a> Gen<'a> {
                         Ok(())
                     },
                     &mut |g| {
-                        g.value_inner(&Expr {
-                            kind: ExprKind::Ident(n.clone()),
-                            pos,
-                        })?;
+                        g.value_inner(&Expr { kind: ExprKind::Ident(n.clone()), pos })?;
                         step(g);
                         g.store_var(n, pos)
                     },
@@ -5415,11 +5314,12 @@ impl<'a> Gen<'a> {
             // (In a `with`, the object `eval` is found on, else undefined:
             // the `this` of an `eval` not the builtin, `EVAL_THIS`, as for
             // `with_call`. Not an `eval`'s scope object's.)
-            let receiver = if self.in_with("eval") && self.withs[self.with_skip("eval")..].iter().any(|w| w.starts_with("%w")) {
-                Some(self.alloc(pos)?)
-            } else {
-                None
-            };
+            let receiver =
+                if self.in_with("eval") && self.withs[self.with_skip("eval")..].iter().any(|w| w.starts_with("%w")) {
+                    Some(self.alloc(pos)?)
+                } else {
+                    None
+                };
             let fr = self.alloc(pos)?;
             match receiver {
                 Some(rr) => {
@@ -5574,7 +5474,11 @@ impl<'a> Gen<'a> {
             let at: Vec<usize> = kept
                 .iter()
                 .map(|b| {
-                    let skip = if b.0 == EVAL_HOME_BINDING { self.p.functions[method].withs.len() } else { self.with_skip(b.1) };
+                    let skip = if b.0 == EVAL_HOME_BINDING {
+                        self.p.functions[method].withs.len()
+                    } else {
+                        self.with_skip(b.1)
+                    };
                     let outside = &self.withs[..skip.min(self.withs.len())];
                     outside.iter().filter(|w| own || &***w != "%e1").count() + lead
                 })
@@ -5631,14 +5535,19 @@ impl<'a> Gen<'a> {
             while self.p.functions[k].arrow {
                 k = self.p.functions[k].parent.unwrap();
             }
-            let new_target = if k == 0 { self.p.direct_eval && self.p.eval_new_target } else { !self.p.functions[k].module };
+            let new_target =
+                if k == 0 { self.p.direct_eval && self.p.eval_new_target } else { !self.p.functions[k].module };
             let strict = self.alloc(pos)?;
             let flags = if self.f.strict { EVAL_STRICT } else { 0 }
                 | if new_target { EVAL_NEW_TARGET } else { 0 }
                 | packed
                 | if receiver.is_some() { EVAL_THIS } else { 0 }
                 | if self.p.functions[k].home.is_some() { EVAL_HOME } else { 0 }
-                | if self.p.functions[k].class_kind == 3 || (k == 0 && self.p.eval_live_this) { EVAL_LIVE_THIS } else { 0 };
+                | if self.p.functions[k].class_kind == 3 || (k == 0 && self.p.eval_live_this) {
+                    EVAL_LIVE_THIS
+                } else {
+                    0
+                };
             self.emit(Op::LdaSmi, &[Arg::Imm(flags as i32)]);
             self.star(strict);
             let params = self.alloc(pos)?;
@@ -5728,7 +5637,8 @@ impl<'a> Gen<'a> {
             self.star(d);
             let m4 = self.temp;
             for &(p, g) in &group_regs {
-                let valued: Vec<_> = kept.iter().zip(&at).filter(|(b, q)| b.3.is_none() && **q == p).map(|(b, _)| *b).collect();
+                let valued: Vec<_> =
+                    kept.iter().zip(&at).filter(|(b, q)| b.3.is_none() && **q == p).map(|(b, _)| *b).collect();
                 // (Four registers each, in the room left past those in use,
                 // with some for loading an import's holder or a value.)
                 let part_size = (256usize.saturating_sub(self.temp + 12) / 4).clamp(1, 48);
@@ -5890,8 +5800,7 @@ impl<'a> Gen<'a> {
         if !forward && self.args_array_needed(args) {
             return self.call_spread(f, args, new, optional, chain, pos);
         }
-        let n =
-            u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
+        let n = u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
         let c = self.alloc(pos)?;
         let w;
         if method {
@@ -6374,7 +6283,8 @@ impl<'a> Gen<'a> {
     /// [`Self::destructure`]) may throw: a default not a literal, a nested
     /// pattern, a target, an assignment to what isn't a local variable.
     fn may_throw(&self, p: &Pattern, d: Option<&Expr>, mode: u8) -> bool {
-        let literal = |e: &Expr| matches!(e.kind, ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Null);
+        let literal =
+            |e: &Expr| matches!(e.kind, ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Null);
         if d.is_some_and(|e| !literal(e)) {
             return true;
         }
@@ -6441,7 +6351,9 @@ impl<'a> Gen<'a> {
     /// class's constructor checks what it returns after them, outside its
     /// `try`s: `derived_return`.)
     fn return_acc(&mut self, pos: Pos) -> R<()> {
-        if self.trys.iter().any(|t| t.finally.is_some() || t.close.is_some()) || self.f.class_kind == 3 && !self.trys.is_empty() {
+        if self.trys.iter().any(|t| t.finally.is_some() || t.close.is_some())
+            || self.f.class_kind == 3 && !self.trys.is_empty()
+        {
             // The value waits in a register while the `finally` blocks run.
             let mark = self.temp;
             let r = self.alloc(pos)?;
@@ -6777,16 +6689,7 @@ impl<'a> Gen<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn test_binary(
-        &mut self,
-        op: BinOp,
-        l: &Expr,
-        r: &Expr,
-        t: L,
-        f: L,
-        fall: Fall,
-        pos: Pos,
-    ) -> R<()> {
+    fn test_binary(&mut self, op: BinOp, l: &Expr, r: &Expr, t: L, f: L, fall: Fall, pos: Pos) -> R<()> {
         match op {
             BinOp::Ne => return self.test_binary(BinOp::Eq, l, r, f, t, fall.flip(), pos),
             BinOp::StrictNe => {
@@ -6813,10 +6716,7 @@ impl<'a> Gen<'a> {
         let tests_one_value = Self::nullish_test(op, l, r).is_some();
         self.binary(op, l, r, pos)?;
         let boolean = tests_one_value
-            || matches!(
-                op,
-                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::StrictEq
-            );
+            || matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::StrictEq);
         self.branch(boolean, t, f, fall);
         Ok(())
     }
@@ -6970,9 +6870,7 @@ impl<'a> Gen<'a> {
                 self.cleared = outer;
                 return r;
             }
-            StmtKind::If(c, then, None)
-                if self.in_try == 0 && returns(then) && self.jumps_when_true(c) =>
-            {
+            StmtKind::If(c, then, None) if self.in_try == 0 && returns(then) && self.jumps_when_true(c) => {
                 // The `then` branch goes out of line, so the test can jump
                 // to it.
                 let (lt, cont) = (self.label(), self.label());
@@ -6996,12 +6894,7 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
-            StmtKind::For {
-                init,
-                test,
-                update,
-                body,
-            } => {
+            StmtKind::For { init, test, update, body } => {
                 let mut fresh = Vec::new();
                 match init {
                     Some(ForInit::Var(ds)) => self.var_decls(ds)?,
@@ -7049,17 +6942,12 @@ impl<'a> Gen<'a> {
                 self.withs.pop();
                 res?;
             }
-            StmtKind::ForIn {
-                name, object, body, fresh, ..
-            } => self.for_in(labels, name, *fresh, object, body, s.pos)?,
-            StmtKind::ForOf {
-                kind,
-                target,
-                iterable,
-                body,
-                pattern,
-                is_await,
-            } => self.for_of(labels, *kind, target, pattern.as_deref(), iterable, body, *is_await, s.pos)?,
+            StmtKind::ForIn { name, object, body, fresh, .. } => {
+                self.for_in(labels, name, *fresh, object, body, s.pos)?
+            }
+            StmtKind::ForOf { kind, target, iterable, body, pattern, is_await } => {
+                self.for_of(labels, *kind, target, pattern.as_deref(), iterable, body, *is_await, s.pos)?
+            }
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
             StmtKind::Try(block, catch, finally) => self.try_stmt(block, catch, finally, s.pos)?,
             StmtKind::Throw(e) => {
@@ -7089,10 +6977,7 @@ impl<'a> Gen<'a> {
                     Some(Target { cont: Some(c), .. }) => *c,
                     _ => {
                         let what = if brk { "break" } else { "continue" };
-                        return Err(Error::new(
-                            s.pos as usize,
-                            format!("no target for `{what}`"),
-                        ));
+                        return Err(Error::new(s.pos as usize, format!("no target for `{what}`")));
                     }
                 };
                 // The `try` statements inside the target, left on the way.
@@ -7133,13 +7018,7 @@ impl<'a> Gen<'a> {
                     self.stmt(body)?;
                 } else {
                     let brk = self.label();
-                    self.targets.push(Target {
-                        labels,
-                        brk,
-                        cont: None,
-                        breakable: false,
-                        inner_try: None,
-                    });
+                    self.targets.push(Target { labels, brk, cont: None, breakable: false, inner_try: None });
                     self.stmt(body)?;
                     self.targets.pop();
                     self.bind(brk);
@@ -7155,17 +7034,10 @@ impl<'a> Gen<'a> {
     /// int32 literal, which keeps the discriminant in `acc`), then a jump
     /// to `default` or past the end; the statements follow in order, each
     /// falling into the next.
-    fn switch(
-        &mut self,
-        labels: Vec<Name>,
-        d: &Expr,
-        cases: &'a [(Option<Expr>, Vec<Stmt>)],
-    ) -> R<()> {
+    fn switch(&mut self, labels: Vec<Name>, d: &Expr, cases: &'a [(Option<Expr>, Vec<Stmt>)]) -> R<()> {
         // A local discriminant tested only against literals can't change
         // before the jump: its register serves.
-        let literal_tests = cases
-            .iter()
-            .all(|(t, _)| t.as_ref().is_none_or(|t| smi(t).is_some()));
+        let literal_tests = cases.iter().all(|(t, _)| t.as_ref().is_none_or(|t| smi(t).is_some()));
         let dr = match self.local(d) {
             Some(r) if literal_tests => r,
             _ => {
@@ -7198,13 +7070,7 @@ impl<'a> Gen<'a> {
             Some(i) => self.jump(bodies[i]),
             None => self.jump(end),
         }
-        self.targets.push(Target {
-            labels,
-            brk: end,
-            cont: None,
-            breakable: true,
-            inner_try: None,
-        });
+        self.targets.push(Target { labels, brk: end, cont: None, breakable: true, inner_try: None });
         for ((_, body), &l) in cases.iter().zip(&bodies) {
             self.bind(l);
             for s in body {
@@ -7276,13 +7142,7 @@ impl<'a> Gen<'a> {
         self.emit(Op::LdaHole, &[]);
         self.star(hole);
         let (top, cont, done, brk) = (self.loop_label(), self.label(), self.label(), self.label());
-        self.targets.push(Target {
-            labels,
-            brk,
-            cont: Some(cont),
-            breakable: true,
-            inner_try: Some(self.trys.len()),
-        });
+        self.targets.push(Target { labels, brk, cont: Some(cont), breakable: true, inner_try: Some(self.trys.len()) });
         self.open_try(None);
         self.trys.last_mut().unwrap().close = Some(it);
         self.trys.last_mut().unwrap().close_async = sync;
@@ -7322,7 +7182,18 @@ impl<'a> Gen<'a> {
                         self.fresh_binding(n, false, pos)?;
                     }
                 }
-                self.destructure(p, v, if kind >= 2 { 2 } else if kind == 1 { 1 } else { 0 }, pos)?;
+                self.destructure(
+                    p,
+                    v,
+                    if kind >= 2 {
+                        2
+                    } else if kind == 1 {
+                        1
+                    } else {
+                        0
+                    },
+                    pos,
+                )?;
             }
             (2 | 3, ExprKind::Ident(n)) => {
                 self.fresh_binding(n, false, pos)?;
@@ -7399,15 +7270,7 @@ impl<'a> Gen<'a> {
     /// loop over them with an index in a temporary:
     /// `keys; i = 0; Jump test; body: x = keys[i]; …; continue: i++;
     /// test: keys.length > i, back to body; break:`.
-    fn for_in(
-        &mut self,
-        labels: Vec<Name>,
-        name: &str,
-        fresh: bool,
-        object: &Expr,
-        body: &'a Stmt,
-        pos: Pos,
-    ) -> R<()> {
+    fn for_in(&mut self, labels: Vec<Name>, name: &str, fresh: bool, object: &Expr, body: &'a Stmt, pos: Pos) -> R<()> {
         if fresh {
             self.fresh_binding(name, true, pos)?;
         }
@@ -7447,13 +7310,7 @@ impl<'a> Gen<'a> {
         } else {
             self.store_var(name, pos)?;
         }
-        self.targets.push(Target {
-            labels,
-            brk,
-            cont: Some(cont),
-            breakable: true,
-            inner_try: None,
-        });
+        self.targets.push(Target { labels, brk, cont: Some(cont), breakable: true, inner_try: None });
         self.stmt(body)?;
         self.targets.pop();
         self.bind(cont);
@@ -7516,19 +7373,12 @@ impl<'a> Gen<'a> {
         jump_to_test: bool,
     ) -> R<()> {
         let fresh = std::mem::take(&mut self.fresh);
-        let (top, cont, test_l, brk) =
-            (self.loop_label(), self.label(), self.label(), self.label());
+        let (top, cont, test_l, brk) = (self.loop_label(), self.label(), self.label(), self.label());
         if jump_to_test {
             self.jump(test_l);
         }
         self.bind(top);
-        self.targets.push(Target {
-            labels,
-            brk,
-            cont: Some(cont),
-            breakable: true,
-            inner_try: None,
-        });
+        self.targets.push(Target { labels, brk, cont: Some(cont), breakable: true, inner_try: None });
         self.stmt(body)?;
         self.targets.pop();
         self.bind(cont);
@@ -7553,8 +7403,7 @@ impl<'a> Gen<'a> {
 /// sets `x` to `a` and `test` is `x < b` (or `<=`, `>`, `>=`), and `a` is
 /// in that relation to `b`.
 fn first_test_passes(init: Option<&ForInit>, test: &Expr) -> bool {
-    let ExprKind::Binary(op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), x, b) = &test.kind
-    else {
+    let ExprKind::Binary(op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), x, b) = &test.kind else {
         return false;
     };
     let (ExprKind::Ident(x), Some(b)) = (&x.kind, smi(b)) else {
@@ -7566,10 +7415,9 @@ fn first_test_passes(init: Option<&ForInit>, test: &Expr) -> bool {
             Some((n, Some(e))) if n == x => smi(e),
             _ => None,
         },
-        Some(ForInit::Expr(Expr {
-            kind: ExprKind::Assign(None, t, e),
-            ..
-        })) if matches!(&t.kind, ExprKind::Ident(n) if n == x) => smi(e),
+        Some(ForInit::Expr(Expr { kind: ExprKind::Assign(None, t, e), .. })) if matches!(&t.kind, ExprKind::Ident(n) if n == x) => {
+            smi(e)
+        }
         _ => None,
     };
     start.is_some_and(|a| match op {

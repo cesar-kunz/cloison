@@ -9,20 +9,16 @@ use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, as_object, object_value};
 use crate::value::Value;
-use crate::vm::{Error, NativeFn, Result, Vm, check_string_len, is_string, number_to_string, push_string, string_len, string_units, wrapped};
+use crate::vm::{
+    Error, NativeFn, Result, Vm, check_string_len, is_string, number_to_string, push_string, string_len, string_units,
+    wrapped,
+};
 
 /// The kinds of error objects, in `Vm::error_prototypes` order. The
 /// runtime's own errors (`Error::type_error`, …) are caught as objects of
 /// the kind their message starts with.
-pub(crate) const ERROR_KINDS: [&str; 7] = [
-    "Error",
-    "TypeError",
-    "RangeError",
-    "ReferenceError",
-    "SyntaxError",
-    "EvalError",
-    "URIError",
-];
+pub(crate) const ERROR_KINDS: [&str; 7] =
+    ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "EvalError", "URIError"];
 
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
@@ -46,8 +42,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("slice", string_slice, 2),
             ("toLowerCase", string_to_lower_case, 0),
             ("toUpperCase", string_to_upper_case, 0),
-        ("toLocaleLowerCase", string_to_lower_case, 0),
-        ("toLocaleUpperCase", string_to_upper_case, 0),
+            ("toLocaleLowerCase", string_to_lower_case, 0),
+            ("toLocaleUpperCase", string_to_upper_case, 0),
             ("trim", string_trim, 0),
             ("split", string_split, 2),
             ("match", string_match, 1),
@@ -194,7 +190,12 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     let a = vm.intern_name("SQRT1_2");
-    vm.add_property_with(math, a, Value::from_f64(std::f64::consts::FRAC_1_SQRT_2), READ_ONLY | DONT_ENUM | DONT_DELETE);
+    vm.add_property_with(
+        math,
+        a,
+        Value::from_f64(std::f64::consts::FRAC_1_SQRT_2),
+        READ_ONLY | DONT_ENUM | DONT_DELETE,
+    );
 
     vm.define_natives(
         g,
@@ -334,9 +335,7 @@ fn units<'a>(v: Value) -> Cow<'a, [u16]> {
 /// `this` of a `String.prototype` method, as a string.
 fn this_units<'a>(this: Value) -> Result<Cow<'a, [u16]>> {
     if this.is_undefined() || this.is_null() {
-        return Err(Error::type_error(
-            "String.prototype method called on null or undefined",
-        ));
+        return Err(Error::type_error("String.prototype method called on null or undefined"));
     }
     if let Some(u) = string_units(this) {
         return Ok(Cow::Borrowed(u));
@@ -366,11 +365,7 @@ fn int_arg(a: &[Value], i: usize) -> f64 {
 /// A relative index (`slice`'s): negative counts from `len`; clamped to
 /// `0..=len`.
 fn relative(d: f64, len: usize) -> usize {
-    if d < 0.0 {
-        (len as f64 + d).max(0.0) as usize
-    } else {
-        d.min(len as f64) as usize
-    }
+    if d < 0.0 { (len as f64 + d).max(0.0) as usize } else { d.min(len as f64) as usize }
 }
 
 /// The string of units `s..e` of `this`'s, `u`: `this` itself if a
@@ -438,13 +433,7 @@ fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     let u: Vec<u16> = a
         .iter()
-        .map(|&v| {
-            if v.is_int32() {
-                v.as_i32_unchecked() as u16
-            } else {
-                crate::interp::to_int32(to_number(v)) as u16
-            }
-        })
+        .map(|&v| if v.is_int32() { v.as_i32_unchecked() as u16 } else { crate::interp::to_int32(to_number(v)) as u16 })
         .collect();
     Ok(string(vm, &u))
 }
@@ -462,11 +451,7 @@ fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn string_char_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(a, 0);
-    Ok(if i >= 0.0 && (i as usize) < u.len() {
-        vm.single_char(u[i as usize])
-    } else {
-        vm.new_string(&[])
-    })
+    Ok(if i >= 0.0 && (i as usize) < u.len() { vm.single_char(u[i as usize]) } else { vm.new_string(&[]) })
 }
 
 fn find(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
@@ -604,7 +589,9 @@ fn string_locale_compare(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> 
 /// regular expression.
 fn search_string<'a>(v: Value, what: &str) -> Result<Cow<'a, [u16]>> {
     if regexp_of(v).is_some() {
-        return Err(Error::type_error(format!("First argument to String.prototype.{what} must not be a regular expression")));
+        return Err(Error::type_error(format!(
+            "First argument to String.prototype.{what} must not be a regular expression"
+        )));
     }
     Ok(units(v))
 }
@@ -992,7 +979,8 @@ fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
     for (p, b) in [(&*params, &[][..]), (&[][..], &*body)] {
         if !crate::js::is_one_function_source(&whole(p, b)) {
             let what = if b.is_empty() { "parameter list" } else { "function body" };
-            let e = crate::js::compile_script_lazy_source(&whole(p, b)).err().unwrap_or_else(|| format!("invalid {what}"));
+            let e =
+                crate::js::compile_script_lazy_source(&whole(p, b)).err().unwrap_or_else(|| format!("invalid {what}"));
             return Err(Error(format!("SyntaxError: {e}"), None));
         }
     }
@@ -1026,7 +1014,8 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
         None => {
             let units: Box<[u16]> = source.into();
             let src = crate::js::lex::Source::from_units(&units);
-            let compile = if strict { crate::js::compile_strict_eval_source } else { crate::js::compile_indirect_eval_source };
+            let compile =
+                if strict { crate::js::compile_strict_eval_source } else { crate::js::compile_indirect_eval_source };
             let module = compile(&src).map_err(crate::intrinsics::eval_error)?;
             vm.global_declarations(&module, true)?;
             let globals = crate::asm::Module {
@@ -1284,10 +1273,11 @@ pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: *mu
 /// makes it with CreateUnmappedArgumentsObject), `@@iterator`, and the
 /// hidden mark `Object.prototype.toString` knows it by.
 pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
-    let unmapped = callee.is_null() || unsafe {
-        let code = &*(*callee).code;
-        code.strict || !code.simple_parameters
-    };
+    let unmapped = callee.is_null()
+        || unsafe {
+            let code = &*(*callee).code;
+            code.strict || !code.simple_parameters
+        };
     if !unmapped {
         // The common case: one shape (its elements of any type from the
         // start, so `arguments.length` stays monomorphic), its slots and
@@ -1527,10 +1517,11 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
             Class::RegExp => "RegExp",
             Class::Wrapper => primitive_tag(wrapped(this).unwrap()),
             Class::Plain if unsafe { (*o).flags } & crate::object::ERROR != 0 => "Error",
-            Class::Plain if {
-                let mark = vm.intern_name(ARGUMENTS_MARK);
-                vm.own_property(o, crate::vm::Key::Name(mark)).is_some()
-            } =>
+            Class::Plain
+                if {
+                    let mark = vm.intern_name(ARGUMENTS_MARK);
+                    vm.own_property(o, crate::vm::Key::Name(mark)).is_some()
+                } =>
             {
                 "Arguments"
             }
@@ -1569,11 +1560,7 @@ pub(crate) fn object_value_of(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
 
 pub(crate) fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
-    if n.is_number() {
-        Ok(n)
-    } else {
-        Err(Error::type_error("Number.prototype.valueOf called on a non-number"))
-    }
+    if n.is_number() { Ok(n) } else { Err(Error::type_error("Number.prototype.valueOf called on a non-number")) }
 }
 
 // ---- Math ----
@@ -1790,11 +1777,7 @@ impl ExactSum {
             }
             // The leading bit's exponent: (`e` + 52) - 1074.
             let exp = e as i64 + 52 - 1074;
-            if exp > 1023 {
-                f64::INFINITY
-            } else {
-                f64::from_bits(((exp + 1023) as u64) << 52 | (m & ((1 << 52) - 1)))
-            }
+            if exp > 1023 { f64::INFINITY } else { f64::from_bits(((exp + 1023) as u64) << 52 | (m & ((1 << 52) - 1))) }
         };
         if negative { -d } else { d }
     }
@@ -1890,11 +1873,7 @@ fn parse_float(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         i += 1;
     }
     if t[i..].starts_with("Infinity") {
-        return Ok(Value::from_f64(if b.first() == Some(&b'-') {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        }));
+        return Ok(Value::from_f64(if b.first() == Some(&b'-') { f64::NEG_INFINITY } else { f64::INFINITY }));
     }
     let digits = |i: &mut usize| {
         let s = *i;
@@ -2066,7 +2045,9 @@ fn decode_uri(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `%ThrowTypeError%`.
 fn throw_type_error(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Err(Error::type_error("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"))
+    Err(Error::type_error(
+        "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+    ))
 }
 
 fn number_is_integer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -2076,7 +2057,9 @@ fn number_is_integer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn number_is_safe_integer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let v = arg(a, 0);
-    Ok(Value::from_bool(v.as_number().is_some_and(|d| d.is_finite() && d.trunc() == d && d.abs() <= 9007199254740991.0)))
+    Ok(Value::from_bool(
+        v.as_number().is_some_and(|d| d.is_finite() && d.trunc() == d && d.abs() <= 9007199254740991.0),
+    ))
 }
 
 fn number_is_finite(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -2109,7 +2092,6 @@ pub(crate) fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) -> *m
 pub(crate) fn is_class(v: Value, c: Class) -> bool {
     v.is_cell() && unsafe { (*as_object(v)).class } == c
 }
-
 
 // ---- JSON ----
 
@@ -2172,11 +2154,7 @@ fn install_regexps(vm: &mut Vm) {
     install_legacy(vm, c);
     vm.define_natives(
         rp,
-        &[
-            ("exec", regexp_exec as NativeFn, 1),
-            ("test", regexp_test, 1),
-            ("toString", regexp_to_string, 0),
-        ],
+        &[("exec", regexp_exec as NativeFn, 1), ("test", regexp_test, 1), ("toString", regexp_to_string, 0)],
     );
     vm.regexp_atoms[0] = vm.intern_name("exec");
     vm.regexp_fns[0] = as_object(vm.get(object_value(rp), vm.regexp_atoms[0]).unwrap());
@@ -2516,7 +2494,12 @@ fn this_regexp<'a>(this: Value) -> Result<&'a crate::regexp::Regex> {
 
 /// The match of `re` (the object `this`) in `s` where `exec` looks: from
 /// `lastIndex` if global (then set past the match, or to 0 on none).
-fn regexp_match(vm: &mut Vm, this: Value, re: &crate::regexp::Regex, s: &[u16]) -> Result<Option<crate::regexp::Captures>> {
+fn regexp_match(
+    vm: &mut Vm,
+    this: Value,
+    re: &crate::regexp::Regex,
+    s: &[u16],
+) -> Result<Option<crate::regexp::Captures>> {
     let mut caps = Vec::new();
     Ok(regexp_match_into(vm, this, re, s, &mut caps)?.map(|_| caps))
 }
@@ -2547,11 +2530,7 @@ fn regexp_match_into<'a>(
         return Err(vm.take_conv_error());
     }
     let re = if quiet { re } else { this_regexp(this)? };
-    let start = if re.global || re.sticky {
-        if li.is_nan() || li < 0.0 { 0 } else { li as usize }
-    } else {
-        0
-    };
+    let start = if re.global || re.sticky { if li.is_nan() || li < 0.0 { 0 } else { li as usize } } else { 0 };
     // (Stores that throw where `lastIndex` is read-only.)
     if start > s.len() {
         vm.put_key(this, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
@@ -2660,7 +2639,9 @@ fn legacy_paren<const N: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result
 /// The legacy static accessors on `RegExp` (`c`).
 fn install_legacy(vm: &mut Vm, c: *mut Object) {
     let holder = vm.new_object(Value::NULL);
-    let native = |vm: &mut Vm, name: &str, f: NativeFn, n: u32| object_value(vm.define_native(holder, name, f, n, Ty::Any, false));
+    let native = |vm: &mut Vm, name: &str, f: NativeFn, n: u32| {
+        object_value(vm.define_native(holder, name, f, n, Ty::Any, false))
+    };
     let input_get = native(vm, "get input", legacy_input_get, 0);
     let input_set = native(vm, "set input", legacy_input_set, 1);
     for name in ["input", "$_"] {
@@ -2708,7 +2689,13 @@ fn with_caps<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm, &mut crate::regexp::Capture
 
 /// The array `exec` returns for `caps` over `s`: the match and each group
 /// (`undefined` if it didn't match), with `index` and `input`.
-fn match_array(vm: &mut Vm, re: &crate::regexp::Regex, caps: &crate::regexp::Captures, s: &[u16], input: Value) -> Result<Value> {
+fn match_array(
+    vm: &mut Vm,
+    re: &crate::regexp::Regex,
+    caps: &crate::regexp::Captures,
+    s: &[u16],
+    input: Value,
+) -> Result<Value> {
     let arr = vm.new_array();
     let o = as_object(arr);
     vm.reserve_elems(o, caps.len());
@@ -2912,7 +2899,8 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     // (`matchAll` and `split` make a copy by SpeciesConstructor, whose
     // IsRegExp reads `Symbol.match`: `Some(0)`'s method. This method
     // itself isn't read: this is it, whatever `this` has now.)
-    let fast = if copies(K) { pristine_for(vm, this, Some(0))? && species_pristine(vm, this) } else { pristine(vm, this)? };
+    let fast =
+        if copies(K) { pristine_for(vm, this, Some(0))? && species_pristine(vm, this) } else { pristine(vm, this)? };
     if !fast {
         return match K {
             0 => rx_match(vm, this, s),
@@ -3169,8 +3157,8 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
-    let func = replacement.is_cell()
-        && matches!(unsafe { (*as_object(replacement)).class }, Class::Function | Class::Native);
+    let func =
+        replacement.is_cell() && matches!(unsafe { (*as_object(replacement)).class }, Class::Function | Class::Native);
     let template = if func { std::borrow::Cow::Borrowed(&[][..]) } else { units(replacement) };
     // The matches: each one's groups.
     let mut flat: crate::regexp::Captures = Vec::new();
@@ -3261,7 +3249,13 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
 ///
 /// Past the longest string, a RangeError: checked at each `$` pattern, as
 /// one copies up to the whole string.
-fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(String, usize)], out: &mut Vec<u16>) -> Result<()> {
+fn expand(
+    t: &[u16],
+    s: &[u16],
+    caps: &[Option<(usize, usize)>],
+    names: &[(String, usize)],
+    out: &mut Vec<u16>,
+) -> Result<()> {
     let (x, y) = caps[0].unwrap();
     let mut i = 0;
     while i < t.len() {
@@ -3309,7 +3303,10 @@ fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(Strin
                 let d1 = (n - b'0' as u16) as usize;
                 let two = t.get(i + 2).filter(|&&c| (b'0' as u16..=b'9' as u16).contains(&c));
                 let (g, len) = match two {
-                    Some(&d2) if d1 * 10 + ((d2 - b'0' as u16) as usize) < caps.len() && d1 * 10 + ((d2 - b'0' as u16) as usize) > 0 => {
+                    Some(&d2)
+                        if d1 * 10 + ((d2 - b'0' as u16) as usize) < caps.len()
+                            && d1 * 10 + ((d2 - b'0' as u16) as usize) > 0 =>
+                    {
                         (d1 * 10 + (d2 - b'0' as u16) as usize, 3)
                     }
                     _ => (d1, 2),
@@ -3426,9 +3423,7 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
 /// [[ErrorData]]), not one that only inherits from `Error.prototype`.
 fn error_is_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let v = arg(a, 0);
-    Ok(Value::from_bool(
-        crate::props::is_object(v) && crate::object::is_error(as_object(v)),
-    ))
+    Ok(Value::from_bool(crate::props::is_object(v) && crate::object::is_error(as_object(v))))
 }
 
 /// `get Error.prototype.stack`: for an error object, a string of its kind
@@ -3648,7 +3643,9 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
             // (An accessor's slot holds its getter-setter pair.)
             let getter_ok = |i: usize| *(*as_object(at(i))).elems == object_value(vm.regexp_fns[i]);
-            return Ok(ok(0) && k.is_none_or(|k| ok(1 + k) && (!copies(k) || ok(1))) && (6..crate::vm::REGEXP_FNS).all(getter_ok));
+            return Ok(ok(0)
+                && k.is_none_or(|k| ok(1 + k) && (!copies(k) || ok(1)))
+                && (6..crate::vm::REGEXP_FNS).all(getter_ok));
         }
     }
     pristine_slow(vm, rx, k)
@@ -3825,7 +3822,13 @@ fn rx_search(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     let prev = vm.get(r, a)?;
     // (SameValue by bits: a number that is 0 is the int32 0 or ±0.0;
     // keeping `same_value` to its callers keeps it inlined there.)
-    let same = |x: Value, y: Value| x.to_bits() == y.to_bits() || x.is_number() && y.is_number() && x.to_number() == y.to_number() && x.to_number().is_sign_negative() == y.to_number().is_sign_negative();
+    let same = |x: Value, y: Value| {
+        x.to_bits() == y.to_bits()
+            || x.is_number()
+                && y.is_number()
+                && x.to_number() == y.to_number()
+                && x.to_number().is_sign_negative() == y.to_number().is_sign_negative()
+    };
     if !same(prev, Value::from_i32(0)) {
         set_last_index(vm, r, 0.0)?;
     }
@@ -4066,7 +4069,8 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
         if (*as_object(r)).shape == vm.regexp_shapes.1 && (*rp).shape == ps && (*rc).shape == cs {
             let [pl, cl] = vm.regexp_species_slots;
             // (An accessor's slot holds its getter-setter pair.)
-            return *Object::slot(rp, pl) == object_value(rc) && *(*as_object(*Object::slot(rc, cl))).elems == vm.regexp_species_getter;
+            return *Object::slot(rp, pl) == object_value(rc)
+                && *(*as_object(*Object::slot(rc, cl))).elems == vm.regexp_species_getter;
         }
     }
     species_pristine_slow(vm, r)
@@ -4107,7 +4111,8 @@ fn species_pristine_slow(vm: &mut Vm, r: Value) -> bool {
     }
     let a_s = vm.a_sym_species;
     let rc = vm.regexp_constructor;
-    let Some(g) = vm.own_property(rc, crate::vm::Key::Name(a_s)).and_then(|d| d.get).filter(|&g| builtin_species(g)) else {
+    let Some(g) = vm.own_property(rc, crate::vm::Key::Name(a_s)).and_then(|d| d.get).filter(|&g| builtin_species(g))
+    else {
         return false;
     };
     // (Where they are, for the next time: `constructor` a data property

@@ -833,14 +833,7 @@ pub struct MegaEntry {
 }
 
 impl MegaEntry {
-    pub const EMPTY: MegaEntry = MegaEntry {
-        shape: 0,
-        name: 0,
-        epoch: 0,
-        off: 0,
-        _pad: 0,
-        addr: 0,
-    };
+    pub const EMPTY: MegaEntry = MegaEntry { shape: 0, name: 0, epoch: 0, off: 0, _pad: 0, addr: 0 };
 }
 
 /// An entry of `Vm::mega_stores`: how compiled code stores a named
@@ -864,15 +857,7 @@ pub struct MegaStore {
 }
 
 impl MegaStore {
-    pub const EMPTY: MegaStore = MegaStore {
-        shape: 0,
-        name: 0,
-        epoch: 0,
-        ft: 0,
-        new_shape: 0,
-        loc: 0,
-        _pad: 0,
-    };
+    pub const EMPTY: MegaStore = MegaStore { shape: 0, name: 0, epoch: 0, ft: 0, new_shape: 0, loc: 0, _pad: 0 };
 }
 
 /// The entry of `shape` and `name` in `Vm::megas` and `Vm::mega_stores`.

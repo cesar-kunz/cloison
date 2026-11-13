@@ -42,10 +42,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let proto = vm.new_object(op);
     let c = vm.define_native(g, "ShadowRealm", shadow_realm_ctor, 0, any, true);
     crate::builtins::link_constructor(vm, c, proto);
-    vm.define_natives(
-        proto,
-        &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)],
-    );
+    vm.define_natives(proto, &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
     crate::symbol::to_string_tag(vm, proto, "ShadowRealm");
     let wrapped = vm.native_function("", wrapped_call, 0, any, false);
     let imported = vm.native_function("", imported, 1, any, false);
@@ -276,4 +273,3 @@ fn import_failed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));
     call_function(vm, reject, Value::UNDEFINED, &[v])
 }
-

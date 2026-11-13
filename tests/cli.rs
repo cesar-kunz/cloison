@@ -85,7 +85,10 @@ fn agents_not_spawned_free_their_heaps() {
     }
     let out = c.output().unwrap();
     assert!(out.status.success(), "{}", out.status);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "$262.agent.start: Resource temporarily unavailable (os error 11)\nundefined\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "$262.agent.start: Resource temporarily unavailable (os error 11)\nundefined\n"
+    );
 }
 
 /// A local time a zone skips (spring forward) takes the offset from before
@@ -184,7 +187,11 @@ fn prints_in_both_modes(test: &str, src: &str, env: &[(&str, &str)], expected: &
         }
         let out = c.output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{expected}\nundefined\n"), "{env:?}, no JIT {no_jit}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{expected}\nundefined\n"),
+            "{env:?}, no JIT {no_jit}"
+        );
     }
 }
 

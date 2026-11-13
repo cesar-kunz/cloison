@@ -465,9 +465,7 @@ fn internalize(
             let ks = vm.key_string(k);
             let child = match (record.map(|r| &r.kind), k) {
                 (Some(RecordKind::Elements(es)), Key::Index(i)) if array => es.get(i as usize),
-                (Some(RecordKind::Entries(es)), _) if !array => {
-                    string_units(ks).and_then(|u| es.get(u))
-                }
+                (Some(RecordKind::Entries(es)), _) if !array => string_units(ks).and_then(|u| es.get(u)),
                 _ => None,
             };
             let nv = internalize(vm, reviver, v, ks, child, text, a_source)?;

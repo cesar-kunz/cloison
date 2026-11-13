@@ -106,11 +106,7 @@ fn k_sin(x: f64, y: f64, iy: bool) -> f64 {
     let z = x * x;
     let v = z * x;
     let r = S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)));
-    if !iy {
-        x + v * (S1 + z * r)
-    } else {
-        x - ((z * (0.5 * y - v * r) - y) - v * S1)
-    }
+    if !iy { x + v * (S1 + z * r) } else { x - ((z * (0.5 * y - v * r) - y) - v * S1) }
 }
 
 /// cos on [-pi/4, pi/4], `x + y` the argument.
@@ -220,14 +216,12 @@ fn k_tan(x: f64, y: f64, iy: i32) -> f64 {
 
 /// 2/pi, 24 bits per entry: `k_rem_pio2`'s table.
 const IPIO2: [i32; 66] = [
-    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62, 0x95993C, 0x439041, 0xFE5163,
-    0xABDEBB, 0xC561B7, 0x246E3A, 0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,
-    0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C, 0x7026B4, 0x5F7E41, 0x3991D6, 0x398353, 0x39F49C,
-    0x845F8B, 0xBDF928, 0x3B1FF8, 0x97FFDE, 0x05980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D, 0x367ECF,
-    0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5, 0xF17B3D, 0x0739F7, 0x8A5292,
-    0xEA6BFB, 0x5FB11F, 0x8D5D08, 0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3,
-    0x91615E, 0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880, 0x4D7327, 0x310606, 0x1556CA,
-    0x73A8C9, 0x60E27B, 0xC08C6B,
+    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62, 0x95993C, 0x439041, 0xFE5163, 0xABDEBB, 0xC561B7,
+    0x246E3A, 0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129, 0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C,
+    0x7026B4, 0x5F7E41, 0x3991D6, 0x398353, 0x39F49C, 0x845F8B, 0xBDF928, 0x3B1FF8, 0x97FFDE, 0x05980F, 0xEF2F11,
+    0x8B5A0A, 0x6D1F6D, 0x367ECF, 0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5, 0xF17B3D, 0x0739F7,
+    0x8A5292, 0xEA6BFB, 0x5FB11F, 0x8D5D08, 0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3, 0x91615E,
+    0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880, 0x4D7327, 0x310606, 0x1556CA, 0x73A8C9, 0x60E27B, 0xC08C6B,
 ];
 
 /// pi/2 in 24-bit pieces.
@@ -427,10 +421,10 @@ fn k_rem_pio2(x: &[f64], y: &mut [f64; 2], e0: i32, nx: usize) -> i32 {
 /// The high words of `n * pi/2`, n = 1..=32: where the medium-size
 /// reduction must check for cancellation.
 const NPIO2_HW: [i32; 32] = [
-    0x3FF921FB, 0x400921FB, 0x4012D97C, 0x401921FB, 0x401F6A7A, 0x4022D97C, 0x4025FDBB, 0x402921FB,
-    0x402C463A, 0x402F6A7A, 0x4031475C, 0x4032D97C, 0x40346B9C, 0x4035FDBB, 0x40378FDB, 0x403921FB,
-    0x403AB41B, 0x403C463A, 0x403DD85A, 0x403F6A7A, 0x40407E4C, 0x4041475C, 0x4042106C, 0x4042D97C,
-    0x4043A28C, 0x40446B9C, 0x404534AC, 0x4045FDBB, 0x4046C6CB, 0x40478FDB, 0x404858EB, 0x404921FB,
+    0x3FF921FB, 0x400921FB, 0x4012D97C, 0x401921FB, 0x401F6A7A, 0x4022D97C, 0x4025FDBB, 0x402921FB, 0x402C463A,
+    0x402F6A7A, 0x4031475C, 0x4032D97C, 0x40346B9C, 0x4035FDBB, 0x40378FDB, 0x403921FB, 0x403AB41B, 0x403C463A,
+    0x403DD85A, 0x403F6A7A, 0x40407E4C, 0x4041475C, 0x4042106C, 0x4042D97C, 0x4043A28C, 0x40446B9C, 0x404534AC,
+    0x4045FDBB, 0x4046C6CB, 0x40478FDB, 0x404858EB, 0x404921FB,
 ];
 
 /// `x mod pi/2`: the quadrant `n` (mod 4 matters) and the remainder as
@@ -695,18 +689,10 @@ pub fn acos(x: f64) -> f64 {
     }
 }
 
-const ATANHI: [f64; 4] = [
-    4.63647609000806093515e-01,
-    7.85398163397448278999e-01,
-    9.82793723247329054082e-01,
-    1.57079632679489655800e+00,
-];
-const ATANLO: [f64; 4] = [
-    2.26987774529616870924e-17,
-    3.06161699786838301793e-17,
-    1.39033110312309984516e-17,
-    6.12323399573676603587e-17,
-];
+const ATANHI: [f64; 4] =
+    [4.63647609000806093515e-01, 7.85398163397448278999e-01, 9.82793723247329054082e-01, 1.57079632679489655800e+00];
+const ATANLO: [f64; 4] =
+    [2.26987774529616870924e-17, 3.06161699786838301793e-17, 1.39033110312309984516e-17, 6.12323399573676603587e-17];
 
 pub fn atan(x: f64) -> f64 {
     const AT: [f64; 11] = [
@@ -920,11 +906,8 @@ pub fn exp(x: f64) -> f64 {
         lo_ = 0.0;
     }
     let t = x * x;
-    let twopk = if k >= -1021 {
-        from_words(0x3ff00000 + (k << 20), 0)
-    } else {
-        from_words(0x3ff00000 + ((k + 1000) << 20), 0)
-    };
+    let twopk =
+        if k >= -1021 { from_words(0x3ff00000 + (k << 20), 0) } else { from_words(0x3ff00000 + ((k + 1000) << 20), 0) };
     let c = x - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
     if k == 0 {
         return 1.0 - ((x * c) / (c - 2.0) - x);
@@ -1003,11 +986,7 @@ pub fn log(x: f64) -> f64 {
     let r = t2 + t1;
     if i > 0 {
         let hfsq = 0.5 * f * f;
-        if k == 0 {
-            f - (hfsq - s * (hfsq + r))
-        } else {
-            dk * LN2_HI - ((hfsq - (s * (hfsq + r) + dk * LN2_LO)) - f)
-        }
+        if k == 0 { f - (hfsq - s * (hfsq + r)) } else { dk * LN2_HI - ((hfsq - (s * (hfsq + r) + dk * LN2_LO)) - f) }
     } else if k == 0 {
         f - s * (f - r)
     } else {
@@ -1049,11 +1028,7 @@ pub fn pow(x: f64, y: f64) -> f64 {
         return 1.0;
     }
     // +-NaN
-    if ix > 0x7ff00000
-        || (ix == 0x7ff00000 && lx != 0)
-        || iy > 0x7ff00000
-        || (iy == 0x7ff00000 && ly != 0)
-    {
+    if ix > 0x7ff00000 || (ix == 0x7ff00000 && lx != 0) || iy > 0x7ff00000 || (iy == 0x7ff00000 && ly != 0) {
         return x + y;
     }
     // When x < 0, is y an integer? 0: no; 1: odd; 2: even.

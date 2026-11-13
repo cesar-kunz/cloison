@@ -325,10 +325,9 @@ const KEYWORDS: &[&str] = &[
 
 /// Longest first, so that the first match is the longest.
 const PUNCTS: &[&str] = &[
-    ">>>=", "===", "!==", ">>>", "<<=", ">>=", "**=", "...", "&&=", "||=", "??=", "=>", "==", "!=",
-    "<=", ">=", "&&", "||", "??", "?.", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
-    "<<", ">>", "**", "{", "}", "(", ")", "[", "]", ";", ",", "<", ">", "+", "-", "*", "/", "%",
-    "&", "|", "^", "!", "~", "?", ":", "=", ".",
+    ">>>=", "===", "!==", ">>>", "<<=", ">>=", "**=", "...", "&&=", "||=", "??=", "=>", "==", "!=", "<=", ">=", "&&",
+    "||", "??", "?.", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>", "**", "{", "}", "(", ")",
+    "[", "]", ";", ",", "<", ">", "+", "-", "*", "/", "%", "&", "|", "^", "!", "~", "?", ":", "=", ".",
 ];
 
 /// Up to 16 bytes as an integer, the first in the low byte (a word or a
@@ -413,10 +412,11 @@ pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
                 i += 1;
                 continue;
             }
-            0xC2 | 0xE1 | 0xE2 | 0xE3 | 0xEF if {
-                let ch = src[i..].chars().next().unwrap();
-                is_space_char(ch) || ch == '\u{2028}' || ch == '\u{2029}'
-            } =>
+            0xC2 | 0xE1 | 0xE2 | 0xE3 | 0xEF
+                if {
+                    let ch = src[i..].chars().next().unwrap();
+                    is_space_char(ch) || ch == '\u{2028}' || ch == '\u{2029}'
+                } =>
             {
                 let ch = src[i..].chars().next().unwrap();
                 newline |= ch == '\u{2028}' || ch == '\u{2029}';
@@ -439,114 +439,90 @@ pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
             }
             b'/' if b.get(i + 1) == Some(&b'/') => {
                 // (To a line terminator: U+2028 and U+2029 too.)
-                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' && !b[i..].starts_with("\u{2028}".as_bytes()) && !b[i..].starts_with("\u{2029}".as_bytes()) {
+                while i < b.len()
+                    && b[i] != b'\n'
+                    && b[i] != b'\r'
+                    && !b[i..].starts_with("\u{2028}".as_bytes())
+                    && !b[i..].starts_with("\u{2029}".as_bytes())
+                {
                     i += 1;
                 }
                 continue;
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
-                let end = src[i + 2..]
-                    .find("*/")
-                    .ok_or_else(|| err("unterminated comment"))?;
+                let end = src[i + 2..].find("*/").ok_or_else(|| err("unterminated comment"))?;
                 newline |= src[i + 2..i + 2 + end].contains(['\n', '\r', '\u{2028}', '\u{2029}']);
                 i += end + 4;
                 continue;
             }
             _ => {}
         }
-        let tok =
-            if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
-                if let Some((digits, n)) = bigint(&src[i..]) {
-                    i += n;
-                    Tok::BigInt(digits.into())
-                } else {
-                    let (v, n) = number(&src[i..]).ok_or_else(|| err("bad number"))?;
-                    i += n;
-                    Tok::Num(v)
-                }
-            } else if c == b'"' || c == b'\'' {
-                let (s, n) = string(&src[i..], units).ok_or_else(|| err("unterminated string"))?;
-                // (Escapes in it: then not a directive, `"use strict"`.)
-                escaped = src[i..i + n].contains('\\');
+        let tok = if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+            if let Some((digits, n)) = bigint(&src[i..]) {
                 i += n;
-                if too_long(&s) {
-                    return Err(err("Invalid string length"));
-                }
-                Tok::Str(s.into())
-            } else if c == b'`' || (c == b'}' && braces.last() == Some(&2)) {
-                if c == b'}' {
-                    braces.pop();
-                }
-                let (mut part, n) = template(&src[i + 1..], units).ok_or_else(|| err("unterminated template literal"))?;
-                if part.cooked.as_deref().is_some_and(too_long) || too_long(&part.raw) {
-                    return Err(err("Invalid string length"));
-                }
-                part.head = c == b'`';
-                i += 1 + n;
-                if !part.tail {
-                    braces.push(2);
-                }
-                Tok::Template(Box::new(part))
-            } else if c == b'/' && !divides(&toks, closed_expression, closed_paren) {
-                let (pattern, flags, n) = regexp(&src[i..], units).ok_or_else(|| err("unterminated regular expression"))?;
+                Tok::BigInt(digits.into())
+            } else {
+                let (v, n) = number(&src[i..]).ok_or_else(|| err("bad number"))?;
                 i += n;
-                Tok::RegExp(Box::new((pattern, flags)))
-            } else if c == b'#'
-                && src[i + 1..].chars().next().is_some_and(|ch| {
-                    ch.is_ascii_alphabetic() || ch == '_' || ch == '$' || ch == '\\' || !ch.is_ascii() && is_ident_start(ch)
-                })
-            {
-                // A private name (`#x`): an identifier its `#` begins,
-                // never a keyword (its escapes decoded: `#\u{6F}` is `#o`).
-                let n = 1 + src[i + 1..]
-                    .char_indices()
-                    .find(|&(_, ch)| !is_ident_part(ch))
-                    .map_or(src.len() - i - 1, |(n, _)| n);
-                if b.get(i + n) == Some(&b'\\') {
-                    let (word, m) = escaped_ident(&src[i + 1..]).ok_or_else(|| err("bad escape in identifier"))?;
-                    i += 1 + m;
-                    let w: &str = format!("#{word}").leak();
-                    Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
-                } else {
-                    let word = &src[i..i + n];
-                    i += n;
-                    Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone())
-                }
-            } else if is_ascii_ident_part(c) || c >= 0x80 && src[i..].chars().next().is_some_and(is_ident_start) {
-                // ASCII a byte at a time, past it a character at a time.
-                let mut n = 1 + b[i + 1..].iter().take_while(|&&x| is_ascii_ident_part(x)).count();
-                if b.get(i + n).is_some_and(|&x| x >= 0x80) || c >= 0x80 {
-                    n = src[i..]
-                        .char_indices()
-                        .find(|&(_, ch)| !is_ident_part(ch))
-                        .map_or(src.len() - i, |(n, _)| n);
-                }
-                if b.get(i + n) == Some(&b'\\') {
-                    // An identifier with escapes (`\u0061`): decoded,
-                    // never a keyword.
-                    let (word, m) = escaped_ident(&src[i..]).ok_or_else(|| err("bad escape in identifier"))?;
-                    i += m;
-                    escaped = true;
-                    {
-                    let w: &str = word.leak();
-                    Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
-                }
-                } else {
-                    let word = &src[i..i + n];
-                    i += n;
-                    // Keywords: lowercase, of 2 to 10 letters.
-                    let keyword = if c.is_ascii_lowercase() && (2..=10).contains(&n) {
-                        keyword(b, i - n, n)
-                    } else {
-                        None
-                    };
-                    lexical |= n == 3 && word == "let" || matches!(keyword, Some("const" | "class"));
-                    match keyword {
-                        Some(k) => Tok::Keyword(k),
-                        None => Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone()),
-                    }
-                }
-            } else if c == b'\\' && b.get(i + 1) == Some(&b'u') {
+                Tok::Num(v)
+            }
+        } else if c == b'"' || c == b'\'' {
+            let (s, n) = string(&src[i..], units).ok_or_else(|| err("unterminated string"))?;
+            // (Escapes in it: then not a directive, `"use strict"`.)
+            escaped = src[i..i + n].contains('\\');
+            i += n;
+            if too_long(&s) {
+                return Err(err("Invalid string length"));
+            }
+            Tok::Str(s.into())
+        } else if c == b'`' || (c == b'}' && braces.last() == Some(&2)) {
+            if c == b'}' {
+                braces.pop();
+            }
+            let (mut part, n) = template(&src[i + 1..], units).ok_or_else(|| err("unterminated template literal"))?;
+            if part.cooked.as_deref().is_some_and(too_long) || too_long(&part.raw) {
+                return Err(err("Invalid string length"));
+            }
+            part.head = c == b'`';
+            i += 1 + n;
+            if !part.tail {
+                braces.push(2);
+            }
+            Tok::Template(Box::new(part))
+        } else if c == b'/' && !divides(&toks, closed_expression, closed_paren) {
+            let (pattern, flags, n) = regexp(&src[i..], units).ok_or_else(|| err("unterminated regular expression"))?;
+            i += n;
+            Tok::RegExp(Box::new((pattern, flags)))
+        } else if c == b'#'
+            && src[i + 1..].chars().next().is_some_and(|ch| {
+                ch.is_ascii_alphabetic() || ch == '_' || ch == '$' || ch == '\\' || !ch.is_ascii() && is_ident_start(ch)
+            })
+        {
+            // A private name (`#x`): an identifier its `#` begins,
+            // never a keyword (its escapes decoded: `#\u{6F}` is `#o`).
+            let n = 1 + src[i + 1..]
+                .char_indices()
+                .find(|&(_, ch)| !is_ident_part(ch))
+                .map_or(src.len() - i - 1, |(n, _)| n);
+            if b.get(i + n) == Some(&b'\\') {
+                let (word, m) = escaped_ident(&src[i + 1..]).ok_or_else(|| err("bad escape in identifier"))?;
+                i += 1 + m;
+                let w: &str = format!("#{word}").leak();
+                Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
+            } else {
+                let word = &src[i..i + n];
+                i += n;
+                Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone())
+            }
+        } else if is_ascii_ident_part(c) || c >= 0x80 && src[i..].chars().next().is_some_and(is_ident_start) {
+            // ASCII a byte at a time, past it a character at a time.
+            let mut n = 1 + b[i + 1..].iter().take_while(|&&x| is_ascii_ident_part(x)).count();
+            if b.get(i + n).is_some_and(|&x| x >= 0x80) || c >= 0x80 {
+                n = src[i..].char_indices().find(|&(_, ch)| !is_ident_part(ch)).map_or(src.len() - i, |(n, _)| n);
+            }
+            if b.get(i + n) == Some(&b'\\') {
+                // An identifier with escapes (`\u0061`): decoded,
+                // never a keyword.
                 let (word, m) = escaped_ident(&src[i..]).ok_or_else(|| err("bad escape in identifier"))?;
                 i += m;
                 escaped = true;
@@ -554,59 +530,78 @@ pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
                     let w: &str = word.leak();
                     Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
                 }
-            } else if let Some(&(_, _, p)) = {
-                let next = match b.get(i..i + 4) {
-                    Some(w) => u32::from_le_bytes(w.try_into().unwrap()),
-                    None => pack(&b[i..]) as u32,
-                };
-                puncts(c).iter().find(|&&(v, mask, _)| next & mask == v)
-            } {
-                // (`a?.5:b` is a conditional.)
-                let p = if p == "?." && b.get(i + 2).is_some_and(u8::is_ascii_digit) { "?" } else { p };
-                i += p.len();
-                if p == "{" {
-                    let expression = match toks.last().map(|t: &Token| &t.tok) {
-                        None => false,
-                        // A function expression's body (`(function () {}) / 1`).
-                        Some(Tok::Punct(")")) if closed_paren != usize::MAX => {
-                            let mut j = closed_paren;
-                            if j > 0 && matches!(toks[j - 1].tok, Tok::Ident(_)) {
-                                j -= 1;
-                            }
-                            j > 1
-                                && toks[j - 1].tok == Tok::Keyword("function")
-                                && !matches!(
-                                    toks[j - 2].tok,
-                                    Tok::Punct(";" | "}" | "{" | ")") | Tok::Keyword("else" | "do")
-                                )
-                        }
-                        Some(Tok::Punct(q)) => !matches!(*q, ")" | "]" | "}" | ";" | "{" | "=>"),
-                        Some(Tok::Keyword(k)) => matches!(
-                            *k,
-                            "return" | "typeof" | "case" | "delete" | "void" | "throw" | "new" | "in" | "instanceof"
-                        ),
-                        Some(Tok::Template(_)) => true,
-                        _ => false,
-                    };
-                    braces.push(expression as u8);
-                } else if p == "}" {
-                    closed_expression = braces.pop() == Some(1);
-                } else if p == "(" {
-                    parens.push(toks.len());
-                } else if p == ")" {
-                    closed_paren = parens.pop().unwrap_or(usize::MAX);
-                } else if p == "=>"
-                    && !newline
-                    && toks.last().is_some_and(|t: &Token| t.tok == Tok::Punct(")"))
-                    && closed_paren != usize::MAX
-                {
-                    toks[closed_paren].arrow = true;
-                }
-                Tok::Punct(p)
             } else {
-                let ch = shown_char(&src[i..], units);
-                return Err(err(&format!("unexpected character `{ch}`")));
+                let word = &src[i..i + n];
+                i += n;
+                // Keywords: lowercase, of 2 to 10 letters.
+                let keyword = if c.is_ascii_lowercase() && (2..=10).contains(&n) { keyword(b, i - n, n) } else { None };
+                lexical |= n == 3 && word == "let" || matches!(keyword, Some("const" | "class"));
+                match keyword {
+                    Some(k) => Tok::Keyword(k),
+                    None => Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone()),
+                }
+            }
+        } else if c == b'\\' && b.get(i + 1) == Some(&b'u') {
+            let (word, m) = escaped_ident(&src[i..]).ok_or_else(|| err("bad escape in identifier"))?;
+            i += m;
+            escaped = true;
+            {
+                let w: &str = word.leak();
+                Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
+            }
+        } else if let Some(&(_, _, p)) = {
+            let next = match b.get(i..i + 4) {
+                Some(w) => u32::from_le_bytes(w.try_into().unwrap()),
+                None => pack(&b[i..]) as u32,
             };
+            puncts(c).iter().find(|&&(v, mask, _)| next & mask == v)
+        } {
+            // (`a?.5:b` is a conditional.)
+            let p = if p == "?." && b.get(i + 2).is_some_and(u8::is_ascii_digit) { "?" } else { p };
+            i += p.len();
+            if p == "{" {
+                let expression = match toks.last().map(|t: &Token| &t.tok) {
+                    None => false,
+                    // A function expression's body (`(function () {}) / 1`).
+                    Some(Tok::Punct(")")) if closed_paren != usize::MAX => {
+                        let mut j = closed_paren;
+                        if j > 0 && matches!(toks[j - 1].tok, Tok::Ident(_)) {
+                            j -= 1;
+                        }
+                        j > 1
+                            && toks[j - 1].tok == Tok::Keyword("function")
+                            && !matches!(
+                                toks[j - 2].tok,
+                                Tok::Punct(";" | "}" | "{" | ")") | Tok::Keyword("else" | "do")
+                            )
+                    }
+                    Some(Tok::Punct(q)) => !matches!(*q, ")" | "]" | "}" | ";" | "{" | "=>"),
+                    Some(Tok::Keyword(k)) => matches!(
+                        *k,
+                        "return" | "typeof" | "case" | "delete" | "void" | "throw" | "new" | "in" | "instanceof"
+                    ),
+                    Some(Tok::Template(_)) => true,
+                    _ => false,
+                };
+                braces.push(expression as u8);
+            } else if p == "}" {
+                closed_expression = braces.pop() == Some(1);
+            } else if p == "(" {
+                parens.push(toks.len());
+            } else if p == ")" {
+                closed_paren = parens.pop().unwrap_or(usize::MAX);
+            } else if p == "=>"
+                && !newline
+                && toks.last().is_some_and(|t: &Token| t.tok == Tok::Punct(")"))
+                && closed_paren != usize::MAX
+            {
+                toks[closed_paren].arrow = true;
+            }
+            Tok::Punct(p)
+        } else {
+            let ch = shown_char(&src[i..], units);
+            return Err(err(&format!("unexpected character `{ch}`")));
+        };
         toks.push(Token {
             tok,
             pos: start as u32,
@@ -642,13 +637,13 @@ fn divides(toks: &[Token], closed_expression: bool, closed_paren: usize) -> bool
     }
     match &t.tok {
         Tok::Punct("}") => closed_expression,
-        Tok::Punct(")") => !(closed_paren != usize::MAX
-            && closed_paren > 0
-            && matches!(toks[closed_paren - 1].tok, Tok::Keyword("if" | "while" | "for" | "with"))
-            && !property_name(toks, closed_paren - 1)),
-        Tok::Punct("++" | "--") => {
-            !t.newline_before && toks.len() >= 2 && ends_operand(toks, toks.len() - 2)
+        Tok::Punct(")") => {
+            !(closed_paren != usize::MAX
+                && closed_paren > 0
+                && matches!(toks[closed_paren - 1].tok, Tok::Keyword("if" | "while" | "for" | "with"))
+                && !property_name(toks, closed_paren - 1))
         }
+        Tok::Punct("++" | "--") => !t.newline_before && toks.len() >= 2 && ends_operand(toks, toks.len() - 2),
         Tok::Ident(n) if matches!(&**n, "yield" | "await") => false,
         // `for (x of /a/g…)`: `of` after an operand is the keyword.
         Tok::Ident(n) if &**n == "of" && toks.len() >= 2 && ends_operand(toks, toks.len() - 2) => false,
@@ -659,9 +654,7 @@ fn divides(toks: &[Token], closed_expression: bool, closed_paren: usize) -> bool
 /// Whether `toks[j]` is a word after `.` or `?.` (`o.if`, `o?.yield`): a
 /// property name, which ends an expression whatever the word.
 fn property_name(toks: &[Token], j: usize) -> bool {
-    j > 0
-        && matches!(toks[j].tok, Tok::Ident(_) | Tok::Keyword(_))
-        && matches!(toks[j - 1].tok, Tok::Punct("." | "?."))
+    j > 0 && matches!(toks[j].tok, Tok::Ident(_) | Tok::Keyword(_)) && matches!(toks[j - 1].tok, Tok::Punct("." | "?."))
 }
 
 /// Whether `toks[j]` ends an expression (a property name or as
@@ -703,10 +696,7 @@ fn regexp(s: &str, units: bool) -> Option<(String, String, usize)> {
             _ => {}
         }
     };
-    let flags_len = s[end + 1..]
-        .char_indices()
-        .find(|&(_, c)| !is_ident_part(c))
-        .map_or(s.len() - end - 1, |(n, _)| n);
+    let flags_len = s[end + 1..].char_indices().find(|&(_, c)| !is_ident_part(c)).map_or(s.len() - end - 1, |(n, _)| n);
     let flags = s[end + 1..end + 1 + flags_len].to_string();
     // (As `units_to_string` has its code units.)
     let mut body = String::with_capacity(end);
@@ -745,8 +735,11 @@ fn is_other_id_start(c: char) -> bool {
 }
 
 fn is_other_id_continue(c: char) -> bool {
-    matches!(c, '\u{00B7}' | '\u{0387}' | '\u{1369}'..='\u{1371}' | '\u{19DA}' | '\u{200C}' | '\u{200D}' | '\u{30FB}' | '\u{FF65}')
-        || matches!(unicode_general_category(c), Some("Mn" | "Mc" | "Nd" | "Pc"))
+    matches!(
+        c,
+        '\u{00B7}' | '\u{0387}' | '\u{1369}'
+            ..='\u{1371}' | '\u{19DA}' | '\u{200C}' | '\u{200D}' | '\u{30FB}' | '\u{FF65}'
+    ) || matches!(unicode_general_category(c), Some("Mn" | "Mc" | "Nd" | "Pc"))
 }
 
 /// Whether `c` is Unicode whitespace as JavaScript has it (`Zs`, tab,
@@ -754,7 +747,8 @@ fn is_other_id_continue(c: char) -> bool {
 fn is_space_char(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\u{0B}' | '\u{0C}' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
+        '\t' | '\u{0B}' | '\u{0C}' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' | '\u{FEFF}'
     )
 }
 
@@ -762,7 +756,8 @@ fn is_space_char(c: char) -> bool {
 /// identifiers may continue with (the ranges `char` doesn't classify).
 fn unicode_general_category(c: char) -> Option<&'static str> {
     let u = c as u32;
-    if matches!(u, 0x0300..=0x036F | 0x0483..=0x0487 | 0x0591..=0x05BD | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06DC | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20F0 | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F) {
+    if matches!(u, 0x0300..=0x036F | 0x0483..=0x0487 | 0x0591..=0x05BD | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06DC | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20F0 | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F)
+    {
         return Some("Mn");
     }
     if matches!(u, 0x0903 | 0x093B | 0x093E..=0x0940 | 0x0949..=0x094C | 0x094E | 0x094F) {
@@ -817,8 +812,6 @@ fn escaped_ident(s: &str) -> Option<(String, usize)> {
     Some((out, i))
 }
 
-
-
 /// An ASCII identifier character (a digit only past the first: digits
 /// begin numbers, lexed before identifiers).
 fn is_ascii_ident_part(c: u8) -> bool {
@@ -838,9 +831,7 @@ fn number(s: &str) -> Option<(f64, usize)> {
             b'o' => 8,
             _ => 2,
         };
-        let n = 2 + s[2..]
-            .find(|c: char| !c.is_digit(radix) && c != '_')
-            .unwrap_or(s.len() - 2);
+        let n = 2 + s[2..].find(|c: char| !c.is_digit(radix) && c != '_').unwrap_or(s.len() - 2);
         if n == 2 || !separated(&s[2..n]) {
             return None;
         }
@@ -901,9 +892,14 @@ fn number(s: &str) -> Option<(f64, usize)> {
 fn bigint(s: &str) -> Option<(String, usize)> {
     let b = s.as_bytes();
     let (radix, start) = match b {
-        [b'0', p, ..] if matches!(p | 0x20, b'x' | b'o' | b'b') => {
-            (match p | 0x20 { b'x' => 16, b'o' => 8, _ => 2 }, 2)
-        }
+        [b'0', p, ..] if matches!(p | 0x20, b'x' | b'o' | b'b') => (
+            match p | 0x20 {
+                b'x' => 16,
+                b'o' => 8,
+                _ => 2,
+            },
+            2,
+        ),
         _ => (10, 0),
     };
     let n = start + s[start..].find(|c: char| !c.is_digit(radix) && c != '_').unwrap_or(s.len() - start);
@@ -1047,7 +1043,9 @@ fn escape(s: &str, i: usize, out: &mut Vec<u16>, units: bool) -> (bool, usize) {
             return (true, n);
         }
         b'x' => {
-            let v = s.get(i + 2..i + 4).and_then(|h| u32::from_str_radix(h, 16).ok().filter(|_| h.bytes().all(|c| c.is_ascii_hexdigit())));
+            let v = s
+                .get(i + 2..i + 4)
+                .and_then(|h| u32::from_str_radix(h, 16).ok().filter(|_| h.bytes().all(|c| c.is_ascii_hexdigit())));
             match v {
                 Some(v) => {
                     unit(out, v as u16);
@@ -1076,7 +1074,10 @@ fn escape(s: &str, i: usize, out: &mut Vec<u16>, units: bool) -> (bool, usize) {
                     _ => return (false, 2),
                 }
             }
-            let v = s.get(i + 2..i + 6).filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit())).and_then(|h| u32::from_str_radix(h, 16).ok());
+            let v = s
+                .get(i + 2..i + 6)
+                .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
+                .and_then(|h| u32::from_str_radix(h, 16).ok());
             match v {
                 Some(v) => {
                     unit(out, v as u16);

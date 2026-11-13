@@ -17,10 +17,9 @@
 use std::cell::Cell;
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number};
-use crate::object::{Slots, 
+use crate::object::{
     ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FN_LENGTH_DELETED, FN_NAME_DELETED, FROZEN, FieldType,
-    LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, READ_ONLY, SEALED, SPARSE, Shape, as_object,
-    object_value,
+    LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, READ_ONLY, SEALED, SPARSE, Shape, Slots, as_object, object_value,
 };
 use crate::value::Value;
 use crate::vm::{Error, Key, NO_ELEMENTS, NativeFn, Result, Vm, string_units, wrapped};
@@ -300,7 +299,11 @@ impl Vm {
             let s = &*(*o).shape;
             let root = &*self.array_shape;
             if s.keys().is_empty() && s.proto == root.proto && s.capacity.get() == root.capacity.get() {
-                let t = if elems == FieldType::None { self.array_shape } else { self.elements_transition(self.array_shape, elems) };
+                let t = if elems == FieldType::None {
+                    self.array_shape
+                } else {
+                    self.elements_transition(self.array_shape, elems)
+                };
                 crate::object::set_shape(o, t);
                 return;
             }
@@ -514,7 +517,10 @@ impl Vm {
             {
                 out.push((Key::Name(self.a_length), false));
             }
-            if matches!(class, Class::Function | Class::Native) && flags & FN_NAME_DELETED == 0 && s.lookup(self.a_name).is_none() {
+            if matches!(class, Class::Function | Class::Native)
+                && flags & FN_NAME_DELETED == 0
+                && s.lookup(self.a_name).is_none()
+            {
                 out.push((Key::Name(self.a_name), false));
             }
             for (k, &name) in s.keys().iter().enumerate() {
@@ -644,8 +650,7 @@ impl Vm {
         // are the sparse shape keys.
         let protected = unsafe {
             let flags = (*o).flags;
-            let dense_or_far = flags & FROZEN != 0
-                && ((*o).elems_len != 0 || crate::far::is_far(o));
+            let dense_or_far = flags & FROZEN != 0 && ((*o).elems_len != 0 || crate::far::is_far(o));
             // A typed array takes an inherited store of an index outside
             // its length (doing nothing: its [[Set]]); a string object's
             // characters are read-only.
@@ -653,13 +658,9 @@ impl Vm {
             let chars = Self::string_of(o).is_some_and(|u| !u.is_empty());
             let s = &*(*o).shape;
             let sparse = flags & SPARSE != 0
-                && s
-                    .keys()
-                    .iter()
-                    .zip(s.attrs())
-                    .any(|(&name, &attrs)| {
-                        index_of_name(self.atom_name(name)).is_some() && attrs & (ACCESSOR | READ_ONLY) != 0
-                    });
+                && s.keys().iter().zip(s.attrs()).any(|(&name, &attrs)| {
+                    index_of_name(self.atom_name(name)).is_some() && attrs & (ACCESSOR | READ_ONLY) != 0
+                });
             dense_or_far || typed || chars || sparse
         };
         if protected {
@@ -708,7 +709,10 @@ impl Vm {
                 }
                 // (Made an element again, of an object whose frame ended:
                 // hidden again, see `Vm::hide_element`.)
-                if self.released_mark.is_some() && !self.mapped_args.iter().any(|m| m.o == o) && self.mapped_get(o, i).is_some() {
+                if self.released_mark.is_some()
+                    && !self.mapped_args.iter().any(|m| m.o == o)
+                    && self.mapped_get(o, i).is_some()
+                {
                     self.hide_element(o, i);
                 }
             }
@@ -1241,10 +1245,7 @@ impl Vm {
             return Ok(as_object(v));
         }
         if v.is_undefined() || v.is_null() {
-            return Err(Error::type_error(format!(
-                "Cannot convert {} to object",
-                crate::vm::shown(v)
-            )));
+            return Err(Error::type_error(format!("Cannot convert {} to object", crate::vm::shown(v))));
         }
         Ok(as_object(self.new_wrapper(v)))
     }
@@ -1289,7 +1290,10 @@ impl Vm {
         if is_object(o) && crate::proxy::chain_has_proxy(self, as_object(o)) {
             if !crate::proxy::generic_set(self, o, key, v, o)? {
                 let k = self.key_string(key);
-                return Err(Error::type_error(format!("Cannot assign to property '{}' of object", crate::vm::shown(k))));
+                return Err(Error::type_error(format!(
+                    "Cannot assign to property '{}' of object",
+                    crate::vm::shown(k)
+                )));
             }
             return Ok(());
         }
@@ -1350,10 +1354,7 @@ impl Vm {
     pub(crate) fn delete_key(&mut self, o: Value, key: Key) -> Result<()> {
         if is_object(o) && !crate::proxy::delete(self, as_object(o), key)? {
             let k = self.key_string(key);
-            return Err(Error::type_error(format!(
-                "Cannot delete property '{}' of object",
-                crate::vm::shown(k)
-            )));
+            return Err(Error::type_error(format!("Cannot delete property '{}' of object", crate::vm::shown(k))));
         }
         Ok(())
     }
@@ -1364,10 +1365,7 @@ impl Vm {
         let d = Desc::data(v, true, true, true);
         if !self.define_own_property(obj, key, &d)? {
             let k = self.key_string(key);
-            return Err(Error::type_error(format!(
-                "Cannot define property '{}'",
-                crate::vm::shown(k)
-            )));
+            return Err(Error::type_error(format!("Cannot define property '{}'", crate::vm::shown(k))));
         }
         Ok(())
     }
@@ -1376,11 +1374,7 @@ impl Vm {
     pub(crate) fn length_of(&mut self, o: Value) -> Result<f64> {
         let n = self.get(o, self.a_length)?;
         let n = to_number(n);
-        Ok(if n.is_nan() || n <= 0.0 {
-            0.0
-        } else {
-            n.trunc().min(9007199254740991.0)
-        })
+        Ok(if n.is_nan() || n <= 0.0 { 0.0 } else { n.trunc().min(9007199254740991.0) })
     }
 }
 
@@ -1455,10 +1449,7 @@ fn object_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let d = vm.to_descriptor(arg(a, 2))?;
     if !vm.define_own_property(o, key, &d)? {
         let k = vm.key_string(key);
-        return Err(Error::type_error(format!(
-            "Cannot redefine property: {}",
-            crate::vm::shown(k)
-        )));
+        return Err(Error::type_error(format!("Cannot redefine property: {}", crate::vm::shown(k))));
     }
     Ok(arg(a, 0))
 }
@@ -1492,10 +1483,7 @@ fn define_all(vm: &mut Vm, o: *mut Object, descs: &[(Key, Desc)]) -> Result<()> 
     for &(key, d) in descs {
         if !vm.define_own_property(o, key, &d)? {
             let k = vm.key_string(key);
-            return Err(Error::type_error(format!(
-                "Cannot redefine property: {}",
-                crate::vm::shown(k)
-            )));
+            return Err(Error::type_error(format!("Cannot redefine property: {}", crate::vm::shown(k))));
         }
     }
     Ok(())

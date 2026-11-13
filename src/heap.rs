@@ -46,7 +46,9 @@ use crate::value::Value;
 // What compiled code knows of the heap is defined with the other layouts
 // it shares: the granule, card and large-cell sizes, the metadata bytes,
 // the side tables' place, the address space of a heap.
-pub use crate::layout::{CARD, COLOR, EVAC, GRANULE, LARGE, SIDE, SLICE, VALUES, YOUNG, card, card_mark, color_byte, meta};
+pub use crate::layout::{
+    CARD, COLOR, EVAC, GRANULE, LARGE, SIDE, SLICE, VALUES, YOUNG, card, card_mark, color_byte, meta,
+};
 pub(crate) use crate::layout::{meta_clear, meta_load, meta_store, meta_word};
 /// Block size: allocation's unit of memory.
 pub const BLOCK: usize = 32 << 10;
@@ -174,10 +176,7 @@ fn space() -> &'static Space {
                 }
                 continue;
             }
-            return Space {
-                base,
-                free: std::sync::Mutex::new((0..SPACE / SLICE).rev().collect()),
-            };
+            return Space { base, free: std::sync::Mutex::new((0..SPACE / SLICE).rev().collect()) };
         }
         panic!("no room for the heap's reservation at any of {BASES:x?}");
     })
@@ -406,10 +405,7 @@ impl Heap {
 
     /// A heap in the slice `slice` reserved (see [`reserve`]).
     pub fn with_slice(slice: Slice) -> Heap {
-        let limit = std::env::var("CLOISON_HEAP_LIMIT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map_or(ROOM, limit);
+        let limit = std::env::var("CLOISON_HEAP_LIMIT").ok().and_then(|s| s.parse::<usize>().ok()).map_or(ROOM, limit);
         let s = space();
         // (The heap gives it back when dropped.)
         let slice = std::mem::ManuallyDrop::new(slice).0;
@@ -719,9 +715,7 @@ impl Heap {
         self.swept[3] += empty.len();
         self.swept_free.extend_from_slice(partly);
         self.recycle.extend(
-            (partly.iter().rev())
-                .filter(|&&(_, free)| free >= RECYCLE)
-                .map(|&(a, _)| ((a - self.base) / BLOCK) as u32),
+            (partly.iter().rev()).filter(|&&(_, free)| free >= RECYCLE).map(|&(a, _)| ((a - self.base) / BLOCK) as u32),
         );
         let keep = self.kept_blocks();
         let mut empty = empty.to_vec();
@@ -906,9 +900,11 @@ impl Heap {
         // Only the kept blocks hold old bytes, where released ones are
         // zero (see `RELEASED_ZERO`).
         let mut kept = Vec::new();
-        self.empty.retain(|&k| !run.contains(&k) || {
-            kept.push(k);
-            false
+        self.empty.retain(|&k| {
+            !run.contains(&k) || {
+                kept.push(k);
+                false
+            }
         });
         self.clear_meta(self.block_addr(b) as usize, n);
         if RELEASED_ZERO {

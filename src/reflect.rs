@@ -1,7 +1,7 @@
 //! `Reflect`: the object operations as functions.
 
-use crate::intrinsics::{construct_with, get_from, is_constructor, ordinary_set, to_property_key};
 use crate::interp::call_function;
+use crate::intrinsics::{construct_with, get_from, is_constructor, ordinary_set, to_property_key};
 use crate::object::{DONT_ENUM, Object, as_object, object_value};
 use crate::props::is_object;
 use crate::value::Value;

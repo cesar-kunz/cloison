@@ -23,8 +23,20 @@ pub(crate) enum Field {
     Year,
 }
 
-const FIELD_NAMES: [&str; 12] =
-    ["day", "hour", "microsecond", "millisecond", "minute", "month", "monthCode", "nanosecond", "offset", "second", "timeZone", "year"];
+const FIELD_NAMES: [&str; 12] = [
+    "day",
+    "hour",
+    "microsecond",
+    "millisecond",
+    "minute",
+    "month",
+    "monthCode",
+    "nanosecond",
+    "offset",
+    "second",
+    "timeZone",
+    "year",
+];
 
 pub(crate) const DATE_FIELDS: &[Field] = &[Field::Year, Field::Month, Field::MonthCode, Field::Day];
 pub(crate) const TIME_FIELDS: &[Field] =
@@ -57,7 +69,10 @@ fn to_month_code(vm: &mut Vm, v: Value) -> Result<(u8, bool)> {
     let p = to_primitive_string(vm, v)?;
     let s = require_string(p).map_err(|_| type_err("month code must be a string"))?;
     let b = s.as_bytes();
-    let ok = (b.len() == 3 || b.len() == 4 && b[3] == b'L') && b[0] == b'M' && b[1].is_ascii_digit() && b[2].is_ascii_digit();
+    let ok = (b.len() == 3 || b.len() == 4 && b[3] == b'L')
+        && b[0] == b'M'
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit();
     let n = if ok { (b[1] - b'0') * 10 + (b[2] - b'0') } else { 0 };
     if !ok || (n == 0 && b.len() == 3) {
         return Err(range(format!("bad month code {s}; must match M01-M99 or M00L-M99L")));
@@ -79,7 +94,10 @@ pub(crate) fn prepare(vm: &mut Vm, bag: Value, which: &[Field], required: Requir
                 Required::Partial => {}
                 Required::Some(req) => {
                     if req.contains(&f) {
-                        return Err(type_err(format!("required property '{}' missing or undefined", FIELD_NAMES[f as usize])));
+                        return Err(type_err(format!(
+                            "required property '{}' missing or undefined",
+                            FIELD_NAMES[f as usize]
+                        )));
                     }
                     if let Some(k) = time_index(f) {
                         out.time[k] = Some(0.0);
@@ -191,7 +209,10 @@ fn resolve(f: &Fields, t: FieldsType) -> Result<f64> {
         None => f.month.ok_or_else(|| type_err("either month or monthCode is required")),
         Some((n, leap)) => {
             if leap || !(1..=12).contains(&n) {
-                return Err(range(format!("invalid monthCode for the ISO calendar: M{n:02}{}", if leap { "L" } else { "" })));
+                return Err(range(format!(
+                    "invalid monthCode for the ISO calendar: M{n:02}{}",
+                    if leap { "L" } else { "" }
+                )));
             }
             if f.month.is_some_and(|m| m != n as f64) {
                 return Err(range("month and monthCode must match"));

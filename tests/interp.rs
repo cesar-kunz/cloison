@@ -15,9 +15,7 @@ use cloison::value::Value;
 /// match. Everything else compares bitwise.
 fn same(a: Value, b: Value) -> bool {
     match (a.as_number(), b.as_number()) {
-        (Some(x), Some(y)) => {
-            (x == y && x.is_sign_negative() == y.is_sign_negative()) || (x.is_nan() && y.is_nan())
-        }
+        (Some(x), Some(y)) => (x == y && x.is_sign_negative() == y.is_sign_negative()) || (x.is_nan() && y.is_nan()),
         _ => a == b,
     }
 }
@@ -31,41 +29,23 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
     cloison::bytecode::quicken(&mut quick);
     let mut quick_regs = initial.clone();
     let q = unsafe { cloison::interp::run(&quick, &mut quick_regs) };
-    assert!(
-        same(interp, q),
-        "interp returned {interp:?}, quickened {q:?}"
-    );
+    assert!(same(interp, q), "interp returned {interp:?}, quickened {q:?}");
     for (r, (i, j)) in regs.iter().zip(&quick_regs).enumerate() {
         assert!(same(*i, *j), "r{r}: interp {i:?}, quickened {j:?}");
     }
     for (name, mut f) in [
         ("jit1", JitFunction::new(&code).eager().unspecialized()),
-        (
-            "jit2",
-            JitFunction::new(&code).eager().without_register_homes(),
-        ),
+        ("jit2", JitFunction::new(&code).eager().without_register_homes()),
         ("jit3", JitFunction::new(&code).eager().without_fusion()),
-        (
-            "jit4",
-            JitFunction::new(&code).eager().without_unboxed_ints(),
-        ),
+        ("jit4", JitFunction::new(&code).eager().without_unboxed_ints()),
         // Starts in the interpreter and tiers up at the third loop back edge,
         // so loops cross into JIT code mid-way.
-        (
-            "tiered",
-            JitFunction::new(&code).tiered(Tiering {
-                back_edges: 3,
-                calls: 1,
-            }),
-        ),
+        ("tiered", JitFunction::new(&code).tiered(Tiering { back_edges: 3, calls: 1 })),
         ("jit", JitFunction::new(&code).eager()),
     ] {
         let mut jit_regs = initial.clone();
         let jit = unsafe { f.run(&mut jit_regs) };
-        assert!(
-            same(interp, jit),
-            "interp returned {interp:?}, {name} {jit:?}"
-        );
+        assert!(same(interp, jit), "interp returned {interp:?}, {name} {jit:?}");
         for (r, (i, j)) in regs.iter().zip(&jit_regs).enumerate() {
             assert!(same(*i, *j), "r{r}: interp {i:?}, {name} {j:?}");
         }
@@ -156,33 +136,19 @@ fn double_plus_double() {
 fn double_overflow_and_nan() {
     let mut a = Assembler::new();
     a.ldar(0).add(1).ret();
-    let r = exec(
-        a,
-        &mut [
-            Value::from_f64(f64::INFINITY),
-            Value::from_f64(f64::NEG_INFINITY),
-        ],
-    );
+    let r = exec(a, &mut [Value::from_f64(f64::INFINITY), Value::from_f64(f64::NEG_INFINITY)]);
     assert!(r.is_double() && r.as_number().unwrap().is_nan(), "{r:?}");
 }
 
 #[test]
 fn add_primitives() {
     // undefined + 1 = NaN, null + 1 = 1, true + 1 = 2.
-    let cases = [
-        (Value::UNDEFINED, f64::NAN),
-        (Value::NULL, 1.0),
-        (Value::TRUE, 2.0),
-        (Value::FALSE, 1.0),
-    ];
+    let cases = [(Value::UNDEFINED, f64::NAN), (Value::NULL, 1.0), (Value::TRUE, 2.0), (Value::FALSE, 1.0)];
     for (v, expected) in cases {
         let mut a = Assembler::new();
         a.lda_smi(1).add(0).ret();
         let r = exec(a, &mut [v]).as_number().unwrap();
-        assert!(
-            r == expected || (r.is_nan() && expected.is_nan()),
-            "{v:?} + 1 = {r}"
-        );
+        assert!(r == expected || (r.is_nan() && expected.is_nan()), "{v:?} + 1 = {r}");
     }
 }
 
@@ -190,12 +156,7 @@ fn add_primitives() {
 fn inc_undefined_is_nan() {
     let mut a = Assembler::new();
     a.ldar(0).inc().ret();
-    assert!(
-        exec(a, &mut [Value::UNDEFINED])
-            .as_number()
-            .unwrap()
-            .is_nan()
-    );
+    assert!(exec(a, &mut [Value::UNDEFINED]).as_number().unwrap().is_nan());
 }
 
 #[test]
@@ -279,31 +240,18 @@ fn i32_state_overflow_recovers_original_acc() {
     // acc is unboxed in I32 when the add overflows; the slow path must see
     // the original operands, not the wrapped sum.
     let mut a = Assembler::new();
-    a.lda_smi(i32::MAX - 1)
-        .star(0)
-        .lda_smi(i32::MAX)
-        .add(0)
-        .ret();
-    assert_eq!(
-        exec(a, &mut [Value::UNDEFINED]).as_number(),
-        Some(2.0 * i32::MAX as f64 - 1.0)
-    );
+    a.lda_smi(i32::MAX - 1).star(0).lda_smi(i32::MAX).add(0).ret();
+    assert_eq!(exec(a, &mut [Value::UNDEFINED]).as_number(), Some(2.0 * i32::MAX as f64 - 1.0));
     let mut a = Assembler::new();
     a.lda_smi(i32::MIN).star(0).add(0).ret();
-    assert_eq!(
-        exec(a, &mut [Value::UNDEFINED]).as_number(),
-        Some(2.0 * i32::MIN as f64)
-    );
+    assert_eq!(exec(a, &mut [Value::UNDEFINED]).as_number(), Some(2.0 * i32::MIN as f64));
 }
 
 #[test]
 fn i32_state_add_with_non_int_rhs() {
     let mut a = Assembler::new();
     a.lda_smi(1).add(0).ret();
-    assert_eq!(
-        exec(a, &mut [Value::from_f64(0.25)]).as_number(),
-        Some(1.25)
-    );
+    assert_eq!(exec(a, &mut [Value::from_f64(0.25)]).as_number(), Some(1.25));
 }
 
 #[test]
@@ -323,19 +271,9 @@ fn i32_state_star_stores_boxed_values() {
     // (whose unboxed form has high bits clear).
     let mut regs = [Value::UNDEFINED; 3];
     let mut a = Assembler::new();
-    a.lda_smi(-5)
-        .inc()
-        .star(0)
-        .add_smi(10)
-        .star(1)
-        .add(1)
-        .star(2)
-        .ret();
+    a.lda_smi(-5).inc().star(0).add_smi(10).star(1).add(1).star(2).ret();
     let r = exec(a, &mut regs);
-    assert_eq!(
-        regs,
-        [Value::from_i32(-4), Value::from_i32(6), Value::from_i32(12)]
-    );
+    assert_eq!(regs, [Value::from_i32(-4), Value::from_i32(6), Value::from_i32(12)]);
     assert_eq!(r, Value::from_i32(12));
 }
 
@@ -361,11 +299,7 @@ fn jit(a: &Assembler, regs: &mut [Value]) -> (Value, JitFunction) {
 }
 
 fn stencils(f: &JitFunction) -> Vec<String> {
-    f.last_code()
-        .unwrap()
-        .stencils()
-        .map(String::from)
-        .collect()
+    f.last_code().unwrap().stencils().map(String::from).collect()
 }
 
 /// Whether some selected stencil adds with type case `case` (`"fi"`, …),
@@ -377,19 +311,12 @@ fn has_add(s: &[String], case: &str) -> bool {
 /// Whether `suffix` is a location: `m`, `g<k>`, `u<k>` or `f<k>`.
 fn is_loc(suffix: &str) -> bool {
     suffix == "m"
-        || suffix
-            .strip_prefix(['g', 'u', 'f'])
-            .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+        || suffix.strip_prefix(['g', 'u', 'f']).is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether some selected stencil is `name`, or `name` at some location.
 fn has(s: &[String], name: &str) -> bool {
-    s.iter().any(|n| {
-        n == name
-            || n.strip_prefix(name)
-                .and_then(|r| r.strip_prefix('_'))
-                .is_some_and(is_loc)
-    })
+    s.iter().any(|n| n == name || n.strip_prefix(name).and_then(|r| r.strip_prefix('_')).is_some_and(is_loc))
 }
 
 #[test]
@@ -402,15 +329,10 @@ fn int_loop_is_fully_specialized() {
     // The add may be fused (`addr_ii_<r>_<r2>`); `inc` isn't, since
     // `sum_loop` puts a `nop` between it and its `star`.
     assert!(
-        (has(&s, "add_ii") || s.iter().any(|n| n.starts_with("addr_ii_")))
-            && has(&s, "inc_i")
-            && has(&s, "jlt_ii"),
+        (has(&s, "add_ii") || s.iter().any(|n| n.starts_with("addr_ii_"))) && has(&s, "inc_i") && has(&s, "jlt_ii"),
         "{s:?}"
     );
-    assert!(
-        !["add", "inc", "jlt"].iter().any(|g| has(&s, g)),
-        "generic stencil in {s:?}"
-    );
+    assert!(!["add", "inc", "jlt"].iter().any(|g| has(&s, g)), "generic stencil in {s:?}");
 }
 
 #[test]
@@ -494,16 +416,9 @@ fn loop_registers_live_in_machine_registers() {
     let (v, f) = jit(&sum_loop(1000), &mut [Value::UNDEFINED; 3]);
     assert_eq!(v, Value::from_i32(499500));
     // Only ever int32: unboxed in GPR slots.
-    assert!(
-        homes(&f).iter().all(|h| matches!(h, Home::Int(_))),
-        "{:?}",
-        homes(&f)
-    );
+    assert!(homes(&f).iter().all(|h| matches!(h, Home::Int(_))), "{:?}", homes(&f));
     let s = stencils(&f);
-    assert!(
-        s.iter().all(|n| !n.ends_with("_m")),
-        "memory access in {s:?}"
-    );
+    assert!(s.iter().all(|n| !n.ends_with("_m")), "memory access in {s:?}");
 }
 
 #[test]
@@ -557,16 +472,8 @@ fn more_registers_than_slots_use_memory() {
     let (v, f) = jit(&a, &mut regs);
     assert_eq!(v, Value::from_i32(100));
     let h = homes(&f);
-    assert_eq!(
-        h.iter()
-            .filter(|h| matches!(h, Home::Gpr(_) | Home::Int(_)))
-            .count(),
-        GPR_SLOTS
-    );
-    assert_eq!(
-        h.iter().filter(|h| **h == Home::Mem).count(),
-        k + 1 - GPR_SLOTS
-    );
+    assert_eq!(h.iter().filter(|h| matches!(h, Home::Gpr(_) | Home::Int(_))).count(), GPR_SLOTS);
+    assert_eq!(h.iter().filter(|h| **h == Home::Mem).count(), k + 1 - GPR_SLOTS);
     for (r, v) in regs.iter().enumerate().take(k) {
         assert_eq!(*v, Value::from_i32(100 * (r as i32 + 1)), "r{r}");
     }
@@ -600,11 +507,7 @@ fn runtime_calls_preserve_slot_registers() {
     let v = exec(a.clone(), &mut regs.clone());
     assert_eq!(v.as_number(), Some(50.5));
     let (_, f) = jit(&a, &mut regs);
-    assert!(
-        matches!(homes(&f)[d as usize], Home::Fpr(_)),
-        "{:?}",
-        homes(&f)
-    );
+    assert!(matches!(homes(&f)[d as usize], Home::Fpr(_)), "{:?}", homes(&f));
     assert!(has(&stencils(&f), "add_smi"), "{:?}", stencils(&f));
     for (r, v) in regs.iter().enumerate().take(8) {
         assert_eq!(*v, Value::from_i32(50 * (r as i32 + 1)), "r{r}");
@@ -631,10 +534,7 @@ fn fusible_loop(k: i32, n: i32, start: i32) -> Assembler {
 #[test]
 fn loop_body_and_tail_fuse() {
     let a = fusible_loop(3, 1000, 0);
-    assert_eq!(
-        exec(a.clone(), &mut [Value::UNDEFINED; 2]),
-        Value::from_i32(3000)
-    );
+    assert_eq!(exec(a.clone(), &mut [Value::UNDEFINED; 2]), Value::from_i32(3000));
     let (_, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
     let s = stencils(&f);
     assert!(s.iter().any(|n| n.starts_with("addi_u")), "{s:?}");
@@ -647,18 +547,11 @@ fn fused_add_overflow_exits_and_resumes() {
     // rematerialized from the slot, then a recompile where `s` is a double.
     let a = fusible_loop(1000, 100, i32::MAX - 50_000);
     let expected = (i32::MAX - 50_000) as f64 + 100_000.0;
-    assert_eq!(
-        exec(a.clone(), &mut [Value::UNDEFINED; 2]).as_number(),
-        Some(expected)
-    );
+    assert_eq!(exec(a.clone(), &mut [Value::UNDEFINED; 2]).as_number(), Some(expected));
     let (v, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
     assert_eq!(v.as_number(), Some(expected));
     assert_eq!((f.stats.compiles, f.stats.exits), (2, 1));
-    assert!(
-        stencils(&f).iter().any(|n| n.starts_with("addi_f")),
-        "{:?}",
-        stencils(&f)
-    );
+    assert!(stencils(&f).iter().any(|n| n.starts_with("addi_f")), "{:?}", stencils(&f));
 }
 
 #[test]
@@ -674,10 +567,7 @@ fn fused_loop_tail_overflow_exits() {
     a.ldar(0).inc().star(0).jump_if_less_smi(0, top);
     a.ldar(0).ret();
     let max = [Value::UNDEFINED, Value::from_i32(i32::MAX)];
-    assert_eq!(
-        exec(a.clone(), &mut max.clone()).as_number(),
-        Some(2147483648.0)
-    );
+    assert_eq!(exec(a.clone(), &mut max.clone()).as_number(), Some(2147483648.0));
     let code = a.clone().finish();
     let mut f = JitFunction::new(&code).eager();
     let v = unsafe { f.run(&mut max.clone()) };
@@ -698,16 +588,9 @@ fn live_accumulator_after_a_fused_group() {
     let mut a = Assembler::new();
     a.lda_smi(1).star(0).star(1);
     a.ldar(0).add_smi(5).star(0).star(1).add(0).ret();
-    assert_eq!(
-        exec(a.clone(), &mut [Value::UNDEFINED; 2]),
-        Value::from_i32(12)
-    );
+    assert_eq!(exec(a.clone(), &mut [Value::UNDEFINED; 2]), Value::from_i32(12));
     let (_, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
-    assert!(
-        stencils(&f).iter().any(|n| n.starts_with("addi_u")),
-        "{:?}",
-        stencils(&f)
-    );
+    assert!(stencils(&f).iter().any(|n| n.starts_with("addi_u")), "{:?}", stencils(&f));
 }
 
 #[test]
@@ -721,16 +604,9 @@ fn no_fusion_across_a_jump_target() {
     a.add_smi(1).star(0).jump(out);
     a.bind(out);
     a.ldar(0).ret();
-    assert_eq!(
-        exec(a.clone(), &mut [Value::UNDEFINED]),
-        Value::from_i32(21)
-    );
+    assert_eq!(exec(a.clone(), &mut [Value::UNDEFINED]), Value::from_i32(21));
     let (_, f) = jit(&a, &mut [Value::UNDEFINED]);
-    assert!(
-        !stencils(&f).iter().any(|n| n.starts_with("addi_")),
-        "{:?}",
-        stencils(&f)
-    );
+    assert!(!stencils(&f).iter().any(|n| n.starts_with("addi_")), "{:?}", stencils(&f));
 }
 
 #[test]
@@ -748,11 +624,7 @@ fn fused_double_accumulation() {
     let regs = [Value::from_f64(0.5), Value::UNDEFINED];
     assert_eq!(exec(a.clone(), &mut regs.clone()).as_number(), Some(4950.5));
     let (_, f) = jit(&a, &mut regs.clone());
-    assert!(
-        stencils(&f).iter().any(|n| n.starts_with("addr_fi_f")),
-        "{:?}",
-        stencils(&f)
-    );
+    assert!(stencils(&f).iter().any(|n| n.starts_with("addr_fi_f")), "{:?}", stencils(&f));
 }
 
 // ---- Unboxed int32 slots ----
@@ -769,11 +641,7 @@ fn fused_register_add_overflow_undoes_and_exits() {
     a.ldar(a_).add(b_).star(a_);
     a.ldar(i).inc().star(i).jump_if_less_smi(10, top);
     a.ldar(a_).ret();
-    let regs = [
-        Value::from_i32(i32::MAX - 5_000_000),
-        Value::from_i32(1_000_000),
-        Value::UNDEFINED,
-    ];
+    let regs = [Value::from_i32(i32::MAX - 5_000_000), Value::from_i32(1_000_000), Value::UNDEFINED];
     let v = exec(a.clone(), &mut regs.clone());
     assert_eq!(v.as_number(), Some((i32::MAX - 5_000_000) as f64 + 10e6));
     let code = a.finish();
@@ -831,10 +699,7 @@ fn int_acc_is_boxed_where_a_join_widens_it() {
 
 /// Names of the fused groups (and in-place adds) in `f`'s last code.
 fn group_names(f: &JitFunction) -> Vec<String> {
-    stencils(f)
-        .into_iter()
-        .filter(|n| n.contains('+') || n.starts_with("addr_"))
-        .collect()
+    stencils(f).into_iter().filter(|n| n.contains('+') || n.starts_with("addr_")).collect()
 }
 
 /// `r2 = r0 + r1 (+ r1 …)` in a loop, `extra` more adds of r1.
@@ -857,39 +722,22 @@ fn three_address_loop(extra: usize) -> Assembler {
 #[test]
 fn three_address_add_fuses_as_move_and_add() {
     let a = three_address_loop(0);
-    let regs = [
-        Value::from_i32(5),
-        Value::from_i32(7),
-        Value::UNDEFINED,
-        Value::UNDEFINED,
-    ];
+    let regs = [Value::from_i32(5), Value::from_i32(7), Value::UNDEFINED, Value::UNDEFINED];
     assert_eq!(exec(a.clone(), &mut regs.clone()), Value::from_i32(12));
     let (_, f) = jit(&a, &mut regs.clone());
     let g = group_names(&f);
-    assert!(
-        g.iter()
-            .any(|n| n.starts_with("mov_u") && n.contains("+addr_ii_u")),
-        "{g:?}"
-    );
+    assert!(g.iter().any(|n| n.starts_with("mov_u") && n.contains("+addr_ii_u")), "{g:?}");
 }
 
 #[test]
 fn add_chain_fuses() {
     // t = x + y + y + y
     let a = three_address_loop(2);
-    let regs = [
-        Value::from_i32(5),
-        Value::from_i32(7),
-        Value::UNDEFINED,
-        Value::UNDEFINED,
-    ];
+    let regs = [Value::from_i32(5), Value::from_i32(7), Value::UNDEFINED, Value::UNDEFINED];
     assert_eq!(exec(a.clone(), &mut regs.clone()), Value::from_i32(26));
     let (_, f) = jit(&a, &mut regs.clone());
     let g = group_names(&f);
-    assert!(
-        g.iter().any(|n| n.matches("+addr_ii_u").count() == 3),
-        "{g:?}"
-    );
+    assert!(g.iter().any(|n| n.matches("+addr_ii_u").count() == 3), "{g:?}");
 }
 
 #[test]
@@ -907,25 +755,16 @@ fn add_chain_overflow_mid_chain() {
     let yv = 1_500_000_000;
     let regs = [Value::from_i32(7), Value::from_i32(yv), Value::UNDEFINED];
     let expected = 7.0 + 2.0 * yv as f64;
-    assert_eq!(
-        exec(a.clone(), &mut regs.clone()).as_number(),
-        Some(expected)
-    );
+    assert_eq!(exec(a.clone(), &mut regs.clone()).as_number(), Some(expected));
     let mut r = regs;
     let (v, f) = jit(&a, &mut r);
     assert_eq!(v.as_number(), Some(expected));
     assert_eq!(f.stats.exits, 1);
     assert_eq!(r[t as usize].as_number(), Some(expected));
     // Without the overflow, the code shows the fused chain.
-    let (_, f) = jit(
-        &a,
-        &mut [Value::from_i32(1), Value::from_i32(2), Value::UNDEFINED],
-    );
+    let (_, f) = jit(&a, &mut [Value::from_i32(1), Value::from_i32(2), Value::UNDEFINED]);
     let g = group_names(&f);
-    assert!(
-        g.iter().any(|n| n.matches("+addr_ii_u").count() == 2),
-        "{g:?}"
-    );
+    assert!(g.iter().any(|n| n.matches("+addr_ii_u").count() == 2), "{g:?}");
 }
 
 #[test]
@@ -942,11 +781,7 @@ fn add_chain_reading_its_destination_is_not_fused() {
     let regs = [Value::from_i32(3), Value::UNDEFINED, Value::UNDEFINED];
     assert_eq!(exec(a.clone(), &mut regs.clone()), Value::from_i32(30));
     let (_, f) = jit(&a, &mut regs.clone());
-    assert!(
-        !stencils(&f).iter().any(|n| n.starts_with("mov_u")),
-        "{:?}",
-        stencils(&f)
-    );
+    assert!(!stencils(&f).iter().any(|n| n.starts_with("mov_u")), "{:?}", stencils(&f));
 }
 
 #[test]
@@ -963,13 +798,7 @@ fn three_address_double_from_int() {
     let regs = [Value::from_f64(0.5), Value::from_f64(0.0), Value::UNDEFINED];
     assert_eq!(exec(a.clone(), &mut regs.clone()).as_number(), Some(9.5));
     let (_, f) = jit(&a, &mut regs.clone());
-    assert!(
-        stencils(&f)
-            .iter()
-            .any(|n| n.starts_with("mov_f") && n.contains("+addr_ff_f")),
-        "{:?}",
-        stencils(&f)
-    );
+    assert!(stencils(&f).iter().any(|n| n.starts_with("mov_f") && n.contains("+addr_ff_f")), "{:?}", stencils(&f));
 }
 
 // ---- Tiering and versions (milestone 4) ----
@@ -984,10 +813,7 @@ fn hot_loop_tiers_up_at_its_header() {
     let mut f = JitFunction::new(&code).tiered(tiered(100, 10));
     let v = unsafe { f.run(&mut [Value::UNDEFINED; 3]) };
     assert_eq!(v, Value::from_i32(499500));
-    assert_eq!(
-        (f.stats.interp_runs, f.stats.osr_entries, f.stats.compiles),
-        (1, 1, 1)
-    );
+    assert_eq!((f.stats.interp_runs, f.stats.osr_entries, f.stats.compiles), (1, 1, 1));
 }
 
 #[test]
@@ -1021,10 +847,7 @@ fn frequent_calls_compile_at_entry() {
     let code = a.finish();
     let mut f = JitFunction::new(&code).tiered(tiered(100, 3));
     for _ in 0..10 {
-        assert_eq!(
-            unsafe { f.run(&mut [Value::from_i32(41)]) },
-            Value::from_i32(42)
-        );
+        assert_eq!(unsafe { f.run(&mut [Value::from_i32(41)]) }, Value::from_i32(42));
     }
     assert_eq!((f.stats.interp_runs, f.stats.compiles), (3, 1));
 }
@@ -1036,11 +859,7 @@ fn versions_are_reused_across_calls() {
     let code = a.finish();
     let mut f = JitFunction::new(&code).eager();
     for i in 0..10 {
-        let (arg, expected) = if i % 2 == 0 {
-            (Value::from_i32(1), 2.0)
-        } else {
-            (Value::from_f64(1.5), 2.5)
-        };
+        let (arg, expected) = if i % 2 == 0 { (Value::from_i32(1), 2.0) } else { (Value::from_f64(1.5), 2.5) };
         assert_eq!(unsafe { f.run(&mut [arg]) }.as_number(), Some(expected));
     }
     assert_eq!((f.stats.compiles, f.version_count()), (2, 2));
@@ -1053,14 +872,8 @@ fn an_int_enters_a_double_version() {
     a.ldar(0).add_smi(1).ret();
     let code = a.finish();
     let mut f = JitFunction::new(&code).eager();
-    assert_eq!(
-        unsafe { f.run(&mut [Value::from_f64(0.5)]) }.as_number(),
-        Some(1.5)
-    );
-    assert_eq!(
-        unsafe { f.run(&mut [Value::from_i32(2)]) }.as_number(),
-        Some(3.0)
-    );
+    assert_eq!(unsafe { f.run(&mut [Value::from_f64(0.5)]) }.as_number(), Some(1.5));
+    assert_eq!(unsafe { f.run(&mut [Value::from_i32(2)]) }.as_number(), Some(3.0));
     assert_eq!(f.stats.compiles, 1);
 }
 
@@ -1086,28 +899,12 @@ fn megamorphic_entries_generalize() {
     let code = a.finish();
     let mut f = JitFunction::new(&code).eager();
     let (i, d, n) = (Value::from_i32(1), Value::from_f64(0.5), Value::NULL);
-    let calls = [
-        (i, i),
-        (d, i),
-        (i, d),
-        (n, i),
-        (i, n),
-        (d, d),
-        (n, n),
-        (i, i),
-    ];
+    let calls = [(i, i), (d, i), (i, d), (n, i), (i, n), (d, d), (n, n), (i, i)];
     let expected = [2.0, 1.5, 1.5, 1.0, 1.0, 1.0, 0.0, 2.0];
     for ((x, y), e) in calls.into_iter().zip(expected) {
-        assert_eq!(
-            unsafe { f.run(&mut [x, y]) }.as_number(),
-            Some(e),
-            "{x:?} + {y:?}"
-        );
+        assert_eq!(unsafe { f.run(&mut [x, y]) }.as_number(), Some(e), "{x:?} + {y:?}");
     }
-    assert_eq!(
-        (f.stats.compiles, f.stats.generalizations, f.version_count()),
-        (5, 1, 1)
-    );
+    assert_eq!((f.stats.compiles, f.stats.generalizations, f.version_count()), (5, 1, 1));
 }
 
 #[test]
@@ -1120,16 +917,10 @@ fn accumulator_carried_across_the_back_edge() {
     a.bind(top);
     a.add_smi(1).star(0).jump_if_less_smi(100, top);
     a.ret();
-    assert_eq!(
-        exec(a.clone(), &mut [Value::UNDEFINED]),
-        Value::from_i32(100)
-    );
+    assert_eq!(exec(a.clone(), &mut [Value::UNDEFINED]), Value::from_i32(100));
     let code = a.finish();
     let mut f = JitFunction::new(&code).tiered(tiered(10, 10));
-    assert_eq!(
-        unsafe { f.run(&mut [Value::UNDEFINED]) },
-        Value::from_i32(100)
-    );
+    assert_eq!(unsafe { f.run(&mut [Value::UNDEFINED]) }, Value::from_i32(100));
     assert_eq!(f.stats.osr_entries, 1);
 }
 
@@ -1137,17 +928,11 @@ fn accumulator_carried_across_the_back_edge() {
 fn tiering_is_the_default() {
     // Short: stays in the interpreter. Long: tiers up after 1000 back edges.
     let mut short = JitFunction::new(&sum_loop(100).finish());
-    assert_eq!(
-        unsafe { short.run(&mut [Value::UNDEFINED; 3]) },
-        Value::from_i32(4950)
-    );
+    assert_eq!(unsafe { short.run(&mut [Value::UNDEFINED; 3]) }, Value::from_i32(4950));
     assert_eq!((short.stats.compiles, short.stats.osr_entries), (0, 0));
     let mut long = JitFunction::new(&sum_loop(5000).finish());
     let n = 5000i64;
-    assert_eq!(
-        unsafe { long.run(&mut [Value::UNDEFINED; 3]) }.as_number(),
-        Some((n * (n - 1) / 2) as f64)
-    );
+    assert_eq!(unsafe { long.run(&mut [Value::UNDEFINED; 3]) }.as_number(), Some((n * (n - 1) / 2) as f64));
     assert_eq!(long.stats.osr_entries, 1);
 }
 
@@ -1159,24 +944,9 @@ fn emit(a: &mut Assembler, op: Op, args: &[Arg]) {
 
 /// Values of every kind the numeric operations distinguish.
 fn sample_values() -> Vec<Value> {
-    let mut v: Vec<Value> = [0, 1, -1, 7, -6, -7, 1024, i32::MIN, i32::MAX]
-        .into_iter()
-        .map(Value::from_i32)
-        .collect();
+    let mut v: Vec<Value> = [0, 1, -1, 7, -6, -7, 1024, i32::MIN, i32::MAX].into_iter().map(Value::from_i32).collect();
     v.extend(
-        [
-            2.5,
-            -0.0,
-            -6.0,
-            7.75,
-            f64::NAN,
-            f64::INFINITY,
-            -1e20,
-            1e300,
-            4294967301.0,
-        ]
-        .into_iter()
-        .map(Value::from_f64),
+        [2.5, -0.0, -6.0, 7.75, f64::NAN, f64::INFINITY, -1e20, 1e300, 4294967301.0].into_iter().map(Value::from_f64),
     );
     v.extend([Value::UNDEFINED, Value::NULL, Value::TRUE, Value::FALSE]);
     v
@@ -1229,12 +999,7 @@ fn comparisons_agree_on_every_pair_of_values() {
 
 #[test]
 fn to_boolean_jumps_agree_on_every_kind_of_value() {
-    for jump in [
-        Op::JumpIfToBooleanTrue,
-        Op::JumpIfToBooleanFalse,
-        Op::JumpIfTrue,
-        Op::JumpIfFalse,
-    ] {
+    for jump in [Op::JumpIfToBooleanTrue, Op::JumpIfToBooleanFalse, Op::JumpIfTrue, Op::JumpIfFalse] {
         for v in sample_values() {
             let mut a = Assembler::new();
             let yes = a.label();
@@ -1310,25 +1075,14 @@ fn numeric_loop_fuses_compares_with_branches() {
         let s = stencils(&f);
         // `i` never holds a negative int32: the `_u` forms, without sign
         // handling (7's magic number shift is 31 + ⌈log2 7⌉).
-        let mod_stencil = if modulus == 8 {
-            "mod_smi_pow2_u"
-        } else {
-            "mod_smi_u_s34"
-        };
+        let mod_stencil = if modulus == 8 { "mod_smi_pow2_u" } else { "mod_smi_u_s34" };
         for want in [mod_stencil, "bit_and_smi_i", "bit_or_smi_i"] {
-            assert!(
-                s.iter()
-                    .any(|n| n == want || n.starts_with(&format!("{want}_k16"))),
-                "{want}: {s:?}"
-            );
+            assert!(s.iter().any(|n| n == want || n.starts_with(&format!("{want}_k16"))), "{want}: {s:?}");
         }
         for want in ["tlt_jf_", "tstz_jf_", "teq_jf_", "teq_smi_jf_"] {
             assert!(s.iter().any(|n| n.starts_with(want)), "{want}: {s:?}");
         }
-        assert!(
-            !s.iter().any(|n| n.starts_with("test_") || n == "jfalse"),
-            "unfused comparison in {s:?}"
-        );
+        assert!(!s.iter().any(|n| n.starts_with("test_") || n == "jfalse"), "unfused comparison in {s:?}");
     }
 }
 
@@ -1371,11 +1125,7 @@ fn negative_zero_remainder_exits_then_produces_doubles() {
         let (_, f) = jit(&a, &mut [Value::UNDEFINED; 3]);
         assert_eq!(f.stats.exits, 1, "k = {k}");
         let s = stencils(&f);
-        assert!(
-            s.iter()
-                .any(|n| n.starts_with("mod_smi") && n.contains("iif")),
-            "{s:?}"
-        );
+        assert!(s.iter().any(|n| n.starts_with("mod_smi") && n.contains("iif")), "{s:?}");
     }
 }
 
@@ -1432,9 +1182,7 @@ fn remainders_of_non_negative_values_skip_sign_handling() {
     a.ldar(i).inc().star(i).jump_if_less_smi(1000, top);
     a.ldar(sum).ret();
     let v = exec(a.clone(), &mut [Value::UNDEFINED; 4]);
-    let expect: i32 = (0..1000)
-        .map(|i| ((i & 255) + 3) % 10 + if i == 5 { -3 } else { i % 7 })
-        .sum();
+    let expect: i32 = (0..1000).map(|i| ((i & 255) + 3) % 10 + if i == 5 { -3 } else { i % 7 }).sum();
     assert_eq!(v, Value::from_i32(expect));
     let (_, f) = jit(&a, &mut [Value::UNDEFINED; 4]);
     let s = stencils(&f);
@@ -1467,9 +1215,7 @@ fn remainders_of_negative_adds_and_joins() {
     a.bind(minus);
     a.lda_smi(-3).jump(rem);
     let v = exec(a.clone(), &mut [Value::UNDEFINED; 3]);
-    let expect: i32 = (0..1000)
-        .map(|i| (i - 5) % 7 + if i == 3 { -3 } else { i % 10 })
-        .sum();
+    let expect: i32 = (0..1000).map(|i| (i - 5) % 7 + if i == 3 { -3 } else { i % 10 }).sum();
     assert_eq!(v, Value::from_i32(expect));
 }
 
@@ -1519,8 +1265,5 @@ fn add_feeding_to_int32_wraps_without_exits() {
     let (_, f) = jit(&a, &mut [Value::UNDEFINED; 3]);
     assert_eq!(f.stats.exits, 0);
     let s = stencils(&f);
-    assert!(
-        has(&s, "add_wrap_ii") && s.iter().any(|n| n.starts_with("add_smi_wrap_i")),
-        "{s:?}"
-    );
+    assert!(has(&s, "add_wrap_ii") && s.iter().any(|n| n.starts_with("add_smi_wrap_i")), "{s:?}");
 }

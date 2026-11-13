@@ -166,7 +166,11 @@ impl Parser<'_> {
                 0 => Node::Empty,
                 // (A lone surrogate as its code unit, matching alone: see
                 // `code_points`.)
-                _ => Node::Seq(s.into_iter().map(|c| char::from_u32(c).map_or(code_points(Node::Char(c as u16)), |c| self.char_here(c))).collect()),
+                _ => Node::Seq(
+                    s.into_iter()
+                        .map(|c| char::from_u32(c).map_or(code_points(Node::Char(c as u16)), |c| self.char_here(c)))
+                        .collect(),
+                ),
             })
             .collect();
         if !set.cps.is_empty() || alts.is_empty() {
@@ -499,7 +503,13 @@ impl Regex {
         if p.i != chars.len() {
             return Err(p.error("Unmatched ')'"));
         }
-        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, sets], explicit))
+        Ok((
+            node,
+            p.groups,
+            p.names,
+            [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, sets],
+            explicit,
+        ))
     }
 
     /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
@@ -510,8 +520,13 @@ impl Regex {
     /// [`Regex::new`] of a pattern's code units (a lone surrogate in it a
     /// pattern character).
     pub fn of_units(pattern: &[u16], flags: &str) -> Result<Regex, String> {
-        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, unicode_sets], explicit) =
-            Regex::parse(pattern, flags)?;
+        let (
+            node,
+            groups,
+            names,
+            [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, unicode_sets],
+            explicit,
+        ) = Regex::parse(pattern, flags)?;
         let fold = Case::of(ignore_case && !explicit, unicode);
         let mut re = Regex {
             node,
@@ -729,7 +744,12 @@ impl Regex {
             }
             // (`u`: a match begins at a code point, never between a pair's
             // halves, where `lastIndex` advances past both.)
-            if self.unicode && at > start && at < s.len() && (0xD800..0xDC00).contains(&s[at - 1]) && (0xDC00..0xE000).contains(&s[at]) {
+            if self.unicode
+                && at > start
+                && at < s.len()
+                && (0xD800..0xDC00).contains(&s[at - 1])
+                && (0xDC00..0xE000).contains(&s[at])
+            {
                 at += 1;
                 continue;
             }
@@ -755,17 +775,14 @@ impl Regex {
             Some((ascii, other, false))
         };
         match n {
-            Node::Empty | Node::Start(_) | Node::End(_) | Node::Boundary(..) | Node::Look(..) => {
-                Some((0, false, true))
-            }
+            Node::Empty | Node::Start(_) | Node::End(_) | Node::Boundary(..) | Node::Look(..) => Some((0, false, true)),
             // (Case folding maps no unit past ASCII to one in it, or back,
             // but Unicode's: `ſ` and the Kelvin sign.)
             Node::Char(c) => units(&|x| eq(ic, x, *c), *c >= 128 || ic == Case::Unicode),
             Node::Any => units(&|x| !is_line_terminator(x), true),
-            Node::Class(r, neg) | Node::Alone(r, neg) => units(
-                &|x| in_class(ic, r, *neg, x),
-                *neg || r.iter().any(|&(_, hi)| hi >= 128) || ic == Case::Unicode,
-            ),
+            Node::Class(r, neg) | Node::Alone(r, neg) => {
+                units(&|x| in_class(ic, r, *neg, x), *neg || r.iter().any(|&(_, hi)| hi >= 128) || ic == Case::Unicode)
+            }
             Node::Astral(_) => Some((0, true, false)),
             Node::Group(inner, _) => self.first(inner),
             Node::BackRef(..) => None,
@@ -920,13 +937,14 @@ fn in_class_of(ic: Case, ranges: &[(u16, u16)], merged: bool, long: Option<bool>
     let mut r = has(c);
     if !r && ic != Case::Exact {
         let u = ic.canon(c);
-        r = has(u) || if long.unwrap_or_else(|| long_class(ranges)) {
-            let groups = case_groups(ic);
-            let from = groups.partition_point(|p| p.0 < u);
-            groups[from..].iter().take_while(|p| p.0 == u).any(|p| has(p.1))
-        } else {
-            ranges.iter().any(|&(lo, hi)| (lo..=hi).any(|x| ic.canon(x) == u))
-        };
+        r = has(u)
+            || if long.unwrap_or_else(|| long_class(ranges)) {
+                let groups = case_groups(ic);
+                let from = groups.partition_point(|p| p.0 < u);
+                groups[from..].iter().take_while(|p| p.0 == u).any(|p| has(p.1))
+            } else {
+                ranges.iter().any(|&(lo, hi)| (lo..=hi).any(|x| ic.canon(x) == u))
+            };
     }
     r != neg
 }
@@ -968,7 +986,10 @@ fn in_class_folded(ic: Case, ranges: &[(u16, u16)], folds: &[u16], neg: bool, c:
 
 /// Sorted inclusive ranges `r`, overlapping and adjacent ones merged.
 fn merge_units(r: &[(u16, u16)]) -> Vec<(u16, u16)> {
-    merge(r.iter().map(|&(lo, hi)| (lo as u32, hi as u32)).collect()).into_iter().map(|(lo, hi)| (lo as u16, hi as u16)).collect()
+    merge(r.iter().map(|&(lo, hi)| (lo as u32, hi as u32)).collect())
+        .into_iter()
+        .map(|(lo, hi)| (lo as u16, hi as u16))
+        .collect()
 }
 
 /// The first of `units` (none to four) in `s` at or after `from`.
@@ -1052,9 +1073,10 @@ fn width(n: &Node) -> (usize, Option<usize>) {
         Node::Astral(_) => (2, Some(2)),
         Node::Group(inner, _) => width(inner),
         Node::BackRef(..) => (0, None),
-        Node::Alt(alts) => alts.iter().map(width).fold((usize::MAX, Some(0)), |(a, b), (c, d)| {
-            (a.min(c), b.zip(d).map(|(b, d)| b.max(d)))
-        }),
+        Node::Alt(alts) => alts
+            .iter()
+            .map(width)
+            .fold((usize::MAX, Some(0)), |(a, b), (c, d)| (a.min(c), b.zip(d).map(|(b, d)| b.max(d)))),
         Node::Seq(nodes) => seq_width(nodes),
         Node::Repeat(inner, min, max, ..) => {
             let (c, d) = width(inner);
@@ -1069,9 +1091,10 @@ fn width(n: &Node) -> (usize, Option<usize>) {
 }
 
 fn seq_width(nodes: &[Node]) -> (usize, Option<usize>) {
-    nodes.iter().map(width).fold((0, Some(0)), |(a, b), (c, d)| {
-        (a.saturating_add(c), b.zip(d).map(|(b, d)| b.saturating_add(d)))
-    })
+    nodes
+        .iter()
+        .map(width)
+        .fold((0, Some(0)), |(a, b), (c, d)| (a.saturating_add(c), b.zip(d).map(|(b, d)| b.saturating_add(d))))
 }
 
 /// Whether every match of `n` begins where `^` matches (multiline as
@@ -1438,7 +1461,11 @@ impl Parser<'_> {
             if add[k] || remove[k] {
                 return Err(self.error("Repeated flag in modifiers"));
             }
-            if adding { add[k] = true } else { remove[k] = true }
+            if adding {
+                add[k] = true
+            } else {
+                remove[k] = true
+            }
             any = true;
         }
         if !any {
@@ -1457,7 +1484,11 @@ impl Parser<'_> {
         self.i += 1;
         Ok(match c {
             '.' if self.dot_all => {
-                if self.unicode { pair_or_unit(&[]) } else { Node::Class(vec![(0, 0xFFFF)], false) }
+                if self.unicode {
+                    pair_or_unit(&[])
+                } else {
+                    Node::Class(vec![(0, 0xFFFF)], false)
+                }
             }
             '.' if self.unicode => pair_or_unit(&[(0x0A, 0x0A), (0x0D, 0x0D), (0x2028, 0x2029)]),
             '.' => Node::Any,
@@ -1580,8 +1611,12 @@ impl Parser<'_> {
                 let name = self.group_name()?;
                 // (Of a name's groups in different alternatives, the one
                 // that matched: the others match empty.)
-                let refs: Vec<Node> =
-                    self.names.iter().filter(|(n, _)| *n == name).map(|&(_, g)| Node::BackRef(g, self.case())).collect();
+                let refs: Vec<Node> = self
+                    .names
+                    .iter()
+                    .filter(|(n, _)| *n == name)
+                    .map(|&(_, g)| Node::BackRef(g, self.case()))
+                    .collect();
                 match refs.len() {
                     0 => return Err(self.error("Invalid named capture referenced")),
                     1 => refs.into_iter().next().unwrap(),
@@ -1601,11 +1636,7 @@ impl Parser<'_> {
             }
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                 let (ranges, neg) = self.class_escape(e);
-                if neg && self.unicode {
-                    pair_or_unit(&ranges)
-                } else {
-                    Node::Class(ranges, neg)
-                }
+                if neg && self.unicode { pair_or_unit(&ranges) } else { Node::Class(ranges, neg) }
             }
             'u' if self.unicode && self.peek() == Some('{') => {
                 // `\u{…}`: a code point.
@@ -1614,7 +1645,9 @@ impl Parser<'_> {
                     return Err(self.error("Invalid Unicode escape"));
                 };
                 let hex: String = self.c[s..s + end].iter().collect();
-                let cp = u32::from_str_radix(&hex, 16).ok().filter(|&v| v <= 0x10FFFF && !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()));
+                let cp = u32::from_str_radix(&hex, 16)
+                    .ok()
+                    .filter(|&v| v <= 0x10FFFF && !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()));
                 let Some(cp) = cp else {
                     return Err(self.error("Invalid Unicode escape"));
                 };
@@ -1765,9 +1798,10 @@ impl Parser<'_> {
         if self.unicode
             && (0xD800..0xDC00).contains(&u)
             && self.c.get(self.i..self.i + 2) == Some(&['\\', 'u'])
-            && let Some(t) = self.c.get(self.i + 2..self.i + 6).and_then(|h| {
-                u32::from_str_radix(&h.iter().collect::<String>(), 16).ok()
-            })
+            && let Some(t) = self
+                .c
+                .get(self.i + 2..self.i + 6)
+                .and_then(|h| u32::from_str_radix(&h.iter().collect::<String>(), 16).ok())
             && (0xDC00..0xE000).contains(&t)
         {
             self.i += 6;
@@ -2132,7 +2166,11 @@ fn cp_class(mut ranges: Vec<(u32, u32)>, neg: bool) -> Node {
     let bmp: Vec<(u16, u16)> =
         ranges.iter().filter(|r| r.0 <= 0xFFFF).map(|&(lo, hi)| (lo as u16, hi.min(0xFFFF) as u16)).collect();
     if neg {
-        astral = complement_points(&astral).into_iter().filter(|r| r.1 >= 0x10000).map(|(lo, hi)| (lo.max(0x10000), hi)).collect();
+        astral = complement_points(&astral)
+            .into_iter()
+            .filter(|r| r.1 >= 0x10000)
+            .map(|(lo, hi)| (lo.max(0x10000), hi))
+            .collect();
     }
     let mut alts = Vec::new();
     if !astral.is_empty() {
@@ -2263,15 +2301,24 @@ enum Insn {
     /// The code units `Program::strs[k]`, in a row.
     Str(u32),
     /// One code unit, case folded: as given, or with its canonical form.
-    CharFold { c: u16, canon: u16 },
+    CharFold {
+        c: u16,
+        canon: u16,
+    },
     /// `.`: anything but a line terminator.
     Any,
     /// A class: ASCII members by `ascii`'s bits, the rest by
     /// `Program::classes[k]`.
-    Class { ascii: u128, k: u32 },
+    Class {
+        ascii: u128,
+        k: u32,
+    },
     /// A class's unit that is no surrogate pair's half (`Node::Alone`), as
     /// `Class`.
-    Alone { ascii: u128, k: u32 },
+    Alone {
+        ascii: u128,
+        k: u32,
+    },
     /// A surrogate pair of a code point in `Program::astral[k]`.
     Astral(u32),
     /// `^`, `$`: multiline or not.
@@ -2286,37 +2333,69 @@ enum Insn {
     /// Register `r` takes the position.
     Mark(u32),
     /// Group `g` matched from register `r`'s position to here.
-    Save { g: u32, r: u32 },
+    Save {
+        g: u32,
+        r: u32,
+    },
     /// Groups `lo..hi` are cleared (each iteration of a repetition).
-    Clear { lo: u32, hi: u32 },
+    Clear {
+        lo: u32,
+        hi: u32,
+    },
     /// Register `r` takes 0.
     Zero(u32),
     /// A repetition's head, with its count in register `c`: on into the
     /// body (the next instruction) or out to `exit`, greedy or lazy.
-    Head { c: u32, min: u32, max: u32, greedy: bool, exit: u32 },
+    Head {
+        c: u32,
+        min: u32,
+        max: u32,
+        greedy: bool,
+        exit: u32,
+    },
     /// A repetition's body done, having started at register `p`'s
     /// position: an empty iteration past the minimum fails; otherwise the
     /// count goes up, back to `head`.
-    Tail { c: u32, p: u32, min: u32, head: u32 },
+    Tail {
+        c: u32,
+        p: u32,
+        min: u32,
+        head: u32,
+    },
     /// A greedy repetition of the single-unit instruction that follows:
     /// as many as match (at most `max`), then fewer on backtracking (at
     /// least `min`); on after that instruction.
-    Run { min: u32, max: u32 },
+    Run {
+        min: u32,
+        max: u32,
+    },
     /// A lazy repetition of the single-unit instruction that follows: as
     /// few as `min`, then one more on each backtracking (at most `max`).
-    LazyRun { min: u32, max: u32 },
+    LazyRun {
+        min: u32,
+        max: u32,
+    },
     /// A lookahead, whose body follows and ends in `LookEnd`; on at
     /// `after`.
-    Look { negative: bool, after: u32 },
+    Look {
+        negative: bool,
+        after: u32,
+    },
     LookEnd,
     /// A lookbehind: its body (ending in `BehindEnd`) matched backwards
     /// from here, right to left (see `Program::backward`); on at `after`.
-    Behind { negative: bool, after: u32 },
+    Behind {
+        negative: bool,
+        after: u32,
+    },
     BehindEnd,
     /// A step back, one unit (before and after a unit matched backwards).
     Back,
     /// Group `g` matched backwards, from here to register `r`'s position.
-    SaveBack { g: u32, r: u32 },
+    SaveBack {
+        g: u32,
+        r: u32,
+    },
     /// A backreference matched backwards: the text before here.
     BackRefBack(u32, Case),
     Match,
@@ -2540,7 +2619,11 @@ impl Native {
             .classes
             .iter()
             .zip(&ranges)
-            .map(|((_, neg, alone), r)| rx::Class { ranges: r.as_ptr(), n: r.len(), neg: *neg as usize | (*alone as usize) << 1 })
+            .map(|((_, neg, alone), r)| rx::Class {
+                ranges: r.as_ptr(),
+                n: r.len(),
+                neg: *neg as usize | (*alone as usize) << 1,
+            })
             .collect();
         let reg = |r: u32| 1 + r as usize;
         let group = |g: u32| caps_at + 2 * g as usize;
@@ -2557,9 +2640,10 @@ impl Native {
         while i < code.len() {
             let p = match code[i] {
                 Insn::Char(c) => Piece { imm: c as u32, ..piece("rx_char") },
-                Insn::CharFold { c, canon } => {
-                    Piece { imm: c as u32 | ascii_upper(re.fold, canon) << 16, ..piece(if u { "rx_fold_u" } else { "rx_fold" }) }
-                }
+                Insn::CharFold { c, canon } => Piece {
+                    imm: c as u32 | ascii_upper(re.fold, canon) << 16,
+                    ..piece(if u { "rx_fold_u" } else { "rx_fold" })
+                },
                 Insn::Any => piece("rx_any"),
                 Insn::Class { ascii, k } => Piece {
                     imm: k,
@@ -2719,9 +2803,8 @@ impl Native {
             (*ctx).limit = bt.as_mut_ptr().add(bt.len() - 4);
             (*ctx).prog = &re.prog as *const Program as *const u8;
         }
-        let end = unsafe {
-            (self.code.entry())(s.as_ptr(), s.len(), at, bt.as_mut_ptr().add(2), slots.as_mut_ptr(), ctx)
-        };
+        let end =
+            unsafe { (self.code.entry())(s.as_ptr(), s.len(), at, bt.as_mut_ptr().add(2), slots.as_mut_ptr(), ctx) };
         match end {
             rx::NOMATCH => Some(false),
             rx::BAIL => {
@@ -2811,7 +2894,11 @@ impl Program {
                 let r = self.reg();
                 self.code.push(Insn::Mark(r));
                 self.emit(re, inner);
-                self.code.push(if self.backward { Insn::SaveBack { g: *g as u32, r } } else { Insn::Save { g: *g as u32, r } });
+                self.code.push(if self.backward {
+                    Insn::SaveBack { g: *g as u32, r }
+                } else {
+                    Insn::Save { g: *g as u32, r }
+                });
             }
             // A lookahead's body forwards, a lookbehind's backwards, wherever
             // they are.
@@ -3010,7 +3097,8 @@ impl Program {
                 }
                 Insn::Astral(k) => {
                     pc += 1;
-                    let ok = pos + 1 < s.len() && astral_at(s, pos).is_some_and(|c| in_points(&self.astral[k as usize], c));
+                    let ok =
+                        pos + 1 < s.len() && astral_at(s, pos).is_some_and(|c| in_points(&self.astral[k as usize], c));
                     pos += 2;
                     ok
                 }
@@ -3083,7 +3171,11 @@ impl Program {
                     let (body, exit) = (pc as u32 + 1, exit);
                     // Greedy: another iteration first, then out; lazy: out
                     // first.
-                    let (first, second) = if greedy { (more.then_some(body), done.then_some(exit)) } else { (done.then_some(exit), more.then_some(body)) };
+                    let (first, second) = if greedy {
+                        (more.then_some(body), done.then_some(exit))
+                    } else {
+                        (done.then_some(exit), more.then_some(body))
+                    };
                     match (first, second) {
                         (Some(a), Some(b)) => {
                             stack.push(Bt::Resume { pc: b, pos });
@@ -3248,11 +3340,7 @@ mod reference {
     impl Regex {
         /// [`Regex::exec`], by the reference matcher.
         pub(super) fn exec_reference(&self, s: &[u16], start: usize) -> Option<Captures> {
-            let mut m = Matcher {
-                re: self,
-                s,
-                caps: vec![None; self.groups],
-            };
+            let mut m = Matcher { re: self, s, caps: vec![None; self.groups] };
             // At every position (no skipping, which `exec` does).
             (start..=s.len()).find(|&at| {
                 for c in m.caps.iter_mut() {
@@ -3267,165 +3355,165 @@ mod reference {
         }
     }
 
-struct Matcher<'a> {
-    re: &'a Regex,
-    s: &'a [u16],
-    caps: Captures,
-}
-
-type K<'k, 'a> = &'k mut dyn FnMut(&mut Matcher<'a>, usize) -> bool;
-
-impl<'a> Matcher<'a> {
-    fn eq(&self, a: u16, b: u16) -> bool {
-        eq(self.re.fold, a, b)
+    struct Matcher<'a> {
+        re: &'a Regex,
+        s: &'a [u16],
+        caps: Captures,
     }
 
-    fn in_class(&self, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
-        in_class(self.re.fold, ranges, neg, c)
-    }
+    type K<'k, 'a> = &'k mut dyn FnMut(&mut Matcher<'a>, usize) -> bool;
 
-    fn node(&mut self, n: &Node, i: usize, k: K<'_, 'a>) -> bool {
-        let s = self.s;
-        match n {
-            Node::Empty => k(self, i),
-            Node::Char(c) => i < s.len() && self.eq(s[i], *c) && k(self, i + 1),
-            Node::Any => i < s.len() && !is_line_terminator(s[i]) && k(self, i + 1),
-            Node::Class(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && k(self, i + 1),
-            Node::Alone(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && alone(s, i) && k(self, i + 1),
-            Node::Astral(r) => astral_at(s, i).is_some_and(|c| in_points(r, c)) && k(self, i + 2),
-            Node::Start(m) => (i == 0 || (*m && is_line_terminator(s[i - 1]))) && k(self, i),
-            Node::End(m) => (i == s.len() || (*m && is_line_terminator(s[i]))) && k(self, i),
-            Node::Boundary(want, case) => {
-                let a = i > 0 && case.word(s[i - 1]);
-                let b = i < s.len() && case.word(s[i]);
-                ((a != b) == *want) && k(self, i)
-            }
-            Node::Group(inner, None) => self.node(inner, i, k),
-            Node::Group(inner, Some(g)) => {
-                let g = *g;
-                self.node(inner, i, &mut |m, j| {
-                    let prev = m.caps[g];
-                    m.caps[g] = Some((i, j));
-                    if k(m, j) {
-                        return true;
+    impl<'a> Matcher<'a> {
+        fn eq(&self, a: u16, b: u16) -> bool {
+            eq(self.re.fold, a, b)
+        }
+
+        fn in_class(&self, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
+            in_class(self.re.fold, ranges, neg, c)
+        }
+
+        fn node(&mut self, n: &Node, i: usize, k: K<'_, 'a>) -> bool {
+            let s = self.s;
+            match n {
+                Node::Empty => k(self, i),
+                Node::Char(c) => i < s.len() && self.eq(s[i], *c) && k(self, i + 1),
+                Node::Any => i < s.len() && !is_line_terminator(s[i]) && k(self, i + 1),
+                Node::Class(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && k(self, i + 1),
+                Node::Alone(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && alone(s, i) && k(self, i + 1),
+                Node::Astral(r) => astral_at(s, i).is_some_and(|c| in_points(r, c)) && k(self, i + 2),
+                Node::Start(m) => (i == 0 || (*m && is_line_terminator(s[i - 1]))) && k(self, i),
+                Node::End(m) => (i == s.len() || (*m && is_line_terminator(s[i]))) && k(self, i),
+                Node::Boundary(want, case) => {
+                    let a = i > 0 && case.word(s[i - 1]);
+                    let b = i < s.len() && case.word(s[i]);
+                    ((a != b) == *want) && k(self, i)
+                }
+                Node::Group(inner, None) => self.node(inner, i, k),
+                Node::Group(inner, Some(g)) => {
+                    let g = *g;
+                    self.node(inner, i, &mut |m, j| {
+                        let prev = m.caps[g];
+                        m.caps[g] = Some((i, j));
+                        if k(m, j) {
+                            return true;
+                        }
+                        m.caps[g] = prev;
+                        false
+                    })
+                }
+                Node::Look(inner, positive, behind) => {
+                    let saved = self.caps.clone();
+                    // (A lookbehind's body forwards from each start, the nearest
+                    // first: its captures not the spec's, which `Program`'s
+                    // matches backwards, `Insn::Back`.)
+                    let found = if *behind {
+                        (0..=i).rev().any(|k| self.node(inner, k, &mut |_, end| end == i))
+                    } else {
+                        self.node(inner, i, &mut |_, _| true)
+                    };
+                    if found == *positive {
+                        if k(self, i) {
+                            return true;
+                        }
                     }
-                    m.caps[g] = prev;
+                    self.caps = saved;
                     false
-                })
+                }
+                Node::BackRef(g, case) => {
+                    let Some((a, b)) = self.caps.get(*g).copied().flatten() else {
+                        return k(self, i);
+                    };
+                    backref_at(*case, s, a, b, i).is_some_and(|end| k(self, end))
+                }
+                // A failed match leaves the captures as they were (a group
+                // restores its own when `k` fails), so nothing is saved here.
+                Node::Alt(alts) => alts.iter().any(|alt| self.node(alt, i, k)),
+                Node::Seq(nodes) => self.seq(nodes, i, k),
+                Node::Repeat(inner, min, max, greedy, groups) => {
+                    self.repeat(inner, *min, *max, *greedy, groups, 0, i, k)
+                }
             }
-            Node::Look(inner, positive, behind) => {
-                let saved = self.caps.clone();
-                // (A lookbehind's body forwards from each start, the nearest
-                // first: its captures not the spec's, which `Program`'s
-                // matches backwards, `Insn::Back`.)
-                let found = if *behind {
-                    (0..=i).rev().any(|k| self.node(inner, k, &mut |_, end| end == i))
-                } else {
-                    self.node(inner, i, &mut |_, _| true)
-                };
-                if found == *positive {
-                    if k(self, i) {
+        }
+
+        fn seq(&mut self, nodes: &[Node], i: usize, k: K<'_, 'a>) -> bool {
+            match nodes {
+                [] => k(self, i),
+                [n] => self.node(n, i, k),
+                [n, rest @ ..] => self.node(n, i, &mut |m, j| m.seq(rest, j, k)),
+            }
+        }
+
+        /// `inner` repeated `count` times so far, from `i`.
+        #[allow(clippy::too_many_arguments)]
+        fn repeat(
+            &mut self,
+            inner: &Node,
+            min: u32,
+            max: u32,
+            greedy: bool,
+            groups: &std::ops::Range<usize>,
+            count: u32,
+            i: usize,
+            k: K<'_, 'a>,
+        ) -> bool {
+            // A single character or class repeated greedily: count the run,
+            // then try the rest from the longest down (no recursion per char).
+            if greedy && let Some(len) = self.single_run(inner, i, max - count) {
+                let mut n = len;
+                loop {
+                    if count + n as u32 >= min && k(self, i + n) {
                         return true;
                     }
+                    if n == 0 {
+                        return false;
+                    }
+                    n -= 1;
                 }
-                self.caps = saved;
-                false
             }
-            Node::BackRef(g, case) => {
-                let Some((a, b)) = self.caps.get(*g).copied().flatten() else {
-                    return k(self, i);
-                };
-                backref_at(*case, s, a, b, i).is_some_and(|end| k(self, end))
-            }
-            // A failed match leaves the captures as they were (a group
-            // restores its own when `k` fails), so nothing is saved here.
-            Node::Alt(alts) => alts.iter().any(|alt| self.node(alt, i, k)),
-            Node::Seq(nodes) => self.seq(nodes, i, k),
-            Node::Repeat(inner, min, max, greedy, groups) => {
-                self.repeat(inner, *min, *max, *greedy, groups, 0, i, k)
-            }
-        }
-    }
-
-    fn seq(&mut self, nodes: &[Node], i: usize, k: K<'_, 'a>) -> bool {
-        match nodes {
-            [] => k(self, i),
-            [n] => self.node(n, i, k),
-            [n, rest @ ..] => self.node(n, i, &mut |m, j| m.seq(rest, j, k)),
-        }
-    }
-
-    /// `inner` repeated `count` times so far, from `i`.
-    #[allow(clippy::too_many_arguments)]
-    fn repeat(
-        &mut self,
-        inner: &Node,
-        min: u32,
-        max: u32,
-        greedy: bool,
-        groups: &std::ops::Range<usize>,
-        count: u32,
-        i: usize,
-        k: K<'_, 'a>,
-    ) -> bool {
-        // A single character or class repeated greedily: count the run,
-        // then try the rest from the longest down (no recursion per char).
-        if greedy && let Some(len) = self.single_run(inner, i, max - count) {
-            let mut n = len;
-            loop {
-                if count + n as u32 >= min && k(self, i + n) {
-                    return true;
-                }
-                if n == 0 {
+            // Each iteration starts with the groups inside cleared, and puts
+            // them back if it fails (a failed match changes no captures).
+            let more = |m: &mut Self, k: K<'_, 'a>| {
+                if count >= max {
                     return false;
                 }
-                n -= 1;
-            }
-        }
-        // Each iteration starts with the groups inside cleared, and puts
-        // them back if it fails (a failed match changes no captures).
-        let more = |m: &mut Self, k: K<'_, 'a>| {
-            if count >= max {
-                return false;
-            }
-            let saved = (!groups.is_empty()).then(|| m.caps[groups.clone()].to_vec());
-            m.caps[groups.clone()].fill(None);
-            let found = m.node(inner, i, &mut |m, j| {
-                // An empty iteration past the minimum ends the loop.
-                if j == i && count >= min {
-                    return false;
+                let saved = (!groups.is_empty()).then(|| m.caps[groups.clone()].to_vec());
+                m.caps[groups.clone()].fill(None);
+                let found = m.node(inner, i, &mut |m, j| {
+                    // An empty iteration past the minimum ends the loop.
+                    if j == i && count >= min {
+                        return false;
+                    }
+                    m.repeat(inner, min, max, greedy, groups, count + 1, j, k)
+                });
+                if !found && let Some(saved) = saved {
+                    m.caps[groups.clone()].copy_from_slice(&saved);
                 }
-                m.repeat(inner, min, max, greedy, groups, count + 1, j, k)
-            });
-            if !found && let Some(saved) = saved {
-                m.caps[groups.clone()].copy_from_slice(&saved);
+                found
+            };
+            if greedy {
+                more(self, k) || (count >= min && k(self, i))
+            } else {
+                (count >= min && k(self, i)) || more(self, k)
             }
-            found
-        };
-        if greedy {
-            more(self, k) || (count >= min && k(self, i))
-        } else {
-            (count >= min && k(self, i)) || more(self, k)
         }
-    }
 
-    /// For a node matching one code unit with no captures: how many in a
-    /// row match from `i` (at most `max`).
-    fn single_run(&self, n: &Node, i: usize, max: u32) -> Option<usize> {
-        let s = self.s;
-        let one = |c: u16| match n {
-            Node::Char(x) => self.eq(c, *x),
-            Node::Any => !is_line_terminator(c),
-            Node::Class(r, neg) => self.in_class(r, *neg, c),
-            _ => unreachable!(),
-        };
-        if !matches!(n, Node::Char(_) | Node::Any | Node::Class(..)) {
-            return None;
+        /// For a node matching one code unit with no captures: how many in a
+        /// row match from `i` (at most `max`).
+        fn single_run(&self, n: &Node, i: usize, max: u32) -> Option<usize> {
+            let s = self.s;
+            let one = |c: u16| match n {
+                Node::Char(x) => self.eq(c, *x),
+                Node::Any => !is_line_terminator(c),
+                Node::Class(r, neg) => self.in_class(r, *neg, c),
+                _ => unreachable!(),
+            };
+            if !matches!(n, Node::Char(_) | Node::Any | Node::Class(..)) {
+                return None;
+            }
+            let limit = (s.len() - i).min(max as usize);
+            Some(s[i..i + limit].iter().take_while(|&&c| one(c)).count())
         }
-        let limit = (s.len() - i).min(max as usize);
-        Some(s[i..i + limit].iter().take_while(|&&c| one(c)).count())
     }
-}
 }
 
 #[cfg(test)]
@@ -3454,11 +3542,7 @@ mod tests {
     fn find(p: &str, f: &str, s: &str) -> Option<Vec<Option<String>>> {
         let re = Regex::new(p, f).unwrap();
         let u: Vec<u16> = s.encode_utf16().collect();
-        re.exec(&u, 0).map(|caps| {
-            caps.iter()
-                .map(|c| c.map(|(a, b)| String::from_utf16_lossy(&u[a..b])))
-                .collect()
-        })
+        re.exec(&u, 0).map(|caps| caps.iter().map(|c| c.map(|(a, b)| String::from_utf16_lossy(&u[a..b]))).collect())
     }
 
     #[test]
@@ -3486,7 +3570,10 @@ mod tests {
         assert_eq!(find("(a)|(b)", "", "b").unwrap()[1], None);
         // A repetition's iteration clears the groups inside it.
         assert_eq!(find("((a)|b)+", "", "ab").unwrap()[2], None);
-        assert_eq!(find("(z)((a+)?(b+)?(c))*", "", "zaacbbbcac").unwrap()[3..], [Some("a".into()), None, Some("c".into())]);
+        assert_eq!(
+            find("(z)((a+)?(b+)?(c))*", "", "zaacbbbcac").unwrap()[3..],
+            [Some("a".into()), None, Some("c".into())]
+        );
         assert_eq!(find("(?:(a)|b)*", "", "ab").unwrap()[1], None);
         assert_eq!(find("(a)*", "", "b").unwrap()[1], None);
         assert_eq!(find("(?:(a)|(b))+?c", "", "abc").unwrap()[1..], [None, Some("b".into())]);
@@ -3618,7 +3705,9 @@ mod tests {
         let units = [b'a' as u16, b',' as u16, 0xD83D, 0xDE00, 0xD83D, 0xDE00];
         let (mut tried, mut matched) = (0, 0);
         for k in 0..4000 {
-            let mut p: String = (0..1 + rand(3)).map(|_| format!("{}{}", atoms[rand(atoms.len())], quants[rand(quants.len())])).collect();
+            let mut p: String = (0..1 + rand(3))
+                .map(|_| format!("{}{}", atoms[rand(atoms.len())], quants[rand(quants.len())]))
+                .collect();
             match rand(4) {
                 0 => p = format!("a(?<={p})"),
                 1 => p = format!("(?<!{p}),"),
@@ -3665,7 +3754,8 @@ mod tests {
             let s: Vec<u16> = (0..rand(40)).map(|_| b"aab\xe9"[rand(4)] as u16).collect();
             let needle: Vec<u16> = (0..1 + rand(5)).map(|_| b"aab\xe9"[rand(4)] as u16).collect();
             for from in 0..=s.len() + 1 {
-                let want = (from..s.len().saturating_sub(needle.len() - 1)).find(|&i| s[i..i + needle.len()] == *needle);
+                let want =
+                    (from..s.len().saturating_sub(needle.len() - 1)).find(|&i| s[i..i + needle.len()] == *needle);
                 assert_eq!(super::find(&s, &needle, from), want, "{s:?} {needle:?} from {from}");
             }
         }
@@ -3708,10 +3798,7 @@ mod tests {
         assert!(matches!(Regex::new("[a-e]z", "").unwrap().starts, Starts::Units { few: None, .. }));
         // Folding case: an ASCII unit or class begins no match past ASCII;
         // a needle of units that fold to none but themselves.
-        assert!(matches!(
-            Regex::new("#|[x-z]", "i").unwrap().starts,
-            Starts::Units { other: false, few: None, .. }
-        ));
+        assert!(matches!(Regex::new("#|[x-z]", "i").unwrap().starts, Starts::Units { other: false, few: None, .. }));
         let nd = Regex::new("\\s?;\\s?", "").unwrap().needle.unwrap();
         assert_eq!((nd.units.len(), nd.min, nd.max), (1, 0, Some(1)));
         assert!(Regex::new("x?;", "").unwrap().needle.is_none());

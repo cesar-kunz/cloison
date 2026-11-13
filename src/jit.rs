@@ -119,6 +119,24 @@ thread_local! {
 }
 
 impl Snapshot {
+    /// A function's before its first lowering.
+    fn empty() -> Snapshot {
+        Snapshot {
+            insns: Rc::from([]),
+            exit_at: HashMap::default(),
+            mats: HashMap::default(),
+            frames: Vec::new(),
+            frame_regs: Vec::new(),
+            aliases: Vec::new(),
+            restores: Vec::new(),
+            split: Vec::new(),
+            exit_live: Vec::new(),
+            sites: Vec::new(),
+            caches: Vec::new(),
+            kept: Default::default(),
+        }
+    }
+
     /// Its call sites unbound from their versions (see
     /// `JitFunction::unbind_targets`).
     fn drop_targets(&self) {
@@ -223,6 +241,144 @@ pub(crate) fn mark_referenced_codes(
         }
         more
     })
+}
+
+/// What a function's compiled code keeps (see [`kept_by_function`]).
+pub(crate) struct KeptBy {
+    pub(crate) code: *const crate::vm::Code,
+    /// The addresses its lowerings and versions alive refer to (see
+    /// `gc::KeptCells`).
+    pub(crate) addrs: Vec<usize>,
+    /// Those of them its call sites' dispatch tables refer to (see
+    /// [`Dispatch`]).
+    pub(crate) dispatched: Vec<usize>,
+    /// The codes they compiled: its own and those inlined, whose inline
+    /// caches' cells they took (see `Vm::weak_kept`).
+    pub(crate) codes: Vec<*const crate::vm::Code>,
+    /// Its code can't be dropped now: a frame runs a version of it, or its
+    /// state is in use.
+    pub(crate) held: bool,
+}
+
+/// At a full marking, the cells compiled code alive keeps and the codes it
+/// compiled, by the function compiled (its frame 0, one of `mine`: this
+/// VM's codes not freed), for the marking to hold the cells weakly (see
+/// `Vm::weak_kept`). A function is
+/// held while a frame runs a version of it, a word of the stacks `words`
+/// pointing into its code or at it (as for [`free_retired`]), or its
+/// state is borrowed.
+pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::Code) -> bool) -> Vec<KeptBy> {
+    fn site_addrs(site: &CallSite, out: &mut Vec<usize>) {
+        if let Some(d) = &site.dispatch {
+            out.extend_from_slice(d.kept.addrs());
+            for s in d.sites.values() {
+                site_addrs(unsafe { &*s.get() }, out);
+            }
+        }
+    }
+    ALIVE.with(|a| {
+        let (snaps, codes) = &*a.borrow();
+        let mut by: Vec<KeptBy> = Vec::new();
+        let mut index: HashMap<*const crate::vm::Code, usize> = HashMap::default();
+        let mut of = |by: &mut Vec<KeptBy>, s: &Snapshot| -> Option<usize> {
+            let code = s.frames.first()?.code;
+            if !mine(code) {
+                return None;
+            }
+            Some(*index.entry(code).or_insert_with(|| {
+                let held = unsafe { (*code).jit.try_borrow_mut().is_err() };
+                by.push(KeptBy { code, addrs: Vec::new(), dispatched: Vec::new(), codes: Vec::new(), held });
+                by.len() - 1
+            }))
+        };
+        for s in snaps.iter().map(|&s| unsafe { &*s }) {
+            let Some(k) = of(&mut by, s) else { continue };
+            by[k].addrs.extend_from_slice(s.kept.addrs());
+            by[k].codes.extend(s.frames.iter().map(|f| f.code));
+            for site in &s.sites {
+                site_addrs(unsafe { &*site.get() }, &mut by[k].dispatched);
+            }
+        }
+        // (Each version's ranges, by start, to look the words up in.)
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(2 * codes.len());
+        for c in codes.iter().map(|&c| unsafe { &*c }) {
+            let Some(k) = c.snap.as_ref().and_then(|s| of(&mut by, s)) else { continue };
+            by[k].addrs.extend_from_slice(c.kept.addrs());
+            for site in &c.forks {
+                site_addrs(unsafe { &*site.get() }, &mut by[k].dispatched);
+            }
+            ranges.push((c.mem.ptr as usize, c.mem.ptr as usize + c.len.max(1), k));
+            let at = c as *const JitCode as usize;
+            ranges.push((at, at + std::mem::size_of::<JitCode>(), k));
+        }
+        ranges.sort_unstable();
+        for &w in words {
+            let i = ranges.partition_point(|r| r.0 <= w);
+            if i > 0 && w < ranges[i - 1].1 {
+                by[ranges[i - 1].2].held = true;
+            }
+        }
+        for k in by.iter_mut() {
+            k.codes.sort_unstable();
+            k.codes.dedup();
+        }
+        by
+    })
+}
+
+/// Drop the compiled code of the functions `gone` (of one VM, none held:
+/// see [`kept_by_function`]), which refers to cells nothing else reaches: their
+/// versions and lowerings, those retired too, and every call site bound to
+/// one unbound, to bind again at its next call (as `unbind_calls` leaves
+/// it). What the functions learned stays (see `JitFunction::retire`).
+pub(crate) fn retire_functions(vm: &mut crate::vm::Vm, gone: &HashSet<*const crate::vm::Code>) {
+    let of = |c: &JitCode| c.snap.as_ref().is_some_and(|s| s.frames.first().is_some_and(|f| gone.contains(&f.code)));
+    // (Dropped at the end: a version dropping leaves `ALIVE`, and the
+    // sites of one dropped are still to visit.)
+    let mut versions: Vec<Rc<JitCode>> = Vec::new();
+    let mut snaps: Vec<Rc<Snapshot>> = Vec::new();
+    fn unbind(site: &mut CallSite, of: &dyn Fn(&JitCode) -> bool, out: &mut Vec<Rc<JitCode>>) {
+        if site.target.as_ref().is_some_and(|t| of(t)) {
+            out.extend(site.target.take());
+            if site.entry != 0 {
+                site.entry = 0;
+                site.pending = site.claim.is_some();
+                site.rebind = true;
+            }
+        }
+        if let Some(d) = &mut site.dispatch {
+            for s in d.sites.values_mut() {
+                unbind(s.get_mut(), of, out);
+            }
+        }
+    }
+    let (alive_snaps, alive_codes): (Vec<_>, Vec<_>) = ALIVE.with(|a| {
+        let a = a.borrow();
+        (a.0.iter().copied().collect(), a.1.iter().copied().collect())
+    });
+    for s in alive_snaps {
+        for site in unsafe { &(*s).sites } {
+            unbind(unsafe { &mut *site.get() }, &of, &mut versions);
+        }
+    }
+    for c in alive_codes {
+        for site in unsafe { &(*c).forks } {
+            unbind(unsafe { &mut *site.get() }, &of, &mut versions);
+        }
+    }
+    let retired = std::mem::take(&mut vm.jit_caches.retired);
+    let (theirs, others): (Vec<_>, Vec<_>) = retired.into_iter().partition(|c| of(c));
+    vm.jit_caches.retired = others;
+    versions.extend(theirs);
+    for &code in gone {
+        if let Ok(mut j) = unsafe { (*code).jit.try_borrow_mut() }
+            && let Some(j) = j.as_mut()
+        {
+            j.retire(&mut versions, &mut snaps);
+        }
+    }
+    drop(versions);
+    drop(snaps);
 }
 
 /// [`mark_referenced_codes`] for the frames and call sites of a snapshot
@@ -14382,7 +14538,6 @@ impl Lowering<'_> {
             site.wait_hot = !compiled;
         }
         site.closure = fo as u64;
-        unsafe { (*self.state.vm).heap.keep(fo as usize) };
         // A closure with upvalues, likely made anew at each call of the
         // function making it (EarleyBoyer's `loop2`, made at each call of
         // `sc_loop1_98`), or one made more than once already (its
@@ -14393,6 +14548,8 @@ impl Lowering<'_> {
         if i.op != Op::Construct && unsafe { !(&(*callee).upvalues).is_empty() || (*callee).closures_made.get() > 1 } {
             site.by_code = true;
             site.closure = callee as u64;
+        } else {
+            unsafe { (*self.state.vm).heap.keep(fo as usize) };
         }
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
@@ -15811,7 +15968,6 @@ impl Lowering<'_> {
         if !self.small_leaf(fo) {
             self.inlined += self.decoded(callee).0.len();
         }
-        unsafe { (*self.state.vm).heap.keep(fo as usize) };
         let mut extra = if self.forwards(callee) { (i.imm as u8).saturating_add(1) } else { 0 };
         if self.accessor_sites(callee) {
             extra = extra.max(ACCESSOR_EXTRA as u8);
@@ -15826,6 +15982,12 @@ impl Lowering<'_> {
             && alloc == 0
             && !std::mem::take(&mut self.accessor_call)
             && inline_by_code(fo, i);
+        // (Checked for by its code, the closure isn't referred to: kept,
+        // each function inlining one of a TypeScript checker's held that
+        // checker's program while it ran.)
+        if !by_code {
+            unsafe { (*self.state.vm).heap.keep(fo as usize) };
+        }
         let array_args = self.array_arguments(callee);
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
@@ -15951,6 +16113,23 @@ impl JitFunction {
         }
     }
 
+    /// Drop its versions and its lowering, handed to `versions` and `snaps`
+    /// (see [`retire_functions`]): its next entry lowers it again and
+    /// compiles anew. What it learned from its exits stays, and the
+    /// compilations of the versions dropped don't count against it.
+    fn retire(&mut self, versions: &mut Vec<Rc<JitCode>>, snaps: &mut Vec<Rc<Snapshot>>) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        let before = versions.len();
+        versions.extend(self.versions.drain().flat_map(|(_, vs)| vs).map(|(_, c)| c));
+        self.stats.compiles = self.stats.compiles.saturating_sub((versions.len() - before) as u32);
+        self.fits.get_mut().clear();
+        self.live_at.clear();
+        self.last = None;
+        snaps.push(std::mem::replace(&mut vm.snap, Rc::new(Snapshot::empty())));
+        vm.dirty = true;
+        self.note_spent();
+    }
+
     /// Prepare `code`, to start in the interpreter and tier up with the
     /// default [`Tiering`]. Panics on malformed bytecode.
     pub fn new(code: &[u8]) -> JitFunction {
@@ -16001,20 +16180,7 @@ impl JitFunction {
             props: Vec::new(),
             polys: Vec::new(),
             fbs: Vec::new(),
-            snap: Rc::new(Snapshot {
-                insns: Rc::from([]),
-                exit_at: HashMap::default(),
-                mats: HashMap::default(),
-                frames: Vec::new(),
-                frame_regs: Vec::new(),
-                aliases: Vec::new(),
-                restores: Vec::new(),
-                split: Vec::new(),
-                exit_live: Vec::new(),
-                sites: Vec::new(),
-                caches: Vec::new(),
-                kept: Default::default(),
-            }),
+            snap: Rc::new(Snapshot::empty()),
             inline_base: nregs,
             direct_base: usize::MAX,
             dirty: true,
@@ -17664,7 +17830,7 @@ unsafe fn direct_exit(
         let ran = interp::exit_code(callee_regs);
         let code: &JitCode = match &site.target {
             Some(code) if code.mem.ptr as u64 == ran => code,
-            None if (*site.self_code).mem.ptr as u64 == ran => &*site.self_code,
+            None if !site.self_code.is_null() && (*site.self_code).mem.ptr as u64 == ran => &*site.self_code,
             _ => vm
                 .jit_caches
                 .retired

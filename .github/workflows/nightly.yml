@@ -38,6 +38,9 @@ jobs:
     name: test262
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # (To push the badge's data to the `badges` branch.)
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install || rustup show
@@ -51,6 +54,7 @@ jobs:
           git -C test262 fetch -q --depth 1 https://github.com/tc39/test262.git "$rev"
           git -C test262 checkout -q FETCH_HEAD
       - name: Run test262
+        id: run
         run: |
           python3 -I scripts/test262-editions.py | tee editions.txt
           { echo '```'; cat editions.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -63,3 +67,25 @@ jobs:
           path: |
             editions.tsv
             fails-all.txt
+      # The README's test262 badge (shields.io's endpoint badge) reads
+      # test262.json on the `badges` branch: one commit, replaced nightly.
+      - name: Publish the badge's data
+        if: always() && steps.run.outcome == 'success' && github.ref == 'refs/heads/master'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir badges && cd badges
+          python3 -I - <<'EOF'
+          import json
+          rows = [l.split('\t') for l in open('../editions.tsv') if l.strip()]
+          r = 100 * sum(int(p) for _, p, _ in rows) / sum(int(t) for _, _, t in rows)
+          color = 'brightgreen' if r >= 98 else 'green' if r >= 95 else 'yellow'
+          json.dump({'schemaVersion': 1, 'label': 'test262', 'message': f'{r:.1f}%', 'color': color},
+                    open('test262.json', 'w'))
+          EOF
+          git init -q -b badges
+          git add test262.json
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -qm "test262: $(python3 -c "import json; print(json.load(open('test262.json'))['message'])")"
+          git push -qf "https://x-access-token:$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY.git" badges

@@ -127,21 +127,25 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,828 | 17,067 | 98.6% |
-| ES2015 | 8,982 | 9,197 | 97.7% |
+| ES5 (untagged) | 16,851 | 17,067 | 98.7% |
+| ES2015 | 9,013 | 9,197 | 98.0% |
 | ES2016 | 100 | 100 | 100.0% |
-| ES2017 | 699 | 741 | 94.3% |
-| ES2018 | 4,759 | 4,825 | 98.6% |
+| ES2017 | 721 | 741 | 97.3% |
+| ES2018 | 4,685 | 4,825 | 97.1% |
 | ES2019 | 161 | 161 | 100.0% |
-| ES2020 | 1,979 | 2,020 | 98.0% |
-| ES2021 | 617 | 630 | 97.9% |
-| ES2022 | 5,170 | 5,374 | 96.2% |
+| ES2020 | 1,996 | 2,020 | 98.8% |
+| ES2021 | 619 | 630 | 98.3% |
+| ES2022 | 5,204 | 5,374 | 96.8% |
 | ES2023 | 284 | 284 | 100.0% |
 | ES2024 | 840 | 843 | 99.6% |
-| ES2025 | 980 | 998 | 98.2% |
+| ES2025 | 996 | 998 | 99.8% |
 | ES2026 | 745 | 745 | 100.0% |
 | Stage 3 proposals | 5,628 | 5,650 | 99.6% |
-| **all** | **47,772** | **48,635** | **98.2%** |
+| **all** | **47,843** | **48,635** | **98.4%** |
+
+Most of ES2018's failures (90) are property escapes' tests of code points
+Unicode 18 assigns: cloison's tables are Unicode 18's, this test262's
+Unicode 17's.
 
 The `Atomics` tests that need several agents run them as test262's
 `$262.agent` has them: each agent a thread with a VM of its own, sharing

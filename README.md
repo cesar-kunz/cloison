@@ -1,5 +1,12 @@
 # cloison
 
+[![CI](https://github.com/cesar-kunz/cloison/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/cesar-kunz/cloison/actions/workflows/ci.yml)
+[![Nightly](https://github.com/cesar-kunz/cloison/actions/workflows/nightly.yml/badge.svg?branch=master)](https://github.com/cesar-kunz/cloison/actions/workflows/nightly.yml)
+[![test262](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fcesar-kunz%2Fcloison%2Fbadges%2Ftest262.json)](docs/README-long.md#standards-support)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20x86--64%20%7C%20Linux%20arm64%20%7C%20macOS%20arm64-lightgrey)](docs/README-long.md)
+[![Rust nightly-2026-10-06](https://img.shields.io/badge/rust-nightly--2026--10--06-orange)](rust-toolchain.toml)
+
 A JavaScript engine in Rust: a register-bytecode interpreter and a
 copy-and-patch JIT, in one small static binary.
 
@@ -13,7 +20,7 @@ copy-and-patch JIT, in one small static binary.
 - **Lean on Octane**: a 76 MB peak with the JIT (V8 67, SpiderMonkey 82,
   JavaScriptCore 218), 51 MB without.
 - **Modern JavaScript**: ES5 through ES2026 and most Stage 3 proposals,
-  98.2% of test262.
+  98.4% of test262.
 - **Real applications run**: TypeScript's compiler, pdf.js, Excalidraw,
   ECharts, Sass, MathJax and more; interpreted, the fastest interpreter
   measured: 1.14× V8's Ignition, 2.9× SpiderMonkey's interpreter.

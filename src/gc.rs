@@ -595,6 +595,8 @@ struct WeakKept {
     done: bool,
     /// What the functions with compiled code alive refer to.
     kept: Vec<crate::jit::KeptBy>,
+    /// The functions to retire for their age (`jit::age_functions`).
+    aged: crate::jit::HashSet<*const crate::vm::Code>,
     retired: usize,
 }
 
@@ -2699,6 +2701,10 @@ impl Vm {
                     st.done = true;
                 } else {
                     st.kept = listed(self);
+                    st.aged = crate::jit::age_functions(self, &st.kept);
+                    if report {
+                        eprintln!("  kept: {} functions idle, to retire", st.aged.len());
+                    }
                     for k in &st.kept {
                         if k.held {
                             self.mark_kept_by(m, k);
@@ -2738,7 +2744,9 @@ impl Vm {
                 .map(|c| &**c as *const crate::vm::Code)
                 .collect();
             let gone: crate::jit::HashSet<*const crate::vm::Code> = (st.kept.iter())
-                .filter(|k| !k.held && k.addrs.iter().chain(&k.dispatched).any(|&a| dead(a)))
+                .filter(|k| {
+                    !k.held && (st.aged.contains(&k.code) || k.addrs.iter().chain(&k.dispatched).any(|&a| dead(a)))
+                })
                 .map(|k| k.code)
                 .collect();
             if gone.is_empty() {

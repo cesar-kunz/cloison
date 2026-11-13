@@ -7224,6 +7224,43 @@ total + " " + obj.x;
     }
 }
 
+/// Code aging (`jit::age_functions`): a function's compiled code not used
+/// for a few full collections is dropped, and compiled again if it is
+/// called later; one called directly from compiled code all along stays.
+/// The expected values are Node's.
+#[test]
+fn compiled_code_idle_for_some_collections_is_dropped() {
+    let src = |rounds: u32, after: &str| {
+        format!(
+            r#"
+function idle(n) {{ var s = 0; for (var i = 0; i < n; i++) s += i & 3; return s; }}
+function busy(n) {{ return n < 2 ? n : busy(n - 1) + busy(n - 2); }}
+function caller(n) {{ return busy(n) + 1; }}
+var total = 0;
+for (var i = 0; i < 3000; i++) total += idle(20) + caller(7);
+for (var r = 0; r < {rounds}; r++) {{
+  for (var i = 0; i < 3000; i++) total += caller(7);
+  $262.gc();
+}}
+{after}
+total;
+"#
+        )
+    };
+    let run = |src: String| {
+        let mut vm = Vm::new();
+        let r = vm.run(&cloison::js::compile(&src).unwrap()).map(display).unwrap();
+        (r, cloison::jit::alive().1)
+    };
+    let (r, young) = run(src(2, ""));
+    assert_eq!(r, "216000");
+    let (r, old) = run(src(6, ""));
+    assert_eq!(r, "384000");
+    assert_eq!(old + 1, young, "`idle`'s version alone is dropped");
+    let (r, _) = run(src(6, "for (var i = 0; i < 3000; i++) total += idle(20);"));
+    assert_eq!(r, "474000");
+}
+
 /// A VM dropped leaves none of its compiled versions (the review of #39):
 /// versions calling each other, bound to each other's, and retired ones
 /// whose own call sites were bound to them, held each other after their

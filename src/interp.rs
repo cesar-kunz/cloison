@@ -1713,34 +1713,10 @@ handlers! {
                 break;
             }
         }
-        // A typed array's `length` where its shape is known to reach the
-        // builtin getter (`Vm::known_typed_length`; not one whose length
-        // the runtime reads, `RUNTIME_LENGTH`), at a site that met arrays
-        // or it.
-        let l = (*ic).loc;
-        if (l == LENGTH_LOC || l == crate::vm::ACCESSOR_LOC) && (*o).class == Class::TypedArray {
-            tail!(typed_get_length, acc)
-        }
         // Megamorphic: see `mega_get_named` (out of line, for the hit
         // paths above to stay as they were).
         if !(*ic.add(IC_WAYS - 1)).shape.is_null() {
             tail!(mega_get_named, acc)
-        }
-        tail!(slow_get_named, acc)
-    }
-
-    // `poly_get_named`'s typed array `length`, out of line.
-    #[inline(never)]
-    fn typed_get_length(pc, acc, regs, tag) {
-        let o = as_object(*reg(pc, 1, regs));
-        let vm = &*frame_vm(regs);
-        if (*o).flags & crate::object::RUNTIME_LENGTH == 0
-            && vm.known_typed_length(o).is_some()
-            && ((*ic_at(regs, pc, 2)).loc == LENGTH_LOC
-                || *(&(*frame_code(regs)).ic_names).get_unchecked(index_at(pc, 2) as usize) == vm.a_length)
-        {
-            let n = crate::typed::ta_length(o).unwrap_or(0);
-            next!(any, Op::GetNamed.size(), Value::from_i32(n as i32))
         }
         tail!(slow_get_named, acc)
     }
@@ -2107,7 +2083,37 @@ handlers! {
     #[inline(never)]
     fn slow_get_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
+        // (A typed array's `length`: see `typed_get_named`.)
+        if is_cell(tag, obj) && (*as_object(obj)).class == Class::TypedArray {
+            tail!(typed_get_named, acc)
+        }
         let r = with_top(regs, None, |vm| vm.get_named_miss(&*frame_code(regs), index_at(pc, 2), obj));
+        next_or_throw!(Op::GetNamed.size(), r)
+    }
+
+    // `slow_get_named` of a typed array: its `length` where its shape is
+    // known to reach the builtin getter (`Vm::known_typed_length`; not one
+    // whose length the runtime reads, `RUNTIME_LENGTH`) with no call, where
+    // the cache already says what the JIT needs (arrays' `LENGTH_LOC`, or
+    // the getter noted: see `Vm::named_miss_slotless`); else the miss.
+    #[cold]
+    #[inline(never)]
+    fn typed_get_named(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        let o = as_object(obj);
+        let vm = &*frame_vm(regs);
+        let code = &*frame_code(regs);
+        let ic = ic_at(regs, pc, 2);
+        if *(&code.ic_names).get_unchecked(index_at(pc, 2) as usize) == vm.a_length
+            && (*o).flags & crate::object::RUNTIME_LENGTH == 0
+            && let Some(h) = vm.known_typed_length(o)
+            && ((*ic).loc == LENGTH_LOC || (*ic).loc == crate::vm::ACCESSOR_LOC && (*ic).holder == h)
+        {
+            code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
+            let n = crate::typed::ta_length(o).unwrap_or(0);
+            next!(any, Op::GetNamed.size(), Value::from_i32(n as i32))
+        }
+        let r = with_top(regs, None, |vm| vm.get_named_miss(code, index_at(pc, 2), obj));
         next_or_throw!(Op::GetNamed.size(), r)
     }
 

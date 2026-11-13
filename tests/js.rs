@@ -18942,3 +18942,92 @@ r.join();
         "3,3,3,0"
     );
 }
+
+#[test]
+fn typed_array_length_read_on_class_alone_until_one_differs() {
+    // Compiled code reads any typed array's `length` from its header,
+    // as an array's, while every one's is the builtin getter's
+    // (`jit::typed_lengths_standard`); each way one can differ drops it.
+    assert_eq!(
+        value(
+            r#"
+function len(o) { return o.length; }
+function warm(xs) { var r; for (var i = 0; i < 3000; i++) for (var j = 0; j < xs.length; j++) r = len(xs[j]); return r; }
+var a = [1, 2], t = new Uint8Array(3), out = [warm([a, t, 'abcd'])];
+Object.defineProperty(Int16Array.prototype, 'length', {value: 'i16'});
+out.push(warm([a, new Int16Array(2)]));
+out.join();
+"#
+        ),
+        "4,i16"
+    );
+    assert_eq!(
+        value(
+            r#"
+function len(o) { return o.length; }
+function warm(xs) { var r; for (var i = 0; i < 3000; i++) for (var j = 0; j < xs.length; j++) r = len(xs[j]); return r; }
+var a = [1, 2], t = new Uint8Array(3), out = [warm([a, t, 'abcd'])];
+Object.defineProperty(Uint8Array.prototype, 'length', {value: 'u8', configurable: true});
+out.push(warm([a, t]));
+delete Uint8Array.prototype.length;
+out.push(warm([a, t]));
+out.join();
+"#
+        ),
+        "4,u8,3"
+    );
+    assert_eq!(
+        value(
+            r#"
+function len(o) { return o.length; }
+function warm(xs) { var r; for (var i = 0; i < 3000; i++) for (var j = 0; j < xs.length; j++) r = len(xs[j]); return r; }
+var a = [1, 2], t = new Uint8Array(3), out = [warm([a, t, 'abcd'])];
+var proto = Object.getPrototypeOf(Int8Array.prototype);
+Object.defineProperty(proto, 'length', {get: function () { return 'g'; }});
+out.push(warm([a, t]));
+out.join();
+"#
+        ),
+        "4,g"
+    );
+    assert_eq!(
+        value(
+            r#"
+function len(o) { return o.length; }
+function warm(xs) { var r; for (var i = 0; i < 3000; i++) for (var j = 0; j < xs.length; j++) r = len(xs[j]); return r; }
+var a = [1, 2], t = new Uint8Array(3), out = [warm([a, t, 'abcd'])];
+function F() {}
+F.prototype = Object.create(Float32Array.prototype, {length: {value: 'F'}});
+out.push(warm([a, Reflect.construct(Float32Array, [1], F)]));
+out.join();
+"#
+        ),
+        "4,F"
+    );
+    assert_eq!(
+        value(
+            r#"
+function len(o) { return o.length; }
+function warm(xs) { var r; for (var i = 0; i < 3000; i++) for (var j = 0; j < xs.length; j++) r = len(xs[j]); return r; }
+var a = [1, 2], t = new Uint8Array(3), out = [warm([a, t, 'abcd'])];
+Object.setPrototypeOf(t, {length: 'p'});
+out.push(warm([a, t]));
+out.join();
+"#
+        ),
+        "4,p"
+    );
+    assert_eq!(
+        value(
+            r#"
+function len(o) { return o.length; }
+function warm(xs) { var r; for (var i = 0; i < 3000; i++) for (var j = 0; j < xs.length; j++) r = len(xs[j]); return r; }
+var a = [1, 2], t = new Uint8Array(3), out = [warm([a, t, 'abcd'])];
+Object.defineProperty(t, 'length', {value: 'own'});
+out.push(warm([a, t]));
+out.join();
+"#
+        ),
+        "4,own"
+    );
+}

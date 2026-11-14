@@ -2702,6 +2702,7 @@ impl Vm {
                 } else {
                     st.kept = listed(self);
                     st.aged = crate::jit::age_functions(self, &st.kept);
+                    self.jit_caches.age();
                     if report {
                         eprintln!("  kept: {} functions idle, to retire", st.aged.len());
                     }

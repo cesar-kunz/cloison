@@ -4,7 +4,7 @@
 //! [`install`].
 
 use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
-use crate::object::{Class, DONT_ENUM, RAW_JSON, as_object, object_value};
+use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Object, RAW_JSON, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, string_len, string_units, wrapped};
@@ -36,6 +36,7 @@ struct Stringify {
     replacer: Option<Value>,
     keys: Option<Vec<Value>>,
     gap: Vec<u16>,
+    /// The indentation: so many gaps as objects are being serialized.
     indent: Vec<u16>,
     stack: Vec<u64>,
     a_to_json: crate::object::Atom,
@@ -131,19 +132,90 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     r
 }
 
+/// A property's key while it is serialized: its string is made only for a
+/// `toJSON` or a replacer to get.
+#[derive(Clone, Copy)]
+enum PKey {
+    Str(Value),
+    /// An array's index (an array-like's may be past an element's).
+    Num(f64),
+    Name(Atom),
+}
+
+impl PKey {
+    fn string(self, vm: &mut Vm) -> Value {
+        match self {
+            PKey::Str(s) => s,
+            PKey::Num(i) => vm.new_string(&to_string_units(Value::number(i))),
+            PKey::Name(a) => vm.atom_string(a),
+        }
+    }
+
+    fn get(self, vm: &mut Vm, holder: Value) -> Result<Value> {
+        match self {
+            PKey::Str(s) => vm.get_keyed(holder, s),
+            PKey::Num(i) => vm.get_keyed(holder, Value::number(i)),
+            PKey::Name(a) => vm.get(holder, a),
+        }
+    }
+}
+
+fn push_ascii(out: &mut Vec<u16>, s: &str) {
+    out.extend(s.bytes().map(u16::from));
+}
+
 /// SerializeJSONProperty: `holder[key]` as JSON appended to `out`; false
 /// if it has none (`undefined`, a function).
 fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mut Vec<u16>) -> Result<bool> {
-    check_native_stack(vm)?;
-    let mut v = vm.get_keyed(holder, key)?;
-    if is_object(v) || crate::bigint::is_bigint(v) {
-        let f = vm.get(v, st.a_to_json)?;
-        if is_callable(f) {
-            v = call_function(vm, f, v, &[key])?;
+    let v = vm.get_keyed(holder, key)?;
+    value(vm, st, PKey::Str(key), holder, v, out)
+}
+
+/// [`property`] from where `holder[key]` was read: `v`. An array's
+/// elements and a plain object's data properties are read where they
+/// are, and everything is written to `out` as it comes (a 1 MiB array of
+/// small integers made a key string, a part and its copy for each: 19
+/// times V8's time).
+fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value, out: &mut Vec<u16>) -> Result<bool> {
+    if v.is_int32() {
+        if let Some(r) = st.replacer {
+            let k = key.string(vm);
+            v = call_function(vm, r, holder, &[k, v])?;
         }
-    }
-    if let Some(r) = st.replacer {
-        v = call_function(vm, r, holder, &[key, v])?;
+        if v.is_int32() {
+            let mut b = [0u8; 11];
+            let mut n = v.as_i32_unchecked() as i64;
+            let neg = n < 0;
+            n = n.abs();
+            let mut i = b.len();
+            loop {
+                i -= 1;
+                b[i] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            if neg {
+                i -= 1;
+                b[i] = b'-';
+            }
+            out.extend(b[i..].iter().map(|&c| c as u16));
+            return Ok(true);
+        }
+    } else {
+        check_native_stack(vm)?;
+        if is_object(v) || crate::bigint::is_bigint(v) {
+            let f = vm.get(v, st.a_to_json)?;
+            if is_callable(f) {
+                let k = key.string(vm);
+                v = call_function(vm, f, v, &[k])?;
+            }
+        }
+        if let Some(r) = st.replacer {
+            let k = key.string(vm);
+            v = call_function(vm, r, holder, &[k, v])?;
+        }
     }
     if let Some(p) = wrapped(v) {
         if p.is_number() {
@@ -171,13 +243,12 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         check_string_len(out.len())?;
         return Ok(true);
     }
-    let push = |out: &mut Vec<u16>, s: &str| out.extend(s.encode_utf16());
     if v.is_null() {
-        push(out, "null");
+        push_ascii(out, "null");
         return Ok(true);
     }
     if v.is_bool() {
-        push(out, if v == Value::TRUE { "true" } else { "false" });
+        push_ascii(out, if v == Value::TRUE { "true" } else { "false" });
         return Ok(true);
     }
     if let Some(n) = string_len(v) {
@@ -188,7 +259,13 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         return Ok(true);
     }
     if let Some(d) = v.as_number() {
-        push(out, &if d.is_finite() { crate::vm::display(v) } else { "null".into() });
+        if v.is_int32() {
+            push_ascii(out, &crate::vm::display(v));
+        } else if d.is_finite() {
+            push_ascii(out, crate::vm::number_ascii(d).as_str());
+        } else {
+            push_ascii(out, "null");
+        }
         return Ok(true);
     }
     if crate::bigint::is_bigint(v) {
@@ -202,100 +279,151 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     }
     st.stack.push(v.to_bits());
     vm.handles.push(v);
-    let stepback = st.indent.clone();
-    st.indent.extend_from_slice(&st.gap.clone());
+    let stepback = st.indent.len();
+    let gap = !st.gap.is_empty();
+    if gap {
+        let Stringify { indent, gap, .. } = st;
+        indent.extend_from_slice(gap);
+    }
     let o = as_object(v);
     let array = crate::proxy::is_array(vm, v)?;
-    let mut parts: Vec<Vec<u16>> = Vec::new();
-    // The units `out` gets: its brackets, `parts` and a separator between
-    // each two (with a gap, `,` a newline and the indentation), and with a
-    // gap and parts, a newline and indentation after `[` and before `]`:
-    // checked before they are written.
-    let sep_len = if st.gap.is_empty() { 1 } else { 2 + st.indent.len() };
-    let wrap = if st.gap.is_empty() { 0 } else { 2 + st.indent.len() + stepback.len() };
-    let mut held = out.len() + 2 + wrap;
+    // The units `out` gets after a part: the closing bracket, with a gap
+    // after a newline and the indentation. `out` with them is checked
+    // against the longest string after each part.
+    let tail = if gap { 2 + stepback } else { 1 };
+    // Before a part: `,` after another, and with a gap a newline and the
+    // indentation.
+    let lead = |st: &Stringify, out: &mut Vec<u16>, any: bool| {
+        if any {
+            out.push(b',' as u16);
+        }
+        if gap {
+            out.push(b'\n' as u16);
+            out.extend_from_slice(&st.indent);
+        }
+    };
+    let mut any = false;
+    out.push(if array { b'[' } else { b'{' } as u16);
     if array {
         let len = vm.length_of(v)?;
         let mut i = 0.0;
         while i < len {
-            let k = Value::number(i);
-            let ks = vm.new_string(&to_string_units(k));
-            let mut part = Vec::new();
-            if !property(vm, st, ks, v, &mut part)? {
-                part = "null".encode_utf16().collect();
+            lead(st, out, any);
+            // (An array's element there, not a hole: no code runs.)
+            let own = unsafe {
+                ((*o).class == Class::Array && i < (*o).elems_len as f64)
+                    .then(|| *(*o).elems.add(i as usize))
+                    .filter(|&e| e != Value::EMPTY)
+            };
+            let e = match own {
+                Some(e) => e,
+                None => vm.get_keyed(v, Value::number(i))?,
+            };
+            if !value(vm, st, PKey::Num(i), v, e, out)? {
+                push_ascii(out, "null");
             }
-            held += part.len() + if parts.is_empty() { 0 } else { sep_len };
-            check_string_len(held)?;
-            parts.push(part);
+            any = true;
+            check_string_len(out.len() + tail)?;
             i += 1.0;
         }
     } else {
-        let keys: Vec<Value> = match &st.keys {
-            Some(k) => k.clone(),
+        // (With its slot in the shape, of a plain object's name.)
+        let keys: Vec<(PKey, u32)> = match &st.keys {
+            Some(k) => k.iter().map(|&k| (PKey::Str(k), u32::MAX)).collect(),
             None if vm.proxies_exist && crate::proxy::is_proxy(vm, o) => {
                 let mut ks = Vec::new();
                 for key in crate::proxy::enumerable_own_keys(vm, o)? {
                     let s = vm.key_string(key);
                     vm.handles.push(s);
-                    ks.push(s);
+                    ks.push((PKey::Str(s), u32::MAX));
                 }
                 ks
+            }
+            None if vm.plain_named(o) => {
+                let s = unsafe { &*(*o).shape };
+                let slots = vm.listed_slots(o, false, false).unwrap_or_default();
+                slots
+                    .into_iter()
+                    .map(|k| {
+                        let name = s.keys()[k as usize];
+                        // (While a `toJSON` deletes it and collects.)
+                        vm.hold_atom(name);
+                        (PKey::Name(name), k)
+                    })
+                    .collect()
             }
             None => {
                 let mut ks = Vec::new();
                 for (key, enumerable) in vm.own_keys(o) {
                     if enumerable {
-                        let s = vm.key_string(key);
-                        vm.handles.push(s);
-                        ks.push(s);
+                        ks.push(match key {
+                            Key::Index(i) => (PKey::Num(i as f64), u32::MAX),
+                            Key::Name(a) => {
+                                vm.hold_atom(a);
+                                (PKey::Name(a), u32::MAX)
+                            }
+                        });
                     }
                 }
                 ks
             }
         };
-        for k in keys {
-            let mut part = Vec::new();
-            quote(string_units(k).unwrap(), &mut part)?;
-            part.push(b':' as u16);
-            if !st.gap.is_empty() {
-                part.push(b' ' as u16);
+        for (k, slot) in keys {
+            let mark = out.len();
+            lead(st, out, any);
+            match k {
+                PKey::Str(s) => quote(string_units(s).unwrap(), out)?,
+                PKey::Num(i) => {
+                    out.push(b'"' as u16);
+                    push_ascii(out, &crate::vm::display(Value::number(i)));
+                    out.push(b'"' as u16);
+                }
+                PKey::Name(a) => {
+                    let name = vm.atom_name(a);
+                    if name.bytes().all(|b| (0x20..0x80).contains(&b) && b != b'"' && b != b'\\') {
+                        out.push(b'"' as u16);
+                        push_ascii(out, name);
+                        out.push(b'"' as u16);
+                    } else {
+                        // (Its lone surrogates mapped back: see `property_key`.)
+                        let mut u = Vec::new();
+                        crate::js::lex::string_units(name, &mut u);
+                        quote(&u, out)?;
+                    }
+                }
             }
-            if property(vm, st, k, v, &mut part)? {
-                held += part.len() + if parts.is_empty() { 0 } else { sep_len };
-                check_string_len(held)?;
-                parts.push(part);
+            out.push(b':' as u16);
+            if gap {
+                out.push(b' ' as u16);
+            }
+            // (The data property that is still at the name's slot.)
+            let own = match k {
+                PKey::Name(a) => unsafe {
+                    let s = &*(*o).shape;
+                    (s.keys().get(slot as usize) == Some(&a) && s.attrs()[slot as usize] & ACCESSOR == 0)
+                        .then(|| *Object::slot(o, s.location(slot)))
+                },
+                _ => None,
+            };
+            let pv = match own {
+                Some(pv) => pv,
+                None => k.get(vm, v)?,
+            };
+            if value(vm, st, k, v, pv, out)? {
+                any = true;
+                check_string_len(out.len() + tail)?;
+            } else {
+                out.truncate(mark);
             }
         }
     }
-    let (open, close) = if array { (b'[', b']') } else { (b'{', b'}') };
-    out.push(open as u16);
-    if !parts.is_empty() {
-        let sep: Vec<u16> = if st.gap.is_empty() {
-            vec![b',' as u16]
-        } else {
-            let mut s = vec![b',' as u16, b'\n' as u16];
-            s.extend_from_slice(&st.indent);
-            s
-        };
-        if !st.gap.is_empty() {
-            out.push(b'\n' as u16);
-            out.extend_from_slice(&st.indent);
-        }
-        for (i, p) in parts.iter().enumerate() {
-            if i > 0 {
-                out.extend_from_slice(&sep);
-            }
-            out.extend_from_slice(p);
-        }
-        if !st.gap.is_empty() {
-            out.push(b'\n' as u16);
-            out.extend_from_slice(&stepback);
-        }
+    st.indent.truncate(stepback);
+    if any && gap {
+        out.push(b'\n' as u16);
+        out.extend_from_slice(&st.indent);
     }
-    out.push(close as u16);
-    debug_assert!(out.len() <= held && out.len() <= crate::vm::MAX_STRING_LEN);
+    out.push(if array { b']' } else { b'}' } as u16);
     st.stack.pop();
-    st.indent = stepback;
     Ok(true)
 }
 
@@ -306,31 +434,36 @@ fn quote(u: &[u16], out: &mut Vec<u16>) -> Result<()> {
     if out.len() + 6 * u.len() + 2 > crate::vm::MAX_STRING_LEN {
         check_string_len(out.len() + quoted_len(u))?;
     }
+    let hex = |out: &mut Vec<u16>, c: u16| {
+        push_ascii(out, "\\u");
+        out.extend((0..4).rev().map(|d| b"0123456789abcdef"[(c >> (4 * d)) as usize & 15] as u16));
+    };
+    // (What is written as it is.)
+    let plain = |c: u16| c >= 0x20 && c != 0x22 && c != 0x5C && !(0xD800..0xE000).contains(&c);
+    out.reserve(u.len() + 2);
     out.push(b'"' as u16);
     let mut i = 0;
     while i < u.len() {
-        let c = u[i];
-        let esc = match c {
-            0x22 => Some("\\\""),
-            0x5C => Some("\\\\"),
-            0x08 => Some("\\b"),
-            0x0C => Some("\\f"),
-            0x0A => Some("\\n"),
-            0x0D => Some("\\r"),
-            0x09 => Some("\\t"),
-            _ => None,
-        };
-        match esc {
-            Some(e) => out.extend(e.encode_utf16()),
-            None if c < 0x20 => out.extend(format!("\\u{c:04x}").encode_utf16()),
+        let run = u[i..].iter().position(|&c| !plain(c)).unwrap_or(u.len() - i);
+        out.extend_from_slice(&u[i..i + run]);
+        i += run;
+        let Some(&c) = u.get(i) else { break };
+        match c {
+            0x22 => push_ascii(out, "\\\""),
+            0x5C => push_ascii(out, "\\\\"),
+            0x08 => push_ascii(out, "\\b"),
+            0x0C => push_ascii(out, "\\f"),
+            0x0A => push_ascii(out, "\\n"),
+            0x0D => push_ascii(out, "\\r"),
+            0x09 => push_ascii(out, "\\t"),
+            _ if c < 0x20 => hex(out, c),
             // A lone surrogate is escaped; a pair is kept.
-            None if (0xD800..0xDC00).contains(&c) && i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]) => {
+            _ if c < 0xDC00 && i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]) => {
                 out.push(c);
                 out.push(u[i + 1]);
                 i += 1;
             }
-            None if (0xD800..0xE000).contains(&c) => out.extend(format!("\\u{c:04x}").encode_utf16()),
-            None => out.push(c),
+            _ => hex(out, c),
         }
         i += 1;
     }
@@ -526,7 +659,20 @@ struct Parser<'a> {
     records: Vec<Record>,
 }
 
-impl Parser<'_> {
+/// A property's name in the text as a key (`Vm::to_key` of its string).
+fn property_key(vm: &mut Vm, k: &[u16]) -> Key {
+    if let Some(i) = crate::vm::canonical_index(k) {
+        return Key::Index(i);
+    }
+    let mut b = [0u8; 64];
+    if k.len() <= b.len() && k.iter().all(|&c| c < 0x80) {
+        k.iter().zip(&mut b).for_each(|(&c, b)| *b = c as u8);
+        return Key::Name(vm.intern_name(std::str::from_utf8(&b[..k.len()]).unwrap_or("")));
+    }
+    Key::Name(vm.intern_name(&crate::js::lex::units_to_string(k)))
+}
+
+impl<'a> Parser<'a> {
     fn error(&self) -> Error {
         Error::new_syntax(format!("Unexpected token in JSON at position {}", self.i))
     }
@@ -552,8 +698,8 @@ impl Parser<'_> {
     }
 
     fn word(&mut self, w: &str, v: Value) -> Result<Value> {
-        let w: Vec<u16> = w.encode_utf16().collect();
-        if self.u[self.i..].starts_with(&w) {
+        let rest = &self.u[self.i..];
+        if rest.len() >= w.len() && w.bytes().zip(rest).all(|(b, &c)| b as u16 == c) {
             self.i += w.len();
             Ok(v)
         } else {
@@ -581,11 +727,22 @@ impl Parser<'_> {
                             return Err(self.error());
                         }
                         let v = self.value(vm)?;
-                        let key = vm.new_string(&k);
-                        let key = vm.to_key(key);
-                        vm.create_data_property(o, key, v)?;
+                        // (A name the object has, stored in its slot, a
+                        // new one added: no string of it, no descriptor.)
+                        match property_key(vm, &k) {
+                            Key::Name(a) => unsafe {
+                                let ob = as_object(o);
+                                match (*(*ob).shape).lookup(a) {
+                                    Some(slot) => vm.store_field(ob, slot, v),
+                                    None => {
+                                        vm.add_property_keyed(ob, a, v);
+                                    }
+                                }
+                            },
+                            key => vm.create_data_property(o, key, v)?,
+                        }
                         if self.track {
-                            keys.push(k);
+                            keys.push(k.into_owned());
                         }
                         if self.eat(b'}') {
                             break;
@@ -600,12 +757,18 @@ impl Parser<'_> {
             Some('[') if self.peek() < Some(128) => {
                 self.i += 1;
                 let arr = vm.new_array();
-                let mut n = 0.0;
+                let ao = as_object(arr);
+                let mut n = 0;
                 if !self.eat(b']') {
                     loop {
                         let v = self.value(vm)?;
-                        vm.create_data_property(arr, Key::Index(n as u32), v)?;
-                        n += 1.0;
+                        // (Pushed: traced from here on.)
+                        unsafe {
+                            vm.reserve_elems(ao, n + 1);
+                            vm.store_element(ao, n, v);
+                            n += 1;
+                            (*ao).elems_len = n as u32;
+                        }
                         if self.eat(b']') {
                             break;
                         }
@@ -677,21 +840,49 @@ impl Parser<'_> {
                 self.i += 1;
             }
         }
-        let s = String::from_utf16_lossy(&self.u[start..self.i]);
-        s.parse::<f64>().map(Value::number).map_err(|_| self.error())
+        let t = &self.u[start..self.i];
+        // (A short integer: its digits' value.)
+        if t.len() <= 9 && t.iter().all(|&c| c != b'.' as u16 && c | 0x20 != b'e' as u16) {
+            let neg = t[0] == b'-' as u16;
+            let n = t[neg as usize..].iter().fold(0i32, |n, &c| n * 10 + (c - b'0' as u16) as i32);
+            return Ok(if !neg {
+                Value::from_i32(n)
+            } else if n == 0 {
+                Value::number(-0.0)
+            } else {
+                Value::from_i32(-n)
+            });
+        }
+        let mut b = [0u8; 64];
+        let parsed = if t.len() <= b.len() {
+            t.iter().zip(&mut b).for_each(|(&c, b)| *b = c as u8);
+            std::str::from_utf8(&b[..t.len()]).ok().and_then(|s| s.parse::<f64>().ok())
+        } else {
+            String::from_utf16_lossy(t).parse::<f64>().ok()
+        };
+        parsed.map(Value::number).ok_or_else(|| self.error())
     }
 
-    fn string(&mut self) -> Result<Vec<u16>> {
+    /// A string's units: the text's own where it has no escape.
+    fn string(&mut self) -> Result<std::borrow::Cow<'a, [u16]>> {
         if self.peek() != Some(b'"' as u16) {
             return Err(self.error());
         }
         self.i += 1;
-        let mut out = Vec::new();
+        let u = self.u;
+        let run = u[self.i..].iter().position(|&c| c == 0x22 || c == 0x5C || c < 0x20).unwrap_or(u.len() - self.i);
+        let plain = &u[self.i..self.i + run];
+        self.i += run;
+        if self.peek() == Some(0x22) {
+            self.i += 1;
+            return Ok(plain.into());
+        }
+        let mut out = plain.to_vec();
         loop {
             let Some(c) = self.peek() else { return Err(self.error()) };
             self.i += 1;
             match c {
-                0x22 => return Ok(out),
+                0x22 => return Ok(out.into()),
                 0x5C => {
                     let Some(e) = self.peek() else { return Err(self.error()) };
                     self.i += 1;

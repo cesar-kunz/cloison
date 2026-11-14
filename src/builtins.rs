@@ -582,6 +582,10 @@ fn string_locale_compare(_vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
     let v = units(arg(a, 0));
     #[cfg(feature = "intl")]
     let ord = {
+        // (`that` is converted before the locales and options are read.)
+        if _vm.conv_failed() {
+            return Err(_vm.take_conv_error());
+        }
         // (Reading the options may run code: the strings are copied.)
         let (u, v) = if a.len() > 1 { (Cow::Owned(u.into_owned()), Cow::Owned(v.into_owned())) } else { (u, v) };
         crate::intl::locale_compare(_vm, &u, &v, arg(a, 1), arg(a, 2))?

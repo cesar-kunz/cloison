@@ -2941,13 +2941,18 @@ var r = [
 ];
 for (var f of [() => "a".localeCompare("b", "en_US"), () => "a".localeCompare("b", "en", { sensitivity: "x" }), () => String.prototype.localeCompare.call(null, "b")])
   try { f(); r.push("no error") } catch (e) { r.push(e.name) }
+// `that` failing to convert throws before the options are read.
+log = [];
+for (var that of [Symbol(), { toString() { throw new RangeError("that") } }])
+  try { "a".localeCompare(that, { get length() { log.push("locales") } }, { get usage() { log.push("usage") } }) } catch (e) { r.push(e.name) }
+r.push(log.length);
 r.join(" ; ");
 "#;
     assert_eq!(
         value(src),
         "_u|--tp x|\"A free\"|$:/x|1|10|2|a b|a-b|ab|apple|Apple|e|Edition|Édition|résumé|Résumé|Zed ; \
          _u|--tp x|\"A free\"|$:/x|1|2|10|a b|a-b|ab|apple|Apple|e|Édition|Edition|Résumé|résumé|Zed ; \
-         -1 ; -1 ; 0 ; 1 ; 1 ; 0 ; -1 ; 0 ; 1 ; -1 ; that,usage,sensitivity ; RangeError ; RangeError ; TypeError"
+         -1 ; -1 ; 0 ; 1 ; 1 ; 0 ; -1 ; 0 ; 1 ; -1 ; that,usage,sensitivity ; RangeError ; RangeError ; TypeError ; TypeError ; RangeError ; 0"
     );
 }
 

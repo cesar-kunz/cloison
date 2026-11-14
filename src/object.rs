@@ -1372,7 +1372,10 @@ impl Slots {
         index.get(&name).copied().filter(|&i| i < self.len)
     }
 
-    /// Whether `other`'s slots are the first of these.
+    /// Whether `other`'s slots are the first of these. Slots of one table
+    /// are, without a look at the keys: a table others share only grows
+    /// at its end, and `bury` and `compact`, which change slots in
+    /// place, are for a dictionary's table, its own.
     pub fn starts_with(&self, other: &Slots) -> bool {
         other.len <= self.len
             && (std::rc::Rc::ptr_eq(&self.table, &other.table)

@@ -342,8 +342,9 @@ from its last: 17 s, 51 ms now).
 
 An object used as a **table** goes there without a delete: a plain object
 with 128 properties that gets one more by a computed key (`o[k] = v`,
-`Vm::set`), one no object of its shape got before
-(`Vm::add_property_keyed`). Keyed by names made at run time, it made a
+`Vm::set`; `JSON.parse`, `Object.fromEntries`, `Object.groupBy` and a
+spread, `Vm::create_data_property`), one no object of its shape got
+before (`Vm::keyed_table`). Keyed by names made at run time, it made a
 shape, a transition and a field cell for each (the SheetJS app 705,000
 shapes, 230 MiB of the 400 it had allocated at its exit; 243 MiB now, and
 3.7 s of collection pauses for 6.0). Its first 128 keys' shapes stay; an

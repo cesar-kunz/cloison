@@ -6692,6 +6692,33 @@ n
 }
 
 #[test]
+fn a_table_built_by_a_builtin_makes_no_shape_per_key() {
+    // `JSON.parse`, `Object.fromEntries`, `Object.groupBy` and a spread
+    // define their keys (`Vm::create_data_property`), which makes a big
+    // table a dictionary as a keyed store does: 4 tables of 10,000 keys
+    // and a copy of one, with deleted keys (their buried slots are no
+    // keys of the copy), leave a few hundred shapes, not 50,000.
+    let src = r#"
+var keys = [];
+for (var i = 0; i < 10000; i++) keys.push("k" + i);
+var a = JSON.parse("{" + keys.map((k, i) => '"' + k + '":' + i).join(",") + "}");
+var b = Object.fromEntries(keys.map((k, i) => ["f" + k, i]));
+var c = Object.groupBy(keys, k => "g" + k);
+var d = JSON.parse(JSON.stringify(a), (k, v) => v);
+for (var i = 0; i < 10000; i += 3) delete a["k" + i];
+var e = {...a, last: 1};
+[a, b, c, d, e].map(o => Object.keys(o).length).join() + " " +
+  [a.k9998, b.fk9999, c.gk9999[0], d.k9999, e.k9998, e.k9999, e.last, "k9999" in e, JSON.stringify(e).length].join()
+"#;
+    let mut vm = Vm::new();
+    let before = vm.memory_stats()[0];
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("6666,10000,10000,10000,6667 9998,9999,k9999,9999,9998,,1,false,85192"));
+    let shapes = vm.memory_stats()[0] - before;
+    assert!(shapes < 2000, "{shapes} shapes");
+}
+
+#[test]
 fn direct_evals_in_generators_read_their_boxed_bindings_bound() {
     // A generator's (or an async function's) block-scoped variables a
     // nested function uses are in boxes: a direct `eval`'s code there is

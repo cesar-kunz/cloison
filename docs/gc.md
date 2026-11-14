@@ -595,10 +595,11 @@ is "The header word" at `layout::Header`).
   four (see step 6, *Adaptive nursery*).
 - **Old-generation headroom**: the next major cycle starts when the old
   generation has grown by half its live size after the last cycle (64 MiB
-  at least; `CLOISON_GC_GROWTH` sets the percentage, 50), counted two ways, whichever comes first: blocks in use since
-  the sweep, and bytes minor collections promoted (allocation into
-  recycled holes adds no blocks). Not yet: a CPU-share target, and
-  `CLOISON_HEAP_LIMIT` steering it.
+  at least; `CLOISON_GC_GROWTH` sets the percentage, 50), counted two
+  ways, whichever comes first: blocks in use since the sweep, and bytes
+  minor collections promoted (allocation into recycled holes adds no
+  blocks). Not yet: a CPU-share target, and `CLOISON_HEAP_LIMIT` steering
+  it.
 - **When marking starts**: earlier by what the last cycle grew the heap
   by while marking, so the heap peaks about where a stop-the-world
   collection would have let it.

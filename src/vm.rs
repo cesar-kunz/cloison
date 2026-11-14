@@ -7695,6 +7695,12 @@ impl Vm {
         Some(code.jit.borrow().as_ref()?.stats)
     }
 
+    /// The direct calls' exits so far that left a compiled version retired
+    /// during the call, kept until its frame left it (for tests).
+    pub fn jit_retired_exits(&self) -> u32 {
+        self.jit_caches.retired_exits()
+    }
+
     /// `function`'s current lowering in the JIT, if it has a state there:
     /// its instructions and its tables' bytes (for tests).
     pub fn jit_lowering(&self, function: &str) -> Option<(usize, usize)> {

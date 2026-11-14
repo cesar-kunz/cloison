@@ -277,7 +277,8 @@ waits for, 10,000), also read when building,
 `CLOISON_PERF_MAP` (names JIT code for `perf`),
 `CLOISON_NO_QUICKEN`, `CLOISON_COUNT`, `CLOISON_CODE_SHIFT`; for the collector,
 `CLOISON_GC_STATS` (each collection), `CLOISON_GC_FRAG` (blocks by occupancy and what could not move, after stop-the-world full collections), `CLOISON_GC_NURSERY` (MiB, fixed; else 8 to 32, grown on minor collections' share of the time),
-`CLOISON_HEAP_LIMIT` (MiB), `CLOISON_GC_MIN_HOLE` (bytes; smaller holes wait
+`CLOISON_HEAP_LIMIT` (MiB), `CLOISON_GC_GROWTH` (the share of its live size the heap grows by before a
+full collection, a percentage, 50), `CLOISON_GC_MIN_HOLE` (bytes; smaller holes wait
 for the next collection), `CLOISON_GC_ROOTS` (what each kind of root
 reaches), `CLOISON_GC_VERIFY=<KiB>` (collect that often,
 checking references and poisoning what is freed), `CLOISON_GC_STRESS`

@@ -130,7 +130,10 @@ fn main() -> ExitCode {
         let _ = write!(std::io::stdout(), "{}", cloison::asm::disassemble(&module));
         return ExitCode::SUCCESS;
     }
-    let result = vm.run(&module);
+    // (Neither the text nor the module is needed again: see
+    // `Vm::run_owned`.)
+    drop(src);
+    let result = vm.run_owned(module);
     let uncaught = result.as_ref().err().map(|e| vm.uncaught_message(e));
     // `CLOISON_GC_VERIFY`: walk the heap, checking every cell (see `heap`).
     if std::env::var_os("CLOISON_GC_VERIFY").is_some() {

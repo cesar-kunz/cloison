@@ -776,6 +776,25 @@ fn dictionary_at() -> usize {
     })
 }
 
+/// Functions from which a module loaded has the allocator give back what
+/// its compilation and loading freed (see [`release_freed`]): a small
+/// script's is not worth the call.
+const RELEASE_FUNCTIONS: usize = 1000;
+
+/// Give the memory the allocator holds free back to the system. The front
+/// end's (tokens, the syntax tree, the code generator's tables, the
+/// module once loaded) is freed all at once when a script starts, in
+/// pieces glibc's `malloc` keeps for the next allocations, between ones
+/// still in use: `malloc_trim` returns their whole pages. Elsewhere it
+/// does nothing: musl's `malloc` unmaps what it frees on its own, and
+/// macOS's has no such call.
+pub fn release_freed() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Zombie shapes kept before a sweep looks for those it can free (see
 /// `Vm::free_zombies`): about 6 MB.
 const ZOMBIES_MIN: usize = 1 << 14;
@@ -7300,10 +7319,23 @@ impl Vm {
     /// call of the runtime aborts the process instead: the copied stencils
     /// have no unwind tables; `CLOISON_NO_JIT` runs nothing compiled.)
     pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
+        self.run_owned(module.clone())
+    }
+
+    /// [`Vm::run`] of a module run once: loaded as it is, not a copy of it
+    /// (what the caller kept through the run otherwise: 34 MB of the
+    /// siyuan app's peak, for 6 MB of source). What the load freed, and
+    /// the front end before it if the caller dropped the source, then
+    /// goes back to the system (see [`release_freed`]).
+    pub fn run_owned(&mut self, module: crate::asm::Checked) -> Result<Value> {
         self.usable()?;
         let _running = crate::interp::Running::new(self);
-        self.declare_script(module)?;
-        let code = self.load(Module::clone(module));
+        self.declare_script(&module)?;
+        let big = module.functions.len() >= RELEASE_FUNCTIONS;
+        let code = self.load(module.into_inner());
+        if big {
+            release_freed();
+        }
         let here = 0u8;
         let entered = RunState::new(self, &raw const here as usize);
         let outer = entered.outer;

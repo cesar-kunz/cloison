@@ -3,6 +3,7 @@
 // interpreter makes the calls past that limit, and natives have stack of
 // their own past it (ECharts' force layout, a step calling the next from
 // its callback, threw a RangeError once its keyed stores compiled, #240).
+// release only: a debug build's frames use up the natives' stack sooner.
 // expect: 1200
 
 var left, k = 0;

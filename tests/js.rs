@@ -7307,7 +7307,7 @@ fn code_retired_under_a_running_frame_runs_to_its_exit() {
 var gcs = 0, ints = { v: 1 }, mode = 0, next = [1, 2, 3, 4, 0, 5];
 function fire() {
   mode = 0;
-  deep(50, function () { return other(mk(10 + gcs)); });
+  deep(100, function () { return other(mk(10 + gcs)); });
   $262.gc();
   $262.gc();
   gcs++;
@@ -8738,9 +8738,11 @@ af().then(a => { log.push(kind(a)); return ag().next(); })
 /// A chain of literals longer than the bound still folds where it can.
 #[test]
 fn long_operator_chains_fold_within_a_bound() {
+    // (On a big stack: a debug build's frames, larger, don't fit a test
+    // thread's for chains this long.)
     let n = 400;
-    assert_eq!(value(&format!("var x = 1; x{}", "+1".repeat(n))), (n + 1).to_string());
-    assert_eq!(value(&format!("1{}", "+1".repeat(n))), (n + 1).to_string());
+    assert_eq!(big_stack(|| value(&format!("var x = 1; x{}", "+1".repeat(n)))), (n + 1).to_string());
+    assert_eq!(big_stack(|| value(&format!("1{}", "+1".repeat(n)))), (n + 1).to_string());
     assert_eq!(value(&format!("2 ** 3 * (1{})", " - 0.5".repeat(40))), "-152");
     let e = big_stack(|| compile_error(&format!("var x = 1; x{}", "+1".repeat(200_000))));
     assert!(e.contains("too deeply nested"), "{e}");

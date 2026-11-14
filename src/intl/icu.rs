@@ -108,21 +108,55 @@ impl Collator {
     }
 }
 
-/// The grapheme cluster segmenter: UAX #29's extended grapheme clusters,
-/// the same for every locale.
-pub(crate) struct Graphemes(icu_segmenter::GraphemeClusterSegmenter);
+/// What a segmenter cuts its text into.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Granularity {
+    Grapheme,
+    Word,
+    Sentence,
+}
 
-impl Graphemes {
-    pub(crate) fn new() -> Result<Graphemes, String> {
-        icu_segmenter::GraphemeClusterSegmenter::try_new_with_buffer_provider(provider()?)
-            .map(Graphemes)
-            .map_err(|e| format!("grapheme segmentation: {e}"))
+/// A segmenter of one granularity, by UAX #29's rules untailored (the
+/// same for every locale): extended grapheme clusters, words, sentences.
+/// The words are without dictionaries: a run of Chinese or Japanese,
+/// Thai, Lao, Khmer or Burmese letters is one word.
+pub(crate) enum Breaker {
+    Grapheme(icu_segmenter::GraphemeClusterSegmenter),
+    Word(Box<icu_segmenter::WordSegmenter>),
+    Sentence(icu_segmenter::SentenceSegmenter),
+}
+
+impl Breaker {
+    pub(crate) fn new(granularity: Granularity) -> Result<Breaker, String> {
+        use icu_segmenter::{GraphemeClusterSegmenter, SentenceSegmenter, WordSegmenter};
+        let provider = provider()?;
+        match granularity {
+            Granularity::Grapheme => {
+                GraphemeClusterSegmenter::try_new_with_buffer_provider(provider).map(Breaker::Grapheme)
+            }
+            Granularity::Word => {
+                WordSegmenter::try_new_for_non_complex_scripts_with_buffer_provider(provider, Default::default())
+                    .map(|s| Breaker::Word(Box::new(s)))
+            }
+            Granularity::Sentence => {
+                SentenceSegmenter::try_new_with_buffer_provider(provider, Default::default()).map(Breaker::Sentence)
+            }
+        }
+        .map_err(|e| format!("segmentation: {e}"))
     }
 
-    /// Where the grapheme cluster at the start of `units` (not empty)
-    /// ends.
-    pub(crate) fn first(&self, units: &[u16]) -> usize {
-        self.0.as_borrowed().segment_utf16(units).find(|&b| b > 0).unwrap_or(units.len())
+    /// Where the segment at the start of `units` (not empty) ends, and
+    /// whether it is word-like (a word segmenter's: of letters or digits).
+    pub(crate) fn first(&self, units: &[u16]) -> (usize, bool) {
+        let end = units.len();
+        match self {
+            Breaker::Grapheme(s) => (s.as_borrowed().segment_utf16(units).find(|&b| b > 0).unwrap_or(end), false),
+            Breaker::Word(s) => {
+                let mut breaks = s.as_borrowed().segment_utf16(units).iter_with_word_type();
+                breaks.find(|&(b, _)| b > 0).map_or((end, false), |(b, t)| (b, t.is_word_like()))
+            }
+            Breaker::Sentence(s) => (s.as_borrowed().segment_utf16(units).find(|&b| b > 0).unwrap_or(end), false),
+        }
     }
 }
 
@@ -138,4 +172,87 @@ pub(crate) fn available(locale: &str) -> Result<bool, String> {
         case_first: CaseFirst::False,
     };
     Ok(Collator::new(&key).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the Segments objects and their iterators rely on: the
+    /// segment found from a boundary is the one a pass over the whole
+    /// string finds there, of each granularity, in strings of what the
+    /// rules look around (marks, joiners, flags, quotes, terminators,
+    /// line ends, lone surrogates, a complex script's letters).
+    #[test]
+    fn a_segment_from_a_boundary_is_the_whole_strings() {
+        let alphabet: Vec<Vec<u16>> = [
+            "a",
+            "B",
+            "1",
+            " ",
+            ".",
+            ",",
+            "'",
+            ":",
+            "_",
+            "-",
+            "\n",
+            "\r",
+            "\"",
+            "(",
+            ")",
+            "?",
+            "!",
+            ";",
+            "\u{300}",
+            "\u{200d}",
+            "\u{ad}",
+            "\u{1F600}",
+            "\u{1F1EB}",
+            "\u{5d0}",
+            "\u{30ab}",
+            "\u{3000}",
+            "\u{2029}",
+            "\u{85}",
+            "\u{e9}",
+            "\u{200b}",
+            "\u{e01}",
+            "\u{4e2d}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{915}",
+            "\u{94d}",
+        ]
+        .iter()
+        .map(|s| s.encode_utf16().collect())
+        .chain([vec![0xD800], vec![0xDC00]])
+        .collect();
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut random = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        for granularity in [Granularity::Grapheme, Granularity::Word, Granularity::Sentence] {
+            let breaker = Breaker::new(granularity).unwrap();
+            for _ in 0..20000 {
+                let units: Vec<u16> = (0..=random(40)).flat_map(|_| alphabet[random(alphabet.len())].clone()).collect();
+                let whole: Vec<usize> = match &breaker {
+                    Breaker::Grapheme(s) => s.as_borrowed().segment_utf16(&units).collect(),
+                    Breaker::Word(s) => s.as_borrowed().segment_utf16(&units).collect(),
+                    Breaker::Sentence(s) => s.as_borrowed().segment_utf16(&units).collect(),
+                };
+                let mut chained = vec![0];
+                let mut at = 0;
+                while at < units.len() {
+                    at += breaker.first(&units[at..]).0;
+                    chained.push(at);
+                }
+                assert_eq!(chained, whole, "{units:x?}");
+                // And each breaks after a line feed, where `containing`
+                // starts from.
+                let fed = (0..units.len()).all(|i| units[i] != 0x0A || whole.contains(&(i + 1)));
+                assert!(fed, "{units:x?}");
+            }
+        }
+    }
 }

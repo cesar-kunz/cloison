@@ -2991,9 +2991,8 @@ r.join(" ; ");
 /// `Intl.Segmenter` (the `intl` feature) of graphemes: UAX #29's extended
 /// grapheme clusters by ICU4X (CR LF, a combining sequence, an emoji ZWJ
 /// sequence and a flag are one segment each), as a Segments object's
-/// iterator and its `containing` give them; `word` and `sentence` are
-/// valid but refused. Univer makes one at startup. V8's results, but the
-/// refusals.
+/// iterator and its `containing` give them. Univer makes one at startup.
+/// V8's results.
 #[cfg(feature = "intl")]
 #[test]
 fn intl_segmenter_segments_graphemes() {
@@ -3031,8 +3030,54 @@ r.join(" | ");
          [object Segmenter String Iterator] | true | \
          {\"value\":{\"segment\":\"a\u{300}\",\"index\":0,\"input\":\"a\u{300}b\\n😀c\"},\"done\":false} | \
          2,3,4,6 | {\"done\":true} | true | containing | [Symbol.iterator] | 0 | 1 | en-US,en-GB | \
-         localeMatcher,granularity | TypeError | RangeError | Error | Error | TypeError | RangeError | TypeError | \
+         localeMatcher,granularity | TypeError | RangeError | no error | no error | TypeError | RangeError | TypeError | \
          TypeError | TypeError | TypeError | TypeError | TypeError | true | b"
+    );
+}
+
+/// `Intl.Segmenter` of words and sentences: UAX #29's by ICU4X, with
+/// `isWordLike` on a word segmenter's segments (`+` here). Node's
+/// results, but `a:b` (one word by the default rules, three by CLDR's)
+/// and the scripts whose words take a dictionary, which there is none
+/// of: a run of Chinese or Japanese, or Thai, is one word. And
+/// `containing` finds the iterator's segments, asked in any order.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_segmenter_segments_words_and_sentences() {
+    let src = r#"
+var cut = (g, s) => Array.from(new Intl.Segmenter("en", { granularity: g }).segment(s), x => (x.isWordLike ? "+" : "") + x.segment).join("|");
+var w = new Intl.Segmenter("en", { granularity: "word" }), st = new Intl.Segmenter(undefined, { granularity: "sentence" });
+var r = [
+  cut("word", "Hello, world! It's 3.14 e.g. can't"), cut("word", "a:b x_y \u{1F600}\r\n"),
+  cut("word", "Hello世界です カタカナ สวัสดีครับ 한국어"),
+  cut("sentence", "Hello world. How are you? Mr. Smith went. \"Yes!\" he said.\nNew"), cut("sentence", ""), cut("word", ""),
+  JSON.stringify(w.segment("ab cd").containing(3)), JSON.stringify(w.segment(" ").containing(0)),
+  JSON.stringify(st.segment("A. B.").containing(4)), JSON.stringify([...w.segment("a ")[Symbol.iterator]()].map(x => Object.keys(x).join())),
+  w.resolvedOptions().granularity, st.resolvedOptions().granularity,
+];
+// `containing` at every index, in any order, is the iterator's segment
+// there (in a string longer than its marks are apart).
+var s = ""; for (var i = 0; s.length < 3000; i++) s += "word" + i + (i % 7 ? " " : ". ") + (i % 5 ? "" : "é\u{1F600}\n");
+for (var g of ["grapheme", "word", "sentence"]) {
+  var segs = new Intl.Segmenter("en", { granularity: g }).segment(s), at = [], bad = 0, seed = 1;
+  for (var x of segs) for (var i = 0; i < x.segment.length; i++) at.push(x);
+  var ask = i => { var d = segs.containing(i), x = at[i]; if (d.index !== x.index || d.segment !== x.segment || d.isWordLike !== x.isWordLike) bad++ };
+  for (var i = s.length - 1; i >= 0; i -= 3) ask(i);
+  for (var i = 0; i < 2000; i++) ask((seed = seed * 16807 % 2147483647) % s.length);
+  for (var i = 0; i < s.length; i++) ask(i);
+  r.push(bad);
+}
+r.join(" ; ");
+"#;
+    assert_eq!(
+        value(src),
+        "+Hello|,| |+world|!| |+It's| |+3.14| |+e.g|.| |+can't ; +a:b| |+x_y| |😀|\r\n ; \
+         +Hello|+世界です| |+カタカナ| |+สวัสดีครับ| |+한국어 ; \
+         Hello world. |How are you? |Mr. |Smith went. |\"Yes!\" |he said.\n|New ;  ;  ; \
+         {\"segment\":\"cd\",\"index\":3,\"input\":\"ab cd\",\"isWordLike\":true} ; \
+         {\"segment\":\" \",\"index\":0,\"input\":\" \",\"isWordLike\":false} ; \
+         {\"segment\":\"B.\",\"index\":3,\"input\":\"A. B.\"} ; \
+         [\"segment,index,input,isWordLike\",\"segment,index,input,isWordLike\"] ; word ; sentence ; 0 ; 0 ; 0"
     );
 }
 

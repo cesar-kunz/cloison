@@ -1,13 +1,13 @@
 //! ECMA-402, the `Intl` object (the `intl` feature): `Intl.Collator`,
-//! what TypeScript's compiler uses, and `Intl.Segmenter` of graphemes,
-//! what Univer uses. ICU4X does the work
+//! what TypeScript's compiler uses, and `Intl.Segmenter`, what Univer
+//! uses. ICU4X does the work
 //! behind [`icu`]; this module is the JS side: locale lists, options,
 //! locale resolution, the objects. See docs/intl.md.
 //!
 //! An `Intl` object is of class `Intl`, its internal slots hidden
 //! in-object slots ([`slot`]), the first what it is ([`Kind`]);
 //! `vm.intl` holds what Rust needs (the collators, interned by what they
-//! are made of; the grapheme segmenter).
+//! are made of; the segmenter of each granularity).
 
 mod collator;
 mod icu;
@@ -37,8 +37,9 @@ pub(crate) struct State {
     /// The collators of the locale strings `localeCompare` was given
     /// without options (the strings as given, by their units).
     locale_collators: HashMap<Box<[u16]>, u32>,
-    /// The grapheme segmenter (all segmenters'), once made.
-    graphemes: Option<icu::Graphemes>,
+    /// The segmenter of each granularity (all `Intl.Segmenter`s'), once
+    /// made.
+    breakers: [Option<icu::Breaker>; 3],
 }
 
 pub(crate) use collator::locale_compare;

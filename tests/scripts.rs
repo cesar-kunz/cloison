@@ -8,7 +8,9 @@
 //!
 //! With `-json` after the word (`// expect-json: "a\nb"`), what follows is
 //! a JSON string, for a result with line breaks, edge spaces or characters
-//! that don't show. The script is what follows that line, exactly. It runs
+//! that don't show. The script is what follows that line, exactly. A
+//! `// release only: why` line before it leaves the test out of a debug
+//! build, whose larger frames reach a stack limit sooner. The script runs
 //! with the interpreter only, tiering up after 1, 2 and 1000 back edges and
 //! with the default, each in a new `Vm` whose heap is verified at the end;
 //! all must agree.
@@ -161,7 +163,10 @@ fn main() {
         .into_iter()
         .map(|p| {
             let name = p.strip_prefix(&dir).unwrap().with_extension("").to_string_lossy().into_owned();
-            Trial::test(name, move || check(&p))
+            let text = std::fs::read_to_string(&p).unwrap_or_default();
+            let release_only =
+                text.lines().take_while(|l| l.starts_with("//")).any(|l| l.starts_with("// release only:"));
+            Trial::test(name, move || check(&p)).with_ignored_flag(release_only && cfg!(debug_assertions))
         })
         .collect();
     libtest_mimic::run(&args, trials).exit();

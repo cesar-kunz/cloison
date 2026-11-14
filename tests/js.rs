@@ -2951,6 +2951,54 @@ r.join(" ; ");
     );
 }
 
+/// `Intl.Segmenter` (the `intl` feature) of graphemes: UAX #29's extended
+/// grapheme clusters by ICU4X (CR LF, a combining sequence, an emoji ZWJ
+/// sequence and a flag are one segment each), as a Segments object's
+/// iterator and its `containing` give them; `word` and `sentence` are
+/// valid but refused. Univer makes one at startup. V8's results, but the
+/// refusals.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_segmenter_segments_graphemes() {
+    let src = r#"
+var show = s => Array.from(new Intl.Segmenter().segment(s), x => x.segment.length + "@" + x.index).join(",");
+var sg = new Intl.Segmenter("en-US-u-co-phonebk", { granularity: "grapheme" });
+var ss = sg.segment("àb\n\u{1F600}c"), it = ss[Symbol.iterator](), order = [];
+new Intl.Segmenter(undefined, { get localeMatcher() { order.push("localeMatcher") }, get granularity() { order.push("granularity") } });
+var r = [
+  show("a\r\nb"), show("éx"), show("\u{1F468}‍\u{1F469}‍\u{1F467}!"),
+  show("\u{1F1EB}\u{1F1F7}\u{1F1E9}\u{1F1EA}\u{1F1EF}"), show("한각"), show(""), show(12),
+  JSON.stringify(sg.resolvedOptions()), Object.prototype.toString.call(sg),
+  [-1, 0, 1, 2, 3, 4, 5, 6, 7, "2", NaN, Infinity].map(i => { var d = ss.containing(i); return d ? d.index + ":" + d.segment.length : d }).join(),
+  JSON.stringify(sg.segment("ab").containing(1)), ss.containing(0).input === ss.containing(6).input,
+  Object.prototype.toString.call(it), it[Symbol.iterator]() === it, JSON.stringify(it.next()),
+  [...it].map(x => x.index).join(), JSON.stringify(it.next()),
+  Object.getPrototypeOf(ss) === Object.getPrototypeOf(sg.segment("")), Object.getOwnPropertyNames(Object.getPrototypeOf(ss)).join(),
+  ss[Symbol.iterator].name, Intl.Segmenter.length, Intl.Segmenter.prototype.segment.length,
+  Intl.Segmenter.supportedLocalesOf(["EN-us", "zz", "en-GB"]).join(), order.join(),
+];
+for (var f of [() => Intl.Segmenter(), () => new Intl.Segmenter("en", { granularity: "line" }), () => new Intl.Segmenter("en", { granularity: "word" }),
+               () => new Intl.Segmenter("en", { granularity: "sentence" }), () => new Intl.Segmenter("en", null), () => new Intl.Segmenter("x_y"),
+               () => sg.segment.call(new Intl.Collator(), "a"), () => Intl.Collator.prototype.resolvedOptions.call(sg),
+               () => ss.containing.call(sg, 0), () => it.next.call(ss), () => ss[Symbol.iterator].call(it), () => ss.containing(Symbol())])
+  try { f(); r.push("no error") } catch (e) { r.push(e.name) }
+class S extends Intl.Segmenter {}
+r.push(new S() instanceof S, new S().segment("ab").containing(1).segment);
+r.join(" | ");
+"#;
+    assert_eq!(
+        value(src),
+        "1@0,2@1,1@3 | 2@0,1@2 | 8@0,1@8 | 4@0,4@4,2@8 | 1@0,3@1 |  | 1@0,1@1 | \
+         {\"locale\":\"en-US\",\"granularity\":\"grapheme\"} | [object Intl.Segmenter] | \
+         ,0:2,0:2,2:1,3:1,4:2,4:2,6:1,,2:1,0:2, | {\"segment\":\"b\",\"index\":1,\"input\":\"ab\"} | true | \
+         [object Segmenter String Iterator] | true | \
+         {\"value\":{\"segment\":\"a\u{300}\",\"index\":0,\"input\":\"a\u{300}b\\n😀c\"},\"done\":false} | \
+         2,3,4,6 | {\"done\":true} | true | containing | [Symbol.iterator] | 0 | 1 | en-US,en-GB | \
+         localeMatcher,granularity | TypeError | RangeError | Error | Error | TypeError | RangeError | TypeError | \
+         TypeError | TypeError | TypeError | TypeError | TypeError | true | b"
+    );
+}
+
 /// Without the `intl` feature, `localeCompare` compares code units.
 #[cfg(not(feature = "intl"))]
 #[test]

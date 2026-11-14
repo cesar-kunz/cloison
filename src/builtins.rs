@@ -372,7 +372,7 @@ fn relative(d: f64, len: usize) -> usize {
 /// string and that is all of it (TypeScript's `getText(0, length)` copied
 /// its 6 MB source 4 times over), an equal short one made recently (see
 /// `Vm::short_string`), or a new one.
-fn part(vm: &mut Vm, this: Value, u: &[u16], s: usize, e: usize) -> Value {
+pub(crate) fn part(vm: &mut Vm, this: Value, u: &[u16], s: usize, e: usize) -> Value {
     if s == 0 && e == u.len() && string_len(this).is_some() {
         return this;
     }
@@ -586,8 +586,6 @@ fn string_locale_compare(_vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
         if _vm.conv_failed() {
             return Err(_vm.take_conv_error());
         }
-        // (Reading the options may run code: the strings are copied.)
-        let (u, v) = if a.len() > 1 { (Cow::Owned(u.into_owned()), Cow::Owned(v.into_owned())) } else { (u, v) };
         crate::intl::locale_compare(_vm, &u, &v, arg(a, 1), arg(a, 2))?
     };
     #[cfg(not(feature = "intl"))]

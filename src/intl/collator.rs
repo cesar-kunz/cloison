@@ -8,19 +8,18 @@ use std::cmp::Ordering;
 
 use super::icu::{self, CaseFirst, CollatorKey, Sensitivity};
 use super::{
-    Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, resolve_locale, root, slot,
-    string_array, string_option, supported_locales,
+    Kind, Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, require, resolve_locale,
+    root, slot, string_array, string_option, supported_locales,
 };
-use crate::builtins::is_class;
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Object, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, string_units};
 
-const HANDLE: usize = 0;
-const BOUND_COMPARE: usize = 1;
-const LOCALE: usize = 2;
-const FLAGS: usize = 3;
+const HANDLE: usize = 1;
+const BOUND_COMPARE: usize = 2;
+const LOCALE: usize = 3;
+const FLAGS: usize = 4;
 
 const SENSITIVITIES: [&str; 4] = ["base", "accent", "case", "variant"];
 const CASE_FIRSTS: [&str; 3] = ["false", "lower", "upper"];
@@ -77,7 +76,8 @@ fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let proto = if construct { vm.take_new_target(f, default)? } else { default };
     let (handle, locale, flags) = initialize(vm, arg(a, 0), arg(a, 1))?;
     let locale = crate::temporal::string(vm, &locale);
-    Ok(create(vm, proto, &[Value::from_i32(handle as i32), Value::UNDEFINED, locale, Value::from_i32(flags.pack())]))
+    let slots = [Value::from_i32(handle as i32), Value::UNDEFINED, locale, Value::from_i32(flags.pack())];
+    Ok(create(vm, proto, Kind::Collator, &slots))
 }
 
 /// InitializeCollator: the collator `locales` and `options` ask for (its
@@ -165,14 +165,7 @@ fn is_type(s: &str) -> bool {
 }
 
 fn this_collator(this: Value, what: &str) -> Result<*mut Object> {
-    if is_class(this, Class::Intl) {
-        Ok(as_object(this))
-    } else {
-        Err(Error::type_error(format!(
-            "Method Intl.Collator.prototype.{what} called on incompatible receiver {}",
-            crate::vm::shown(this)
-        )))
-    }
+    require(this, Kind::Collator, &format!("Intl.Collator.prototype.{what}"))
 }
 
 /// `get Intl.Collator.prototype.compare`: the collator's bound compare

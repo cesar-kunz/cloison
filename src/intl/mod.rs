@@ -1,14 +1,17 @@
-//! ECMA-402, the `Intl` object (the `intl` feature): `Intl.Collator`
-//! alone so far, what TypeScript's compiler uses. ICU4X does the work
+//! ECMA-402, the `Intl` object (the `intl` feature): `Intl.Collator`,
+//! what TypeScript's compiler uses, and `Intl.Segmenter` of graphemes,
+//! what Univer uses. ICU4X does the work
 //! behind [`icu`]; this module is the JS side: locale lists, options,
 //! locale resolution, the objects. See docs/intl.md.
 //!
 //! An `Intl` object is of class `Intl`, its internal slots hidden
-//! in-object slots ([`slot`]); `vm.intl` holds what Rust needs (the
-//! collators, interned by what they are made of).
+//! in-object slots ([`slot`]), the first what it is ([`Kind`]);
+//! `vm.intl` holds what Rust needs (the collators, interned by what they
+//! are made of; the grapheme segmenter).
 
 mod collator;
 mod icu;
+mod segmenter;
 
 use std::collections::HashMap;
 
@@ -31,6 +34,8 @@ pub(crate) struct State {
     /// The collator of no locales and no options (`localeCompare`'s),
     /// once made.
     default_collator: Option<u32>,
+    /// The grapheme segmenter (all segmenters'), once made.
+    graphemes: Option<icu::Graphemes>,
 }
 
 pub(crate) use collator::locale_compare;
@@ -41,6 +46,9 @@ enum Root {
     CollatorPrototype,
     /// The template of collators' bound `compare` functions.
     Compare,
+    SegmenterPrototype,
+    SegmentsPrototype,
+    SegmentIteratorPrototype,
 }
 
 fn root(vm: &Vm, r: Root) -> *mut Object {
@@ -54,8 +62,9 @@ pub(crate) fn install(vm: &mut Vm) {
     let a = vm.intern_name("Intl");
     vm.add_property_with(g, a, object_value(intl), DONT_ENUM);
     crate::symbol::to_string_tag(vm, intl, "Intl");
-    vm.intl_roots = vec![std::ptr::null_mut(); 2];
+    vm.intl_roots = vec![std::ptr::null_mut(); 5];
     collator::install(vm, intl);
+    segmenter::install(vm, intl);
 }
 
 fn data_error(e: String) -> Error {
@@ -64,16 +73,38 @@ fn data_error(e: String) -> Error {
 
 // ---- Objects ----
 
-/// A new `Intl` object of prototype `proto` with internal slots `slots`.
-fn create(vm: &mut Vm, proto: Value, slots: &[Value]) -> Value {
-    let full = vm.root_shape(crate::object::Class::Intl, proto, slots.len() as u32);
+/// What an `Intl` object is: its first internal slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Collator,
+    Segmenter,
+    Segments,
+    SegmentIterator,
+}
+
+/// A new `Intl` object of prototype `proto`, a `kind` with internal
+/// slots `slots` (the first is slot 1).
+fn create(vm: &mut Vm, proto: Value, kind: Kind, slots: &[Value]) -> Value {
+    let full = vm.root_shape(crate::object::Class::Intl, proto, slots.len() as u32 + 1);
     let bare = vm.root_shape(crate::object::Class::Intl, proto, 0);
     let o = vm.heap.alloc_object(unsafe { &*full });
     unsafe { crate::object::set_shape(o, bare) };
+    crate::promise::set_slot(o, 0, Value::from_i32(kind as i32));
     for (i, &v) in slots.iter().enumerate() {
-        crate::promise::set_slot(o, i, v);
+        crate::promise::set_slot(o, i + 1, v);
     }
     object_value(o)
+}
+
+/// `v` as the `Intl` object of kind `kind` it is (RequireInternalSlot),
+/// or a `TypeError` naming `method`.
+fn require(v: Value, kind: Kind, method: &str) -> Result<*mut Object> {
+    if crate::builtins::is_class(v, crate::object::Class::Intl)
+        && slot(crate::object::as_object(v), 0).as_i32_unchecked() == kind as i32
+    {
+        return Ok(crate::object::as_object(v));
+    }
+    Err(Error::type_error(format!("Method {method} called on incompatible receiver {}", crate::vm::shown(v))))
 }
 
 /// Internal slot `i` of `Intl` object `o`.
@@ -275,6 +306,17 @@ fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
         return Ok(object_value(vm.new_object(Value::NULL)));
     }
     Ok(object_value(vm.to_object(v)?))
+}
+
+/// GetOptionsObject.
+fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
+    if v.is_undefined() {
+        return Ok(object_value(vm.new_object(Value::NULL)));
+    }
+    if is_object(v) {
+        return Ok(v);
+    }
+    Err(Error::type_error("Intl options must be an object or undefined"))
 }
 
 /// GetOption of a string: undefined, or one of `allowed` (any, if empty).

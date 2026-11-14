@@ -108,6 +108,24 @@ impl Collator {
     }
 }
 
+/// The grapheme cluster segmenter: UAX #29's extended grapheme clusters,
+/// the same for every locale.
+pub(crate) struct Graphemes(icu_segmenter::GraphemeClusterSegmenter);
+
+impl Graphemes {
+    pub(crate) fn new() -> Result<Graphemes, String> {
+        icu_segmenter::GraphemeClusterSegmenter::try_new_with_buffer_provider(provider()?)
+            .map(Graphemes)
+            .map_err(|e| format!("grapheme segmentation: {e}"))
+    }
+
+    /// Where the grapheme cluster at the start of `units` (not empty)
+    /// ends.
+    pub(crate) fn first(&self, units: &[u16]) -> usize {
+        self.0.as_borrowed().segment_utf16(units).find(|&b| b > 0).unwrap_or(units.len())
+    }
+}
+
 /// Whether the data has collation for `locale` (a canonical tag without
 /// extensions); an error if there is no data at all.
 pub(crate) fn available(locale: &str) -> Result<bool, String> {

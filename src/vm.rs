@@ -761,6 +761,21 @@ const WIDE_TRANSITIONS: usize = 16;
 /// `Vm::dict_remove`).
 const DICTIONARY_HOLES: u32 = 8;
 
+/// Properties from which a plain object given one more by a computed key,
+/// one no object of its shape got before, goes to dictionary mode (see
+/// `Vm::add_property_keyed`). `CLOISON_DICTIONARY_AT` sets it (0: never),
+/// to compare.
+const DICTIONARY_AT: usize = 128;
+
+fn dictionary_at() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("CLOISON_DICTIONARY_AT").ok().and_then(|s| s.parse().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => DICTIONARY_AT,
+    })
+}
+
 /// Zombie shapes kept before a sweep looks for those it can free (see
 /// `Vm::free_zombies`): about 6 MB.
 const ZOMBIES_MIN: usize = 1 << 14;
@@ -2728,6 +2743,30 @@ impl Vm {
         self.add_property_with(o, name, value, 0)
     }
 
+    /// `add_property` for a store by a computed key (`Vm::set`). A plain
+    /// object with [`DICTIONARY_AT`] properties that gets one no object of
+    /// its shape got before goes to dictionary mode first: it is a table,
+    /// keyed by names made at run time, and would make a shape, a
+    /// transition and a field cell for each (the SheetJS app 705,000
+    /// shapes, 230 MiB). One whose shape has the transition (named stores
+    /// or a literal made it: a record with many fields, copied key by
+    /// key) keeps its shapes, and named stores add to them as before:
+    /// the inline caches and the JIT read such objects by shape, and
+    /// every add a dictionary made the TypeScript app a quarter slower.
+    /// (V8 normalizes past 128 properties out of the object, past 12 on
+    /// a keyed store: `Map::TooManyFastProperties`.)
+    fn add_property_keyed(&mut self, o: *mut Object, name: Atom, value: Value) -> u32 {
+        let s = unsafe { &*(*o).shape };
+        if !s.dictionary
+            && s.keys().len() >= dictionary_at()
+            && self.may_be_dictionary(o)
+            && (s.unique || s.fixed || self.find_transition(s, name, 0).is_none())
+        {
+            self.to_dictionary(o);
+        }
+        self.add_property(o, name, value)
+    }
+
     /// `add_property` with attributes `attrs`.
     pub(crate) fn add_property_with(&mut self, o: *mut Object, name: Atom, value: Value, attrs: u8) -> u32 {
         let new = self.transition_with(unsafe { (*o).shape }, name, attrs);
@@ -3857,7 +3896,7 @@ impl Vm {
                         self.store_failed = true;
                         return Ok(());
                     }
-                    self.add_property(o, name, value);
+                    self.add_property_keyed(o, name, value);
                 }
             }
         }

@@ -175,11 +175,11 @@ fn generate_from<'p>(
             let mut loops = captured_loop_lexicals(p, i);
             let most = (0..loops.len()).max_by_key(|&k| loops[k].len());
             let slots = most.map_or(Vec::new(), |k| loops.swap_remove(k));
-            if d.len() + slots.len() > LOCAL_REGS {
-                return unsupported(
-                    f.pos,
-                    format_args!("more than {} variables of one loop used by closures", LOCAL_REGS - d.len()),
-                );
+            // (Without such a loop, what is past the registers overflows
+            // as ever, `arguments` and the function's name too.)
+            if !slots.is_empty() && d.len() + slots.len() > LOCAL_REGS {
+                let left = LOCAL_REGS.saturating_sub(d.len());
+                return unsupported(f.pos, format_args!("more than {left} variables of one loop used by closures"));
             }
             for (&n, &slot) in loops.iter().flat_map(|l| l.iter().zip(&slots)) {
                 shared[i].push((n, slot));

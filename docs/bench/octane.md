@@ -1,14 +1,14 @@
 # Octane against other engines
 
 Measured on one Linux x86-64 host (AMD EPYC 9454P, Zen 4, 96 cores,
-shared): cloison of 2026-11-13, the other engines on 2026-11-11. Made by `scripts/compare/octane.py`
+shared): cloison of 2026-11-14, the other engines on 2026-11-11. Made by `scripts/compare/octane.py`
 (results in `bench/compare/octane.tsv`, tables by `scripts/compare/report.py`).
 
 The engines, each run directly (not through a wrapper shell):
 
 | engine | version | with a JIT | without |
 |---|---|---|---|
-| cloison | 2026-11-13 | default | `CLOISON_NO_JIT=1` |
+| cloison | 2026-11-14 | default | `CLOISON_NO_JIT=1` |
 | V8 (`d8`) | 15.8.30 | default | `--jitless` |
 | JavaScriptCore | 323696 (GTK port) | default | `--useJIT=false` |
 | SpiderMonkey | 159.0b1 | default | `--no-blinterp --no-baseline --no-ion --no-native-regexp` |
@@ -43,43 +43,43 @@ regular expressions or `~`). A geomean over fewer benchmarks says how many.
 
 | | cloison | V8 | JSC | SpiderMonkey | ARK JIT |
 |---|---:|---:|---:|---:|---:|
-| richards | 42,581 | 51,509 | 60,349 | 24,207 | 6,065 |
-| deltablue | 61,212 | 134,061 | 71,460 | 27,842 | 4,529 |
-| crypto | 25,412 | 51,762 | 63,655 | 29,716 | — |
-| raytrace | 42,771 | 161,392 | 165,684 | 49,949 | 3,384 |
-| earley-boyer | 27,631 | 120,186 | 94,783 | 62,651 | — |
-| regexp | 4,780 | 14,036 | 15,031 | 11,682 | 728 |
-| splay | 18,452 | 82,404 | 58,708 | 46,935 | 10,043 |
-| navier-stokes | 21,306 | 46,996 | 41,428 | 30,540 | — |
-| pdfjs | 17,694 | 81,442 | 69,445 | 63,281 | — |
-| mandreel | 35,001 | 75,508 | 70,359 | 56,836 | — |
-| gbemu | 69,045 | 132,612 | 145,613 | 117,011 | — |
-| code-load | 29,631 | 51,980 | 47,365 | 54,199 | — |
-| box2d | 36,577 | 129,042 | 132,838 | 79,239 | 15,416 |
-| zlib | 39,385 | 72,117 | 99,038 | 75,278 | — |
-| typescript | 44,288 | 141,988 | 116,550 | 88,978 | — |
-| **geomean** | **29,627** | **77,321** | **72,564** | **47,163** | **4,678** (6) |
+| richards | 43,316 | 51,509 | 60,349 | 24,207 | 6,065 |
+| deltablue | 60,769 | 134,061 | 71,460 | 27,842 | 4,529 |
+| crypto | 25,250 | 51,762 | 63,655 | 29,716 | — |
+| raytrace | 42,993 | 161,392 | 165,684 | 49,949 | 3,384 |
+| earley-boyer | 27,894 | 120,186 | 94,783 | 62,651 | — |
+| regexp | 4,550 | 14,036 | 15,031 | 11,682 | 728 |
+| splay | 18,952 | 82,404 | 58,708 | 46,935 | 10,043 |
+| navier-stokes | 21,179 | 46,996 | 41,428 | 30,540 | — |
+| pdfjs | 17,507 | 81,442 | 69,445 | 63,281 | — |
+| mandreel | 35,426 | 75,508 | 70,359 | 56,836 | — |
+| gbemu | 69,999 | 132,612 | 145,613 | 117,011 | — |
+| code-load | 29,496 | 51,980 | 47,365 | 54,199 | — |
+| box2d | 36,327 | 129,042 | 132,838 | 79,239 | 15,416 |
+| zlib | 39,254 | 72,117 | 99,038 | 75,278 | — |
+| typescript | 43,018 | 141,988 | 116,550 | 88,978 | — |
+| **geomean** | **29,549** | **77,321** | **72,564** | **47,163** | **4,678** (6) |
 
 ## Scores without a JIT (higher is better)
 
 | | cloison | V8 `--jitless` | JSC no JIT | SpiderMonkey no JIT | QuickJS | ARK | KetteVM |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| richards | 2,927 | 2,060 | 1,931 | 471 | 1,140 | 1,837 | — |
-| deltablue | 2,572 | 1,990 | 1,541 | 492 | 1,006 | 2,232 | 1,194 |
-| crypto | 3,511 | 1,452 | 1,718 | 808 | 1,099 | — | — |
-| raytrace | 6,988 | 5,579 | 2,738 | 1,461 | 2,243 | 4,534 | — |
-| earley-boyer | 10,014 | 8,050 | 4,737 | 1,965 | 2,740 | — | — |
-| regexp | 3,511 | 3,844 | 750 | 921 | 467 | 707 | — |
-| splay | 13,843 | 11,358 | 12,117 | 3,940 | 6,532 | 9,358 | 2,462 |
-| navier-stokes | 4,587 | 2,270 | 2,748 | 797 | 2,174 | — | — |
-| pdfjs | 11,219 | 10,930 | 8,629 | 4,780 | 5,892 | — | — |
-| mandreel | 5,221 | 3,338 | 2,794 | 977 | 2,946 | — | — |
-| gbemu | 16,114 | 9,718 | 8,439 | 3,621 | 8,209 | — | — |
-| code-load | 29,915 | 50,877 | 44,123 | 49,720 | 19,958 | — | — |
-| box2d | 9,701 | 5,847 | 6,287 | 2,316 | 4,578 | 5,929 | — |
-| zlib | 3,859 | 2,402 | 2,281 | 1,342 | 1,462 | — | — |
-| typescript | 29,945 | 26,575 | 18,288 | 8,192 | 14,866 | — | — |
-| **geomean** | **7,488** | **5,625** | **4,359** | **2,002** | **3,003** | **3,000** (6) | **1,715** (2) |
+| richards | 2,990 | 2,060 | 1,931 | 471 | 1,140 | 1,837 | — |
+| deltablue | 2,532 | 1,990 | 1,541 | 492 | 1,006 | 2,232 | 1,194 |
+| crypto | 3,902 | 1,452 | 1,718 | 808 | 1,099 | — | — |
+| raytrace | 6,942 | 5,579 | 2,738 | 1,461 | 2,243 | 4,534 | — |
+| earley-boyer | 10,116 | 8,050 | 4,737 | 1,965 | 2,740 | — | — |
+| regexp | 3,421 | 3,844 | 750 | 921 | 467 | 707 | — |
+| splay | 14,034 | 11,358 | 12,117 | 3,940 | 6,532 | 9,358 | 2,462 |
+| navier-stokes | 4,335 | 2,270 | 2,748 | 797 | 2,174 | — | — |
+| pdfjs | 11,302 | 10,930 | 8,629 | 4,780 | 5,892 | — | — |
+| mandreel | 5,162 | 3,338 | 2,794 | 977 | 2,946 | — | — |
+| gbemu | 16,128 | 9,718 | 8,439 | 3,621 | 8,209 | — | — |
+| code-load | 30,241 | 50,877 | 44,123 | 49,720 | 19,958 | — | — |
+| box2d | 9,750 | 5,847 | 6,287 | 2,316 | 4,578 | 5,929 | — |
+| zlib | 3,728 | 2,402 | 2,281 | 1,342 | 1,462 | — | — |
+| typescript | 30,093 | 26,575 | 18,288 | 8,192 | 14,866 | — | — |
+| **geomean** | **7,503** | **5,625** | **4,359** | **2,002** | **3,003** | **3,000** (6) | **1,715** (2) |
 
 V8, JavaScriptCore and SpiderMonkey are ahead on CodeLoad, which measures
 loading code: cloison compiles an `eval`'s functions to bytecode at their
@@ -95,7 +95,7 @@ first calls, but skims every one's tokens up front. V8 is ahead on RegExp.
 | raytrace | 164 | 253 | 300 | 869 | 499 | 258 | — |
 | earley-boyer | 276 | 382 | 424 | 1,443 | 824 | — | — |
 | regexp | 39.2 | 38.4 | 175 | 142 | 278 | 168 | — |
-| splay | 47.0 | 52.4 | 40.9 | 87.6 | 51.8 | 66.9 | 182 |
+| splay | 47.4 | 52.4 | 40.9 | 87.6 | 51.8 | 66.9 | 182 |
 | navier-stokes | 169 | 446 | 259 | 613 | 280 | — | — |
 | pdfjs | 32.6 | 36.5 | 32.0 | 66.5 | 53.3 | — | — |
 | mandreel | 177 | 325 | 287 | 827 | 309 | — | — |
@@ -103,7 +103,7 @@ first calls, but skims every one's tokens up front. V8 is ahead on RegExp.
 | code-load | 9.20 | 6.36 | 5.57 | 6.32 | 18.1 | — | — |
 | box2d | 42.2 | 79.6 | 56.4 | 202 | 77.8 | 63.8 | — |
 | zlib | 433 | 1000 | 819 | 1,541 | 871 | — | — |
-| typescript | 41.4 | 61.0 | 69.6 | 191 | 78.0 | — | — |
+| typescript | 41.2 | 61.0 | 69.6 | 191 | 78.0 | — | — |
 | **geomean** | **97.2** | **157** | **150** | **361** | **213** | **184** (6) | **375** (2) |
 
 ## Fixed work with a JIT: G instructions (lower is better)
@@ -116,16 +116,16 @@ first calls, but skims every one's tokens up front. V8 is ahead on RegExp.
 | raytrace | 25.7 | 8.13 | 7.92 | 22.8 | 325 |
 | earley-boyer | 105 | 31.1 | 25.1 | 49.0 | — |
 | regexp | 31.0 | 11.1 | 10.2 | 10.9 | 165 |
-| splay | 32.0 | 8.50 | 6.46 | 7.61 | 58.0 |
+| splay | 32.3 | 8.50 | 6.46 | 7.61 | 58.0 |
 | navier-stokes | 45.0 | 14.3 | 10.9 | 19.1 | — |
-| pdfjs | 18.5 | 7.10 | 6.67 | 5.78 | — |
+| pdfjs | 18.6 | 7.10 | 6.67 | 5.78 | — |
 | mandreel | 24.8 | 11.0 | 11.2 | 11.7 | — |
-| gbemu | 12.8 | 8.45 | 7.11 | 6.26 | — |
-| code-load | 9.24 | 6.40 | 5.57 | 5.24 | — |
+| gbemu | 12.6 | 8.45 | 7.11 | 6.26 | — |
+| code-load | 9.25 | 6.40 | 5.57 | 5.24 | — |
 | box2d | 11.6 | 5.15 | 6.60 | 6.20 | 29.0 |
-| zlib | 66.0 | 34.2 | 22.3 | 29.9 | — |
-| typescript | 22.0 | 13.0 | 15.7 | 10.2 | — |
-| **geomean** | **27.8** | **12.4** | **11.5** | **15.6** | **120** (6) |
+| zlib | 66.1 | 34.2 | 22.3 | 29.9 | — |
+| typescript | 22.4 | 13.0 | 15.7 | 10.2 | — |
+| **geomean** | **27.9** | **12.4** | **11.5** | **15.6** | **120** (6) |
 
 With the JIT, cloison runs about twice the instructions of the optimizing
 engines for the same work: its stencils are per bytecode instruction, and

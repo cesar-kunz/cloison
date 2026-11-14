@@ -1151,7 +1151,7 @@ pub struct Vm {
     pub(crate) native_new_target: (Value, Value),
     /// The scope objects of the direct `eval`s running (see
     /// `intrinsics::direct_eval`), innermost last: the caller's, the
-    /// eval's own, then the `with` objects around it.
+    /// eval's own, then the `with` objects around it. Roots.
     pub(crate) eval_envs: Vec<Vec<Value>>,
     /// Those of `eval_envs` in use (the rest kept for their room).
     pub(crate) eval_depth: usize,

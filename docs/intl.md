@@ -35,7 +35,13 @@ and `organizeImports` asks `Intl.Collator.supportedLocalesOf`); and
   `Intl.Collator(locales, options)` does (ECMA-402's definition of it;
   without the feature it compares code units). TiddlyWiki sorts its
   titles with it. Without locales and options it is one collator, made
-  once; otherwise the options are read at each call, as the
+  once. With a locale string and no options (`x.localeCompare(y, "en")`)
+  the string's collator is kept, by the string as given, so a call
+  costs about what a call without locales does (a sort of 200,000
+  strings: 0.55 s, 2.66 s before; 0.46 s without locales); nothing of
+  it shows, a string having nothing to read, and a malformed tag is
+  not kept: it is a `RangeError` each time. Otherwise (options, or
+  locales that are an object) all is read at each call, as the
   specification has it, and the collator found among those made.
 
 - `Intl.Segmenter(locales, options)`, with `new` only, subclassable:

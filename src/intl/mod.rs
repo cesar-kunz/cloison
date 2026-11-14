@@ -34,6 +34,9 @@ pub(crate) struct State {
     /// The collator of no locales and no options (`localeCompare`'s),
     /// once made.
     default_collator: Option<u32>,
+    /// The collators of the locale strings `localeCompare` was given
+    /// without options (the strings as given, by their units).
+    locale_collators: HashMap<Box<[u16]>, u32>,
     /// The grapheme segmenter (all segmenters'), once made.
     graphemes: Option<icu::Graphemes>,
 }

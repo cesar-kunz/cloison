@@ -3036,6 +3036,30 @@ r.join(" | ");
     );
 }
 
+/// `localeCompare` with a locale string and no options, whose collator
+/// is kept: the same results call after call (Node's), a `RangeError`
+/// for a malformed tag each time, and an array's elements read each time.
+#[cfg(feature = "intl")]
+#[test]
+fn locale_compare_keeps_a_locale_strings_collator() {
+    let src = r#"
+var n = 0, log = [];
+var r = [
+  "a".localeCompare("B", "en"), "a".localeCompare("B", "en"), "ä".localeCompare("z", "en"), "a".localeCompare("A", "en-u-kf-upper"), "a".localeCompare("A", "en-u-kf-upper"),
+  "file10".localeCompare("file9", "en-u-kn"), "file10".localeCompare("file9", "en"), "file10".localeCompare("file9", "EN-u-kn"),
+  "a".localeCompare("B", ["en"]),
+];
+for (var i = 0; i < 3; i++) for (var tag of ["x_y", "en-", ""]) try { "a".localeCompare("b", tag) } catch (e) { if (e instanceof RangeError) n++ }
+r.push(n);
+// A String object's or an array's locales are read (observably) each time.
+var l = ["en"]; Object.defineProperty(l, 0, { get() { log.push("0"); return "en" } });
+"a".localeCompare("b", l); "a".localeCompare("b", l);
+r.push(log.join());
+r.join(" ; ");
+"#;
+    assert_eq!(value(src), "-1 ; -1 ; -1 ; 1 ; 1 ; 1 ; -1 ; 1 ; -1 ; 9 ; 0,0");
+}
+
 /// Without the `intl` feature, `localeCompare` compares code units.
 #[cfg(not(feature = "intl"))]
 #[test]

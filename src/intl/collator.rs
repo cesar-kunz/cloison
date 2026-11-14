@@ -142,21 +142,43 @@ fn initialize(vm: &mut Vm, locales: Value, options: Value) -> Result<(u32, Strin
 /// `String.prototype.localeCompare(that, locales, options)` of ECMA-402:
 /// CompareStrings of `x` and `y` by the collator `Intl.Collator(locales,
 /// options)` would make. Without locales and options that is one
-/// collator, made once.
+/// collator, made once; so is that of a locale given as a string without
+/// options (nothing of the program's runs to make either, so making it
+/// once doesn't show). Otherwise the locales and options are read at
+/// each call.
 pub(crate) fn locale_compare(vm: &mut Vm, x: &[u16], y: &[u16], locales: Value, options: Value) -> Result<Ordering> {
-    let default = locales.is_undefined() && options.is_undefined();
-    let h = match vm.intl.default_collator {
-        Some(h) if default => h,
-        _ => {
-            let (h, ..) = initialize(vm, locales, options)?;
-            if default {
+    let h = if !options.is_undefined() {
+        initialize(vm, locales, options)?.0
+    } else if locales.is_undefined() {
+        match vm.intl.default_collator {
+            Some(h) => h,
+            None => {
+                let (h, ..) = initialize(vm, locales, options)?;
                 vm.intl.default_collator = Some(h);
+                h
             }
-            h
         }
+    } else if let Some(tag) = string_units(locales) {
+        match vm.intl.locale_collators.get(tag) {
+            Some(&h) => h,
+            None => {
+                // (An invalid tag throws here, at each call.)
+                let (h, ..) = initialize(vm, locales, options)?;
+                if vm.intl.locale_collators.len() < LOCALE_COLLATORS {
+                    vm.intl.locale_collators.insert(tag.into(), h);
+                }
+                h
+            }
+        }
+    } else {
+        initialize(vm, locales, options)?.0
     };
     Ok(vm.intl.collators[h as usize].compare(x, y))
 }
+
+/// How many locale strings `localeCompare` remembers the collators of (a
+/// program has a few; past that they are resolved at each call).
+const LOCALE_COLLATORS: usize = 64;
 
 /// Whether `s` is a `type` of UTS #35's grammar: alphanumeric subtags of
 /// 3 to 8, joined by `-`.

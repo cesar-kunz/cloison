@@ -3354,6 +3354,14 @@ impl Vm {
             for i in 0..self.handles.len() {
                 m.value(self.handles[i]);
             }
+            // The scope objects of the direct `eval`s running: until its
+            // code's first instructions read them, an `eval`'s own is
+            // nowhere else.
+            for d in 0..self.eval_depth {
+                for i in 0..self.eval_envs[d].len() {
+                    m.value(self.eval_envs[d][i]);
+                }
+            }
             for &v in self.globals.slots.borrow().iter() {
                 m.value(v);
             }
@@ -4011,11 +4019,6 @@ impl Vm {
             ] {
                 fw.value(v);
             }
-            for env in self.eval_envs.iter_mut() {
-                for v in env.iter_mut() {
-                    fw.value(v);
-                }
-            }
             if let Some(crate::vm::Error(_, Some(e))) = &mut self.conv_error {
                 fw.value(e);
             }
@@ -4558,7 +4561,8 @@ impl Vm {
     /// that must stay (stage 2 of evacuating fragmented blocks): the VM
     /// stack's words and the arguments the runtime passes (`pending_args`),
     /// the VM's own references, field by field (`named_root_slots`), the
-    /// handles, the host's `Global`s, `WeakRef` targets and open upvalues, what Rust structures
+    /// handles, the host's `Global`s, `WeakRef` targets, the running direct
+    /// `eval`s' scope objects and open upvalues, what Rust structures
     /// took since the last collection, the prototypes of the shapes it
     /// keeps, the constants and inline caches' holders of the functions it
     /// keeps, the string constants and `Symbol.for`'s symbols; pinned, what
@@ -4597,6 +4601,9 @@ impl Vm {
                 f(Root::Object(o));
             }
             for v in self.handles.iter_mut().chain(self.kept_alive.iter_mut()) {
+                f(Root::Value(v));
+            }
+            for v in self.eval_envs[..self.eval_depth].iter_mut().flatten() {
                 f(Root::Value(v));
             }
             for v in self.globals.slots.borrow_mut().iter_mut() {

@@ -6380,6 +6380,40 @@ out.join(" ")
     assert!(shapes < 2000, "{shapes} shapes");
 }
 
+/// The scope objects made for a direct `eval` whose code has an `eval`
+/// (of the bindings' accessors, one at each place among the scopes) are
+/// roots until the code runs with them (issue #282): in Rust `Vec`s only,
+/// a collection while the next was made, or the code compiled and loaded,
+/// freed them, and the code looked its names up in freed cells. With a
+/// collection at every KiB allocated, what it frees poisoned.
+#[test]
+fn nested_direct_evals_scope_objects_are_roots() {
+    let src = r#"
+function f(n, o, p) {
+  let a = n;
+  with (o) {
+    let b = a + 1;
+    with (p) {
+      let c = b + 1;
+      return eval("var t" + n + " = a + b + c + x + y; eval('t" + n + " + a')");
+    }
+  }
+}
+var s = 0;
+for (var i = 0; i < 300; i++) s += f(i, {x: 1}, {y: 2});
+s
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_gc_verify(1 << 10);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("181200"), "tier at {budget}");
+        vm.verify_heap();
+    }
+}
+
 #[test]
 fn mapped_arguments_objects_share_a_shape() {
     // A sloppy function's `arguments` with parameters, its elements mapped

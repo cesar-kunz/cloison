@@ -1166,13 +1166,12 @@ fn site_bindings(site: Value) -> (usize, usize, Vec<SiteBinding>) {
 /// as `Gen::call` makes otherwise: `eval_scope`, then `direct_eval`, then
 /// `eval_scope_flush`.
 fn eval_through_scope(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) -> Result<Value> {
-    // (The scope object and the eval's arguments are held in Rust across
-    // the eval, which runs JS: no cell moves meanwhile, see
-    // `Vm::unmovable`. Rare: an eval in code an eval runs.)
-    vm.unmovable += 1;
-    let r = eval_through_scope_in(vm, a, carrier, site);
-    vm.unmovable -= 1;
-    r
+    // (The scope objects and the eval's arguments are held in Rust across
+    // the eval, which runs JS: the scope objects are handles, in `Vec`s
+    // only until the eval's code runs with them, and no cell moves
+    // meanwhile, see `Vm::handle_scope`. Rare: an eval in code an eval
+    // runs.)
+    vm.handle_scope(|vm| eval_through_scope_in(vm, a, carrier, site))
 }
 
 fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) -> Result<Value> {
@@ -1190,6 +1189,7 @@ fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) 
     for i in 0..=scopes.len() {
         if places.contains(&i) {
             let s = object_value(vm.new_object(Value::NULL));
+            vm.handles.push(s);
             bound_accessors(vm, s, carrier, &bindings, i)?;
             made.push(s);
             da.push(s);

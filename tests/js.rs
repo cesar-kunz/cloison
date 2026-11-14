@@ -2806,6 +2806,38 @@ var log = [];
     assert_eq!(display(vm.get(g, a).unwrap()), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
 }
 
+/// A function with more variables than registers whose loops declare
+/// block-scoped variables that closures use: each iteration's is a binding
+/// of its own (CreatePerIterationEnvironment, ForIn/OfBodyEvaluation's new
+/// environment, a block's each time it is entered), so they keep registers,
+/// not the one scope object. (A DOM shim in a bundle's 22,000-line function
+/// defined a canvas's `width` and `height` accessors this way: both were
+/// `height`'s.) The expected value is V8's.
+#[test]
+fn loop_bindings_stay_fresh_past_the_registers() {
+    let vars: String = (0..300).map(|i| format!("var x{i} = {i};\n")).collect();
+    let src = format!(
+        r#"(() => {{
+{vars}
+  var fs = [];
+  for (const [k, d] of [["a", 1], ["b", 2]]) fs.push(() => k + d);
+  for (const v of [1, 2]) fs.push(() => v);
+  for (let i = 0; i < 2; i++) fs.push(() => i);
+  for (const key in {{ p: 1, q: 2 }}) fs.push(() => key);
+  var n = 0;
+  while (n < 2) {{ let w = n++; const c = w * 10; fs.push(() => w + c); }}
+  do {{ let w = n++; fs.push(() => w); }} while (n < 4);
+  for (var j = 0; j < 2; j++) {{ function g() {{ return j0; }} let j0 = j; fs.push(g); }}
+  for (var j = 0; j < 2; j++) {{ try {{ throw j; }} catch (e) {{ fs.push(() => e); }} }}
+  for (var j = 0; j < 2; j++) {{ class C {{ static v = j; }} fs.push(() => C.v); }}
+  l: for (var j = 0; j < 2; j++) {{ switch (j) {{ default: let s = j; fs.push(() => s); }} }}
+  if (n) {{ for (const {{ a, b = a }} of [{{ a: 1 }}, {{ a: 2, b: 3 }}]) fs.push(() => a + b); }}
+  return fs.map(f => f()).join() + " " + x299;
+}})();"#
+    );
+    assert_eq!(value(&src), "a1,b2,1,2,0,1,p,q,0,11,2,3,0,1,0,1,0,1,0,1,2,5 299");
+}
+
 /// A function using `a` variables of one enclosing function and `b` of
 /// another (each with no more variables than registers, so none is in a
 /// scope object): `a + b` upvalues.

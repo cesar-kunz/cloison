@@ -164,7 +164,12 @@ fn generate_from<'p>(
             let mut d: Vec<&str> = decls[i][..params].to_vec();
             d.push(ENV);
             d.extend(implicit.iter().copied());
-            d.extend(decls[i][params..].iter().copied().filter(|n| !implicit.contains(n)));
+            // (Registers first for the block-scoped ones of its loops that
+            // nested functions use: each iteration's is a binding of its
+            // own, which the one scope object can't hold.)
+            let fresh = captured_loop_lexicals(p, i);
+            d.extend(fresh.iter().copied());
+            d.extend(decls[i][params..].iter().copied().filter(|n| !implicit.contains(n) && !fresh.contains(n)));
             overflow[i] = d.split_off(LOCAL_REGS);
             d.extend(overflow[i].iter().copied());
             decls[i] = d;
@@ -1147,70 +1152,117 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
 /// `explicit_declarations`, the `var`s of Annex B's functions in blocks
 /// among them if `annex_b`.
 fn declarations_with<'a>(p: &'a Program<'_>, f: usize, annex_b: bool) -> Vec<&'a str> {
-    fn stmt<'a>(s: &'a Stmt, p: &'a Program, annex_b: bool, out: &mut Vec<&'a str>) {
-        let add = |n: &'a str, out: &mut Vec<&'a str>| {
-            if !out.contains(&n) {
-                out.push(n)
-            }
-        };
-        match &s.kind {
-            StmtKind::Var(ds)
-            | StmtKind::Lexical(_, ds)
-            | StmtKind::For { init: Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)), .. } => {
-                ds.iter().filter(|(n, _)| !n.is_empty()).for_each(|(n, _)| add(n, out))
-            }
-            StmtKind::ForOf { kind: 1..=3, pattern: Some(pat), .. } => {
-                let mut ns = Vec::new();
-                pat.names(&mut ns);
-                for n in ns {
-                    if !out.iter().any(|o| *o == &*n) {
-                        // (The names live in the tree: find this one's.)
-                        if let Some(n) = pattern_name(pat, &n) {
-                            out.push(n);
-                        }
-                    }
-                }
-            }
-            StmtKind::Function(i) => {
-                let f = &p.functions[*i];
-                if let Some(b) = &f.binding {
-                    add(b, out);
-                }
-                if f.binding.is_none() || annex_b && f.annex_b {
-                    add(f.name.as_deref().unwrap(), out)
-                }
-            }
-            StmtKind::ForIn { var, fresh, name, .. } if *var || *fresh => add(name, out),
-            StmtKind::ForOf { kind: 1..=3, target: Expr { kind: ExprKind::Ident(name), .. }, .. } => add(name, out),
-            StmtKind::Try(_, Some((name, _)), _) if p.lexicals.contains_key(name) => add(name, out),
-            _ => {}
-        }
-        match &s.kind {
-            StmtKind::If(_, a, b) => {
-                stmt(a, p, annex_b, out);
-                if let Some(b) = b {
-                    stmt(b, p, annex_b, out);
-                }
-            }
-            // (Its object's variable: `Function::hidden`.)
-            StmtKind::With(_, _, body) => stmt(body, p, annex_b, out),
-            StmtKind::For { body, .. }
-            | StmtKind::ForIn { body, .. }
-            | StmtKind::ForOf { body, .. }
-            | StmtKind::While(_, body)
-            | StmtKind::DoWhile(body, _)
-            | StmtKind::Labeled(_, body) => stmt(body, p, annex_b, out),
-            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, annex_b, out)),
-            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| stmt(s, p, annex_b, out)),
-            StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, p, annex_b, out)),
-            _ => {}
-        }
-    }
     let f = &p.functions[f];
     let mut out: Vec<&str> = f.params.iter().map(|p| &**p).collect();
     for s in &f.body {
-        stmt(s, p, annex_b, &mut out);
+        declared_in(s, p, annex_b, &mut out);
     }
+    out
+}
+
+/// What statement `s` declares, the statements in it too, added to `out`.
+fn declared_in<'a>(s: &'a Stmt, p: &'a Program, annex_b: bool, out: &mut Vec<&'a str>) {
+    let add = |n: &'a str, out: &mut Vec<&'a str>| {
+        if !out.contains(&n) {
+            out.push(n)
+        }
+    };
+    match &s.kind {
+        StmtKind::Var(ds)
+        | StmtKind::Lexical(_, ds)
+        | StmtKind::For { init: Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)), .. } => {
+            ds.iter().filter(|(n, _)| !n.is_empty()).for_each(|(n, _)| add(n, out))
+        }
+        StmtKind::ForOf { kind: 1..=3, pattern: Some(pat), .. } => {
+            let mut ns = Vec::new();
+            pat.names(&mut ns);
+            for n in ns {
+                if !out.iter().any(|o| *o == &*n) {
+                    // (The names live in the tree: find this one's.)
+                    if let Some(n) = pattern_name(pat, &n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+        StmtKind::Function(i) => {
+            let f = &p.functions[*i];
+            if let Some(b) = &f.binding {
+                add(b, out);
+            }
+            if f.binding.is_none() || annex_b && f.annex_b {
+                add(f.name.as_deref().unwrap(), out)
+            }
+        }
+        StmtKind::ForIn { var, fresh, name, .. } if *var || *fresh => add(name, out),
+        StmtKind::ForOf { kind: 1..=3, target: Expr { kind: ExprKind::Ident(name), .. }, .. } => add(name, out),
+        StmtKind::Try(_, Some((name, _)), _) if p.lexicals.contains_key(name) => add(name, out),
+        _ => {}
+    }
+    match &s.kind {
+        StmtKind::If(_, a, b) => {
+            declared_in(a, p, annex_b, out);
+            if let Some(b) = b {
+                declared_in(b, p, annex_b, out);
+            }
+        }
+        // (Its object's variable: `Function::hidden`.)
+        StmtKind::With(_, _, body) => declared_in(body, p, annex_b, out),
+        StmtKind::For { body, .. }
+        | StmtKind::ForIn { body, .. }
+        | StmtKind::ForOf { body, .. }
+        | StmtKind::While(_, body)
+        | StmtKind::DoWhile(body, _)
+        | StmtKind::Labeled(_, body) => declared_in(body, p, annex_b, out),
+        StmtKind::Block(b) => b.iter().for_each(|s| declared_in(s, p, annex_b, out)),
+        StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| declared_in(s, p, annex_b, out)),
+        StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| declared_in(s, p, annex_b, out)),
+        _ => {}
+    }
+}
+
+/// The block-scoped variables function `f` declares in its loops (their
+/// heads too) that its nested functions use: each iteration's a binding
+/// of its own, which the closures made in it keep.
+fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
+    fn stmt<'a>(s: &'a Stmt, p: &'a Program, out: &mut Vec<&'a str>) {
+        match &s.kind {
+            StmtKind::For { .. }
+            | StmtKind::ForIn { .. }
+            | StmtKind::ForOf { .. }
+            | StmtKind::While(..)
+            | StmtKind::DoWhile(..) => declared_in(s, p, false, out),
+            StmtKind::If(_, a, b) => {
+                stmt(a, p, out);
+                if let Some(b) = b {
+                    stmt(b, p, out);
+                }
+            }
+            StmtKind::With(_, _, body) | StmtKind::Labeled(_, body) => stmt(body, p, out),
+            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, out)),
+            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| stmt(s, p, out)),
+            StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, p, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    p.functions[f].body.iter().for_each(|s| stmt(s, p, &mut out));
+    out.retain(|n| p.lexicals.contains_key(*n));
+    if out.is_empty() {
+        return out;
+    }
+    let mut used: HashSet<&str> = HashSet::default();
+    for c in f + 1..p.functions.len() {
+        let mut j = p.functions[c].parent;
+        while let Some(k) = j {
+            if k == f {
+                used.extend(references(&p.functions[c]));
+                break;
+            }
+            j = p.functions[k].parent;
+        }
+    }
+    out.retain(|n| used.contains(n));
     out
 }
 

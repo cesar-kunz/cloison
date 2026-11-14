@@ -8,9 +8,13 @@
 //! Each function is a direct port of its fdlibm source (`k_sin.c`,
 //! `k_cos.c`, `k_tan.c`, `e_rem_pio2.c`, `k_rem_pio2.c`, `s_sin.c`,
 //! `s_cos.c`, `s_tan.c`, `e_asin.c`, `e_acos.c`, `s_atan.c`, `e_atan2.c`,
-//! `e_exp.c`, `e_log.c`, `e_pow.c`, `s_scalbn.c`), with the same operation
-//! order, since that is what fixes the rounding. `sqrt` is exact everywhere
-//! and stays the hardware's.
+//! `e_exp.c`, `e_log.c`, `s_scalbn.c`), with the same operation order,
+//! since that is what fixes the rounding. `sqrt` is exact everywhere and
+//! stays the hardware's.
+//!
+//! `pow` is the exception: fdlibm's is too often a bit off, and V8 no
+//! longer uses it either. It is Arm Optimized Routines' (see `pow`), ported
+//! the same way, so the same on every platform too.
 //!
 //! So fdlibm's idioms stay as written, where Clippy would change them:
 //! `x - x` and `x / x` make NaN or raise flags on purpose (`eq_op`), its
@@ -994,244 +998,250 @@ pub fn log(x: f64) -> f64 {
     }
 }
 
+/// The top 12 bits of a double: its sign and exponent.
+#[inline(always)]
+fn top12(x: f64) -> u32 {
+    (x.to_bits() >> 52) as u32
+}
+
+const ONE_BITS: u64 = 0x3ff0_0000_0000_0000;
+const INF_BITS: u64 = 0x7ff0_0000_0000_0000;
+const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
+/// `pow_exp`'s `sign_bias` for a negative result.
+const SIGN_BIAS: u32 = 0x800 << 7;
+
+/// `log(x)` for `pow`, as `(y, tail)`: `y` the rounded result and `tail`
+/// about 15 more bits of it. `ix` is `x`'s bits (`x` positive), a
+/// subnormal's normalized with a negative exponent that runs into the sign
+/// bit.
+#[inline(always)]
+fn pow_log(ix: u64) -> (f64, f64) {
+    use crate::math_pow_data::{LN2_HI, LN2_LO, LOG_POLY as A, LOG_TAB};
+    const OFF: u64 = 0x3fe6_9555_0000_0000;
+    // x = 2^k z, z in [OFF, 2 OFF) and exact; the range is 128 intervals,
+    // and c is near the centre of z's.
+    let tmp = ix.wrapping_sub(OFF);
+    let i = ((tmp >> (52 - 7)) % 128) as usize;
+    let k = (tmp as i64) >> 52;
+    let iz = ix.wrapping_sub(tmp & (0xfff << 52));
+    let z = f64::from_bits(iz);
+    let kd = k as f64;
+    // log(x) = k ln2 + log(c) + log1p(z/c - 1)
+    let [invc, logc, logctail] = LOG_TAB[i];
+    // 1/c is j/128 or j/256, j an integer in [128, 256), and |z/c - 1| <
+    // 1/128, so r = z/c - 1 is representable. z is split so that rhi, rlo
+    // and rhi*rhi are exact, and |rlo| <= |r|.
+    let zhi = f64::from_bits(iz.wrapping_add(1 << 31) & (!0 << 32));
+    let zlo = z - zhi;
+    let rhi = zhi * invc - 1.0;
+    let rlo = zlo * invc;
+    let r = rhi + rlo;
+    // k ln2 + log(c) + r
+    let t1 = kd * LN2_HI + logc;
+    let t2 = t1 + r;
+    let lo1 = kd * LN2_LO + logctail;
+    let lo2 = t1 - t2 + r;
+    let ar = A[0] * r; // A[0] is -0.5
+    let ar2 = r * ar;
+    let ar3 = r * ar2;
+    // k ln2 + log(c) + r + A[0] r r
+    let arhi = A[0] * rhi;
+    let arhi2 = rhi * arhi;
+    let hi = t2 + arhi2;
+    let lo3 = rlo * (ar + arhi);
+    let lo4 = t2 - hi + arhi2;
+    // p = log1p(r) - r - A[0] r r
+    let p = ar3 * (A[1] + r * A[2] + ar2 * (A[3] + r * A[4] + ar2 * (A[5] + r * A[6])));
+    let lo = lo1 + lo2 + lo3 + lo4 + p;
+    let y = hi + lo;
+    (y, hi - y + lo)
+}
+
+/// `pow_exp`'s result where it may overflow or underflow: `scale * (1 +
+/// tmp)` without an intermediate rounding. `sbits` is `scale`'s bits, its
+/// exponent possibly overflown into the sign bit; `ki`'s low 32 bits are
+/// the `k` of the argument reduction (positive: the result may overflow;
+/// negative: underflow).
+#[cold]
+fn pow_exp_special(tmp: f64, sbits: u64, ki: u64) -> f64 {
+    if ki & 0x8000_0000 == 0 {
+        // k > 0: the exponent of scale may have overflowed, by <= 460.
+        let scale = f64::from_bits(sbits.wrapping_sub(1009 << 52));
+        return f64::from_bits((1009 + 1023) << 52) * (scale + scale * tmp);
+    }
+    // k < 0: the subnormal range needs care. (`sbits` is a signed scale.)
+    let sbits = sbits.wrapping_add(1022 << 52);
+    let scale = f64::from_bits(sbits);
+    let mut y = scale + scale * tmp;
+    if y.abs() < 1.0 {
+        // y rounded to the right precision before it is scaled into the
+        // subnormal range, against a double rounding.
+        let one = if y < 0.0 { -1.0 } else { 1.0 };
+        let lo = scale - y + scale * tmp;
+        let hi = one + y;
+        let lo = one - hi + y + lo;
+        y = (hi + lo) - one;
+        // The sign of 0.
+        if y == 0.0 {
+            y = f64::from_bits(sbits & SIGN_BIT);
+        }
+    }
+    f64::MIN_POSITIVE * y
+}
+
+/// `±exp(x + xtail)` for `pow`, where `|xtail| < 2^-8/128` and `|xtail| <=
+/// |x|`; `sign_bias` is `SIGN_BIAS` for a negative result, or 0.
+#[inline(always)]
+fn pow_exp(x: f64, xtail: f64, sign_bias: u32) -> f64 {
+    use crate::math_pow_data::{EXP_POLY as C, EXP_TAB, INV_LN2_N, NEG_LN2_HI_N, NEG_LN2_LO_N};
+    const SHIFT: f64 = 6755399441055744.0; // 1.5 * 2^52
+    const TOP_2M54: u32 = 0x3ff - 54;
+    const TOP_512: u32 = 0x3ff + 9;
+    const TOP_1024: u32 = 0x3ff + 10;
+    let mut abstop = top12(x) & 0x7ff;
+    if abstop.wrapping_sub(TOP_2M54) >= TOP_512 - TOP_2M54 {
+        if abstop.wrapping_sub(TOP_2M54) >= 0x8000_0000 {
+            // |x| is tiny (0 is common): the result rounds to ±1.
+            return if sign_bias != 0 { -1.0 } else { 1.0 };
+        }
+        if abstop >= TOP_1024 {
+            // Under- or overflow. (Infinities and NaNs are handled before.)
+            let r = if x.is_sign_negative() { 0.0 } else { f64::INFINITY };
+            return if sign_bias != 0 { -r } else { r };
+        }
+        // A large x is special-cased below.
+        abstop = 0;
+    }
+    // exp(x) = 2^(k/128) exp(r), where x = k ln2/128 + r, k an integer and
+    // r in [-ln2/256, ln2/256].
+    let z = INV_LN2_N * x;
+    let kd = z + SHIFT;
+    let ki = kd.to_bits();
+    let kd = kd - SHIFT;
+    let r = x + kd * NEG_LN2_HI_N + kd * NEG_LN2_LO_N;
+    let r = r + xtail;
+    // 2^(k/128) ~= scale * (1 + tail)
+    let idx = 2 * (ki % 128) as usize;
+    let top = ki.wrapping_add(sign_bias as u64) << (52 - 7);
+    let tail = f64::from_bits(EXP_TAB[idx]);
+    // (A valid scale only when -1023*128 < k < 1024*128.)
+    let sbits = EXP_TAB[idx + 1].wrapping_add(top);
+    // exp(x) = 2^(k/128) exp(r) ~= scale + scale * (tail + exp(r) - 1)
+    let r2 = r * r;
+    let tmp = tail + r + r2 * (C[0] + r * C[1]) + r2 * r2 * (C[2] + r * C[3]);
+    if abstop == 0 {
+        return pow_exp_special(tmp, sbits, ki);
+    }
+    let scale = f64::from_bits(sbits);
+    scale + scale * tmp
+}
+
+/// Whether the non-zero finite double of bits `iy` is an integer: 0 (no),
+/// 1 (odd) or 2 (even).
+fn pow_checkint(iy: u64) -> i32 {
+    let e = (iy >> 52 & 0x7ff) as i32;
+    if e < 0x3ff {
+        return 0;
+    }
+    if e > 0x3ff + 52 {
+        return 2;
+    }
+    if iy & ((1 << (0x3ff + 52 - e)) - 1) != 0 {
+        return 0;
+    }
+    if iy & (1 << (0x3ff + 52 - e)) != 0 {
+        return 1;
+    }
+    2
+}
+
+/// Whether `i` is the bits of a zero, an infinity or a NaN.
+#[inline(always)]
+fn zeroinfnan(i: u64) -> bool {
+    (i << 1).wrapping_sub(1) >= (INF_BITS << 1) - 1
+}
+
+/// `x ** y` (Number::exponentiate), as Arm Optimized Routines' `pow`
+/// computes it (`math/pow.c`, v23.01; glibc's since 2.28, musl's and
+/// bionic's), in its form without fused multiply-add: `exp(y * log(x))`
+/// with `log(x)` to about 68 bits, for an error under 0.52 ULP. So nearly
+/// every result is the correctly rounded one, as in the other engines,
+/// which call the platform's `pow`; fdlibm's `e_pow.c` (0.70 ULP) gets the
+/// last bit of one in ten wrong (`2 ** -0.5` isn't `Math.SQRT1_2`), and an
+/// audio synthesizer's output shows it. `x ** ±1`, `x ** 2` and `x ** 0.5`
+/// are `x`, `1 / x`, `x * x` and `sqrt(x)`, exactly. Where C and
+/// ECMAScript differ, this is ECMAScript's: a NaN `y` gives NaN even for
+/// `x` 1, and `(±1) ** ±∞` is NaN.
 pub fn pow(x: f64, y: f64) -> f64 {
-    const BP: [f64; 2] = [1.0, 1.5];
-    const DP_H: [f64; 2] = [0.0, 5.84962487220764160156e-01];
-    const DP_L: [f64; 2] = [0.0, 1.35003920212974897128e-08];
-    const TWO53: f64 = 9007199254740992.0;
-    const L1: f64 = 5.99999999999994648725e-01;
-    const L2: f64 = 4.28571428578550184252e-01;
-    const L3: f64 = 3.33333329818377432918e-01;
-    const L4: f64 = 2.72728123808534006489e-01;
-    const L5: f64 = 2.30660745775561754067e-01;
-    const L6: f64 = 2.06975017800338417784e-01;
-    const LG2: f64 = 6.93147180559945286227e-01;
-    const LG2_H: f64 = 6.93147182464599609375e-01;
-    const LG2_L: f64 = -1.90465429995776804525e-09;
-    const OVT: f64 = 8.0085662595372944372e-0017;
-    const CP: f64 = 9.61796693925975554329e-01;
-    const CP_H: f64 = 9.61796700954437255859e-01;
-    const CP_L: f64 = -7.02846165095275826516e-09;
-    const IVLN2: f64 = 1.44269504088896338700e+00;
-    const IVLN2_H: f64 = 1.44269502162933349609e+00;
-    const IVLN2_L: f64 = 1.92596299112661746887e-08;
-
-    let hx = hi(x);
-    let lx = lo(x);
-    let hy = hi(y);
-    let ly = lo(y);
-    let mut ix = hx & 0x7fffffff;
-    let iy = hy & 0x7fffffff;
-
-    // y == 0: x**0 = 1
-    if (iy as u32 | ly) == 0 {
-        return 1.0;
+    let mut sign_bias = 0;
+    let mut ix = x.to_bits();
+    let iy = y.to_bits();
+    let mut topx = top12(x);
+    let topy = top12(y);
+    // The powers that are one exact operation, which the general path only
+    // gets within its error.
+    match iy {
+        ONE_BITS => return x,
+        0xbff0_0000_0000_0000 => return 1.0 / x,
+        0x4000_0000_0000_0000 => return x * x,
+        // (Not of -0 or -inf, whose square roots aren't their powers.)
+        0x3fe0_0000_0000_0000 if ix <= INF_BITS => return x.sqrt(),
+        _ => {}
     }
-    // +-NaN
-    if ix > 0x7ff00000 || (ix == 0x7ff00000 && lx != 0) || iy > 0x7ff00000 || (iy == 0x7ff00000 && ly != 0) {
-        return x + y;
-    }
-    // When x < 0, is y an integer? 0: no; 1: odd; 2: even.
-    let mut yisint = 0;
-    if hx < 0 {
-        if iy >= 0x43400000 {
-            yisint = 2; // even integer y
-        } else if iy >= 0x3ff00000 {
-            let k = (iy >> 20) - 0x3ff; // exponent
-            if k > 20 {
-                let j = ly >> (52 - k);
-                if (j << (52 - k)) == ly {
-                    yisint = 2 - (j & 1) as i32;
-                }
-            } else if ly == 0 {
-                let j = iy >> (20 - k);
-                if (j << (20 - k)) == iy {
-                    yisint = 2 - (j & 1);
-                }
+    if topx.wrapping_sub(0x001) >= 0x7ff - 0x001 || (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be {
+        // The special cases: x < 2^-1022, negative, an infinity or NaN; or
+        // |y| < 2^-65, |y| >= 2^63, or NaN. (If |y| > 1075 ln2 2^53 the
+        // result is an infinity or 0; if |y| < 2^-54 / 1075, ±1.)
+        if zeroinfnan(iy) {
+            if iy << 1 == 0 {
+                return 1.0; // x**±0 is 1, even for a NaN x
             }
-        }
-    }
-    // Special values of y.
-    if ly == 0 {
-        if iy == 0x7ff00000 {
-            // y is +-inf
-            return if ((ix - 0x3ff00000) as u32 | lx) == 0 {
-                y - y // +-1**+-inf is NaN
-            } else if ix >= 0x3ff00000 {
-                // (|x|>1)**+-inf = inf, 0
-                if hy >= 0 { y } else { 0.0 }
-            } else {
-                // (|x|<1)**-,+inf = inf, 0
-                if hy < 0 { -y } else { 0.0 }
-            };
-        }
-        if iy == 0x3ff00000 {
-            // y is +-1
-            return if hy < 0 { 1.0 / x } else { x };
-        }
-        if hy == 0x40000000 {
-            return x * x; // y is 2
-        }
-        if hy == 0x3fe00000 && hx >= 0 {
-            // y is 0.5, x >= +0
-            return x.sqrt();
-        }
-    }
-
-    let mut ax = x.abs();
-    // Special values of x.
-    if lx == 0 && (ix == 0x7ff00000 || ix == 0 || ix == 0x3ff00000) {
-        let mut z = ax; // x is +-0, +-inf, +-1
-        if hy < 0 {
-            z = 1.0 / z; // z = (1/|x|)
-        }
-        if hx < 0 {
-            if ((ix - 0x3ff00000) | yisint) == 0 {
-                z = (z - z) / (z - z); // (-1)**non-int is NaN
-            } else if yisint == 1 {
-                z = -z; // (x<0)**odd = -(|x|**odd)
+            if x.is_nan() || y.is_nan() || ix << 1 == ONE_BITS << 1 {
+                return f64::NAN; // (±1)**±inf is NaN too
             }
+            // y is ±inf: (|x|<1)**inf and (|x|>1)**-inf are 0.
+            return if (ix << 1 < ONE_BITS << 1) == (iy >> 63 == 0) { 0.0 } else { y * y };
         }
-        return z;
-    }
-
-    let mut n = (hx >> 31) + 1;
-    // (x<0)**(non-int) is NaN
-    if (n | yisint) == 0 {
-        return (x - x) / (x - x);
-    }
-    let mut s = 1.0; // sign of the result: -1 for (-ve)**(odd int)
-    if (n | (yisint - 1)) == 0 {
-        s = -1.0;
-    }
-
-    let (t1, t2);
-    if iy > 0x41e00000 {
-        // |y| > 2^31
-        if iy > 0x43f00000 {
-            // |y| > 2^64: must over/underflow
-            if ix <= 0x3fefffff {
-                return if hy < 0 { HUGE * HUGE } else { TINY * TINY };
+        if zeroinfnan(ix) {
+            let mut x2 = x * x;
+            if ix >> 63 != 0 && pow_checkint(iy) == 1 {
+                x2 = -x2;
             }
-            if ix >= 0x3ff00000 {
-                return if hy > 0 { HUGE * HUGE } else { TINY * TINY };
+            return if iy >> 63 != 0 { 1.0 / x2 } else { x2 };
+        }
+        // x and y are non-zero and finite.
+        if ix >> 63 != 0 {
+            // x < 0
+            match pow_checkint(iy) {
+                0 => return f64::NAN,
+                1 => sign_bias = SIGN_BIAS,
+                _ => {}
             }
+            ix &= !SIGN_BIT;
+            topx &= 0x7ff;
         }
-        // Over/underflow if x is not close to one.
-        if ix < 0x3fefffff {
-            return if hy < 0 { s * HUGE * HUGE } else { s * TINY * TINY };
+        if (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be {
+            // (sign_bias is 0: y isn't odd.)
+            if ix == ONE_BITS || (topy & 0x7ff) < 0x3be {
+                return 1.0; // |y| < 2^-65: x**y ~= 1 + y log(x)
+            }
+            return if (ix > ONE_BITS) == (topy < 0x800) { f64::INFINITY } else { 0.0 };
         }
-        if ix > 0x3ff00000 {
-            return if hy > 0 { s * HUGE * HUGE } else { s * TINY * TINY };
-        }
-        // |1-x| is tiny <= 2^-20: log(x) by x - x^2/2 + x^3/3 - x^4/4
-        let t = ax - 1.0;
-        let w = (t * t) * (0.5 - t * (0.3333333333333333333333 - t * 0.25));
-        let u = IVLN2_H * t;
-        let v = t * IVLN2_L - w * IVLN2;
-        t1 = with_lo(u + v, 0);
-        t2 = v - (t1 - u);
-    } else {
-        n = 0;
-        // Subnormal x.
-        if ix < 0x00100000 {
-            ax *= TWO53;
-            n -= 53;
-            ix = hi(ax);
-        }
-        n += (ix >> 20) - 0x3ff;
-        let j = ix & 0x000fffff;
-        // The interval.
-        ix = j | 0x3ff00000; // normalize ix
-        let k: usize;
-        if j <= 0x3988E {
-            k = 0; // |x| < sqrt(3/2)
-        } else if j < 0xBB67A {
-            k = 1; // |x| < sqrt(3)
-        } else {
-            k = 0;
-            n += 1;
-            ix -= 0x00100000;
-        }
-        ax = with_hi(ax, ix);
-        // ss = s_h + s_l = (x-1)/(x+1) or (x-1.5)/(x+1.5)
-        let u = ax - BP[k];
-        let v = 1.0 / (ax + BP[k]);
-        let ss = u * v;
-        let s_h = with_lo(ss, 0);
-        // t_h = ax + bp[k], high
-        let t_h = from_words(((ix >> 1) | 0x20000000) + 0x00080000 + ((k as i32) << 18), 0);
-        let t_l = ax - (t_h - BP[k]);
-        let s_l = v * ((u - s_h * t_h) - s_h * t_l);
-        // log(ax)
-        let s2 = ss * ss;
-        let mut r = s2 * s2 * (L1 + s2 * (L2 + s2 * (L3 + s2 * (L4 + s2 * (L5 + s2 * L6)))));
-        r += s_l * (s_h + ss);
-        let s2 = s_h * s_h;
-        let t_h = with_lo(3.0 + s2 + r, 0);
-        let t_l = r - ((t_h - 3.0) - s2);
-        // u + v = ss*(1+...)
-        let u = s_h * t_h;
-        let v = s_l * t_h + t_l * ss;
-        // 2/(3log2)*(ss+...)
-        let p_h = with_lo(u + v, 0);
-        let p_l = v - (p_h - u);
-        let z_h = CP_H * p_h;
-        let z_l = CP_L * p_h + p_l * CP + DP_L[k];
-        // log2(ax) = (ss+..)*2/(3*log2) = n + dp_h + z_h + z_l
-        let t = n as f64;
-        t1 = with_lo(((z_h + z_l) + DP_H[k]) + t, 0);
-        t2 = z_l - (((t1 - t) - DP_H[k]) - z_h);
-    }
-
-    // y as y1 + y2; (y1+y2)*(t1+t2)
-    let y1 = with_lo(y, 0);
-    let p_l = (y - y1) * t1 + y * t2;
-    let mut p_h = y1 * t1;
-    let z = p_l + p_h;
-    let j = hi(z);
-    let i = lo(z);
-    if j >= 0x40900000 {
-        // z >= 1024
-        if ((j - 0x40900000) as u32 | i) != 0 || p_l + OVT > z - p_h {
-            return s * HUGE * HUGE; // overflow
-        }
-    } else if (j & 0x7fffffff) >= 0x4090cc00 {
-        // z <= -1075
-        if ((j as u32).wrapping_sub(0xc090cc00) | i) != 0 || p_l <= z - p_h {
-            return s * TINY * TINY; // underflow
+        if topx == 0 {
+            // A subnormal x, normalized: its exponent becomes negative.
+            ix = (x * 4503599627370496.0).to_bits();
+            ix &= !SIGN_BIT;
+            ix = ix.wrapping_sub(52 << 52);
         }
     }
-    // 2**(p_h+p_l)
-    let i = j & 0x7fffffff;
-    let mut k = (i >> 20) - 0x3ff;
-    let mut n = 0;
-    if i > 0x3fe00000 {
-        // |z| > 0.5: n = [z+0.5]
-        n = j + (0x00100000 >> (k + 1));
-        k = ((n & 0x7fffffff) >> 20) - 0x3ff; // new k for n
-        let t = from_words(n & !(0x000fffff >> k), 0);
-        n = ((n & 0x000fffff) | 0x00100000) >> (20 - k);
-        if j < 0 {
-            n = -n;
-        }
-        p_h -= t;
-    }
-    let t = with_lo(p_l + p_h, 0);
-    let u = t * LG2_H;
-    let v = (p_l - (t - p_h)) * LG2 + t * LG2_L;
-    let z = u + v;
-    let w = v - (z - u);
-    let t = z * z;
-    let t1 = z - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
-    let r = (z * t1) / (t1 - 2.0) - (w + z * w);
-    let z = 1.0 - (r - z);
-    let j = hi(z) + (n << 20);
-    if (j >> 20) <= 0 {
-        s * scalbn(z, n) // subnormal output
-    } else {
-        s * with_hi(z, j)
-    }
+    let (hi, lo) = pow_log(ix);
+    let yhi = f64::from_bits(iy & (!0 << 27));
+    let ylo = y - yhi;
+    let lhi = f64::from_bits(hi.to_bits() & (!0 << 27));
+    let llo = hi - lhi + lo;
+    let ehi = yhi * lhi;
+    let elo = ylo * lhi + y * llo; // |elo| < |ehi| * 2^-25
+    pow_exp(ehi, elo, sign_bias)
 }
 
 /// `d` rounded to the nearest IEEE binary16 (ties to even), as its bits:
@@ -1280,8 +1290,7 @@ mod tests {
 
     /// Node's (V8's) results, as bits, on x86-64: every reduction path of
     /// the trigonometry (none, +-1, medium, large), the tie in `exp(1)`,
-    /// the subnormal ends of `exp`, `log` and `pow`, and `pow`'s sign and
-    /// overflow cases.
+    /// the subnormal ends of `exp` and `log`; and `pow`'s special cases.
     #[test]
     fn bit_for_bit_with_v8() {
         let b = f64::to_bits;
@@ -1326,5 +1335,50 @@ mod tests {
         assert_eq!(pow(f64::NAN, 0.0), 1.0);
         assert_eq!(b(pow(-0.0, -3.0)), b(f64::NEG_INFINITY));
         assert_eq!(b(atan2(-0.0, -1.0)), b(-std::f64::consts::PI));
+    }
+
+    /// `pow` against Arm Optimized Routines' `pow.c` compiled without fused
+    /// multiply-add or contraction, as bits: results fdlibm's `e_pow.c`
+    /// gets a bit off (the first six; BeepBox computes the first four), a
+    /// tie, negative bases, the over- and underflow thresholds, subnormal
+    /// arguments and results, and tiny and huge exponents; then the powers
+    /// that are exact.
+    #[test]
+    fn pow_bit_for_bit_with_arm_routines() {
+        let b = f64::to_bits;
+        assert_eq!(pow(2.0, -0.5), std::f64::consts::FRAC_1_SQRT_2);
+        assert_eq!(b(pow(2.0, -2.5)), 0x3fc6a09e667f3bcd);
+        assert_eq!(b(pow(2.0, 3.5)), 0x4026a09e667f3bcd);
+        assert_eq!(b(pow(0.5, -0.7272970622351479)), 0x3ffa7d11ba4cd933);
+        assert_eq!(b(pow(2.0, 0.8333333333333334)), 0x3ffc823e074ec129);
+        assert_eq!(b(pow(7.696667909622192, -0.640742301940918)), 0x3fd14f4549252790);
+        assert_eq!(pow(10.0, -5.0), 1e-5);
+        assert_eq!(pow(10.0, 308.0), 1e308);
+        assert_eq!(pow(9.0, 17.0), 16677181699666568.0);
+        assert_eq!(pow(-2.5, 7.0), -610.3515625);
+        assert_eq!(b(pow(-2.5, -8.0)), 0x3f45798ee2308c3a);
+        assert!(pow(-8.0, 1.0 / 3.0).is_nan());
+        assert_eq!(b(pow(1.0000001, 1e9)), 0x48f349445c228792);
+        assert_eq!(b(pow(0.9999999, 1e9)), 0x36ea8c1679619156);
+        assert_eq!(b(pow(2.0, 1023.9999999999999)), 0x7feffffffffffd3a);
+        assert_eq!(pow(f64::MAX, 1.0000000000000002), f64::INFINITY);
+        assert_eq!(b(pow(2.0, -1073.3)), 0x0000000000000002);
+        assert_eq!(b(pow(2.0, -1074.5)), 0x0000000000000001);
+        assert_eq!(b(pow(0.1, 323.5)), 0x0000000000000001);
+        assert_eq!(b(pow(3.0, -678.5)), 0);
+        assert_eq!(b(pow(5e-324, 0.3)), 0x2bcbdb8cdadbe161);
+        assert_eq!(b(pow(1e-310, -0.9)), 0x79dc34c70a777ae0);
+        assert_eq!(pow(1.5, 1e-70), 1.0);
+        assert_eq!(b(pow(1.0000000000000002, 4.5e15)), 0x4005ba97e5c5ee1c);
+        assert_eq!(b(pow(-1.0000000000000002, 4503599627370497.0)), 0xc005bf0a8b14576a);
+        for x in [0.9999999999999999, 4503599627370495.5, f64::MAX, 5e-324, 0.1] {
+            assert_eq!(b(pow(x, 0.5)), b(x.sqrt()));
+            assert_eq!(b(pow(-x, 1.0)), b(-x));
+            assert_eq!(b(pow(-x, -1.0)), b(-1.0 / x));
+            assert_eq!(b(pow(-x, 2.0)), b(x * x));
+        }
+        assert_eq!(b(pow(-0.0, 0.5)), 0);
+        assert_eq!(pow(f64::NEG_INFINITY, 0.5), f64::INFINITY);
+        assert!(pow(f64::NAN, 0.5).is_nan());
     }
 }

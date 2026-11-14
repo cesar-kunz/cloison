@@ -1364,6 +1364,12 @@ impl Vm {
     /// CreateDataPropertyOrThrow: `o[key] = v` as a new plain property.
     pub(crate) fn create_data_property(&mut self, o: Value, key: Key, v: Value) -> Result<()> {
         let obj = as_object(o);
+        // (A big table's new key makes no shape: `Vm::keyed_table`.)
+        if let Key::Name(a) = key
+            && unsafe { (*obj).class == Class::Plain && (*(*obj).shape).lookup(a).is_none() }
+        {
+            self.keyed_table(obj, a);
+        }
         let d = Desc::data(v, true, true, true);
         if !self.define_own_property(obj, key, &d)? {
             let k = self.key_string(key);
@@ -1386,8 +1392,12 @@ impl Vm {
             }
             // (The shape stays `src`'s: only `target` changes.)
             let s = &*(*src).shape;
-            let listed =
-                |vm: &Vm, k: usize| s.attrs()[k] & ACCESSOR == 0 && !crate::symbol::is_symbol_atom(vm, s.keys()[k]);
+            // (A dictionary's buried slot is no property: skipped below,
+            // not enumerable.)
+            let hole = self.a_hole;
+            let listed = |vm: &Vm, k: usize| {
+                s.keys()[k] == hole || s.attrs()[k] & ACCESSOR == 0 && !crate::symbol::is_symbol_atom(vm, s.keys()[k])
+            };
             if !(0..s.keys().len()).all(|k| listed(self, k)) {
                 return Ok(false);
             }
@@ -1399,7 +1409,7 @@ impl Vm {
                 if (*(*target).shape).lookup(name).is_some() {
                     self.create_data_property(object_value(target), Key::Name(name), v)?;
                 } else {
-                    self.add_property(target, name, v);
+                    self.add_property_keyed(target, name, v);
                 }
             }
         }

@@ -2743,19 +2743,28 @@ impl Vm {
         self.add_property_with(o, name, value, 0)
     }
 
-    /// `add_property` for a store by a computed key (`Vm::set`). A plain
-    /// object with [`DICTIONARY_AT`] properties that gets one no object of
-    /// its shape got before goes to dictionary mode first: it is a table,
-    /// keyed by names made at run time, and would make a shape, a
-    /// transition and a field cell for each (the SheetJS app 705,000
-    /// shapes, 230 MiB). One whose shape has the transition (named stores
-    /// or a literal made it: a record with many fields, copied key by
-    /// key) keeps its shapes, and named stores add to them as before:
-    /// the inline caches and the JIT read such objects by shape, and
-    /// every add a dictionary made the TypeScript app a quarter slower.
-    /// (V8 normalizes past 128 properties out of the object, past 12 on
-    /// a keyed store: `Map::TooManyFastProperties`.)
-    fn add_property_keyed(&mut self, o: *mut Object, name: Atom, value: Value) -> u32 {
+    /// `add_property` for a store by a computed key (`Vm::set`), which
+    /// may make `o` a table first (`Vm::keyed_table`).
+    pub(crate) fn add_property_keyed(&mut self, o: *mut Object, name: Atom, value: Value) -> u32 {
+        self.keyed_table(o, name);
+        self.add_property(o, name, value)
+    }
+
+    /// Before `o` gets property `name`, which it doesn't have, by a key
+    /// computed at run time (`Vm::set`, and `Vm::create_data_property`:
+    /// `JSON.parse`, `Object.fromEntries`, `Object.groupBy`, a spread). A
+    /// plain object with [`DICTIONARY_AT`] properties that gets one no
+    /// object of its shape got before goes to dictionary mode first: it
+    /// is a table, keyed by names made at run time, and would make a
+    /// shape, a transition and a field cell for each (the SheetJS app
+    /// 705,000 shapes, 230 MiB). One whose shape has the transition
+    /// (named stores or a literal made it: a record with many fields,
+    /// copied key by key) keeps its shapes, and named stores add to them
+    /// as before: the inline caches and the JIT read such objects by
+    /// shape, and every add a dictionary made the TypeScript app a
+    /// quarter slower. (V8 normalizes past 128 properties out of the
+    /// object, past 12 on a keyed store: `Map::TooManyFastProperties`.)
+    pub(crate) fn keyed_table(&mut self, o: *mut Object, name: Atom) {
         let s = unsafe { &*(*o).shape };
         if !s.dictionary
             && s.keys().len() >= dictionary_at()
@@ -2764,7 +2773,6 @@ impl Vm {
         {
             self.to_dictionary(o);
         }
-        self.add_property(o, name, value)
     }
 
     /// `add_property` with attributes `attrs`.

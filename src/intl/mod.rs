@@ -28,7 +28,12 @@ pub(crate) struct State {
     collators: Vec<icu::Collator>,
     collator_ids: HashMap<icu::CollatorKey, u32>,
     available: HashMap<String, bool>,
+    /// The collator of no locales and no options (`localeCompare`'s),
+    /// once made.
+    default_collator: Option<u32>,
 }
+
+pub(crate) use collator::locale_compare;
 
 /// [`Vm::intl_roots`]' entries (each realm's).
 #[derive(Clone, Copy)]

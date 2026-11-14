@@ -11,7 +11,8 @@ cargo build --release --features intl
 cargo test --release --features intl
 ```
 
-So far it is `Intl.Collator` alone, what TypeScript's compiler uses
+So far it is `Intl.Collator`, and `String.prototype.localeCompare`
+through it: what TypeScript's compiler uses
 (its language service sorts completions with
 `new Intl.Collator(locale, { usage: "sort", sensitivity: "variant", numeric: true }).compare`,
 and `organizeImports` asks `Intl.Collator.supportedLocalesOf`).
@@ -28,6 +29,12 @@ and `organizeImports` asks `Intl.Collator.supportedLocalesOf`).
 - `Intl.Collator.prototype.compare` (a getter: the collator's bound
   compare function, made once), `resolvedOptions()`, `@@toStringTag`.
 - `Intl.Collator.supportedLocalesOf(locales, options)`.
+- `String.prototype.localeCompare(that, locales, options)` compares as
+  `Intl.Collator(locales, options)` does (ECMA-402's definition of it;
+  without the feature it compares code units). TiddlyWiki sorts its
+  titles with it. Without locales and options it is one collator, made
+  once; otherwise the options are read at each call, as the
+  specification has it, and the collator found among those made.
 
 `sensitivity` maps to ICU4X's strength and case level, `numeric` and
 `caseFirst` to its preferences, `ignorePunctuation` to shifted alternate
@@ -46,7 +53,8 @@ export (Unicode 17).
 `scripts/intl-data.sh [locale …]` makes it with `icu4x-datagen` (the
 ICU4X version `Cargo.lock` has).
 
-It is read on the first `Intl.Collator` made (not at startup), once per
+It is read on the first `Intl.Collator` made or `localeCompare` call
+(not at startup), once per
 process: `CLOISON_INTL_DATA`'s file, else the repository's (the path the
 build was made from). Without it, making a collator throws an `Error`
 saying where it looked.
@@ -101,9 +109,8 @@ Beyond the other constructors (`NumberFormat`, `DateTimeFormat`,
   false, `sensitivity` `variant` for search too.
 - DefaultLocale is `en-US`, not the environment's (`LANG`).
 - `best fit` matching is `lookup`.
-- `String.prototype.localeCompare`, `toLocaleString` and the like don't
-  go through `Intl` (ECMA-402 says they should): they behave as without
-  it.
+- `toLocaleString`, `toLocaleUpperCase` and the like don't go through
+  `Intl` (ECMA-402 says they should): they behave as without it.
 
 ## A plugin, later
 

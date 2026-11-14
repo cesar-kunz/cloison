@@ -2921,6 +2921,46 @@ r.join(" | ");
     );
 }
 
+/// `String.prototype.localeCompare` with the `intl` feature compares as
+/// `Intl.Collator(locales, options)` does (ECMA-402), not by code units:
+/// TiddlyWiki sorts its titles with it. V8's results.
+#[cfg(feature = "intl")]
+#[test]
+fn locale_compare_collates_as_intl_collator() {
+    let src = r#"
+var words = ["--tp x", "\"A free\"", "Résumé", "Édition", "Zed", "apple", "Apple", "a b", "ab", "a-b", "$:/x", "_u", "1", "10", "2", "résumé", "Edition", "e"];
+var log = [];
+var r = [
+  words.slice().sort((x, y) => x.localeCompare(y)).join("|"),
+  words.slice().sort((x, y) => x.localeCompare(y, undefined, { numeric: true, sensitivity: "base" })).join("|"),
+  "a".localeCompare("B"), "a".localeCompare("A"), "a".localeCompare("A", undefined, { sensitivity: "base" }),
+  "a".localeCompare("A", "en", { caseFirst: "upper" }), "file10".localeCompare("file9", "en-u-kn"),
+  "\u00e9".localeCompare("e\u0301"), "a".localeCompare(), "undefined".localeCompare(), String.prototype.localeCompare.length,
+  "a".localeCompare({ toString() { log.push("that"); return "b" } }, undefined, { get usage() { log.push("usage") }, get sensitivity() { log.push("sensitivity") } }),
+  log.join(),
+];
+for (var f of [() => "a".localeCompare("b", "en_US"), () => "a".localeCompare("b", "en", { sensitivity: "x" }), () => String.prototype.localeCompare.call(null, "b")])
+  try { f(); r.push("no error") } catch (e) { r.push(e.name) }
+r.join(" ; ");
+"#;
+    assert_eq!(
+        value(src),
+        "_u|--tp x|\"A free\"|$:/x|1|10|2|a b|a-b|ab|apple|Apple|e|Edition|Édition|résumé|Résumé|Zed ; \
+         _u|--tp x|\"A free\"|$:/x|1|2|10|a b|a-b|ab|apple|Apple|e|Édition|Edition|Résumé|résumé|Zed ; \
+         -1 ; -1 ; 0 ; 1 ; 1 ; 0 ; -1 ; 0 ; 1 ; -1 ; that,usage,sensitivity ; RangeError ; RangeError ; TypeError"
+    );
+}
+
+/// Without the `intl` feature, `localeCompare` compares code units.
+#[cfg(not(feature = "intl"))]
+#[test]
+fn locale_compare_is_by_code_units_without_intl() {
+    assert_eq!(
+        value(r#"["a".localeCompare("B"), "a".localeCompare("a"), "a".localeCompare("b", "en", {})].join()"#),
+        "1,0,-1"
+    );
+}
+
 /// Without the `intl` feature, there is no `Intl`.
 #[cfg(not(feature = "intl"))]
 #[test]

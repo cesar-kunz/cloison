@@ -4,6 +4,8 @@
 //! an int ([`Flags`]). Its [[Collation]] is "default" (the data has no
 //! other collation types).
 
+use std::cmp::Ordering;
+
 use super::icu::{self, CaseFirst, CollatorKey, Sensitivity};
 use super::{
     Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, resolve_locale, root, slot,
@@ -73,9 +75,16 @@ fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let f = vm.callee;
     let default = object_value(root(vm, Root::CollatorPrototype));
     let proto = if construct { vm.take_new_target(f, default)? } else { default };
-    // InitializeCollator.
-    let requested = canonicalize_locale_list(vm, arg(a, 0))?;
-    let options = coerce_options(vm, arg(a, 1))?;
+    let (handle, locale, flags) = initialize(vm, arg(a, 0), arg(a, 1))?;
+    let locale = crate::temporal::string(vm, &locale);
+    Ok(create(vm, proto, &[Value::from_i32(handle as i32), Value::UNDEFINED, locale, Value::from_i32(flags.pack())]))
+}
+
+/// InitializeCollator: the collator `locales` and `options` ask for (its
+/// handle), its locale and its other resolved options.
+fn initialize(vm: &mut Vm, locales: Value, options: Value) -> Result<(u32, String, Flags)> {
+    let requested = canonicalize_locale_list(vm, locales)?;
+    let options = coerce_options(vm, options)?;
     let search = string_option(vm, options, "usage", &["sort", "search"])?.as_deref() == Some("search");
     string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
     let collation = string_option(vm, options, "collation", &[])?;
@@ -116,6 +125,7 @@ fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         numeric: flags.numeric,
         case_first: flags.case_first,
     };
+    let locale = r.locale;
     let handle = match vm.intl.collator_ids.get(&key) {
         Some(&h) => h,
         None => {
@@ -126,8 +136,26 @@ fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             h
         }
     };
-    let locale = crate::temporal::string(vm, &r.locale);
-    Ok(create(vm, proto, &[Value::from_i32(handle as i32), Value::UNDEFINED, locale, Value::from_i32(flags.pack())]))
+    Ok((handle, locale, flags))
+}
+
+/// `String.prototype.localeCompare(that, locales, options)` of ECMA-402:
+/// CompareStrings of `x` and `y` by the collator `Intl.Collator(locales,
+/// options)` would make. Without locales and options that is one
+/// collator, made once.
+pub(crate) fn locale_compare(vm: &mut Vm, x: &[u16], y: &[u16], locales: Value, options: Value) -> Result<Ordering> {
+    let default = locales.is_undefined() && options.is_undefined();
+    let h = match vm.intl.default_collator {
+        Some(h) if default => h,
+        _ => {
+            let (h, ..) = initialize(vm, locales, options)?;
+            if default {
+                vm.intl.default_collator = Some(h);
+            }
+            h
+        }
+    };
+    Ok(vm.intl.collators[h as usize].compare(x, y))
 }
 
 /// Whether `s` is a `type` of UTS #35's grammar: alphanumeric subtags of

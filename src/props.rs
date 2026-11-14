@@ -1869,8 +1869,10 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         {
             let shape = unsafe { (*so).shape };
             let names: Vec<Atom> = slots.iter().map(|&k| unsafe { (*shape).keys()[k as usize] }).collect();
+            // (Held before any setter runs: one may delete a later name
+            // and collect, and the atom freed be another name's.)
+            names.iter().for_each(|&name| vm.hold_atom(name));
             for (&k, &name) in slots.iter().zip(&names) {
-                vm.hold_atom(name);
                 let key = Key::Name(name);
                 // (The slot checked too: a shape freed gives its address to
                 // the next one made.)

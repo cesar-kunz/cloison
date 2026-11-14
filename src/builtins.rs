@@ -431,6 +431,14 @@ fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     {
         return Ok(vm.single_char(v.as_i32_unchecked() as u16));
     }
+    // Small integers, the usual codes, straight into the string.
+    if a.iter().all(|v| v.is_int32()) {
+        return vm.try_new_string_with(a.len(), |out| {
+            for (o, v) in out.iter_mut().zip(a) {
+                *o = v.as_i32_unchecked() as u16;
+            }
+        });
+    }
     let u: Vec<u16> = a
         .iter()
         .map(|&v| if v.is_int32() { v.as_i32_unchecked() as u16 } else { crate::interp::to_int32(to_number(v)) as u16 })
@@ -516,13 +524,47 @@ fn string_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn string_to_lower_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let u = map_case(&this_units(this)?, str::to_lowercase);
+    let u = this_units(this)?;
+    if let Some(v) = ascii_case(vm, this, &u, b'A', b'a') {
+        return Ok(v);
+    }
+    let u = map_case(&u, str::to_lowercase);
     vm.try_new_string(&u)
 }
 
 fn string_to_upper_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let u = map_case(&this_units(this)?, str::to_uppercase);
+    let u = this_units(this)?;
+    if let Some(v) = ascii_case(vm, this, &u, b'a', b'A') {
+        return Ok(v);
+    }
+    let u = map_case(&u, str::to_uppercase);
     vm.try_new_string(&u)
+}
+
+/// `u`, `this`'s units, all ASCII, with its letters from `from` on
+/// (`b'A'` or `b'a'`) as those from `to`: `this` itself if a string
+/// without any (a tag name, a keyword, lowercase already). `None` for
+/// other text, which [`map_case`] takes. (Both loops without a branch
+/// on the units, for the compiler to vectorize.)
+fn ascii_case(vm: &mut Vm, this: Value, u: &[u16], from: u8, to: u8) -> Option<Value> {
+    let (from, to) = (from as u16, to as u16);
+    let (mut all, mut letters) = (0, false);
+    for &c in u {
+        all |= c;
+        letters |= c.wrapping_sub(from) < 26;
+    }
+    if all >= 0x80 {
+        return None;
+    }
+    if !letters {
+        return Some(this_string(vm, this, u));
+    }
+    let shift = to.wrapping_sub(from);
+    Some(vm.new_string_with(u.len(), |out| {
+        for (o, &c) in out.iter_mut().zip(u) {
+            *o = c.wrapping_add(if c.wrapping_sub(from) < 26 { shift } else { 0 });
+        }
+    }))
 }
 
 /// `u` with `f` (`to_lowercase`, `to_uppercase`) applied to its runs of
@@ -827,7 +869,7 @@ fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// [`string_split`] without a pattern's own `Symbol.split`.
 #[inline(always)]
 fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let u = this_units(this)?.into_owned();
+    let u = this_units(this)?;
     if let Some(re) = regexp_of(arg(a, 0)) {
         return regexp_split(vm, re, &u, a.get(1).copied());
     }
@@ -835,36 +877,55 @@ fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         Some(v) if !v.is_undefined() => crate::interp::to_int32(to_number(*v)) as u32 as usize,
         _ => usize::MAX,
     };
-    let mut parts: Vec<Value> = Vec::new();
+    // (The pieces go to the array as they are made: no collection runs
+    // in between, nothing here calling into JS past the separator.)
     match a.first() {
         Some(v) if !v.is_undefined() => {
-            let sep = units(*v).into_owned();
+            let sep = units(*v);
+            let arr = vm.new_array();
+            let mut n = 0;
             if sep.is_empty() {
                 for &c in u.iter().take(limit) {
-                    parts.push(vm.single_char(c));
+                    let v = vm.single_char(c);
+                    append(vm, arr, v);
                 }
             } else {
                 let mut start = 0;
-                while parts.len() < limit {
-                    match find(&u, &sep, start) {
-                        Some(i) => {
-                            parts.push(string(vm, &u[start..i]));
-                            start = i + sep.len();
-                        }
-                        None => {
-                            parts.push(string(vm, &u[start..]));
-                            break;
-                        }
+                while n < limit {
+                    let end = find(&u, &sep, start);
+                    let v = string(vm, &u[start..end.unwrap_or(u.len())]);
+                    append(vm, arr, v);
+                    n += 1;
+                    match end {
+                        Some(i) => start = i + sep.len(),
+                        None => break,
                     }
                 }
             }
+            Ok(arr)
         }
-        _ if limit > 0 => parts.push(this_string(vm, this, &u)),
-        _ => {}
+        _ => {
+            let arr = vm.new_array();
+            if limit > 0 {
+                let v = this_string(vm, this, &u);
+                append(vm, arr, v);
+            }
+            Ok(arr)
+        }
     }
-    let arr = vm.new_array();
-    crate::vm::array_push(vm, arr, &parts)?;
-    Ok(arr)
+}
+
+/// `v` appended to `arr`, a new array of a builtin's own (plain, its
+/// length within its elements).
+#[inline]
+fn append(vm: &mut Vm, arr: Value, v: Value) {
+    let o = as_object(arr);
+    unsafe {
+        let len = (*o).elems_len as usize;
+        vm.reserve_elems(o, len + 1);
+        vm.store_element(o, len, v);
+        (*o).elems_len = len as u32 + 1;
+    }
 }
 
 /// `this` as a string value (itself if one).
@@ -935,6 +996,11 @@ fn plain_list(list: Value, holes: bool) -> Option<Vec<Value>> {
 fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(this) {
         return Err(Error::type_error("Function.prototype.apply called on a non-function"));
+    }
+    // A plain array's elements as they are (`String.fromCharCode.apply`
+    // of a chunk's 60,000 codes read each through the generic lookup).
+    if let Some(list) = apply_list_fast(arg(a, 1)).filter(|l| l.len() <= crate::array::APPLY_MAX) {
+        return crate::interp::call_function(vm, this, arg(a, 0), &list);
     }
     // (The list rooted while it is made, a getter maybe running; the call
     // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
@@ -1972,20 +2038,39 @@ fn unescape_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `encodeURI…`: UTF-8 bytes as `%XX`, but for `keep`'s characters.
 fn encode(vm: &mut Vm, a: &[Value], keep: &[u8]) -> Result<Value> {
-    let u = units(arg(a, 0)).into_owned();
-    let mut out = Vec::new();
-    let it = char::decode_utf16(u.iter().copied());
-    for c in it {
-        let c = c.map_err(|_| Error(String::from("URIError: URI malformed"), None))?;
-        if c.is_ascii_alphanumeric() || (c.is_ascii() && keep.contains(&(c as u8))) {
-            out.push(c as u16);
-            continue;
+    let v = arg(a, 0);
+    let u = units(v);
+    // The ASCII units that stay as they are.
+    let mut plain = [false; 128];
+    for c in 0..128u8 {
+        plain[c as usize] = c.is_ascii_alphanumeric() || keep.contains(&c);
+    }
+    let escaped = |c: u16| c >= 128 || !plain[c as usize];
+    // Nothing to escape (a key, a file's name): the string itself.
+    let Some(first) = u.iter().position(|&c| escaped(c)) else {
+        return Ok(if is_string(v) { v } else { vm.new_string(&u) });
+    };
+    let mut out = Vec::with_capacity(u.len() + 16);
+    out.extend_from_slice(&u[..first]);
+    let mut i = first;
+    while i < u.len() {
+        // (The runs between escapes copied whole.)
+        let run = u[i..].iter().position(|&c| escaped(c)).unwrap_or(u.len() - i);
+        out.extend_from_slice(&u[i..i + run]);
+        i += run;
+        if i == u.len() {
+            break;
         }
+        let c = match char::decode_utf16(u[i..].iter().copied()).next() {
+            Some(Ok(c)) => c,
+            _ => return Err(Error(String::from("URIError: URI malformed"), None)),
+        };
+        i += c.len_utf16();
         let mut b = [0u8; 4];
         for &byte in c.encode_utf8(&mut b).as_bytes() {
             out.extend([b'%' as u16, HEX[(byte >> 4) as usize] as u16, HEX[(byte & 15) as usize] as u16]);
         }
-        // (Up to 9 units of one: checked as it grows.)
+        // (Up to 12 units of one: checked as it grows.)
         check_string_len(out.len())?;
     }
     vm.try_new_string(&out)
@@ -3161,7 +3246,7 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
     let pattern = arg(a, 0);
     let replacement = arg(a, 1);
     // (The pattern's string before the replacement's.)
-    let pattern_units = if regexp_of(pattern).is_none() { Some(units(pattern).into_owned()) } else { None };
+    let pattern_units = if regexp_of(pattern).is_none() { Some(units(pattern)) } else { None };
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
@@ -3183,7 +3268,7 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
                     flat.extend_from_slice(&caps);
                 }
                 // (Set with throw: a read-only `lastIndex` is a TypeError.)
-                let a_last = vm.intern_name("lastIndex");
+                let a_last = vm.a_last_index;
                 vm.put_key(pattern, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
             } else if let Some(c) = regexp_match(vm, pattern, re, &s)? {
                 stride = c.len();
@@ -3346,24 +3431,33 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
         Some(v) if !v.is_undefined() => crate::interp::to_int32(to_number(v)) as u32 as usize,
         _ => usize::MAX,
     };
-    let mut parts: Vec<Value> = Vec::new();
+    let arr = vm.new_array();
     if limit == 0 {
-        let arr = vm.new_array();
         return Ok(arr);
     }
+    // The pieces so far, appended as they are made (see `split_fast`).
+    let mut n = 0;
+    let mut push = |vm: &mut Vm, v: Value| {
+        append(vm, arr, v);
+        n += 1;
+        n == limit
+    };
+    let mut caps = crate::regexp::Captures::new();
     if s.is_empty() {
-        if re.exec(s, 0).is_none() {
-            parts.push(vm.new_string(&[]));
+        if !re.exec_into(s, 0, &mut caps) {
+            let v = vm.new_string(&[]);
+            push(vm, v);
         }
     } else {
         let (mut p, mut q) = (0, 0);
+        let mut full = false;
         while q < s.len() {
-            match re.exec(s, q) {
+            match re.exec_into(s, q, &mut caps) {
                 // (A sticky one's match only at `q`: the splitter's, which
                 // always is, tries the next position.)
-                None if re.sticky => q = advance(s, q as f64, re.unicode) as usize,
-                None => break,
-                Some(caps) => {
+                false if re.sticky => q = advance(s, q as f64, re.unicode) as usize,
+                false => break,
+                true => {
                     let (x, e) = caps[0].unwrap();
                     if x >= s.len() {
                         break;
@@ -3376,20 +3470,19 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
                         q = advance(s, x as f64, re.unicode) as usize;
                         continue;
                     }
-                    parts.push(string(vm, &s[p..x]));
-                    if parts.len() == limit {
-                        break;
-                    }
+                    let v = string(vm, &s[p..x]);
+                    full = push(vm, v);
                     for c in &caps[1..] {
-                        parts.push(match c {
-                            Some((a, b)) => string(vm, &s[*a..*b]),
-                            None => Value::UNDEFINED,
-                        });
-                        if parts.len() == limit {
+                        if full {
                             break;
                         }
+                        let v = match c {
+                            Some((a, b)) => string(vm, &s[*a..*b]),
+                            None => Value::UNDEFINED,
+                        };
+                        full = push(vm, v);
                     }
-                    if parts.len() == limit {
+                    if full {
                         break;
                     }
                     p = e;
@@ -3397,12 +3490,11 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
                 }
             }
         }
-        if parts.len() < limit {
-            parts.push(string(vm, &s[p..]));
+        if !full {
+            let v = string(vm, &s[p..]);
+            push(vm, v);
         }
     }
-    let arr = vm.new_array();
-    crate::vm::array_push(vm, arr, &parts)?;
     Ok(arr)
 }
 

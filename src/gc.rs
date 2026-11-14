@@ -439,7 +439,8 @@ impl Heap {
                 for k in 0..n {
                     crate::layout::store_word(p.add(k), v);
                 }
-            } else {
+            } else if n > 0 {
+                // (`p` is null in an array without elements: no slice.)
                 std::slice::from_raw_parts_mut(p, n).fill(v);
             }
         }

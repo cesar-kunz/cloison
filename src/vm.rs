@@ -757,6 +757,10 @@ const MAX_ELEM_SHAPES: usize = 8;
 /// `Vm::wide_transitions`).
 const WIDE_TRANSITIONS: usize = 16;
 
+/// Buried slots a dictionary shape keeps whatever its size (see
+/// `Vm::dict_remove`).
+const DICTIONARY_HOLES: u32 = 8;
+
 /// Zombie shapes kept before a sweep looks for those it can free (see
 /// `Vm::free_zombies`): about 6 MB.
 const ZOMBIES_MIN: usize = 1 << 14;
@@ -1126,6 +1130,9 @@ pub struct Vm {
     /// `Symbol.prototype`, the iterator prototypes, … (see `symbol::Root`).
     pub(crate) symbol_roots: Vec<*mut Object>,
     pub(crate) a_sym_iterator: Atom,
+    /// The key of a dictionary shape's buried slots (`Slots::bury`): a
+    /// private name's atom, of no symbol.
+    pub(crate) a_hole: Atom,
     pub(crate) a_sym_species: Atom,
     pub(crate) a_sym_to_string_tag: Atom,
     pub(crate) a_sym_to_primitive: Atom,
@@ -1508,6 +1515,7 @@ impl Vm {
             symbol_count: 0,
             symbol_roots: Vec::new(),
             a_sym_iterator: Atom(0),
+            a_hole: Atom(0),
             a_sym_species: Atom(0),
             a_sym_to_string_tag: Atom(0),
             a_sym_to_primitive: Atom(0),
@@ -4182,6 +4190,11 @@ impl Vm {
                 return;
             };
             if s.attrs()[slot as usize] != attrs {
+                // (A dictionary shape's slots are copied: none buried.)
+                if s.dictionary && s.slots.holes() != 0 {
+                    self.dict_compact(o);
+                    return self.define_property(o, name, value, attrs);
+                }
                 self.shape_left(s);
                 let mut slot_attrs = s.attrs().to_vec();
                 slot_attrs[slot as usize] = attrs;
@@ -4812,10 +4825,10 @@ impl Vm {
                 && p.proto.to_bits() == s.proto.to_bits()
                 && p.elems == s.elems
                 && p.capacity.get() == s.capacity.get()
-                && p.keys() == &s.keys()[..n - 1]
-                && p.attrs() == &s.attrs()[..n - 1]
-                && p.fields() == &s.fields()[..n - 1])
-                .then_some(s.parent)
+                // (Most often the same table, not compared: a table of
+                // 200,000 keys emptied from its last took 17 s.)
+                && s.slots.starts_with(&p.slots))
+            .then_some(s.parent)
         }
     }
 
@@ -4891,19 +4904,47 @@ impl Vm {
         }
     }
 
-    /// Remove slot `k` of `o`, of a dictionary shape, in place: the values
-    /// of the slots after it move down one.
+    /// Remove slot `k` of `o`, of a dictionary shape, in place: the slot
+    /// is buried (`Slots::bury`), the others and their values staying
+    /// where they are until half the slots are buried (`dict_compact`: a
+    /// removal's time doesn't grow with the table then, nor do the slots
+    /// kept past twice the properties).
     fn dict_remove(&mut self, o: *mut Object, k: u32) {
         unsafe {
             let s = (*o).shape;
             let n = (*s).keys().len() as u32;
-            for j in k + 1..n {
-                let v = *Object::slot(o, (*s).location(j));
-                let at = Object::slot(o, (*s).location(j - 1));
-                crate::heap::store(o.cast(), at, v);
+            let slots = Shape::dictionary_slots(s);
+            slots.bury(k, self.a_hole);
+            for j in slots.len() as u32..n {
+                crate::layout::store_word(Object::slot(o, (*s).location(j)), Value::UNDEFINED);
             }
-            crate::layout::store_word(Object::slot(o, (*s).location(n - 1)), Value::UNDEFINED);
-            Shape::dictionary_slots(s).remove(k);
+            if slots.len() == n as usize {
+                crate::layout::store_word(Object::slot(o, (*s).location(k)), Value::UNDEFINED);
+            }
+            if slots.holes() > DICTIONARY_HOLES && 2 * slots.holes() as usize > slots.len() {
+                self.dict_compact(o);
+            }
+        }
+    }
+
+    /// `o`'s slots, of a dictionary shape, without the buried ones: the
+    /// values of the others move down with them. (Before its slots are
+    /// copied to another shape too, which has none buried.)
+    fn dict_compact(&mut self, o: *mut Object) {
+        unsafe {
+            let s = (*o).shape;
+            let slots = Shape::dictionary_slots(s);
+            if slots.holes() == 0 {
+                return;
+            }
+            let n = slots.len() as u32;
+            slots.compact(self.a_hole, |from, to| {
+                let v = *Object::slot(o, (*s).location(from));
+                crate::heap::store(o.cast(), Object::slot(o, (*s).location(to)), v);
+            });
+            for j in slots.len() as u32..n {
+                crate::layout::store_word(Object::slot(o, (*s).location(j)), Value::UNDEFINED);
+            }
         }
     }
 
@@ -4913,10 +4954,11 @@ impl Vm {
     /// don't share a table that changes.
     pub(crate) fn leave_dictionary(&mut self, o: *mut Object) {
         unsafe {
-            let s = &*(*o).shape;
-            if !s.dictionary {
+            if !(*(*o).shape).dictionary {
                 return;
             }
+            self.dict_compact(o);
+            let s = &*(*o).shape;
             let fields: Vec<*const FieldCell> = (0..s.keys().len())
                 .map(|_| {
                     let c = self.new_field_cell();

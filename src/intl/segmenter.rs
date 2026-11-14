@@ -161,9 +161,8 @@ fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// from `start` to `end` of the string of `o` (a Segments object or a
 /// Segment Iterator).
 fn segment_data(vm: &mut Vm, o: *mut Object, start: usize, end: usize) -> Result<Value> {
-    // (Copied: making the string may move the one it is cut from.)
-    let piece = string_units(slot(o, STRING)).unwrap_or(&[])[start..end].to_vec();
-    let segment = vm.new_string(&piece);
+    let string = slot(o, STRING);
+    let segment = crate::builtins::part(vm, string, string_units(string).unwrap_or(&[]), start, end);
     let op = object_value(vm.object_prototype);
     let r = vm.new_object(op);
     let a = vm.intern_name("segment");

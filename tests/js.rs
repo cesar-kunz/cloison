@@ -2884,6 +2884,53 @@ fn loop_bindings_share_registers_past_them() {
     assert!(e.contains("unsupported: more than 159 variables of one loop used by closures"), "{e}");
 }
 
+/// The registers such variables have past the others' are the
+/// temporaries' fewer: a call of 255 arguments or an array literal as
+/// long still fits in a function of 200 variables with 8 of them, and an
+/// expression nested too deep for what is left is refused (two levels of
+/// such calls sooner than without them: 22, not 24), not miscompiled.
+#[test]
+fn loop_binding_registers_leave_room_for_temporaries() {
+    let vars: String = (0..200).map(|i| format!("var x{i} = {i};\n")).collect();
+    let lets: Vec<String> = (0..8).map(|i| format!("c{i} = j + {i}")).collect();
+    let sum: Vec<String> = (0..8).map(|i| format!("c{i}")).collect();
+    let head = format!(
+        "{vars} var fs = []; for (let j = 0; j < 3; j++) {{ let {}; fs.push(() => {}); }}\n\
+         function sum() {{ var t = 0; for (var k = 0; k < arguments.length; k++) t += arguments[k]; return t; }}\n\
+         function g(a, b, c) {{ return a + b + c; }}",
+        lets.join(", "),
+        sum.join(" + ")
+    );
+    let args: Vec<String> = (0..255).map(|i| format!("x{} + {i}", i % 200)).collect();
+    let args = args.join(", ");
+    let nested = |depth: usize| (0..depth).fold("0".to_string(), |e, i| format!("g(x{i}, 1, {e})"));
+    let src = format!(
+        "(() => {{ {head}\n return [fs[1](), sum({args}), [{args}].reduce((a, b) => a + b), {}].join(); }})();",
+        nested(21)
+    );
+    // (36 = 8 * 1 + 0 + … + 7; 53770 = the sum of i % 200 + i under 255;
+    // 231 = 21 + 0 + … + 20.)
+    assert_eq!(value(&src), "36,53770,53770,231");
+    let e = compile_error(&format!("(() => {{ {head}\n return {}; }})();", nested(40)));
+    assert!(e.contains("unsupported: an expression needing more than 256 registers"), "{e}");
+}
+
+/// Parameters alone past the registers, with `arguments` (which then has
+/// none): without a loop whose variables closures use there is nothing
+/// to refuse, and with one it is refused as above.
+#[test]
+fn parameters_past_the_registers_need_no_loop_bindings() {
+    let params: Vec<String> = (0..159).map(|i| format!("p{i}")).collect();
+    let params = params.join(", ");
+    let src =
+        format!("(function ({params}) {{ var v = arguments.length + p0; return v + arguments[1]; }})(10, 20, 30);");
+    assert_eq!(value(&src), "33");
+    let e = compile_error(&format!(
+        "(function ({params}) {{ var fs = []; for (let j = 0; j < 3; j++) fs.push(() => j); return fs; }})();"
+    ));
+    assert!(e.contains("unsupported: more than 0 variables of one loop used by closures"), "{e}");
+}
+
 /// A `finally` block run by a `continue` or `break` leaving its `try` is
 /// entered as any block: new bindings, which closures made then keep.
 #[test]

@@ -9316,3 +9316,245 @@ fn a_module_run_once_is_loaded_as_it_is() {
     assert_eq!(r.as_deref(), Ok("1127249"));
     assert_eq!(run(&src).as_deref(), Ok(want.as_str()));
 }
+
+/// `Object.keys`, `values`, `entries`, `assign` and `for … in` read a
+/// plain object's names and data properties where they are (its shape's
+/// slots; each name's string made once and kept by its atom) instead of
+/// through a key list and a descriptor per key. What V8, SpiderMonkey
+/// and JavaScriptCore give: with index keys, symbols, accessors, hidden
+/// and shadowed names, dictionary objects, sources and targets that
+/// change while `assign` copies, and names freed and made again between
+/// collections.
+#[test]
+fn key_lists_of_plain_objects_agree_with_the_engines() {
+    let src = r#"var out = [];
+function p(x) { out.push(String(x)); }
+function J(x) { return JSON.stringify(x); }
+var sym = Symbol("s");
+var o = { b: 1, a: 2, 10: 3, 2: 4 };
+o[sym] = 5;
+Object.defineProperty(o, "hid", { value: 6 });
+Object.defineProperty(o, "acc", { get: function () { return 7; }, enumerable: true });
+p(J(Object.keys(o)) + J(Object.values(o)) + J(Object.entries(o)) + J(Object.getOwnPropertyNames(o)));
+var q = { x: 1, y: 2, z: 3 };
+delete q.y; q.w = 4;
+p(J(Object.keys(q)) + J(Object.values(q)) + J(Object.entries(q)));
+var ks = []; for (var k in q) ks.push(k); p(ks);
+function C() { this.own = 1; } C.prototype.inh = 2;
+Object.defineProperty(C.prototype, "own", { value: 0, enumerable: true, configurable: true });
+ks = []; for (var k in new C()) ks.push(k); p(ks);
+var sh = Object.create({ a: 1, b: 2 }); Object.defineProperty(sh, "a", { value: 3 }); sh.c = 4;
+ks = []; for (var k in sh) ks.push(k); p(ks);
+ks = []; for (var k in Object.create(null, { n: { value: 1, enumerable: true } })) ks.push(k); p(ks);
+ks = []; for (var k in "ab") ks.push(k); for (var k in [7, , 8]) ks.push(k); for (var k in 5) ks.push(k); p(ks);
+var big = {}; for (var i = 0; i < 300; i++) big["k" + i] = i;
+delete big.k7; big.k7 = 7;
+p(Object.keys(big).length + " " + Object.keys(big)[298] + " " + Object.values(big)[299] + " " + Object.entries(big)[6]);
+// Object.assign: sources that change while they are copied.
+var src = { a: 1, get b() { delete src.c; src.e = 9; return 2; }, c: 3, d: 4 };
+p(J(Object.assign({}, src)));
+var seen = [];
+var tgt = { set a(v) { seen.push("a=" + v); delete s2.b; s2.c = 30; } };
+var s2 = { a: 1, b: 2, c: 3 };
+Object.assign(tgt, s2); p(seen + J(tgt) + J(s2));
+var ro = Object.freeze({ a: 1 });
+try { Object.assign(ro, { a: 2 }); p("no throw"); } catch (e) { p(e.name); }
+var inh = Object.create({ set a(v) { seen.push("proto a=" + v); } });
+Object.assign(inh, { a: 5, b: 6 }); p(seen + J(inh));
+var ne = Object.preventExtensions({ a: 1 });
+try { Object.assign(ne, { a: 2, z: 3 }); p("no throw"); } catch (e) { p(e.name + J(ne)); }
+p(J(Object.assign({}, { 1: 1, x: 2 }, "ab", null, [9], { x: 3, length: 4, name: 5, NaN: 6, "-0": 7, Infinity: 8 })));
+// The names' strings outlive collections, and names freed are made again.
+function churn() { for (var i = 0; i < 3000; i++) { var t = {}; t["g" + i] = i; Object.keys(t); } $262.gc(); }
+var kept = Object.keys({ once_a: 1, once_b: 2 });
+churn(); churn();
+var again = {}; again["g" + 2999] = 1; again.once_a = 2;
+p(kept + " " + Object.keys(again) + " " + J(Object.entries(again)));
+out.join("\n");
+"#;
+    let expected = r#"["2","10","b","a","acc"][4,3,1,2,7][["2",4],["10",3],["b",1],["a",2],["acc",7]]["2","10","b","a","hid","acc"]
+["x","z","w"][1,3,4][["x",1],["z",3],["w",4]]
+x,z,w
+inh,own
+c,b
+n
+0,1,0,2
+300 k299 7 k6,6
+{"a":1,"b":2,"d":4}
+a=1{"c":30}{"a":1,"c":30}
+TypeError
+a=1,proto a=5{"b":6}
+TypeError{"a":2}
+{"0":9,"1":"b","x":3,"length":4,"name":5,"NaN":6,"-0":7,"Infinity":8}
+once_a,once_b g2999,once_a [["g2999",1],["once_a",2]]"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok(expected), "tier at {budget}");
+    }
+}
+
+/// `JSON.stringify` writes as it goes, reading arrays' elements and plain
+/// objects' data properties where they are, and `JSON.parse` stores names
+/// by their atoms and pushes elements. What V8, SpiderMonkey and
+/// JavaScriptCore give: gaps, property lists, replacers, `toJSON`s and
+/// getters that change the object being written, holes, proxies,
+/// escapes and lone surrogates, duplicated and index keys, `__proto__`,
+/// numbers' forms, malformed texts, revivers and their sources.
+#[test]
+fn json_fast_paths_agree_with_the_engines() {
+    let src = r#"var out=[];
+function p(x){ try { out.push(typeof x==='string'?x:String(x)); } catch(e){ out.push('ERR '+e); } }
+function S(){ try { return JSON.stringify.apply(JSON, arguments); } catch(e){ return 'ERR '+e.name; } }
+function P(t,r){ try { return S(JSON.parse(t,r)); } catch(e){ return 'ERR '+e.name; } }
+p(S({a:1,b:[1,2,{c:"x\n\"\\\u0001\ud800é",d:undefined,e:function(){},f:null}],g:-0,h:1e21,i:NaN,j:1.5}));
+p(S([undefined,function(){},Symbol()]));
+p(S({a:1,b:[1,2,[],{} ,{x:[]}]},null,2));
+p(S({a:1,b:[1,2]},null,'--'));
+p(S({a:1,b:2,c:{a:3,d:4}},['a','c']));
+p(S({a:1,b:2},function(k,v){ return typeof v==='number'?v+1:v; }));
+p(S({toJSON:function(k){return 'k='+k;}}));
+p(S([{toJSON:function(k){return 'k='+k;}}]));
+p(S({x:{toJSON:function(k){return 'k='+k;}}}));
+p(S({get a(){ return 5; }, b:2}));
+var o={a:1,b:2,c:3}; Object.defineProperty(o,'a',{get:function(){ delete o.b; o.z=9; return 1; },enumerable:true});
+p(S(o));
+var o2={a:{toJSON:function(){ delete o2.b; o2.c=7; return 1; }},b:2,c:3,d:4};
+p(S(o2));
+var arr=[1,2,3]; arr[0]={toJSON:function(){ arr.length=1; return 0; }}; p(S(arr));
+var h=[1,,3]; p(S(h)); Array.prototype[1]='proto'; p(S(h)); delete Array.prototype[1];
+p(S({1:1,b:2,0:0}));
+p(S(new Number(3))+S(new String('s'))+S(new Boolean(false))+S(Object(Symbol())));
+p(S(1n)); var c={}; c.c=c; p(S(c)); p(S([c]));
+p(S({"\ud800":1,"a\"b":2,"é":3,"\u0000":4,"__proto__x":5}));
+p(S(new Proxy([1,2],{}))+S(new Proxy({a:1},{})));
+p(S(Object.create({inh:1},{own:{value:2,enumerable:true},hid:{value:3}})));
+p(S(new Date(0))); p(S("str")); p(S(undefined)); p(S(null)); p(S(-5)); p(S(-2147483648)); p(S(2147483647)); p(S(4294967295)); p(S(0.1));
+p(S({a:[],b:{}},null,1)); p(S([[]],null,1)); p(S({a:undefined},null,1)); p(S([undefined],null,1));
+var big={}; for(var i=0;i<300;i++) big['k'+i]=i; delete big.k5; p(S(big).length);
+p(S(JSON.rawJSON('1e1000')));
+p(P('{"a":1,"b":[1,2,{"c":"x\\n\\u00e9\\ud800"}],"a":2,"0":5,"__proto__":{"q":1},"-1":3,"1e3":4}'));
+p(JSON.parse('{"__proto__":1}').__proto__===1); p(Object.keys(JSON.parse('{"b":1,"a":2,"1":3,"b":4}')).join());
+p(P('[1,-0,0,-1,123456789,1234567890,12345678901234567890,1.5,1e3,-1e-3,0.1,2147483647,-2147483648,-999999999]'));
+p(1/JSON.parse('-0')); p(1/JSON.parse('[-0]')[0]); p(JSON.parse('[1,2,3]').length);
+['01','1.','.1','-','+1','1e','[1,]','{"a":1,}','{a:1}','"\t"','"\\x"','"abc','tru','nul','[','{','','1 2','"\\u12"',' [ 1 , 2 ] ','\u00a0 1','true','false','null','"\\/\\b\\f\\r\\t"','{"":1}','NaN','-Infinity','0x1','1E+2','{"a" : [ ] , "b" : { } }'].forEach(function(t){ p(P(t)); });
+p(P('{"a":[1,2,{"b":3}],"c":"d"}',function(k,v){ return typeof v==='number'?v*2:v; }));
+p(P('[1,2,3]',function(k,v,c){ return c&&c.source!==undefined?c.source+'!':v; }));
+var long='x'.repeat(100); p(P('{"'+long+'":1,"é'+long+'":2}').length);
+var dict={}; for(var i=0;i<3000;i++) dict['q'+i]=i; var dj=S(dict); p(dj.length); p(S(JSON.parse(dj))===dj);
+p(S(JSON.parse(S({length:1,name:2,constructor:3,toString:4,valueOf:5}))));
+out.join('\n');
+"#;
+    let expected = r#"{"a":1,"b":[1,2,{"c":"x\n\"\\\u0001\ud800é","f":null}],"g":0,"h":1e+21,"i":null,"j":1.5}
+[null,null,null]
+{
+  "a": 1,
+  "b": [
+    1,
+    2,
+    [],
+    {},
+    {
+      "x": []
+    }
+  ]
+}
+{
+--"a": 1,
+--"b": [
+----1,
+----2
+--]
+}
+{"a":1,"c":{"a":3}}
+{"a":2,"b":3}
+"k="
+["k=0"]
+{"x":"k=x"}
+{"a":5,"b":2}
+{"a":1,"c":3}
+{"a":1,"c":7,"d":4}
+[0,null,null]
+[1,null,3]
+[1,"proto",3]
+{"0":0,"1":1,"b":2}
+3"s"false{}
+ERR TypeError
+ERR TypeError
+ERR TypeError
+{"\ud800":1,"a\"b":2,"é":3,"\u0000":4,"__proto__x":5}
+[1,2]{"a":1}
+{"own":2}
+"1970-01-01T00:00:00.000Z"
+"str"
+undefined
+null
+-5
+-2147483648
+2147483647
+4294967295
+0.1
+{
+ "a": [],
+ "b": {}
+}
+[
+ []
+]
+{}
+[
+ null
+]
+3074
+1e1000
+{"0":5,"a":2,"b":[1,2,{"c":"x\né\ud800"}],"__proto__":{"q":1},"-1":3,"1e3":4}
+true
+1,b,a
+[1,0,0,-1,123456789,1234567890,12345678901234567000,1.5,1000,-0.001,0.1,2147483647,-2147483648,-999999999]
+-Infinity
+-Infinity
+3
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+[1,2]
+ERR SyntaxError
+true
+false
+null
+"/\b\f\r\t"
+{"":1}
+ERR SyntaxError
+ERR SyntaxError
+ERR SyntaxError
+100
+{"a":[],"b":{}}
+{"a":[2,4,{"b":6}],"c":"d"}
+["1!","2!","3!"]
+212
+36781
+true
+{"length":1,"name":2,"constructor":3,"toString":4,"valueOf":5}"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok(expected));
+}

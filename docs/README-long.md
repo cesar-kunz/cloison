@@ -290,7 +290,9 @@ refers to a moved one),
 `CLOISON_GC_CYCLES` (major cycles back to back),
 `CLOISON_GC_THREADS` (threads a pause scans cards and traces with; 1 for none),
 `CLOISON_GC_CHECK_BARRIER` (find missed barriers), `CLOISON_HEAP_HIST` (cells by
-kind and size), `CLOISON_SEGV` (a backtrace on a crash); for arrays,
+kind and size), `CLOISON_SEGV` (a backtrace on a crash); for objects,
+`CLOISON_DICTIONARY_AT` (properties from which a keyed store's new key
+makes a plain object a dictionary, 128; 0 never); for arrays,
 `CLOISON_ARRAY_DENSE_MIN`, `CLOISON_ARRAY_DENSE_BACK`, `CLOISON_ARRAY_WASTE`
 and `CLOISON_ARRAY_PREALLOC` (also read when building: see
 `docs/sparse-arrays.md`). `gc-bench.sh` times

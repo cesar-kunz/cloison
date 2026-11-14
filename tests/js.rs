@@ -6667,6 +6667,31 @@ Object.keys(o).length + " " + o.p31
 }
 
 #[test]
+fn a_table_filled_by_keyed_stores_makes_no_shape_per_key() {
+    // A plain object given keys made at run time goes to dictionary mode
+    // at its 129th (`Vm::add_property_keyed`): 20 tables of 5,000 keys
+    // each leave their first 128 keys' shapes, not 100,000 (a shape, a
+    // transition and a field cell per key: the SheetJS app's 705,000
+    // shapes).
+    let src = r#"
+var tables = [], n = 0;
+for (var t = 0; t < 20; t++) {
+  var o = {};
+  for (var i = 0; i < 5000; i++) o["t" + t + "k" + i] = i;
+  tables.push(o);
+}
+for (var t = 0; t < 20; t++) n += Object.keys(tables[t]).length + tables[t]["t" + t + "k4999"];
+n
+"#;
+    let mut vm = Vm::new();
+    let before = vm.memory_stats()[0];
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("199980"));
+    let shapes = vm.memory_stats()[0] - before;
+    assert!(shapes < 4000, "{shapes} shapes");
+}
+
+#[test]
 fn direct_evals_in_generators_read_their_boxed_bindings_bound() {
     // A generator's (or an async function's) block-scoped variables a
     // nested function uses are in boxes: a direct `eval`'s code there is

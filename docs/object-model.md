@@ -340,6 +340,20 @@ checks that its parent's slots are a prefix of its own by their table,
 the same one most often, and not key by key (a table of 200,000 emptied
 from its last: 17 s, 51 ms now).
 
+An object used as a **table** goes there without a delete: a plain object
+with 128 properties that gets one more by a computed key (`o[k] = v`,
+`Vm::set`), one no object of its shape got before
+(`Vm::add_property_keyed`). Keyed by names made at run time, it made a
+shape, a transition and a field cell for each (the SheetJS app 705,000
+shapes, 230 MiB of the 400 it had allocated at its exit; 243 MiB now, and
+3.7 s of collection pauses for 6.0). Its first 128 keys' shapes stay; an
+object whose next shape is there already (named stores or a literal made
+it) takes it, and named stores always add a shape, since caches and the
+JIT read such objects by shape (a dictionary at every add past 128 made
+the TypeScript app a quarter slower). `CLOISON_DICTIONARY_AT` sets the
+count (0: never). V8 normalizes an object past 128 properties out of the
+object, and past 12 on a keyed store (`Map::TooManyFastProperties`).
+
 Since its slots change without its address changing, nothing may rely on
 one: no inline cache holds one (`install`, `note_accessor`), nor the VM's
 lookup, megamorphic load and store tables (`Vm::lookup`, `mega_note`,

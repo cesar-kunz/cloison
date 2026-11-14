@@ -180,7 +180,9 @@ mod tests {
 
     /// What the Segments objects and their iterators rely on: the
     /// segment found from a boundary is the one a pass over the whole
-    /// string finds there, of each granularity, in strings of what the
+    /// string finds there, word-like as there but where that pass keeps
+    /// an earlier segment's type (see below), of each granularity, in
+    /// strings of what the
     /// rules look around (marks, joiners, flags, quotes, terminators,
     /// line ends, lone surrogates, a complex script's letters).
     #[test]
@@ -236,16 +238,28 @@ mod tests {
             let breaker = Breaker::new(granularity).unwrap();
             for _ in 0..20000 {
                 let units: Vec<u16> = (0..=random(40)).flat_map(|_| alphabet[random(alphabet.len())].clone()).collect();
-                let whole: Vec<usize> = match &breaker {
-                    Breaker::Grapheme(s) => s.as_borrowed().segment_utf16(&units).collect(),
-                    Breaker::Word(s) => s.as_borrowed().segment_utf16(&units).collect(),
-                    Breaker::Sentence(s) => s.as_borrowed().segment_utf16(&units).collect(),
+                // (Each boundary with whether the segment ending there
+                // is word-like; the first, at 0, ends none.)
+                let whole: Vec<(usize, bool)> = match &breaker {
+                    Breaker::Grapheme(s) => s.as_borrowed().segment_utf16(&units).map(|b| (b, false)).collect(),
+                    Breaker::Word(s) => {
+                        let breaks = s.as_borrowed().segment_utf16(&units).iter_with_word_type();
+                        breaks.map(|(b, t)| (b, b > 0 && t.is_word_like())).collect()
+                    }
+                    Breaker::Sentence(s) => s.as_borrowed().segment_utf16(&units).map(|b| (b, false)).collect(),
                 };
-                let mut chained = vec![0];
+                let mut chained = vec![(0, false)];
                 let mut at = 0;
                 while at < units.len() {
-                    at += breaker.first(&units[at..]).0;
-                    chained.push(at);
+                    let (n, word_like) = breaker.first(&units[at..]);
+                    at += n;
+                    // The whole pass keeps the type of the segment
+                    // before for one whose rule sets none (an emoji
+                    // after a word, marks alone): word-like there, not
+                    // from its own boundary, as it is not in ICU.
+                    let (_, there) = whole[chained.len()];
+                    let kept = there && !word_like && whole[chained.len() - 1].1;
+                    chained.push((at, word_like || kept));
                 }
                 assert_eq!(chained, whole, "{units:x?}");
             }

@@ -174,6 +174,8 @@ fn parse_pass<'a>(
         lexicals: Default::default(),
         body_vars: Default::default(),
         shadowed_params: Default::default(),
+        loops: Vec::new(),
+        loop_hidden: Default::default(),
         module,
         info: ModuleInfo::default(),
         imports: Default::default(),
@@ -280,6 +282,7 @@ fn parse_pass<'a>(
             lexicals: p.lexicals,
             body_vars: std::mem::take(&mut p.body_vars),
             shadowed_params: std::mem::take(&mut p.shadowed_params),
+            loop_hidden: std::mem::take(&mut p.loop_hidden),
             direct_eval: eval.is_some(),
             eval_locals: false,
             script: eval.is_none() && module.is_none(),
@@ -431,6 +434,11 @@ struct Parser<'t, 'a, 'p> {
     body_vars: std::collections::HashMap<Name, Name>,
     /// (See `Program::shadowed_params`.)
     shadowed_params: std::collections::HashSet<(usize, Name)>,
+    /// The loops enclosing the code being parsed, outermost first: each
+    /// its function and where its statement starts.
+    loops: Vec<(usize, Pos)>,
+    /// (See `Program::loop_hidden`.)
+    loop_hidden: std::collections::HashMap<Name, Pos>,
     /// Parsing a module: its id (see [`parse_module`]).
     module: Option<i32>,
     /// A module's entries so far (see [`Program::module`]).
@@ -778,7 +786,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 let key = self.i;
                 self.push_scope(key, false, false);
-                let r = self.for_rest();
+                let r = self.in_loop(pos, |p| p.for_rest());
                 self.frames.pop();
                 match r? {
                     StmtKind::ForOf { kind, target, pattern, iterable, body, .. } if is_await => {
@@ -793,11 +801,13 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.expect("(")?;
                 let c = self.expression(false)?;
                 self.expect(")")?;
-                StmtKind::While(c, stmt(self.arena, self.sub_statement()?))
+                let body = self.in_loop(pos, |p| p.sub_statement())?;
+                StmtKind::While(c, stmt(self.arena, body))
             }
             Tok::Keyword("do") => {
                 self.advance();
-                let body = stmt(self.arena, self.sub_statement()?);
+                let body = self.in_loop(pos, |p| p.sub_statement())?;
+                let body = stmt(self.arena, body);
                 self.expect("while")?;
                 self.expect("(")?;
                 let c = self.expression(false)?;
@@ -3934,6 +3944,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 // global.)
                 if r != *n {
                     self.functions[self.current].hidden.push(r.clone());
+                    self.note_loop_hidden(&r);
                 }
                 (r != *n).then_some(r)
             }
@@ -4591,10 +4602,27 @@ impl<'a> Parser<'_, 'a, '_> {
         Ok(f)
     }
 
+    /// `parse`'s code, as a loop's starting at `pos` (its head or body).
+    fn in_loop<T>(&mut self, pos: Pos, parse: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        self.loops.push((self.current, pos));
+        let r = parse(self);
+        self.loops.pop();
+        r
+    }
+
+    /// Hidden variable `n` of the current function, if in a loop of it:
+    /// see `Program::loop_hidden`.
+    fn note_loop_hidden(&mut self, n: &Name) {
+        if let Some(&(_, pos)) = self.loops.iter().find(|l| l.0 == self.current) {
+            self.loop_hidden.insert(n.clone(), pos);
+        }
+    }
+
     /// A variable of the current function's, for the parser's own use
     /// (see `Function::hidden`).
     fn hidden_var(&mut self, n: Name) {
         self.functions[self.current].hidden.push(n.clone());
+        self.note_loop_hidden(&n);
         self.lexicals.insert(
             n.clone(),
             Lexical {

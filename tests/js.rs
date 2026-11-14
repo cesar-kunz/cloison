@@ -2838,6 +2838,52 @@ fn loop_bindings_stay_fresh_past_the_registers() {
     assert_eq!(value(&src), "a1,b2,1,2,0,1,p,q,0,11,2,3,0,1,0,1,0,1,0,1,2,5 299");
 }
 
+/// More such variables than registers: those of one loop are in the
+/// registers of another's (no two loops' are live at once), so any number
+/// of loops fits; the parser's own variables too (a class's home objects
+/// and inner name, an object's); one loop with more than the registers
+/// left is refused, not given one binding for all its iterations. The
+/// expected values are V8's, SpiderMonkey's and JSC's.
+#[test]
+fn loop_bindings_share_registers_past_them() {
+    let vars: String = (0..200).map(|i| format!("var x{i} = {i};\n")).collect();
+    let loops: String = (0..300).map(|i| format!("for (const c{i} of [{i}, -{i}]) fs.push(() => c{i});\n")).collect();
+    let src = format!(
+        r#"(() => {{
+{vars}
+  var fs = [];
+{loops}
+  var bad = 0;
+  fs.forEach((f, i) => {{ if (f() !== (i % 2 ? -(i >> 1) : i >> 1)) bad++; }});
+  fs = [];
+  // A closure of one loop called while another's variable has its register.
+  for (const a of [1, 2]) {{ let a2 = a * 2; fs.push(() => a + ":" + a2, v => {{ a2 = v; }}); }}
+  for (const b of [7, 8]) {{ let b2 = b + 1; fs[1](b2); fs.push(() => b + ":" + b2 + ":" + fs[0]()); }}
+  // A loop left early, then another.
+  out: for (const p of [1, 2, 3]) {{
+    for (const q of [10, 20]) {{
+      fs.push(() => p + q);
+      if (q === 10 && p === 2) continue out;
+      if (p === 3) break out;
+    }}
+  }}
+  for (const r of [4, 5]) {{ try {{ fs.push(() => r); if (r === 4) continue; }} finally {{ let t = r * 3; fs.push(() => t); }} }}
+  for (var k = 0; k < 2; k++) {{
+    class C {{ static s = k; #p = k + 5; m() {{ return C.s + this.#p; }} }}
+    fs.push(() => new C().m());
+    const o = {{ __proto__: {{ v() {{ return k0; }} }}, v() {{ return super.v() + 1; }} }}, k0 = k * 100;
+    fs.push(() => o.v());
+    fs.push(class D {{ static n = k; static m() {{ return D.n; }} }}.m);
+  }}
+  return bad + " " + fs.map(f => f()).join() + " " + x199;
+}})();"#
+    );
+    assert_eq!(value(&src), "0 1:9,,2:4,,7:8:1:undefined,8:9:1:undefined,11,21,12,13,4,12,5,15,7,1,0,8,101,1 199");
+    let lets: String = (0..200).map(|i| format!("const c{i} = j + {i}; fs.push(() => c{i});\n")).collect();
+    let e = compile_error(&format!("(() => {{ var fs = []; for (var j = 0; j < 2; j++) {{ {lets} }} }})();"));
+    assert!(e.contains("unsupported: more than 159 variables of one loop used by closures"), "{e}");
+}
+
 /// A `finally` block run by a `continue` or `break` leaving its `try` is
 /// entered as any block: new bindings, which closures made then keep.
 #[test]
@@ -2850,6 +2896,36 @@ var fs = [];
 })();
 fs.map(f => f()).join();"#;
     assert_eq!(value(src), "12,15,18,8,9");
+}
+
+/// Such loops whose closures read the variables through a direct `eval`;
+/// in a function with a direct `eval` of its own; at a script's top level
+/// (their variables all in registers). The expected values are V8's,
+/// SpiderMonkey's and JSC's.
+#[test]
+fn loop_bindings_stay_fresh_for_direct_eval_and_scripts() {
+    let vars: String = (0..300).map(|i| format!("var x{i} = {i};\n")).collect();
+    let loops = r#"
+  var fs = [];
+  for (let i = 0; i < 2; i++) fs.push(function () { return eval("i"); });
+  for (const v of [5, 6]) fs.push(function () { return eval("v"); });
+  for (const [k, d] of [["a", 1], ["b", 2]]) fs.push(() => eval("k + d"));
+  for (let i = 0; i < 2; i++) { fs.push(() => i); i += 10; fs.push(() => i); i -= 10; }
+  for (const [k, d] of [["a", 1], ["b", 2]]) fs.push(() => k + d);
+"#;
+    let want = "0,1,5,6,a1,b2,0,0,1,1,a1,b2";
+    assert_eq!(
+        value(&format!("(() => {{\n{vars}{loops}  return fs.map(f => f()).join() + ' ' + x299;\n}})();")),
+        format!("{want} 299")
+    );
+    let src =
+        format!("(() => {{\n{vars}{loops}  return fs.map(f => f()).join() + ' ' + eval('x299 + fs.length');\n}})();");
+    assert_eq!(value(&src), format!("{want} 311"));
+    let lets: String = (0..200).map(|i| format!("{{ let y{i} = {i}; var h{i} = () => y{i}; }}\n")).collect();
+    assert_eq!(
+        value(&format!("{lets}{loops}fs.map(f => f()).join() + ' ' + h1() + ' ' + h199();")),
+        format!("{want} 1 199")
+    );
 }
 
 /// A function using `a` variables of one enclosing function and `b` of

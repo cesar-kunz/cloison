@@ -130,6 +130,17 @@ pub fn id(name: &str) -> u8 {
     INTRINSICS.iter().position(|(n, _)| *n == name).unwrap_or_else(|| panic!("no intrinsic {name}")) as u8
 }
 
+/// Whether the intrinsic `id` only throws, on a path the code generator
+/// branches to when an error is due (`require_coercible`'s source `null`
+/// or `undefined`, a strict `delete` that failed), and reads nothing of
+/// its frame but its registers. Compiled code exits before one as before
+/// any other, but a function is no slower to compile for having one: it
+/// counts neither as [`crate::bytecode::Op::Intrinsic`] for when its
+/// calls enter compiled code nor against inlining it.
+pub(crate) fn is_cold(id: u8) -> bool {
+    matches!(INTRINSICS[id as usize].0, "require_coercible" | "throw_delete")
+}
+
 fn arg(a: &[Value], i: usize) -> Value {
     a.get(i).copied().unwrap_or(Value::UNDEFINED)
 }

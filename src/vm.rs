@@ -7786,7 +7786,12 @@ impl Scan {
             intrinsic: false,
             ops: 0,
         };
-        for op in ops(f) {
+        for (op, cold) in ops(f) {
+            s.ops += 1;
+            // (An intrinsic on an error's path alone: as if not there.)
+            if cold {
+                continue;
+            }
             s.has_loop |= op.is_loop();
             s.mapped_arguments |= op == crate::bytecode::Op::CreateMappedArguments;
             s.prologue_exits |= matches!(
@@ -7817,19 +7822,20 @@ impl Scan {
                     | crate::bytecode::Op::IteratorOpen
                     | crate::bytecode::Op::IteratorNext
             );
-            s.ops += 1;
         }
         s
     }
 }
 
-/// The opcodes of `f`'s code.
-fn ops(f: &crate::asm::FunctionDef) -> impl Iterator<Item = crate::bytecode::Op> + '_ {
+/// The opcodes of `f`'s code, each with whether it is an intrinsic only
+/// an error's path runs (see [`crate::intrinsics::is_cold`]).
+fn ops(f: &crate::asm::FunctionDef) -> impl Iterator<Item = (crate::bytecode::Op, bool)> + '_ {
     let mut pc = 0;
     std::iter::from_fn(move || {
         let op = crate::bytecode::Op::from_u8(*f.code.get(pc)?).expect("valid bytecode");
+        let cold = op == crate::bytecode::Op::Intrinsic && crate::intrinsics::is_cold(f.code[pc + 1]);
         pc += op.size();
-        Some(op)
+        Some((op, cold))
     })
 }
 

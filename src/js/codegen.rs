@@ -6216,7 +6216,14 @@ impl<'a> Gen<'a> {
                 let mark = self.temp;
                 let src = self.alloc(pos)?;
                 self.mov(r, src);
+                // (The error on a cold path: the intrinsic alone doesn't
+                // keep the function interpreted, see `intrinsics::is_cold`.)
+                self.ldar(src);
+                self.emit(Op::TestNullish, &[]);
+                let ok = self.label();
+                self.jump_if(Jmp::False, ok);
                 self.intrinsic("require_coercible", src, 1);
+                self.bind(ok);
                 let keys = if rest.is_some() {
                     let k = self.alloc(pos)?;
                     self.emit(Op::CreateArray, &[Arg::Count(ps.len().min(255) as u8)]);

@@ -7227,17 +7227,28 @@ total + " " + obj.x;
 /// Code aging (`jit::age_functions`): a function's compiled code not used
 /// for a few full collections is dropped, and compiled again if it is
 /// called later; one called directly from compiled code all along stays.
-/// The expected values are Node's.
+/// The collections run in a second script, below a zeroed stretch of the
+/// stack: a stale word of the first one's frames pointing into `idle`'s
+/// code would count as a frame running it. The expected values are Node's.
 #[test]
 fn compiled_code_idle_for_some_collections_is_dropped() {
-    let src = |rounds: u32, after: &str| {
-        format!(
-            r#"
-function idle(n) {{ var s = 0; for (var i = 0; i < n; i++) s += i & 3; return s; }}
-function busy(n) {{ return n < 2 ? n : busy(n - 1) + busy(n - 2); }}
-function caller(n) {{ return busy(n) + 1; }}
+    #[inline(never)]
+    fn below(vm: &mut Vm, src: &str) -> String {
+        let pad = std::hint::black_box([0usize; 1 << 16]);
+        let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).unwrap();
+        std::hint::black_box(&pad);
+        r
+    }
+    let warm = r#"
+function idle(n) { var s = 0; for (var i = 0; i < n; i++) s += i & 3; return s; }
+function busy(n) { return n < 2 ? n : busy(n - 1) + busy(n - 2); }
+function caller(n) { return busy(n) + 1; }
 var total = 0;
 for (var i = 0; i < 3000; i++) total += idle(20) + caller(7);
+"#;
+    let rounds = |rounds: u32, after: &str| {
+        format!(
+            r#"
 for (var r = 0; r < {rounds}; r++) {{
   for (var i = 0; i < 3000; i++) total += caller(7);
   $262.gc();
@@ -7247,18 +7258,17 @@ total;
 "#
         )
     };
-    let run = |src: String| {
+    let run = |n: u32, after: &str| {
         let mut vm = Vm::new();
-        let r = vm.run(&cloison::js::compile(&src).unwrap()).map(display).unwrap();
-        (r, cloison::jit::alive().1)
+        vm.run(&cloison::js::compile(warm).unwrap()).unwrap();
+        assert!(vm.jit_stencils("idle").is_some());
+        let r = below(&mut vm, &rounds(n, after));
+        (r, vm.jit_stencils("idle").is_some(), vm.jit_stencils("busy").is_some())
     };
-    let (r, young) = run(src(2, ""));
-    assert_eq!(r, "216000");
-    let (r, old) = run(src(6, ""));
-    assert_eq!(r, "384000");
-    assert_eq!(old + 1, young, "`idle`'s version alone is dropped");
-    let (r, _) = run(src(6, "for (var i = 0; i < 3000; i++) total += idle(20);"));
-    assert_eq!(r, "474000");
+    assert_eq!(run(2, ""), ("216000".to_string(), true, true));
+    assert_eq!(run(6, ""), ("384000".to_string(), false, true), "`idle`'s code is dropped");
+    let again = "for (var i = 0; i < 3000; i++) total += idle(20);";
+    assert_eq!(run(6, again), ("474000".to_string(), true, true), "and compiled again");
 }
 
 /// A VM dropped leaves none of its compiled versions (the review of #39):

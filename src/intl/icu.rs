@@ -248,10 +248,6 @@ mod tests {
                     chained.push(at);
                 }
                 assert_eq!(chained, whole, "{units:x?}");
-                // And each breaks after a line feed, where `containing`
-                // starts from.
-                let fed = (0..units.len()).all(|i| units[i] != 0x0A || whole.contains(&(i + 1)));
-                assert!(fed, "{units:x?}");
             }
         }
     }

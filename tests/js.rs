@@ -3040,7 +3040,8 @@ r.join(" | ");
 /// results, but `a:b` (one word by the default rules, three by CLDR's)
 /// and the scripts whose words take a dictionary, which there is none
 /// of: a run of Chinese or Japanese, or Thai, is one word. And
-/// `containing` finds the iterator's segments, asked in any order.
+/// `containing` finds the iterator's segments, asked in any order (of a
+/// string longer than its marks are apart, with words longer too).
 #[cfg(feature = "intl")]
 #[test]
 fn intl_segmenter_segments_words_and_sentences() {
@@ -3057,7 +3058,7 @@ var r = [
 ];
 // `containing` at every index, in any order, is the iterator's segment
 // there (in a string longer than its marks are apart).
-var s = ""; for (var i = 0; s.length < 3000; i++) s += "word" + i + (i % 7 ? " " : ". ") + (i % 5 ? "" : "é\u{1F600}\n");
+var s = ""; for (var i = 0; s.length < 6000; i++) s += "word" + i + (i % 7 ? " " : ". ") + (i % 5 ? "" : "é\u{1F600}\n") + (i % 40 ? "" : "x".repeat(600) + " ");
 for (var g of ["grapheme", "word", "sentence"]) {
   var segs = new Intl.Segmenter("en", { granularity: g }).segment(s), at = [], bad = 0, seed = 1;
   for (var x of segs) for (var i = 0; i < x.segment.length; i++) at.push(x);

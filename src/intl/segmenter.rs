@@ -1,8 +1,8 @@
 //! `Intl.Segmenter`, of graphemes, words and sentences. A segmenter's
 //! internal slots are its locale (a string) and its granularity; a
-//! Segments object's its string and the granularity; a Segment
-//! Iterator's its string, the
-//! granularity and the index of its next segment. The rules are the same
+//! Segments object's its string, the granularity and what `containing`
+//! remembers (its last segment, marks); a Segment Iterator's its string,
+//! the granularity and the index of its next segment. The rules are the same
 //! in every locale, so all share the VM's one ICU4X segmenter of each
 //! granularity and none refers to the segmenter it came from.
 
@@ -22,8 +22,19 @@ const LOCALE: usize = 1;
 const STRING: usize = 1;
 /// All three's: an index into [`GRANULARITIES`].
 const GRANULARITY: usize = 2;
-/// A Segment Iterator's: [[IteratedStringNextSegmentCodeUnitIndex]].
+/// A Segments object's: where the segment `containing` last found
+/// starts. A Segment Iterator's:
+/// [[IteratedStringNextSegmentCodeUnitIndex]].
 const AT: usize = 3;
+/// A Segments object's: where the segment `containing` last found ends
+/// (0 before any), and whether it is word-like.
+const END: usize = 4;
+const WORD_LIKE: usize = 5;
+/// A Segments object's: `containing`'s marks, an array (the program
+/// doesn't see) of boundaries it found, ascending, or undefined.
+const MARKS: usize = 6;
+/// How far apart `containing`'s marks are, at least, in code units.
+const STRIDE: usize = 256;
 
 const GRANULARITIES: [&str; 3] = ["grapheme", "word", "sentence"];
 const WORD: usize = Granularity::Word as usize;
@@ -103,7 +114,8 @@ fn segment(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = require(this, Kind::Segmenter, "Intl.Segmenter.prototype.segment")?;
     let string = crate::intrinsics::to_string(vm, arg(a, 0))?;
     let proto = object_value(root(vm, Root::SegmentsPrototype));
-    Ok(create(vm, proto, Kind::Segments, &[string, slot(o, GRANULARITY)]))
+    let zero = Value::number(0.0);
+    Ok(create(vm, proto, Kind::Segments, &[string, slot(o, GRANULARITY), zero, zero, Value::FALSE, Value::UNDEFINED]))
 }
 
 /// `%IntlSegmentsPrototype%.containing(index)`: the segment the code
@@ -120,18 +132,65 @@ fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Ok(Value::UNDEFINED);
     }
     let n = n as usize;
-    // FindBoundary before and after `n`: the segments from the last
-    // sure boundary before it (after a line feed, where every
-    // granularity breaks), up to its own.
-    let breaker = breaker(vm, o);
-    let mut start = units[..n].iter().rposition(|&u| u == 0x0A).map_or(0, |i| i + 1);
-    let (mut end, mut word_like) = breaker.first(&units[start..]);
-    end += start;
-    while end <= n {
-        start = end;
-        let (length, w) = breaker.first(&units[end..]);
-        (end, word_like) = (end + length, w);
+    // FindBoundary before and after `n`. The segment the last call
+    // found, if `n` is in it too (a long one would be scanned to its
+    // end at each index).
+    let (last, last_end) = (slot(o, AT).to_number() as usize, slot(o, END).to_number() as usize);
+    if last <= n && n < last_end {
+        return segment_data(vm, o, last, last_end, slot(o, WORD_LIKE) == Value::TRUE);
     }
+    // Else the segments from a boundary known at or before `n`, up to
+    // its own: the last segment's end if `n` is shortly after it (asking
+    // index after index), else the last of the marks at or before `n`,
+    // boundaries earlier calls passed, [`STRIDE`] apart or more, so that
+    // no call scans from the string's start what another did (asking
+    // the indices backwards, or here and there, in a long string).
+    let mut marks = slot(o, MARKS);
+    let count = if marks.is_undefined() { 0 } else { crate::far::array_length(crate::object::as_object(marks)) };
+    let mark = |vm: &mut Vm, i: u32| Ok(vm.get_keyed(marks, Value::number(i as f64))?.to_number() as usize);
+    let mut top = if count == 0 { 0 } else { mark(vm, count - 1)? };
+    let mut start = if last_end <= n && n - last_end < STRIDE {
+        last_end
+    } else {
+        // (The last mark at or before `n`; the string's start before the
+        // first.)
+        let (mut low, mut high) = (0, if n >= top { 0 } else { count });
+        while low < high {
+            let middle = (low + high) / 2;
+            if mark(vm, middle)? <= n { low = middle + 1 } else { high = middle }
+        }
+        let known = if n >= top {
+            top
+        } else if low == 0 {
+            0
+        } else {
+            mark(vm, low - 1)?
+        };
+        if last_end <= n { known.max(last_end) } else { known }
+    };
+    let mut found = Vec::new();
+    let breaker = breaker(vm, o);
+    let (end, word_like) = loop {
+        if start >= top + STRIDE {
+            found.push(Value::number(start as f64));
+            top = start;
+        }
+        let (length, word_like) = breaker.first(&units[start..]);
+        if start + length > n {
+            break (start + length, word_like);
+        }
+        start += length;
+    };
+    if !found.is_empty() {
+        if marks.is_undefined() {
+            marks = vm.new_array();
+            crate::promise::set_slot(o, MARKS, marks);
+        }
+        crate::vm::array_push(vm, marks, &found)?;
+    }
+    crate::promise::set_slot(o, AT, Value::number(start as f64));
+    crate::promise::set_slot(o, END, Value::number(end as f64));
+    crate::promise::set_slot(o, WORD_LIKE, Value::from_bool(word_like));
     segment_data(vm, o, start, end, word_like)
 }
 

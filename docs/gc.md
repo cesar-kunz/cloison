@@ -594,8 +594,8 @@ is "The header word" at `layout::Header`).
   whenever minor collections took over 2% of the time across the last
   four (see step 6, *Adaptive nursery*).
 - **Old-generation headroom**: the next major cycle starts when the old
-  generation has grown by its live size after the last cycle (64 MiB at
-  least), counted two ways, whichever comes first: blocks in use since
+  generation has grown by half its live size after the last cycle (64 MiB
+  at least; `CLOISON_GC_GROWTH` sets the percentage, 50), counted two ways, whichever comes first: blocks in use since
   the sweep, and bytes minor collections promoted (allocation into
   recycled holes adds no blocks). Not yet: a CPU-share target, and
   `CLOISON_HEAP_LIMIT` steering it.
@@ -754,7 +754,8 @@ runs) and the microbenchmarks.
    survivors; at 32 MiB it runs at its speed without a collector.
 4. **The full collection, stop-the-world** (done). Colors, sweeping,
    freeing empty blocks to the system, a trigger at the blocks in use
-   after the last full collection plus the live size (64 MiB at least).
+   after the last full collection plus the live size (64 MiB at least;
+   half the live size since 2026-11-14, see step 6's *Growth*).
    Octane after steps 2 to 4 against no collector (Apple silicon, seconds and peak
    RSS):
 
@@ -821,6 +822,22 @@ runs) and the microbenchmarks.
      After a stop-the-world full collection Splay's blocks are 31% full
      on average (2,900 of 12,000 under a tenth): the nursery allocates in
      every recycled block's holes and its survivors pin them all.
+   - *Growth* (done, 2026-11-14): the room is half of what the last
+     cycle found live, not all of it (`gc::GROWTH`, a percentage;
+     `CLOISON_GC_GROWTH=100` is the doubling). Up to 64 MiB live the
+     64 MiB floor is the room either way, which is most of Octane: its
+     geomean is level (29,708 and 29,703, the medians of 5 runs), no
+     benchmark over 1.4% away (TypeScript, 3 full collections both
+     ways), Splay 18,924 and 18,969 with 14 cycles for 13 and a peak RSS
+     of 473 MB for 532. The web apps with large live sets pay cycles for
+     memory (the concurrent collector, the medians of 3 runs, at 100 and
+     at 50): TypeScript 1,511 MB and 1,347, 30 cycles for 16 and 3% more
+     CPU time at the same wall time; sheetjs 1,492 and 1,429 (1,506 and
+     1,135 stop-the-world); excalidraw 751 and 643; echarts 509 and 399;
+     tiddlywiki 739 and 774, inside its noise (695-1,094), 23 cycles for
+     16 and 2% more time; siyuan and mathjax, 8 to 23 cycles either way,
+     level. The pauses' total grows with the cycles (TypeScript 3.1 s to
+     3.4, tiddlywiki 2.7 to 3.2), the longest don't.
    - *Promotion trigger* (done): allocation into recycled blocks' holes
      adds no blocks, so a trigger on blocks in use let old garbage grow
      well past the room. A cycle also starts once minor collections have

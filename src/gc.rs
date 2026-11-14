@@ -54,9 +54,10 @@ const NURSERY_OVERHEAD: u64 = 50;
 /// Minor collections the overhead is measured over before a resize.
 const NURSERY_SAMPLE: u32 = 4;
 /// A full collection runs when the heap's blocks have grown, since the
-/// last one, by this many times what it left marked less one, and at least
-/// [`FULL_MIN`].
-const GROWTH: usize = 2;
+/// last one, by this share (a percentage) of what it left marked, and at
+/// least [`FULL_MIN`]. `CLOISON_GC_GROWTH` sets it, to compare (100: the
+/// heap doubles, as it did until 2026-11-14).
+const GROWTH: usize = 50;
 /// A full marking collects shapes (`Vm::sweep_shapes`) once this many have
 /// been made since the last that did, and an eighth of the shapes there
 /// are: marking them costs every object traced a check (Splay, which makes
@@ -211,6 +212,8 @@ pub struct Gc {
     /// What the heap may grow by before the next full collection (see
     /// [`GROWTH`]).
     pub(crate) room: usize,
+    /// [`GROWTH`], or `CLOISON_GC_GROWTH`'s.
+    growth: usize,
     /// The heap's blocks in use when the current cycle started, and what
     /// the last cycle grew them by while marking: the next one starts that
     /// much earlier, so the heap peaks where a stop-the-world collection
@@ -324,6 +327,7 @@ impl Gc {
                 .map_or(NURSERY_MIN, crate::heap::mib),
             nursery_fixed: env("CLOISON_GC_NURSERY"),
             full_at: FULL_MIN,
+            growth: std::env::var("CLOISON_GC_GROWTH").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(GROWTH),
             threads: std::env::var("CLOISON_GC_THREADS")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -2501,12 +2505,12 @@ impl Vm {
             self.heap.gc.marking = false;
             let concurrent = self.heap.gc.marker.as_ref().map_or(0, |mk| std::mem::take(&mut mk.shared.state().marked));
             // The blocks the sweep left in use (partly free ones too),
-            // and room to grow by what was live, times `GROWTH - 1`: what
+            // and room to grow by `GROWTH` percent of what was live: what
             // this pause and the marker marked. (Not what the cycle's start
             // pause promoted, live too: the pacing was tuned without it, and
             // counting it grew Splay's peak RSS 4% at the same speed.)
             let live = traced + concurrent;
-            let room = ((GROWTH - 1) * live).max(FULL_MIN);
+            let room = (live / 100 * self.heap.gc.growth).max(FULL_MIN);
             let start = if kind == Collection::Final { std::mem::take(&mut self.heap.gc.start_marked) } else { 0 };
             LIVE_PEAK.fetch_max((live + start) as u64, std::sync::atomic::Ordering::Relaxed);
             self.heap.gc.live = live;

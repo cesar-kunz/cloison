@@ -338,10 +338,30 @@ fn prototype_of_target(vm: &mut Vm, nt: Value) -> Result<Value> {
 /// A template literal: `[s0, e1, s1, e2, …]`, each substitution's
 /// ToString between the strings.
 fn template(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let mut units: Vec<u16> = Vec::new();
+    // (Room for the strings, and for an int32's digits per substitution:
+    // most are strings and small integers, a cell's address or a key's
+    // parts, joined without a string made for each.)
+    let room: usize = a.iter().map(|&v| crate::vm::string_len(v).unwrap_or(11)).sum();
+    let mut units: Vec<u16> = Vec::with_capacity(room.min(1 << 12));
     for (i, &v) in a.iter().enumerate() {
         if i % 2 == 0 {
             crate::vm::push_string(&mut units, v)?;
+        } else if v.is_int32() {
+            let i = v.as_i32_unchecked();
+            let (mut digits, mut at, mut n) = ([0u16; 11], 11, i.unsigned_abs());
+            loop {
+                at -= 1;
+                digits[at] = b'0' as u16 + (n % 10) as u16;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            if i < 0 {
+                at -= 1;
+                digits[at] = b'-' as u16;
+            }
+            units.extend_from_slice(&digits[at..]);
         } else {
             let s = template_string(vm, v)?;
             crate::vm::push_string(&mut units, s)?;

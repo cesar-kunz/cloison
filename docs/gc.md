@@ -338,6 +338,25 @@ start zero (a byte buffer). Blocks a full
 collection leaves empty are given back to the system (`madvise`), but
 for as many as the heap will grow by before the next cycle.
 
+Outside the heap, the front end's memory (the source text, tokens, the
+syntax tree, the module before it is loaded) is `malloc`'s, and is
+freed before the script starts: the shell drops the text and gives the
+module away (`Vm::run_owned`: `Vm::run` loads a copy, the caller
+keeping its own through the run), and after
+the load of a module of 1,000 functions or more glibc's allocator is
+asked to return the pages it holds free (`vm::release_freed`,
+`malloc_trim`: it kept them, between what the load left allocated).
+musl's returns what it frees unasked. Peak RSS, stop-the-world
+collections, the medians of 3 runs: siyuan 476 MB, 442 without the copy,
+391 trimmed too (471 and 365 interpreted); TypeScript 1,307, 1,261 and
+1,256; sheetjs, whose peak comes long after, about 1,390 and 1,360. Under
+the concurrent collector siyuan's is 512 and 463 (519 and 417
+interpreted), the others' inside their noise. An empty script starts as
+before (6.48 M instructions for 6.50, 2.0 ms), and the call itself takes
+4 ms after sheetjs's load (12 MB of source) and mathjax's, 12 to 18 ms
+after TypeScript's, Excalidraw's and siyuan's, 25 ms after Univer's
+(24 MB).
+
 ### Cells
 
 Every cell says how big it is from its first words (`heap::cell_size`):

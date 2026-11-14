@@ -9299,3 +9299,20 @@ out.join();
         "4,own"
     );
 }
+
+#[test]
+fn a_module_run_once_is_loaded_as_it_is() {
+    // `Vm::run_owned` loads the module itself, not a copy, and has the
+    // allocator give back what the front end and the load freed when it
+    // has 1,000 functions (`vm::release_freed`): the script runs as under
+    // `Vm::run`, functions keep their text, and the VM runs the next.
+    let fns: String = (0..1500).map(|i| format!("function f{i}(x) {{ return x + {i}; }}\n")).collect();
+    let src = format!("{fns}var s = 0; for (var i = 0; i < 1500; i++) s += globalThis['f' + i](1);\ns + f7.toString()");
+    let want = format!("{}function f7(x) {{ return x + 7; }}", 1500 + 1499 * 1500 / 2);
+    let mut vm = Vm::new();
+    let r = vm.run_owned(cloison::js::compile(&src).unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok(want.as_str()));
+    let r = vm.run_owned(cloison::js::compile("f1499(s)").unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("1127249"));
+    assert_eq!(run(&src).as_deref(), Ok(want.as_str()));
+}

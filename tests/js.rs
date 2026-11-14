@@ -9558,3 +9558,195 @@ true
     let r = vm.run(&module).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(expected));
 }
+
+#[test]
+fn string_builtins_fast_paths_agree_with_the_engines() {
+    // Case mapping of ASCII text, `split` appending its pieces, `apply`
+    // of a plain array, `fromCharCode` of small integers, `join` reading a
+    // plain array's elements and `encodeURI…` by runs: what V8,
+    // SpiderMonkey and JavaScriptCore print.
+    let src = r##"
+var out = [];
+function p(x) { out.push(typeof x === 'string' ? JSON.stringify(x) : String(x)); }
+function t(f) { try { p(f()); } catch (e) { p(e.name); } }
+// Case mapping
+p('Hello, World 123'.toLowerCase()); p('Hello, World 123'.toUpperCase());
+p('already lower'.toLowerCase() === 'already lower'); p('UPPER_1'.toUpperCase());
+p(''.toLowerCase()); p('@[`{'.toLowerCase()); p('@[`{'.toUpperCase());
+p('Straße İ K ǅ'.toLowerCase()); p('straße ŉ ǆ ﬁ'.toUpperCase());
+p('a\ud800B'.toUpperCase().length); p('A\udc00bİ'.toLowerCase().length);
+p(String.prototype.toUpperCase.call(12.5e3)); p(String.prototype.toLowerCase.call({ toString() { return 'OBJ'; } }));
+p(typeof new String('ABC').toLowerCase()); p(new String('abc').toLowerCase());
+t(() => String.prototype.toLowerCase.call(null));
+// split
+p('a,b,,c'.split(',')); p('a,b,,c'.split(',').length); p('a,b,,c'.split(',', 2)); p('a,b,,c'.split(',', 0).length);
+p('abc'.split('')); p('abc'.split('', 2)); p(''.split('').length); p(''.split(',').length); p(''.split(',')[0] === '');
+p('abc'.split()); p('abc'.split(undefined, 0).length); p('abc'.split('abc')); p('abc'.split('abcd')); p('aXXbXXc'.split('XX'));
+p(',a,'.split(',')); p('a,b'.split(',', -1)); p('a,b,c'.split(',', 4294967297)); p('a1b2c'.split(1));
+p('a,b'.split({ toString() { return ','; } })); p('abc'.split(null)); p('anullb'.split(null));
+p(String.prototype.split.call(12345, 3)); p(JSON.stringify('x'.repeat(40).split('x').length));
+var order = []; 'a-b'.split({ toString() { order.push('sep'); return '-'; } }, { valueOf() { order.push('limit'); return 5; } }); p(order);
+var sp = 'k=v;k2=v2'.split(';'); sp.push('z'); p(sp); p(Object.keys(sp)); p(Array.isArray(sp));
+// split by a regular expression
+p('a1b22c'.split(/\d/)); p('a1b22c'.split(/\d+/)); p('a1b22c'.split(/(\d)/)); p('a1b22c'.split(/(\d)(x)?/));
+p('abc'.split(/(?:)/)); p('abc'.split(/(?:)/, 2)); p(''.split(/x/).length); p(''.split(/(?:)/).length);
+p('<a><b>'.split(/[<>]/)); p('a1b2c3'.split(/(\d)/, 3)); p('a1b2c3'.split(/(\d)/, 4)); p('a1b2c3'.split(/\d/, 0).length);
+p('ab'.split(/a*?/)); p('ab'.split(/a*/)); p('A<B>bold</B>and<CODE>coded</CODE>'.split(/<(\/)?([^<>]+)>/));
+p('a😀b'.split(/(?:)/u).length); p('test'.split(/(?=s)/)); p('a b  c'.split(/\s+/y)); p('x'.split(/$/));
+// fromCharCode and apply
+p(String.fromCharCode()); p(String.fromCharCode(65)); p(String.fromCharCode(65, 66, 0x10041, -1).length);
+p(String.fromCharCode(72, 105)); p(String.fromCharCode(72.9, '105', null, undefined, true, { valueOf() { return 33; } }));
+p(String.fromCharCode.apply(null, [72, 101, 108, 108, 111])); p(String.fromCharCode.apply(null, []));
+p(String.fromCharCode.apply(null)); p(String.fromCharCode.apply(null, null)); p(String.fromCharCode.apply(null, [72, , 105]).length);
+p(String.fromCharCode.apply(null, new Uint8Array([104, 105]))); p(String.fromCharCode.apply(null, { length: 2, 0: 111, 1: 107 }));
+var big = []; for (var i = 0; i < 70000; i++) big.push(48 + i % 10); p(String.fromCharCode.apply(null, big).length);
+t(() => String.fromCharCode.apply(null, 5)); t(() => Math.max.apply(null, [1, 5, 3]));
+var holes = [1, , 3]; Array.prototype[1] = 7; p(Math.max.apply(null, holes)); delete Array.prototype[1];
+var self = [3, 1, 2]; p(Array.prototype.push.apply(self, self)); p(self);
+function g() { return arguments.length; } p(g.apply(null, [1, 2, 3])); p(g.bind(null, 0).apply(null, [1, 2]));
+var frozen = Object.freeze([5, 6]); p(Math.min.apply(null, frozen));
+var acc = [1, 2]; Object.defineProperty(acc, 0, { get() { return 40; } }); p(Math.max.apply(null, acc));
+// join
+p([1, 2, 3].join()); p([1, -2, 3.5, -0, 1e21, NaN, Infinity, -2147483648, 2147483647].join('|'));
+p([null, undefined, 'a', true, , 5].join('-')); p([].join()); p([[1, 2], [3, [4]]].join(';')); p([1, 2].join(undefined)); p([1, 2].join(null));
+p([{ toString() { return 'o'; } }, 1n, 'x'].join('')); t(() => [Symbol()].join());
+var grow = [1, 2, 3, 4]; grow[1] = { toString() { grow.length = 2; return 'cut'; } }; p(grow.join(','));
+var ext = [1, 2, 3]; ext[0] = { toString() { ext.push(9); return 'e'; } }; p(ext.join(','));
+var ho = [1, , 3]; Array.prototype[1] = 'proto'; p(ho.join(',')); delete Array.prototype[1];
+p(Array.prototype.join.call({ length: 3, 0: 'a', 2: 'c' }, '+')); p(Array.prototype.join.call('abc', '.'));
+p(new Array(4).join('ab')); p([0.1, 1e-7, 123456789012345680000].join(' '));
+var prox = []; new Proxy([1, 2], { get(t, k, r) { prox.push(String(k)); return Reflect.get(t, k, r); }, has(t, k) { prox.push('has ' + String(k)); return Reflect.has(t, k); } }).join(); p(prox);
+// URI encoding
+p(encodeURIComponent('abc-_.!~*\'()')); p(encodeURIComponent('a b&c=d/é?日本😀')); p(encodeURI('http://x/a b?q=é#h[]'));
+p(encodeURIComponent('')); p(encodeURIComponent(12)); p(encodeURIComponent()); t(() => encodeURIComponent('a\ud800'));
+t(() => encodeURIComponent('\udc00a')); t(() => encodeURI('ok\ud800x')); p(encodeURIComponent('𐀀')); p(encodeURI(';/?:@&=+$,#'));
+p(encodeURIComponent('\x00\x7f\x80߿ࠀ￿'));
+// replace
+p('a-b-c'.replace('-', '+')); p('a-b-c'.replace(/-/g, '+')); p('abc'.replace('', '_')); p('aXb'.replace('X', '$&$&$$'));
+p('a-b'.replace({ toString() { return '-'; } }, { toString() { return '='; } })); p('x'.replaceAll('x', 'yy'));
+var re = /a/g; re.lastIndex = 3; p('aaa'.replace(re, 'b')); p(re.lastIndex);
+out.join('\n')
+"##;
+    let want = r##""hello, world 123"
+"HELLO, WORLD 123"
+true
+"UPPER_1"
+""
+"@[`{"
+"@[`{"
+"straße i̇ k ǆ"
+"STRASSE ʼN Ǆ FI"
+3
+5
+"12500"
+"obj"
+"string"
+"abc"
+"TypeError"
+a,b,,c
+4
+a,b
+0
+a,b,c
+a,b
+0
+1
+true
+abc
+0
+,
+abc
+a,b,c
+,a,
+a,b
+a
+a,b2c
+a,b
+abc
+a,b
+12,45
+"41"
+limit,sep
+k=v,k2=v2,z
+0,1,2
+true
+a,b,,c
+a,b,c
+a,1,b,2,,2,c
+a,1,,b,2,,,2,,c
+a,b,c
+a,b
+1
+0
+,a,,b,
+a,1,b
+a,1,b,2
+0
+a,b
+,b
+A,,B,bold,/,B,and,,CODE,coded,/,CODE,
+3
+te,st
+a,b,c
+x
+""
+"A"
+4
+"Hi"
+"Hi\u0000\u0000\u0001!"
+"Hello"
+""
+""
+""
+3
+"hi"
+"ok"
+70000
+"TypeError"
+5
+7
+6
+3,1,2,3,1,2
+3
+3
+5
+40
+"1,2,3"
+"1|-2|3.5|0|1e+21|NaN|Infinity|-2147483648|2147483647"
+"--a-true--5"
+""
+"1,2;3,4"
+"1,2"
+"1null2"
+"o1x"
+"TypeError"
+"1,cut,,"
+"e,2,3"
+"1,proto,3"
+"a++c"
+"a.b.c"
+"ababab"
+"0.1 1e-7 123456789012345680000"
+join,length,0,1
+"abc-_.!~*'()"
+"a%20b%26c%3Dd%2F%C3%A9%3F%E6%97%A5%E6%9C%AC%F0%9F%98%80"
+"http://x/a%20b?q=%C3%A9#h%5B%5D"
+""
+"12"
+"undefined"
+"URIError"
+"URIError"
+"URIError"
+"%F0%90%80%80"
+";/?:@&=+$,#"
+"%00%7F%C2%80%DF%BF%E0%A0%80%EF%BF%BF"
+"a+b-c"
+"a+b+c"
+"_abc"
+"aXX$b"
+"a=b"
+"yy"
+"bbb"
+0"##;
+    assert_eq!(run(src).as_deref(), Ok(want));
+}

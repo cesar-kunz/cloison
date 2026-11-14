@@ -410,10 +410,37 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
             if i > 0.0 {
                 out.extend_from_slice(&sep);
             }
-            let v = get(vm, o, i)?;
+            // (A plain array's element in place; a number's digits
+            // without a string of its own.)
+            let v = if dense(vm, as_object(o)) { element(vm, o, i)?.1 } else { get(vm, o, i)? };
             if string_len(v).is_some() {
                 // (Past the longest string: thrown before its units are read.)
                 push_string(&mut out, v)?;
+            } else if v.is_number() {
+                let d = v.to_number();
+                if v.is_int32() {
+                    let mut n = d as i64;
+                    let mut digits = [0u16; 11];
+                    let mut k = digits.len();
+                    let neg = n < 0;
+                    n = n.abs();
+                    loop {
+                        k -= 1;
+                        digits[k] = b'0' as u16 + (n % 10) as u16;
+                        n /= 10;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    if neg {
+                        k -= 1;
+                        digits[k] = b'-' as u16;
+                    }
+                    out.extend_from_slice(&digits[k..]);
+                } else {
+                    out.extend(crate::vm::number_ascii(d).as_str().bytes().map(u16::from));
+                }
+                check_string_len(out.len())?;
             } else if !v.is_undefined() && !v.is_null() {
                 out.extend(to_string_units(v));
                 // (Its exception stops the join: no next element read.)
@@ -1535,6 +1562,9 @@ fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(out)
 }
 
+/// The most arguments `apply` passes.
+pub(crate) const APPLY_MAX: usize = 1 << 24;
+
 /// The arguments `f.apply(that, list)` passes: `list`'s elements (holes as
 /// `undefined`; none for `undefined` or `null`): CreateListFromArrayLike.
 pub(crate) fn apply_list(vm: &mut Vm, list: Value) -> Result<Vec<Value>> {
@@ -1545,7 +1575,7 @@ pub(crate) fn apply_list(vm: &mut Vm, list: Value) -> Result<Vec<Value>> {
         return Err(Error::type_error("CreateListFromArrayLike called on non-object"));
     }
     let len = vm.length_of(list)?;
-    if len > (1 << 24) as f64 {
+    if len > APPLY_MAX as f64 {
         return Err(Error::range_error("Too many arguments in function call"));
     }
     let mut out = Vec::with_capacity(len as usize);

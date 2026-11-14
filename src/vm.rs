@@ -7695,6 +7695,13 @@ impl Vm {
         Some(code.jit.borrow().as_ref()?.stats)
     }
 
+    /// `function`'s current lowering in the JIT, if it has a state there:
+    /// its instructions and its tables' bytes (for tests).
+    pub fn jit_lowering(&self, function: &str) -> Option<(usize, usize)> {
+        let code = self.codes.iter().find(|c| c.name == function && c.native.is_none())?;
+        Some(code.jit.borrow().as_ref()?.lowering())
+    }
+
     /// The stencils of `function`'s most recent compiled code, if any (for
     /// tests).
     pub fn jit_stencils(&self, function: &str) -> Option<Vec<String>> {

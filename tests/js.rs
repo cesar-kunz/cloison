@@ -2838,6 +2838,20 @@ fn loop_bindings_stay_fresh_past_the_registers() {
     assert_eq!(value(&src), "a1,b2,1,2,0,1,p,q,0,11,2,3,0,1,0,1,0,1,0,1,2,5 299");
 }
 
+/// A `finally` block run by a `continue` or `break` leaving its `try` is
+/// entered as any block: new bindings, which closures made then keep.
+#[test]
+fn a_finally_block_left_early_has_new_bindings() {
+    let src = r#"
+var fs = [];
+(() => {
+  for (const r of [4, 5, 6]) { try { if (r < 6) continue; } finally { let t = r * 3; fs.push(() => t); } }
+  for (const r of [7, 8]) { try { if (r > 7) break; } finally { function g() { return u; } let u = r + 1; fs.push(g); } }
+})();
+fs.map(f => f()).join();"#;
+    assert_eq!(value(src), "12,15,18,8,9");
+}
+
 /// A function using `a` variables of one enclosing function and `b` of
 /// another (each with no more variables than registers, so none is in a
 /// scope object): `a + b` upvalues.

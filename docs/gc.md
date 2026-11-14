@@ -410,7 +410,8 @@ measurement says the old generation fills with cells that die soon after.
    its closures): roots while the owner lives, which Rust's ownership
    already ties to anything that can still run the code (a version on a
    stack holds its `Rc`, a direct call bound to it holds one, an exit's
-   snapshot one). They were kept for good, every cell compiled code ever
+   snapshot one); a full marking holds them weakly ("Compiled code's
+   cells"). They were kept for good, every cell compiled code ever
    embedded: the web apps' echarts kept 170 MiB of 633 live only through
    versions long dropped, pdfjs 115 of 360, sass 10.6 of 95. A function
    the JIT took is never freed (its address keys the JIT's tables) but
@@ -635,8 +636,70 @@ finalizer.
   constant). The slow path is a runtime call, so a safepoint.
 - **Stores** get the card mark as part of the stencil, elided by type.
 - **Embedded cells** are recorded per compiled version and lowering, and
-  are roots while those live (see Roots, 4); nothing the collector does
-  invalidates code.
+  are roots of a minor collection while those live (see Roots, 4). A
+  full marking holds them weakly and retires the code whose cells died:
+  see "Compiled code's cells" below.
+
+### Compiled code's cells
+
+Compiled code embeds cells: the closures its direct calls are bound to,
+constants it folded, the holders its inline caches check. As roots for as
+long as the code lived (Roots, 4), they kept whole dead object graphs
+alive: most of the live heap of the TypeScript and echarts apps at their
+peak, each of the TypeScript checker's compiled functions holding the
+program it was compiled against.
+
+A full marking that isn't racing a compilation holds them weakly
+(`Vm::weak_kept`; a minor collection keeps them strong, as does
+`CLOISON_GC_STRONG_KEPT=1`). It traces the real roots first, then looks
+at each function's kept cells:
+
+- **A function no frame runs**, with a kept cell nothing else reached,
+  has its compiled code *retired*: its versions, lowerings and call sites
+  are dropped, the sites bound to it unbound, and it runs in the
+  interpreter until it is hot again. A stale inline-cache holder alone
+  doesn't retire it: the way is cleared and the code stays, as code
+  embeds no cell from a cache that it doesn't also keep.
+- **A function a frame runs** is held by version: only the versions the
+  stacks point into (found by the conservative scan of return addresses)
+  stay, with what they and their snapshots keep. Its caches are weak like
+  any other's, and the function is retired with the running versions
+  parked until the frames leave them.
+
+A retired function would compile again at its next entry with its call
+caches just cleared, bail there and compile once more. It is cooled for
+100 calls instead, so the caches fill first, and its bail and compilation
+counts are put back, so that closures made anew and retired at each full
+collection (pdf.js's decoders, one set per image) don't use up their
+compilations and end in the interpreter.
+
+What a call site binds to decides what it keeps. A site that binds by
+code (a guard on the closure's code, not its identity) keeps no closure;
+a polymorphic site whose cached closures share one code has one case
+guarded by the code, where it had one case and one kept closure per
+closure seen.
+
+**Idle code.** With its cells weak, code nothing calls holds no dead
+cells, but its own memory stays. At each weak full marking a function is
+*used* if a frame runs it, or if the runtime entered it or bound a call
+site to it since the last one. Direct calls enter it unseen, so after 2
+idle collections the sites bound to it are unbound: a caller still using
+it binds again through the runtime, which counts as a use. After 2 more
+it is retired. One found in use after an unbinding waits twice as long
+the next time, up to 16 collections (`CLOISON_JIT_IDLE_UNBIND=0` turns
+this off). The cache of decoded bytecode the compiler keeps ages the
+same way, in two generations, once it holds 65,536 instructions.
+
+**At rest**, a function's tables (registers live at each exit and entry,
+the exits' index, the properties its instructions were specialized for)
+are stored packed and unpacked while it compiles; they were nearly half
+of the JIT's bytes.
+
+On the TypeScript app, whose sessions each build a new program, the
+peak RSS went from 4.4 GB to 1.3–1.9 GB at the
+same run time, and the JIT's own memory at exit from 207 MB to 120 MB;
+echarts' peak from 1.04 GB to 0.63 GB, TiddlyWiki's from 1.29 to 0.85,
+Sass's from 0.70 to 0.51.
 
 ### What `object-model.md` keeps
 

@@ -577,3 +577,101 @@ cloison-nojit	tiddlywiki	status	work
 cloison-nojit	tiddlywiki	why	did other work than the reference in: filter.run, html.render, search.filter, wikitext.parse
 cloison-nojit	tiddlywiki	wall_s	30.48
 cloison-nojit	tiddlywiki	rss_mb	862.8
+cloison	excalidraw	status	ok
+cloison	excalidraw	wall_s	60.45
+cloison	excalidraw	rss_mb	800.6
+cloison	pdfjs	status	ok
+cloison	pdfjs	wall_s	82.85
+cloison	pdfjs	rss_mb	930.4
+cloison	typescript	status	ok
+cloison	typescript	wall_s	81.21
+cloison	typescript	rss_mb	1679.0
+cloison	jsnes	status	ok
+cloison	jsnes	wall_s	53.64
+cloison	jsnes	rss_mb	140.1
+cloison	sass	status	ok
+cloison	sass	wall_s	52.24
+cloison	sass	rss_mb	444.4
+cloison	sheetjs	status	ok
+cloison	sheetjs	wall_s	67.74
+cloison	sheetjs	rss_mb	1658.2
+cloison	echarts	status	ok
+cloison	echarts	wall_s	58.46
+cloison	echarts	rss_mb	457.6
+cloison	mathjax	status	ok
+cloison	mathjax	wall_s	19.03
+cloison	mathjax	rss_mb	516.0
+cloison	snap	status	work
+cloison	snap	why	did other work than the reference in: count-change.ask
+cloison	snap	wall_s	62.11
+cloison	snap	rss_mb	364.4
+cloison	cyberchef	status	ok
+cloison	cyberchef	wall_s	23.78
+cloison	cyberchef	rss_mb	888.6
+cloison	beepbox	status	work
+cloison	beepbox	why	did other work than the reference in: edit.transpose, play.sci-stars
+cloison	beepbox	wall_s	15.58
+cloison	beepbox	rss_mb	186.7
+cloison	pcjs	status	ok
+cloison	pcjs	wall_s	33.26
+cloison	pcjs	rss_mb	142.7
+cloison	univer	status	fail
+cloison	univer	why	exit status 1: cloison: uncaught TypeError: undefined is not a constructor
+cloison	univer	wall_s	3.16
+cloison	univer	rss_mb	499.5
+cloison	siyuan	status	ok
+cloison	siyuan	wall_s	43.81
+cloison	siyuan	rss_mb	491.3
+cloison	tiddlywiki	status	work
+cloison	tiddlywiki	why	did other work than the reference in: filter.run, html.render, search.filter, wikitext.parse
+cloison	tiddlywiki	wall_s	34.17
+cloison	tiddlywiki	rss_mb	808.2
+cloison-nojit	excalidraw	status	ok
+cloison-nojit	excalidraw	wall_s	65.77
+cloison-nojit	excalidraw	rss_mb	695.2
+cloison-nojit	pdfjs	status	ok
+cloison-nojit	pdfjs	wall_s	115.00
+cloison-nojit	pdfjs	rss_mb	989.8
+cloison-nojit	typescript	status	ok
+cloison-nojit	typescript	wall_s	83.22
+cloison-nojit	typescript	rss_mb	1215.4
+cloison-nojit	jsnes	status	ok
+cloison-nojit	jsnes	wall_s	150.61
+cloison-nojit	jsnes	rss_mb	133.8
+cloison-nojit	sass	status	ok
+cloison-nojit	sass	wall_s	62.69
+cloison-nojit	sass	rss_mb	340.9
+cloison-nojit	sheetjs	status	ok
+cloison-nojit	sheetjs	wall_s	70.44
+cloison-nojit	sheetjs	rss_mb	1656.8
+cloison-nojit	echarts	status	ok
+cloison-nojit	echarts	wall_s	99.53
+cloison-nojit	echarts	rss_mb	341.8
+cloison-nojit	mathjax	status	ok
+cloison-nojit	mathjax	wall_s	14.76
+cloison-nojit	mathjax	rss_mb	467.5
+cloison-nojit	snap	status	work
+cloison-nojit	snap	why	did other work than the reference in: count-change.ask
+cloison-nojit	snap	wall_s	57.97
+cloison-nojit	snap	rss_mb	301.6
+cloison-nojit	cyberchef	status	ok
+cloison-nojit	cyberchef	wall_s	44.22
+cloison-nojit	cyberchef	rss_mb	836.9
+cloison-nojit	beepbox	status	work
+cloison-nojit	beepbox	why	did other work than the reference in: edit.transpose, play.sci-stars
+cloison-nojit	beepbox	wall_s	31.17
+cloison-nojit	beepbox	rss_mb	176.3
+cloison-nojit	pcjs	status	ok
+cloison-nojit	pcjs	wall_s	39.86
+cloison-nojit	pcjs	rss_mb	123.2
+cloison-nojit	univer	status	fail
+cloison-nojit	univer	why	exit status 1: cloison: uncaught TypeError: undefined is not a constructor
+cloison-nojit	univer	wall_s	3.10
+cloison-nojit	univer	rss_mb	499.5
+cloison-nojit	siyuan	status	ok
+cloison-nojit	siyuan	wall_s	42.31
+cloison-nojit	siyuan	rss_mb	507.9
+cloison-nojit	tiddlywiki	status	work
+cloison-nojit	tiddlywiki	why	did other work than the reference in: filter.run, html.render, search.filter, wikitext.parse
+cloison-nojit	tiddlywiki	wall_s	30.91
+cloison-nojit	tiddlywiki	rss_mb	783.7

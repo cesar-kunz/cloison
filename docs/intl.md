@@ -58,6 +58,18 @@ and `organizeImports` asks `Intl.Collator.supportedLocalesOf`); and
   grapheme clusters, words or sentences, by its default rules, the
   same in every locale; see the gaps for the words of the scripts
   written without spaces.
+- `containing(index)` gives the segment it last found again if the
+  index is in it, and else scans from a boundary known at or before
+  the index: where that segment ends, if the index is shortly after,
+  else the last of its marks before the index, which are boundaries
+  earlier calls passed, kept 256 code units apart or more (in an array
+  the program doesn't see). So asking every index of a long string, in
+  either order, is linear: 40,000 code units of short words without a
+  line break take 9 ms ascending and 74 ms descending (9.3 s and 9.2 s
+  when each call scanned from the last line break), and 40,000 that
+  are one word 8 ms (5 s without the first). A call still scans its
+  segment to the end, so going back and forth between long segments
+  costs their lengths.
 
 `sensitivity` maps to ICU4X's strength and case level, `numeric` and
 `caseFirst` to its preferences, `ignorePunctuation` to shifted alternate
@@ -120,11 +132,12 @@ checks its receiver by. A collator's others are its ICU4X collator (an
 index into `vm.intl`'s, which interns them by locale and options), its
 bound `compare`, its locale string and its other resolved options packed
 in an int; a segmenter's are its locale string and its granularity, a
-Segments object's its string and the granularity, an iterator's its string, the granularity and where its
+Segments object's its string, the granularity and what `containing`
+remembers, an iterator's its string, the granularity and where its
 next segment starts (the VM has one ICU4X segmenter of each granularity
 for them all, made with the first `Intl.Segmenter` of it). An iterator
 finds each segment from the end of the one before, and `containing`
-from the last line feed before the index: no rule of UAX #29 looks back past a boundary, so that
+from a boundary: no rule of UAX #29 looks back past a boundary, so that
 is the segment a pass over the whole string finds (a unit test of
 `icu.rs` checks it on random strings). The prototypes are
 per realm (`vm.intl_roots`).

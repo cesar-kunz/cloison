@@ -6414,6 +6414,31 @@ s
     }
 }
 
+/// A direct `eval` without an `eval` in its code, whose own scope object
+/// no handle holds: it is a root from `Vm::eval_envs` (the review of
+/// #295), with a collection at every KiB allocated, what it frees
+/// poisoned. (This passes without that root too, in debug and release
+/// builds: the stack word of the native that made the object still holds
+/// it, which the root is there not to depend on.)
+#[test]
+fn a_direct_evals_scope_object_is_a_root() {
+    let src = r#"
+function g(n) { return eval("var v = [n, n + 1]; let w = {a: v[1]}; w.a + v.length - 2"); }
+var s = 0;
+for (var i = 0; i < 3000; i++) s += g(i);
+s
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_gc_verify(1 << 10);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("4501500"), "tier at {budget}");
+        vm.verify_heap();
+    }
+}
+
 #[test]
 fn mapped_arguments_objects_share_a_shape() {
     // A sloppy function's `arguments` with parameters, its elements mapped

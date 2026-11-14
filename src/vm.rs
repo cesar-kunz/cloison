@@ -2282,20 +2282,36 @@ impl Vm {
             .then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one((n, ends, place)))
     }
 
-    /// Push a direct `eval`'s scope objects on `eval_envs` (see
-    /// `intrinsics::eval_env`), into the room one before left.
-    pub(crate) fn push_eval_envs(&mut self, envs: impl IntoIterator<Item = Value>) {
+    /// Run `f`, a direct `eval`'s code, with its scope objects on
+    /// `eval_envs` (see `intrinsics::eval_env`), in the room one before
+    /// left. They are roots while there, so they are taken off on return
+    /// and on unwinding alike, as a `handle_scope`'s handles: a panic in
+    /// `f` caught by a native would else keep them for the VM's life.
+    pub(crate) fn with_eval_envs<T>(
+        &mut self,
+        envs: impl IntoIterator<Item = Value>,
+        f: impl FnOnce(&mut Vm) -> T,
+    ) -> T {
+        /// The scope objects' place, left as it drops.
+        struct Pushed {
+            vm: *mut Vm,
+            depth: usize,
+        }
+        impl Drop for Pushed {
+            fn drop(&mut self) {
+                unsafe { (*self.vm).eval_depth = self.depth };
+            }
+        }
         if self.eval_depth == self.eval_envs.len() {
             self.eval_envs.push(Vec::new());
         }
         let e = &mut self.eval_envs[self.eval_depth];
         e.clear();
         e.extend(envs);
-        self.eval_depth += 1;
-    }
-
-    pub(crate) fn pop_eval_envs(&mut self) {
-        self.eval_depth -= 1;
+        let pushed = Pushed { vm: self, depth: self.eval_depth };
+        let vm = unsafe { &mut *pushed.vm };
+        vm.eval_depth += 1;
+        f(vm)
     }
 
     /// The kept code of an `eval` of `source` in `place` (`hash` their

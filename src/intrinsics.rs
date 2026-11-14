@@ -980,10 +980,8 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
         }
     }
     let fenv = if crate::props::is_object(decl) { decl } else { local };
-    vm.push_eval_envs([Value::UNDEFINED, local, fenv].into_iter().chain(scopes.iter().copied()));
-    let r = crate::interp::run_script_with(vm, code, this, kept, std::ptr::null_mut());
-    vm.pop_eval_envs();
-    r
+    let envs = [Value::UNDEFINED, local, fenv].into_iter().chain(scopes.iter().copied());
+    vm.with_eval_envs(envs, |vm| crate::interp::run_script_with(vm, code, this, kept, std::ptr::null_mut()))
 }
 
 /// The scopes a direct `eval`'s `shape` (`a[2]`, see [`direct_eval`])
@@ -1128,10 +1126,8 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
     }
     let fenv = if crate::props::is_object(decl) { decl } else { local };
-    vm.push_eval_envs([Value::UNDEFINED, local, fenv].into_iter().chain(scopes.iter().copied()));
-    let r = crate::interp::run_script_with(vm, code, this, kept, as_object(carrier));
-    vm.pop_eval_envs();
-    r
+    let envs = [Value::UNDEFINED, local, fenv].into_iter().chain(scopes.iter().copied());
+    vm.with_eval_envs(envs, |vm| crate::interp::run_script_with(vm, code, this, kept, as_object(carrier)))
 }
 
 /// A direct `eval` site's binding (see [`site_bindings`]): its name, kind,

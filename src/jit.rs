@@ -16502,6 +16502,14 @@ impl JitFunction {
         self.live_at.clear();
         self.last = None;
         snaps.push(std::mem::replace(&mut vm.snap, Rc::new(Snapshot::empty())));
+        // The lowering goes whole, not only what the snapshot owns: with
+        // no version and `dirty`, nothing reads it before `refresh`
+        // replaces it (a parked version's exit stops at its snapshot not
+        // being the current one), and a function never entered again
+        // (an initialization's) kept it for good.
+        self.insns = Rc::new([]);
+        self.widened = HashSet::default();
+        (vm.props, vm.polys, vm.fbs) = (Props::default(), Vec::new(), Vec::new());
         vm.dirty = true;
         vm.cool = COOL_ENTRIES;
         (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
@@ -17470,6 +17478,15 @@ impl JitFunction {
         let Some(vm) = &self.vm else { return 0 };
         let bound = |s: &std::cell::UnsafeCell<CallSite>| unsafe { (*s.get()).entry != 0 };
         vm.snap.sites.iter().filter(|s| bound(s)).count()
+    }
+
+    /// The instructions of its current lowering and the bytes of the
+    /// lowering's own tables (for tests): none once it is retired.
+    pub fn lowering(&self) -> (usize, usize) {
+        let tables = self.vm.as_ref().map_or(0, |v| {
+            v.props.bytes() + v.polys.capacity() * size_of::<Cases>() + v.fbs.capacity() * size_of::<Feedback>()
+        });
+        (self.insns.len(), tables + self.widened.capacity())
     }
 
     /// Versions currently compiled, over all entry points.

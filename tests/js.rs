@@ -7263,7 +7263,12 @@ total;
         vm.run(&cloison::js::compile(warm).unwrap()).unwrap();
         assert!(vm.jit_stencils("idle").is_some());
         let r = below(&mut vm, &rounds(n, after));
-        (r, vm.jit_stencils("idle").is_some(), vm.jit_stencils("busy").is_some())
+        // Retired, `idle` keeps none of its lowering; compiled, it has one.
+        let (insns, tables) = vm.jit_lowering("idle").unwrap();
+        let compiled = vm.jit_stencils("idle").is_some();
+        assert_eq!((insns > 0, compiled || tables == 0), (compiled, true), "{insns} instructions, {tables} bytes");
+        assert!(vm.jit_lowering("busy").unwrap().0 > 0);
+        (r, compiled, vm.jit_stencils("busy").is_some())
     };
     assert_eq!(run(2, ""), ("216000".to_string(), true, true));
     assert_eq!(run(6, ""), ("384000".to_string(), false, true), "`idle`'s code is dropped");

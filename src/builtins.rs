@@ -574,15 +574,21 @@ fn string_trim_end(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(string(vm, &u[..e]))
 }
 
-/// `localeCompare(that)`: by code units (no locales).
-fn string_locale_compare(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+/// `localeCompare(that, locales, options)`: with the `intl` feature, as
+/// `Intl.Collator(locales, options)` compares (ECMA-402); without it by
+/// code units (no locales).
+fn string_locale_compare(_vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let v = units(arg(a, 0));
-    Ok(Value::from_i32(match u.cmp(&v) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    }))
+    #[cfg(feature = "intl")]
+    let ord = {
+        // (Reading the options may run code: the strings are copied.)
+        let (u, v) = if a.len() > 1 { (Cow::Owned(u.into_owned()), Cow::Owned(v.into_owned())) } else { (u, v) };
+        crate::intl::locale_compare(_vm, &u, &v, arg(a, 1), arg(a, 2))?
+    };
+    #[cfg(not(feature = "intl"))]
+    let ord = u.cmp(&v);
+    Ok(Value::from_i32(ord as i32))
 }
 
 /// The search string of `startsWith` and the like: a `TypeError` for a

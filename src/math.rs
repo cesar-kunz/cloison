@@ -16,6 +16,17 @@
 //! longer uses it either. It is Arm Optimized Routines' (see `pow`), ported
 //! the same way, so the same on every platform too.
 //!
+//! The notices of what is ported here:
+//!
+//! fdlibm: Copyright (C) 1993 by Sun Microsystems, Inc. All rights
+//! reserved. Developed at SunSoft, a Sun Microsystems, Inc. business.
+//! Permission to use, copy, modify, and distribute this software is
+//! freely granted, provided that this notice is preserved.
+//!
+//! Arm Optimized Routines (`math/pow.c`; its tables are in
+//! `math_pow_data.rs`): Copyright (c) 2018-2020, Arm Limited.
+//! SPDX-License-Identifier: MIT OR Apache-2.0 WITH LLVM-exception.
+//!
 //! So fdlibm's idioms stay as written, where Clippy would change them:
 //! `x - x` and `x / x` make NaN or raise flags on purpose (`eq_op`), its
 //! constants keep all their digits (`excessive_precision`), and some are

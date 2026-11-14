@@ -1210,12 +1210,15 @@ impl Drop for SlotTable {
 pub struct Slots {
     table: std::rc::Rc<SlotTable>,
     len: u32,
+    /// The slots buried, of a dictionary shape's (see `bury`): none of any
+    /// other shape's.
+    holes: u32,
 }
 
 impl Slots {
     /// No slots.
     pub fn empty() -> Slots {
-        Slots { table: std::rc::Rc::new(SlotTable::with_capacity(0)), len: 0 }
+        Slots { table: std::rc::Rc::new(SlotTable::with_capacity(0)), len: 0, holes: 0 }
     }
 
     /// These slots, in a table of their own.
@@ -1226,7 +1229,7 @@ impl Slots {
         for i in 0..keys.len() {
             table.push(keys[i], attrs[i], fields[i]);
         }
-        Slots { table: std::rc::Rc::new(table), len: n }
+        Slots { table: std::rc::Rc::new(table), len: n, holes: 0 }
     }
 
     /// These slots and one more: in place if they are all of their table
@@ -1236,37 +1239,95 @@ impl Slots {
         let t = &self.table;
         if t.len.get() == self.len && self.len < t.cap {
             t.push(key, attrs, field);
-            return Slots { table: t.clone(), len: self.len + 1 };
+            return Slots { table: t.clone(), len: self.len + 1, holes: self.holes };
         }
         let table = SlotTable::with_capacity((self.len + 1).max(4).next_power_of_two());
         for i in 0..self.len as usize {
             table.push(self.keys()[i], self.attrs()[i], self.fields()[i]);
         }
         table.push(key, attrs, field);
-        Slots { table: std::rc::Rc::new(table), len: self.len + 1 }
+        Slots { table: std::rc::Rc::new(table), len: self.len + 1, holes: self.holes }
     }
 
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
+    /// How many of the slots are buried (see `bury`).
+    pub(crate) fn holes(&self) -> u32 {
+        self.holes
+    }
+
     /// A dictionary shape's slots (all of their table, its own): slot `k`
-    /// removed in place, those after it moved down one, as their values
-    /// are (`Vm::dict_remove`). Its index is made again as lookups come.
-    pub(crate) fn remove(&mut self, k: u32) {
+    /// removed in place. The last slot is dropped, and the buried ones
+    /// before it; another is buried: its key becomes `hole` (a private
+    /// name's atom no lookup asks for and no reflection lists), the slots
+    /// after it staying where they are, as their values do
+    /// (`Vm::dict_remove`, which compacts the slots once half are buried:
+    /// moving them down at each removal made deleting a third of a
+    /// table's 300,000 keys take 37 s).
+    pub(crate) fn bury(&mut self, k: u32, hole: Atom) {
         let t = &self.table;
         debug_assert!(std::rc::Rc::strong_count(t) == 1 && t.len.get() == self.len && k < self.len);
-        let n = self.len as usize;
-        let k = k as usize;
+        let mut index = t.index.borrow_mut();
         unsafe {
-            let f = *t.fields.add(k);
-            (*f).tables.set((*f).tables.get() - 1);
-            std::ptr::copy(t.keys.add(k + 1), t.keys.add(k), n - k - 1);
-            std::ptr::copy(t.attrs.add(k + 1), t.attrs.add(k), n - k - 1);
-            std::ptr::copy(t.fields.add(k + 1), t.fields.add(k), n - k - 1);
+            let name = *t.keys.add(k as usize);
+            if k < t.indexed.get() {
+                index.remove(&name);
+            }
+            if k + 1 < self.len {
+                t.keys.add(k as usize).write(hole);
+                t.attrs.add(k as usize).write(READ_ONLY | DONT_ENUM | DONT_DELETE);
+                self.holes += 1;
+                return;
+            }
+            let mut n = self.len;
+            loop {
+                n -= 1;
+                let f = *t.fields.add(n as usize);
+                (*f).tables.set((*f).tables.get() - 1);
+                if n == 0 || *t.keys.add(n as usize - 1) != hole {
+                    break;
+                }
+                self.holes -= 1;
+            }
+            // (The buried slots' entry in the index, if any, is `hole`'s.)
+            if n < t.indexed.get() {
+                index.remove(&hole);
+                t.indexed.set(n);
+            }
+            t.len.set(n);
+            self.len = n;
         }
-        t.len.set(self.len - 1);
-        self.len -= 1;
+    }
+
+    /// A dictionary shape's slots without the buried ones (`hole`'s), the
+    /// others moved down in order: `moved(from, to)` for each that moves.
+    /// Its index is made again as lookups come.
+    pub(crate) fn compact(&mut self, hole: Atom, mut moved: impl FnMut(u32, u32)) {
+        let t = &self.table;
+        debug_assert!(std::rc::Rc::strong_count(t) == 1 && t.len.get() == self.len);
+        let mut to = 0;
+        unsafe {
+            for from in 0..self.len {
+                if *t.keys.add(from as usize) == hole {
+                    let f = *t.fields.add(from as usize);
+                    (*f).tables.set((*f).tables.get() - 1);
+                    continue;
+                }
+                if to != from {
+                    t.keys.add(to as usize).write(*t.keys.add(from as usize));
+                    t.attrs.add(to as usize).write(*t.attrs.add(from as usize));
+                    t.fields.add(to as usize).write(*t.fields.add(from as usize));
+                    moved(from, to);
+                }
+                to += 1;
+            }
+        }
+        debug_assert!(to + self.holes == self.len);
+        t.len.set(to);
+        self.len = to;
+        self.holes = 0;
         t.index.borrow_mut().clear();
         t.indexed.set(0);
         t.scanned.set(0);

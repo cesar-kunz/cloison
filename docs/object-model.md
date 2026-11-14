@@ -321,11 +321,24 @@ Caches still hold it, so an object that deletes once and is read after
 keeps its reads cached. A plain object deleting **again** (not a
 prototype, nor the global object, nor one with flags) goes to **dictionary
 mode** (`Shape::dictionary`): its shape is its own and changes in place, a
-delete moving the slots after the property down one (`Vm::dict_remove`),
+delete burying the property's slot (`Vm::dict_remove`),
 an add appending one (`Vm::transition_with`), the fields all one cell
 typed `Any` (`Vm::dictionary_cell`). No new shape, table or cell per add
 or delete: one object's add/delete churn makes none (del.js, issue #6:
 14.5 s and 718 MB on the master of 2026-10-29, 1 s and 16 MB).
+
+A slot buried keeps its place, its key a private name's atom of no symbol
+(`Vm::a_hole`: no lookup asks for it and no listing of keys shows a
+private name), its value `undefined`; the slots after it and their values
+don't move, so a delete's time doesn't grow with the object. The last
+slot deleted is dropped, with those buried before it; once over half the
+slots are buried (and more than 8), the others move down in order
+(`Vm::dict_compact`), as they do before the shape is copied. Moving them
+at each delete made deleting 100,000 of a table's 300,000 keys take 37 s
+(V8 95 ms; 56 ms now). Deleting the last property of a shared shape
+checks that its parent's slots are a prefix of its own by their table,
+the same one most often, and not key by key (a table of 200,000 emptied
+from its last: 17 s, 51 ms now).
 
 Since its slots change without its address changing, nothing may rely on
 one: no inline cache holds one (`install`, `note_accessor`), nor the VM's

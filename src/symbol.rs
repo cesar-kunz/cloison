@@ -315,6 +315,8 @@ pub(crate) fn install(vm: &mut Vm) {
         let _ = vm.define_own_property(ctor, Key::Name(a), &d);
     }
     vm.a_sym_iterator = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.iterator"));
+    // (A private name's, as `is_private_atom` tells them; theirs are numbered.)
+    vm.a_hole = vm.intern_name(&format!("{SYMBOL_MARK}#hole"));
     vm.a_sym_species = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.species"));
     vm.a_sym_to_string_tag = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.toStringTag"));
     vm.a_sym_to_primitive = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.toPrimitive"));

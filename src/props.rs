@@ -586,6 +586,8 @@ impl Vm {
 
     /// `Object.seal(o)` (`freeze`: `Object.freeze(o)`).
     pub(crate) fn seal(&mut self, o: *mut Object, freeze: bool) {
+        // (First: a dictionary shape's buried slots go, see `Vm::dict_compact`.)
+        self.leave_dictionary(o);
         unsafe {
             let s = &*(*o).shape;
             // (Not private names' properties, which stay as they are.)

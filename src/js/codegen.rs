@@ -123,6 +123,8 @@ fn generate_from<'p>(
     // A function with more variables than registers keeps the last ones
     // in a scope object (`%env`, a register; see `Gen::function`).
     let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
+    // Its variables in another's register (see below), with that one.
+    let mut shared: Vec<Vec<(&str, &str)>> = vec![Vec::new(); p.functions.len()];
     for i in 1..p.functions.len() {
         if p.functions[i].has_eval || p.functions[i].generator || p.functions[i].is_async {
             // Its parameters and `var`s in its scope object, where direct
@@ -166,11 +168,29 @@ fn generate_from<'p>(
             d.extend(implicit.iter().copied());
             // (Registers first for the block-scoped ones of its loops that
             // nested functions use: each iteration's is a binding of its
-            // own, which the one scope object can't hold.)
-            let fresh = captured_loop_lexicals(p, i);
-            d.extend(fresh.iter().copied());
-            d.extend(decls[i][params..].iter().copied().filter(|n| !implicit.contains(n) && !fresh.contains(n)));
-            overflow[i] = d.split_off(LOCAL_REGS);
+            // own, which the one scope object can't hold. Those of one
+            // loop, as many registers as the loop with the most has, are
+            // the others' too: no two loops' are live at once, and a
+            // binding's start closes what closures made of its register.)
+            let mut loops = captured_loop_lexicals(p, i);
+            let most = (0..loops.len()).max_by_key(|&k| loops[k].len());
+            let slots = most.map_or(Vec::new(), |k| loops.swap_remove(k));
+            if d.len() + slots.len() > LOCAL_REGS {
+                return unsupported(
+                    f.pos,
+                    format_args!("more than {} variables of one loop used by closures", LOCAL_REGS - d.len()),
+                );
+            }
+            for (&n, &slot) in loops.iter().flat_map(|l| l.iter().zip(&slots)) {
+                shared[i].push((n, slot));
+            }
+            d.extend(slots.iter().copied());
+            let placed: HashSet<&str> = slots.iter().copied().chain(shared[i].iter().map(|s| s.0)).collect();
+            let apart = |n: &&str| !implicit.contains(n) && !placed.contains(n);
+            d.extend(decls[i][params..].iter().copied().filter(apart));
+            // (A few of them in registers past the others', not to put
+            // out of theirs the variables declared last.)
+            overflow[i] = d.split_off((LOCAL_REGS + slots.len().min(LOOP_REGS)).min(d.len()));
             d.extend(overflow[i].iter().copied());
             decls[i] = d;
         }
@@ -178,7 +198,7 @@ fn generate_from<'p>(
     let decls: Vec<Decls> = decls
         .into_iter()
         .enumerate()
-        .map(|(i, d)| Decls::new(d, if i == 0 { 0 } else { p.functions[i].params.len() }))
+        .map(|(i, d)| Decls::new(d, if i == 0 { 0 } else { p.functions[i].params.len() }, &shared[i]))
         .collect();
     let mut scopes = upvalues(p, &decls, &overflow);
     if !p.eval_upvalues.is_empty() {
@@ -354,16 +374,18 @@ type R<T> = Result<T, Error>;
 /// A name is found at its first place, a parameter's at its last among
 /// the parameters: a sloppy function's may repeat, and the last binds
 /// the name (ECMA-262 FunctionDeclarationInstantiation), as in
-/// `Gen::locals`.
+/// `Gen::locals`. `shared`: variables not in the list, each found where
+/// the one whose register it shares is (see [`generate_from`]).
 struct Decls<'a> {
     list: Vec<&'a str>,
     params: usize,
     index: Option<HashMap<&'a str, usize>>,
+    shared: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> Decls<'a> {
-    fn new(list: Vec<&'a str>, params: usize) -> Self {
-        let index = (list.len() > 8).then(|| {
+    fn new(list: Vec<&'a str>, params: usize, shared: &[(&'a str, &'a str)]) -> Self {
+        let index = (list.len() > 8 || !shared.is_empty()).then(|| {
             let mut m = HashMap::default();
             for (i, &n) in list.iter().enumerate() {
                 if i < params {
@@ -372,9 +394,12 @@ impl<'a> Decls<'a> {
                     m.entry(n).or_insert(i);
                 }
             }
+            for &(n, with) in shared {
+                m.insert(n, m[with]);
+            }
             m
         });
-        Decls { list, params, index }
+        Decls { list, params, index, shared: shared.to_vec() }
     }
 
     fn position(&self, name: &str) -> Option<usize> {
@@ -403,6 +428,10 @@ impl<'a> std::ops::Deref for Decls<'a> {
 /// A function's parameters and variables in registers, at most; the rest
 /// go in a scope object (see [`generate`]), leaving room for temporaries.
 const LOCAL_REGS: usize = 160;
+
+/// Registers past those for the variables of a loop that closures use
+/// (see [`generate_from`]), at most.
+const LOOP_REGS: usize = 8;
 
 /// Registers an expression keeps free, past those of a list it puts in
 /// consecutive ones (a call's arguments, a template's pieces), for
@@ -1221,33 +1250,46 @@ fn declared_in<'a>(s: &'a Stmt, p: &'a Program, annex_b: bool, out: &mut Vec<&'a
     }
 }
 
-/// The block-scoped variables function `f` declares in its loops (their
-/// heads too) that its nested functions use: each iteration's a binding
-/// of its own, which the closures made in it keep.
-fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
-    fn stmt<'a>(s: &'a Stmt, p: &'a Program, out: &mut Vec<&'a str>) {
+/// Per loop of function `f` (not one in another), the block-scoped
+/// variables declared in it (its head too; the parser's own, as a class's
+/// home objects) that `f`'s nested functions use: each iteration's a
+/// binding of its own, which the closures made in it keep.
+fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<Vec<&'a str>> {
+    fn stmt<'a>(s: &'a Stmt, p: &'a Program, f: usize, out: &mut Vec<Vec<&'a str>>) {
         match &s.kind {
             StmtKind::For { .. }
             | StmtKind::ForIn { .. }
             | StmtKind::ForOf { .. }
             | StmtKind::While(..)
-            | StmtKind::DoWhile(..) => declared_in(s, p, false, out),
-            StmtKind::If(_, a, b) => {
-                stmt(a, p, out);
-                if let Some(b) = b {
-                    stmt(b, p, out);
+            | StmtKind::DoWhile(..) => {
+                let mut ns = Vec::new();
+                declared_in(s, p, false, &mut ns);
+                ns.retain(|n| p.lexicals.contains_key(*n));
+                let hidden = p.functions[f].hidden.iter().filter(|n| p.loop_hidden.get(*n) == Some(&s.pos));
+                for n in hidden.map(|n| &**n) {
+                    if !ns.contains(&n) {
+                        ns.push(n);
+                    }
+                }
+                if !ns.is_empty() {
+                    out.push(ns);
                 }
             }
-            StmtKind::With(_, _, body) | StmtKind::Labeled(_, body) => stmt(body, p, out),
-            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, out)),
-            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| stmt(s, p, out)),
-            StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, p, out)),
+            StmtKind::If(_, a, b) => {
+                stmt(a, p, f, out);
+                if let Some(b) = b {
+                    stmt(b, p, f, out);
+                }
+            }
+            StmtKind::With(_, _, body) | StmtKind::Labeled(_, body) => stmt(body, p, f, out),
+            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, f, out)),
+            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| stmt(s, p, f, out)),
+            StmtKind::Try(b, c, t) => try_blocks(b, c, t).for_each(|s| stmt(s, p, f, out)),
             _ => {}
         }
     }
     let mut out = Vec::new();
-    p.functions[f].body.iter().for_each(|s| stmt(s, p, &mut out));
-    out.retain(|n| p.lexicals.contains_key(*n));
+    p.functions[f].body.iter().for_each(|s| stmt(s, p, f, &mut out));
     if out.is_empty() {
         return out;
     }
@@ -1262,7 +1304,10 @@ fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
             j = p.functions[k].parent;
         }
     }
-    out.retain(|n| used.contains(n));
+    for ns in &mut out {
+        ns.retain(|n| used.contains(n));
+    }
+    out.retain(|ns| !ns.is_empty());
     out
 }
 
@@ -2138,7 +2183,7 @@ impl<'a> Gen<'a> {
         let f = &p.functions[index];
         // The script's names are globals. (A register past 255 wraps: such
         // a function is refused, see `Gen::function`.)
-        let locals: HashMap<&str, u8> = if index == 0 {
+        let mut locals: HashMap<&str, u8> = if index == 0 {
             decls[0].iter().enumerate().map(|(i, &n)| (n, (i + 1) as u8)).collect()
         } else {
             decls[index]
@@ -2148,6 +2193,9 @@ impl<'a> Gen<'a> {
                 .map(|(i, &n)| (n, (i + 1) as u8))
                 .collect()
         };
+        for &(n, with) in &decls[index].shared {
+            locals.insert(n, locals[with]);
+        }
         // (Past the registers of the variables: some of the scope object's
         // may be parameters, at the start.)
         // (A name may be declared twice, as a hidden variable and as what

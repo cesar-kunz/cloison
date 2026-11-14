@@ -111,8 +111,8 @@ instruction.
   and only the cells nothing pins move out of fragmented blocks
   (`docs/gc.md`).
 - **Bit-for-bit V8 numerics.** fdlibm `Math` and shortest round-trip
-  number printing make results match Node exactly, which makes
-  differential testing against Node possible.
+  number printing make results match Node exactly (but for `pow`, see
+  above), which makes differential testing against Node possible.
 - **Measured, not assumed.** Every change is checked against Octane and
   the microbenchmarks, and its commit message records what it measured;
   code size (`bench/sizes.tsv`), Octane's memory (`bench/octane-memory.tsv`)
@@ -371,7 +371,7 @@ src/object.rs    objects, shapes;  src/props.rs  properties;  src/builtins.rs  t
 src/array.rs     Array's methods;  src/far.rs  sparse arrays' far store and density
 src/heap.rs      the heap;  src/gc.rs  the collector
 src/jit.rs       the JIT;  stencils/stencils.rs  its stencils;  build.rs  extraction
-src/regexp.rs    regular expressions;  src/math.rs  Math's transcendental functions (fdlibm)
+src/regexp.rs    regular expressions;  src/math.rs  Math's transcendental functions (fdlibm; pow apart)
 src/promise.rs   Promise;  src/generator.rs  generators;  src/module.rs  modules
 src/iterator.rs  iterator helpers;  src/collections.rs  Map, Set, weak ones;  src/dispose.rs  `using`
 src/typed.rs     ArrayBuffer, typed arrays;  src/shared.rs  SharedArrayBuffer, Atomics

@@ -3569,7 +3569,11 @@ impl<'a> Gen<'a> {
                 let targets = self.trys[i].targets;
                 let inner = self.trys.split_off(i);
                 let inner_targets = self.targets.split_off(targets);
-                let r = f.iter().try_for_each(|s| self.stmt(s));
+                // (Its scope entered as in `try_stmt`: new bindings.)
+                let r = match f.first() {
+                    Some(s) => self.enter_scope(f, s.pos).and_then(|()| f.iter().try_for_each(|s| self.stmt(s))),
+                    None => Ok(()),
+                };
                 self.targets.extend(inner_targets);
                 self.trys.extend(inner);
                 r?;

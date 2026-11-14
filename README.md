@@ -28,7 +28,7 @@ copy-and-patch JIT, in one small static binary.
   98.4% of test262.
 - **Real applications run**: TypeScript's compiler, pdf.js, Excalidraw,
   ECharts, Sass, MathJax and more; interpreted, the fastest interpreter
-  measured: 1.14× V8's Ignition, 2.9× SpiderMonkey's interpreter.
+  measured: 1.05× V8's Ignition, 2.7× SpiderMonkey's interpreter.
 - **A generational, concurrent collector** that evacuates fragmented blocks.
 - **Numbers match V8's bit for bit** (fdlibm `Math`, shortest round-trip
   printing), but for `pow`, within one ulp of it.

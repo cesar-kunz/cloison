@@ -16,17 +16,18 @@ empty script's figures are by `scripts/compare/startup.py` (`bench/compare/start
 - **Octane's peak RSS with the JIT is 74 MB** (geomean), about V8's (67) and
   SpiderMonkey's (82), a third of JavaScriptCore's (218); **without a JIT
   50 MB**, below every engine but QuickJS, which counts references.
-- On the web apps the peak is about 1.5 times V8's and SpiderMonkey's (JIT
-  geomean 566 MB against 379 and 381, JavaScriptCore 715): objects take 2
+- On the web apps the peak is about 1.4 times V8's and SpiderMonkey's (JIT
+  geomean 532 MB against 379 and 381, JavaScriptCore 715): objects take 2
   to 4 times V8's bytes (V8 compresses pointers to 4 bytes), and the
   collector's blocks stay fragmented. Evacuation of fragmented blocks
   (`docs/gc.md`) took 5 to 24% off the peaks of the apps that fragment most.
-- That geomean was 765 MB on 2026-11-13. Full collections now hold the
+- Over the 11 apps that ran on 2026-11-13 that geomean was 765 MB then
+  and is 554 MB now. Full collections now hold the
   cells that compiled code and inline caches embed weakly, and retire
   the code whose cells died (`docs/gc.md`, "Compiled code's cells"):
-  TypeScript's peak went from 4.4 GB to 1.7 GB, ECharts' from 1.26 GB to
-  0.46 GB, Excalidraw's from 1.09 GB to 0.80 GB, Sass's from 646 MB to
-  444 MB, at the same run times.
+  TypeScript's peak went from 4.4 GB to 1.6 GB, ECharts' from 1.26 GB to
+  0.37 GB, Excalidraw's from 1.09 GB to 0.73 GB, Sass's from 646 MB to
+  468 MB, at the same run times.
 
 ## Size and an empty script
 
@@ -89,45 +90,45 @@ of `Intl`; cloison, QuickJS and KetteVM don't, much of the difference.
 
 | | cloison | V8 | JSC | SpiderMonkey | ARK JIT |
 |---|---:|---:|---:|---:|---:|
-| excalidraw | 801 | 636 | 1,120 | 420 | ✗ |
-| pdfjs | 930 | 989 | 1,210 | 797 | ✗ |
-| typescript | 1,679 | 726 | 2,785 | 1,262 | ✗ |
-| jsnes | 140 | 196 | 285 | 269 | 196 |
-| sass | 444 | 314 | 695 | 241 | 354 |
-| sheetjs | 1,658 | 612 | 1,332 | 631 | 1,581 |
-| echarts | 458 | 492 | 631 | 323 | 523 |
-| mathjax | 516 | 212 | 486 | 215 | 351 |
-| snap | ≠ | 229 | 564 | 368 | ✗ |
-| cyberchef | 889 | 514 | 944 | 398 | ✗ |
-| beepbox | ≠ | 133 | 236 | 157 | 242 |
+| excalidraw | 727 | 636 | 1,120 | 420 | ✗ |
+| pdfjs | 1,049 | 989 | 1,210 | 797 | ✗ |
+| typescript | 1,556 | 726 | 2,785 | 1,262 | ✗ |
+| jsnes | 141 | 196 | 285 | 269 | 196 |
+| sass | 468 | 314 | 695 | 241 | 354 |
+| sheetjs | 1,663 | 612 | 1,332 | 631 | 1,581 |
+| echarts | 371 | 492 | 631 | 323 | 523 |
+| mathjax | 523 | 212 | 486 | 215 | 351 |
+| snap | 364 | 229 | 564 | 368 | ✗ |
+| cyberchef | 857 | 514 | 944 | 398 | ✗ |
+| beepbox | 166 | 133 | 236 | 157 | 242 |
 | pcjs | 143 | 98.4 | 153 | 142 | 172 |
-| univer | ✗ | 772 | 2,100 | 907 | ✗ |
-| siyuan | 491 | 348 | 736 | 308 | 306 |
-| tiddlywiki | ≠ | 653 | ≠ | 477 | ✗ |
-| **geomean** | **566** (11) | **379** | **715** (14) | **381** | **356** (8) |
+| univer | 1,100 | 772 | 2,100 | 907 | ✗ |
+| siyuan | 486 | 348 | 736 | 308 | 306 |
+| tiddlywiki | 774 | 653 | ≠ | 477 | ✗ |
+| **geomean** | **532** | **379** | **715** (14) | **381** | **356** (8) |
 
 ## The web apps, peak RSS in MB, without a JIT
 
 | | cloison | V8 `--jitless` | JSC no JIT | SpiderMonkey no JIT | QuickJS | ARK |
 |---|---:|---:|---:|---:|---:|---:|
-| excalidraw | 695 | 520 | 439 | 324 | ✗ | ≠ |
-| pdfjs | 990 | 501 | 343 | 641 | 308 | ✗ |
-| typescript | 1,215 | 794 | 426 | 648 | ✗ | 529 |
-| jsnes | 134 | 168 | 184 | 216 | 35.1 | 122 |
-| sass | 341 | 234 | 194 | 222 | 152 | 324 |
-| sheetjs | 1,657 | 596 | 505 | 668 | 652 | 1,533 |
-| echarts | 342 | 447 | 265 | 273 | ✗ | 394 |
-| mathjax | 468 | 186 | 335 | 177 | 130 | 386 |
-| snap | ≠ | 221 | 363 | 313 | 183 | ✗ |
-| cyberchef | 837 | 455 | 462 | 398 | 216 | ✗ |
-| beepbox | ≠ | 113 | 98.5 | 144 | 62.9 | 189 |
-| pcjs | 123 | 78.7 | 113 | 127 | 28.1 | 134 |
-| univer | ✗ | 687 | 674 | 756 | ✗ | ✗ |
-| siyuan | 508 | 254 | 266 | 226 | 180 | 236 |
-| tiddlywiki | ≠ | 485 | ≠ | 394 | ✗ | ✗ |
-| **geomean** | **504** (11) | **316** | **293** (14) | **316** | **133** (10) | **313** (9) |
+| excalidraw | 754 | 520 | 439 | 324 | ✗ | ≠ |
+| pdfjs | 873 | 501 | 343 | 641 | 308 | ✗ |
+| typescript | 1,525 | 794 | 426 | 648 | ✗ | 529 |
+| jsnes | 133 | 168 | 184 | 216 | 35.1 | 122 |
+| sass | 338 | 234 | 194 | 222 | 152 | 324 |
+| sheetjs | 1,654 | 596 | 505 | 668 | 652 | 1,533 |
+| echarts | 343 | 447 | 265 | 273 | ✗ | 394 |
+| mathjax | 464 | 186 | 335 | 177 | 130 | 386 |
+| snap | 286 | 221 | 363 | 313 | 183 | ✗ |
+| cyberchef | 844 | 455 | 462 | 398 | 216 | ✗ |
+| beepbox | 158 | 113 | 98.5 | 144 | 62.9 | 189 |
+| pcjs | 124 | 78.7 | 113 | 127 | 28.1 | 134 |
+| univer | 1,051 | 687 | 674 | 756 | ✗ | ✗ |
+| siyuan | 506 | 254 | 266 | 226 | 180 | 236 |
+| tiddlywiki | 768 | 485 | ≠ | 394 | ✗ | ✗ |
+| **geomean** | **491** | **316** | **293** (14) | **316** | **133** (10) | **313** (9) |
 
-The JIT adds the most on the TypeScript app: 1.7 GB of peak RSS with it,
-1.2 GB without (4.4 and 2.5 GB on 2026-11-13). TypeScript's peak varies
-from run to run with the concurrent collector's timing, between 1.3 and
-1.9 GB with the JIT.
+TypeScript's peak varies from run to run with the concurrent collector's
+timing, between 1.3 and 1.9 GB with the JIT and between 1.2 and 1.5 GB
+without (4.4 and 2.5 GB on 2026-11-13): these runs have 1.56 and
+1.53 GB.

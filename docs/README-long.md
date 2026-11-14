@@ -70,11 +70,16 @@ instruction.
   functions (`src/math.rs`) are a port of fdlibm, which V8 ships, rather
   than the platform's `libm`, whose last bits differ between systems
   (Apple's `tan(1)` against glibc's): `sin`, `cos`, `tan`, `asin`,
-  `acos`, `atan`, `atan2`, `exp`, `log` and `pow` are bit for bit Node's
+  `acos`, `atan`, `atan2`, `exp` and `log` are bit for bit Node's
   on x86-64, checked on 57,000 inputs over every reduction path. Node's
   arm64 builds let the C++ compiler fuse multiply-adds in the same code,
   so about 0.5% of their results differ by one ulp; the tests' expected
-  values come from x86-64. Number to string picks the closest of the
+  values come from x86-64. `pow` is the exception: fdlibm's has the last
+  bit wrong on one input in ten (`Math.pow(2, -0.5)` isn't
+  `Math.SQRT1_2`) and V8 has left it for the platform's, so cloison's is
+  a port of Arm Optimized Routines' instead, which glibc and musl use
+  too; it differs from today's V8 on Linux by one ulp on about one
+  input in a thousand. Number to string picks the closest of the
   shortest round-tripping digit strings, ties to even, as ECMA-262 says
   and Rust's own formatting doesn't; checked on 22,000 doubles against
   Node.

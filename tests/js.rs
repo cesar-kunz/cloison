@@ -2198,6 +2198,26 @@ fn builtins_agree_with_node() {
     );
 }
 
+/// Powers fdlibm's `pow` gets a bit off (an audio synthesizer's gains and
+/// frequencies: BeepBox's output differed from the other engines'; and
+/// `10 ** -5` wasn't `0.00001`), from `Math.pow`, `**` and a folded `**`,
+/// in a loop that gets compiled. The expected values are the correctly
+/// rounded ones, which are V8's.
+#[test]
+fn powers_round_as_in_the_other_engines() {
+    assert_eq!(
+        value(
+            r#"
+function f(x, y) { return Math.pow(x, y); }
+function g(x, y) { return x ** y; }
+var a, b;
+for (var i = 0; i < 3000; i++) { a = f(2, -2.5) + f(2, 3.5) + f(0.5, -0.7272970622351479); b = g(2, -0.5); }
+[a, b === Math.SQRT1_2, 2 ** -0.5 === Math.SQRT1_2, 2 ** -1.5, g(2, 0.8333333333333334), f(10, -5), f(1, NaN), g(-1, Infinity)].join();"#
+        ),
+        "13.146019678892063,true,true,0.3535533905932738,1.7817974362806785,0.00001,NaN,NaN"
+    );
+}
+
 /// A method a compiled loop calls inlined, without checking the callee
 /// (its prototype holds it), replaced from a called function and from the
 /// loop itself. The expected value is Node's.

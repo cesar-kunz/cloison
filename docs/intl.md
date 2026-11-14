@@ -16,7 +16,7 @@ through it: what TypeScript's compiler uses
 (its language service sorts completions with
 `new Intl.Collator(locale, { usage: "sort", sensitivity: "variant", numeric: true }).compare`,
 and `organizeImports` asks `Intl.Collator.supportedLocalesOf`); and
-`Intl.Segmenter` of graphemes, which Univer makes at startup
+`Intl.Segmenter`, which Univer makes at startup
 (`new Intl.Segmenter(undefined, { granularity: "grapheme" })`).
 
 ## What is there
@@ -46,15 +46,18 @@ and `organizeImports` asks `Intl.Collator.supportedLocalesOf`); and
 
 - `Intl.Segmenter(locales, options)`, with `new` only, subclassable:
   `localeMatcher` read, the locale resolved, then `granularity`
-  (`grapheme`, the default; see the gaps for the other two).
+  (`grapheme`, the default, `word` or `sentence`).
   `resolvedOptions()` (`locale`, `granularity`), `@@toStringTag`,
   `Intl.Segmenter.supportedLocalesOf(locales, options)`.
 - `Intl.Segmenter.prototype.segment(string)`: a Segments object, with
   `containing(index)` and `@@iterator`; its iterator (of
   `%Iterator.prototype%`, tagged `Segmenter String Iterator`) with
-  `next()`. The segment data objects are `{segment, index, input}`. The
-  segments are UAX #29's extended grapheme clusters, the same in every
-  locale.
+  `next()`. The segment data objects are `{segment, index, input}`,
+  with `isWordLike` after them if the granularity is `word` (true for
+  a segment of letters or digits). The segments are UAX #29's extended
+  grapheme clusters, words or sentences, by its default rules, the
+  same in every locale; see the gaps for the words of the scripts
+  written without spaces.
 
 `sensitivity` maps to ICU4X's strength and case level, `numeric` and
 `caseFirst` to its preferences, `ignorePunctuation` to shifted alternate
@@ -62,17 +65,20 @@ handling.
 
 test262's `intl402/Collator`: 61 of 65 pass. The rest need data the
 blob hasn't (Thai's and German's, the search tailorings) or
-`Intl.NumberFormat`. `intl402/Segmenter`: 61 of 79 pass. Of the rest 16
-segment words or sentences and 2 need Serbian's data. The feature adds
-218 KB of code (6.36 to 6.58 MB of text), 17 KB of it the segmenter;
+`Intl.NumberFormat`. `intl402/Segmenter`: 77 of 79 pass; the other 2
+need Serbian's data. The feature adds
+243 KB of code (6.36 to 6.61 MB of text), 42 KB of it the segmenters;
 the default build changes by a class and an empty list.
 
 ## The data
 
-`data/intl/icu4x.postcard` (464 KB), an ICU4X blob of what the
-collator needs, for `en` and `en-US`, and of the grapheme cluster
-break rules (10 KB, of no locale), from CLDR 49 and ICU 79.1's
-export (Unicode 17).
+`data/intl/icu4x.postcard` (496 KB), an ICU4X blob of what the
+collator needs, for `en` and `en-US`, and of the grapheme cluster, word
+and sentence break rules (10 KB the first, 31 KB the other two, of no
+locale), from CLDR 49 and ICU 79.1's export (Unicode 17). It has none
+of what ICU4X cuts the words of Chinese, Japanese, Thai, Lao, Khmer and
+Burmese with: the Chinese and Japanese dictionary (2.0 MB), and for the
+other four scripts dictionaries (1.0 MB) or LSTM models (0.3 MB).
 `scripts/intl-data.sh [locale …]` makes it with `icu4x-datagen` (the
 ICU4X version `Cargo.lock` has).
 
@@ -95,9 +101,9 @@ root collation, most of the blob, is shared).
 
 - `src/intl/icu.rs` is the boundary to ICU4X: loading the data, locale
   tags canonicalized, whether a locale has data, collators made from a
-  key (a locale and options) and compared over UTF-16, the grapheme
-  segmenter and the first boundary it finds in UTF-16. Plain values in
-  and out, nothing of the VM's.
+  key (a locale and options) and compared over UTF-16, the segmenter
+  of each granularity and the first boundary it finds in UTF-16. Plain
+  values in and out, nothing of the VM's.
 - `src/intl/mod.rs` is the JS side ECMA-402 shares between
   constructors: CanonicalizeLocaleList, the options (GetOption,
   GetOptionsObject, CoerceOptionsToObject), BestAvailableLocale,
@@ -113,9 +119,14 @@ a segmenter, a Segments object, a Segment Iterator), what a method
 checks its receiver by. A collator's others are its ICU4X collator (an
 index into `vm.intl`'s, which interns them by locale and options), its
 bound `compare`, its locale string and its other resolved options packed
-in an int; a segmenter's is its locale string, a Segments object's its
-string, an iterator's its string and where its next segment starts (the
-VM has one ICU4X grapheme segmenter for them all). The prototypes are
+in an int; a segmenter's are its locale string and its granularity, a
+Segments object's its string and the granularity, an iterator's its string, the granularity and where its
+next segment starts (the VM has one ICU4X segmenter of each granularity
+for them all, made with the first `Intl.Segmenter` of it). An iterator
+finds each segment from the end of the one before, and `containing`
+from the last line feed before the index: no rule of UAX #29 looks back past a boundary, so that
+is the segment a pass over the whole string finds (a unit test of
+`icu.rs` checks it on random strings). The prototypes are
 per realm (`vm.intl_roots`).
 
 Host builds link statically, and Cargo applies `.cargo/config.toml`'s
@@ -129,14 +140,34 @@ target's flags. The default build's binary is the same either way.
 Beyond the other constructors (`NumberFormat`, `DateTimeFormat`,
 `PluralRules`, `Locale`, …) and `Intl.getCanonicalLocales`:
 
-- `Intl.Segmenter` segments graphemes only. `granularity: "word"` and
-  `"sentence"` are valid (another value is a `RangeError`, as the
-  specification has it) but making the segmenter then throws an `Error`
-  saying so: the blob has no word or sentence break rules (they, and
-  the dictionaries and models words need in Thai, Chinese or Japanese,
-  are much more data), and segment data objects have no `isWordLike`.
+- `Intl.Segmenter`'s words are without dictionaries. In the scripts
+  written without spaces between words (Chinese and Japanese: Han
+  characters and hiragana; Thai, Lao, Khmer, Burmese) a run of one
+  script's letters is one segment, word-like, where V8 (ICU's
+  dictionaries) cuts words: `今日はいい天気ですね` is one segment (V8:
+  `今日|は|いい|天気|です|ね`), `สวัสดีครับ` one (V8: `สวัสดี|ครับ`),
+  `Hello世界` is `Hello|世界` as in V8, and `カタカナとひらがな` is
+  `カタカナ|とひらがな` (V8: `カタカナ|と|ひ|ら|が|な`). Nothing throws;
+  punctuation, spaces and other scripts still cut (`中。文` is three
+  segments), katakana and Korean go by the rules as in V8, and
+  graphemes and sentences aren't concerned (`今日は晴れ。明日は雨。` is
+  two sentences). That data would add 2.3 MB to the blob, or 3.0 MB.
+- The segmenter's rules are UAX #29's defaults, without CLDR's
+  tailorings, of the root or of a locale. Known differences: `a:b` is
+  one word (the colon is between letters as an apostrophe is; ICU 74
+  and SpiderMonkey cut it in three, JavaScriptCore's ICU doesn't); a
+  lone `_` is word-like (as in SpiderMonkey; not in V8); and Greek's
+  question mark `;` doesn't end a sentence for `el` (ICU4X has that
+  one tailoring; the segmenter isn't given the locale, which the blob
+  has no data of anyway).
 - Locale data for English only: `de`, `fr` and the rest resolve to
-  `en-US` (their tailorings aren't in the blob).
+  `en-US` (their tailorings aren't in the blob). For the segmenter too,
+  though its rules are of no locale: the specification lets an
+  implementation choose its available locales, and test262 wants `sr`
+  (`fr`, `de`, `zh-CN` too) among them and `xyz` not, which takes a
+  list of the locales there are; the blob has none but those it has
+  data of, and saying yes to any well-formed tag would fail other
+  tests.
 - Canonicalization is syntactic (case, order of variants and keywords,
   `true` values dropped); no alias data, so a deprecated tag (`iw`) stays
   as it is.

@@ -868,6 +868,10 @@ pub struct Vm {
     /// freed (Rust code holds an atom across a collection: see
     /// `Vm::prune_atoms`).
     pub(crate) atom_used: Vec<u32>,
+    /// Each atom's name as a string value once asked for (`atom_string`),
+    /// `EMPTY` till then: a string constant, forgotten with them when a
+    /// full marking doesn't find it (`prune_strings`).
+    pub(crate) atom_strings: Vec<Value>,
     pub(crate) atoms_free: Vec<u32>,
     /// The atoms the natives running took (`intern_name`, a key list, a
     /// string's or symbol's atom: `hold_atom`), each kept until the native
@@ -1438,6 +1442,7 @@ impl Vm {
             atoms: Vec::new(),
             atom_ids: HashMap::default(),
             atom_used: Vec::new(),
+            atom_strings: Vec::new(),
             atoms_free: Vec::new(),
             held_atoms: Vec::new(),
             holding: false,
@@ -1884,6 +1889,9 @@ impl Vm {
         let a = match self.atoms_free.pop() {
             Some(i) => {
                 self.atoms[i as usize] = Some(name.clone());
+                if let Some(v) = self.atom_strings.get_mut(i as usize) {
+                    *v = Value::EMPTY;
+                }
                 self.atom_used[i as usize] = epoch;
                 self.held_by[i as usize] = 0;
                 Atom(i)
@@ -2044,6 +2052,9 @@ impl Vm {
         for (i, &l) in live.iter().enumerate().skip(fixed) {
             if !l && let Some(name) = self.atoms[i].take() {
                 self.atom_ids.remove(&*name);
+                if let Some(v) = self.atom_strings.get_mut(i) {
+                    *v = Value::EMPTY;
+                }
                 if !self.atoms_poison {
                     self.atoms_free.push(i as u32);
                 }
@@ -3716,6 +3727,11 @@ impl Vm {
             return display(v);
         }
         e.0.clone()
+    }
+
+    /// Whether no other realm was made (see `realm_proto`).
+    pub(crate) fn realms_empty(&self) -> bool {
+        self.realms.is_empty()
     }
 
     pub(crate) fn is_accessor(&self, h: *mut Object, slot: u32) -> bool {
@@ -5657,54 +5673,68 @@ impl Vm {
     /// [`Vm::for_in_keys`] in a run: what a proxy's trap throws left as a
     /// conversion's error (see `conv_error`).
     pub(crate) fn for_in_key_array(&mut self, v: Value) -> Value {
-        let mut names: Vec<Vec<u16>> = Vec::new();
         // (Through a proxy's traps: what they throw, a conversion's error.)
         if v.is_cell() && crate::proxy::chain_has_proxy(self, as_object(v)) {
-            match crate::proxy::for_in_names(self, as_object(v)) {
-                Ok(n) => names = n,
+            let names = match crate::proxy::for_in_names(self, as_object(v)) {
+                Ok(n) => n,
                 Err(e) => {
                     self.conv_error.get_or_insert(e);
                     self.conv_thrown = true;
+                    Vec::new()
                 }
-            }
-        } else if v.is_cell() {
-            // `for … in` visits every object on the prototype chain.  A
-            // vector here made a flat object with n properties take O(n²)
-            // comparisons before it could produce its keys.
-            let mut seen: HashSet<Key> = HashSet::default();
-            let mut o = as_object(v);
-            loop {
-                for (key, enumerable) in self.own_keys(o) {
-                    if !seen.insert(key) {
-                        continue;
-                    }
-                    if enumerable {
-                        let mut u = Vec::new();
-                        match key {
-                            Key::Index(i) => u.extend(i.to_string().encode_utf16()),
-                            Key::Name(a) => crate::js::lex::string_units(self.atom_name(a), &mut u),
-                        }
-                        names.push(u);
-                    }
-                }
-                let proto = unsafe { (*(*o).shape).proto };
-                if !proto.is_cell() {
-                    break;
-                }
-                o = as_object(proto);
-            }
+            };
+            return self.array_of_with(names.len(), |vm, i| vm.string_constant(&names[i]));
         }
-        let a = self.new_array();
-        let o = as_object(a);
-        unsafe {
-            self.reserve_elems(o, names.len());
-            for (i, n) in names.iter().enumerate() {
-                let s = self.string_constant(n);
-                self.store_element(o, i, s);
-            }
-            (*o).elems_len = names.len() as u32;
+        if !v.is_cell() {
+            return self.new_array();
         }
-        a
+        // A plain object's own names, when no prototype has an enumerable
+        // property (as `Object.prototype` has none): nothing is hidden,
+        // nothing seen twice.
+        let o = as_object(v);
+        if self.plain_named(o) && self.chain_lists_nothing(o) {
+            let slots = self.listed_slots(o, false, false).unwrap_or_default();
+            return self.array_of_with(slots.len(), |vm, i| unsafe {
+                let a = (*(*o).shape).keys()[slots[i] as usize];
+                vm.atom_string(a)
+            });
+        }
+        // `for … in` visits every object on the prototype chain.  A
+        // vector here made a flat object with n properties take O(n²)
+        // comparisons before it could produce its keys.
+        let mut keys: Vec<Key> = Vec::new();
+        let mut seen: HashSet<Key> = HashSet::default();
+        let mut o = o;
+        loop {
+            for (key, enumerable) in self.own_keys(o) {
+                if seen.insert(key) && enumerable {
+                    keys.push(key);
+                }
+            }
+            let proto = unsafe { (*(*o).shape).proto };
+            if !proto.is_cell() {
+                break;
+            }
+            o = as_object(proto);
+        }
+        // (The names' atoms are their shapes', which the objects keep.)
+        self.array_of_with(keys.len(), |vm, i| vm.key_string(keys[i]))
+    }
+
+    /// Whether no object above `o` on its prototype chain has a property
+    /// `for … in` lists: each a plain object without elements whose names
+    /// are all not enumerable.
+    fn chain_lists_nothing(&self, o: *mut Object) -> bool {
+        let mut p = unsafe { (*(*o).shape).proto };
+        while p.is_cell() {
+            let o = as_object(p);
+            let s = unsafe { &*(*o).shape };
+            if !self.plain_named(o) || s.attrs().iter().any(|&a| a & DONT_ENUM == 0) {
+                return false;
+            }
+            p = s.proto;
+        }
+        true
     }
 
     // ---- Strings ----
@@ -7694,6 +7724,11 @@ impl Vm {
     /// a root of every marking). `live`: a cell found.
     pub(crate) fn prune_strings(&mut self, live: impl Fn(Value) -> bool) {
         self.strings.retain(|_, v| live(*v));
+        for v in &mut self.atom_strings {
+            if *v != Value::EMPTY && !live(*v) {
+                *v = Value::EMPTY;
+            }
+        }
         // `typeof`'s copies of them too: a name freed would be given again
         // (its cell another string's by then).
         for t in &mut self.type_names {
@@ -7704,7 +7739,7 @@ impl Vm {
     }
 
     pub(crate) fn string_constant_slots(&mut self) -> impl Iterator<Item = &mut Value> {
-        self.strings.values_mut()
+        self.strings.values_mut().chain(self.atom_strings.iter_mut())
     }
 
     /// `Symbol.for`'s symbols, roots for as long as the agent lives (a
@@ -8724,7 +8759,7 @@ fn units_in_place<'a>(v: Value) -> Option<std::borrow::Cow<'a, [u16]>> {
 
 /// The array index `units` spell canonically (`"7"`, not `"07"`), below
 /// 2^32 - 1.
-fn canonical_index(units: &[u16]) -> Option<u32> {
+pub(crate) fn canonical_index(units: &[u16]) -> Option<u32> {
     if units.is_empty() || units.len() > 10 || (units[0] == b'0' as u16 && units.len() > 1) {
         return None;
     }

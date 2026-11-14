@@ -548,10 +548,96 @@ impl Vm {
         let mut u = Vec::new();
         match key {
             Key::Index(i) => u.extend(i.to_string().encode_utf16()),
-            // (Its lone surrogates mapped back: see `property_key`.)
-            Key::Name(a) => crate::js::lex::string_units(self.atom_name(a), &mut u),
+            Key::Name(a) => return self.atom_string(a),
         }
         self.string_constant(&u)
+    }
+
+    /// Atom `a`'s name as a string value, kept by the atom: listing an
+    /// object's keys doesn't convert and hash each name again (Snap!'s
+    /// `Object.keys` took 7,000 cycles a call).
+    pub(crate) fn atom_string(&mut self, a: Atom) -> Value {
+        let i = a.0 as usize;
+        if let Some(&v) = self.atom_strings.get(i)
+            && v != Value::EMPTY
+        {
+            return v;
+        }
+        let mut u = Vec::new();
+        // (Its lone surrogates mapped back: see `property_key`.)
+        crate::js::lex::string_units(self.atom_name(a), &mut u);
+        let v = self.string_constant(&u);
+        if self.atom_strings.len() <= i {
+            self.atom_strings.resize(i + 1, Value::EMPTY);
+        }
+        self.atom_strings[i] = v;
+        v
+    }
+
+    /// The slots of [`Vm::plain_named`] object `o` that `Object.keys` lists
+    /// (`all`: `getOwnPropertyNames`), in order; `data`: or none if one of
+    /// them is an accessor.
+    pub(crate) fn listed_slots(&self, o: *mut Object, all: bool, data: bool) -> Option<Vec<u32>> {
+        let s = unsafe { &*(*o).shape };
+        let mut out = Vec::with_capacity(s.keys().len());
+        for (k, (&name, &attrs)) in s.keys().iter().zip(s.attrs()).enumerate() {
+            if !all && attrs & DONT_ENUM != 0 || crate::symbol::is_symbol_atom(self, name) {
+                continue;
+            }
+            if data && attrs & ACCESSOR != 0 {
+                return None;
+            }
+            out.push(k as u32);
+        }
+        Some(out)
+    }
+
+    /// Whether `o` is a plain object whose own keys are its shape's, in
+    /// order: no elements, no index among its names, not a proxy.
+    #[inline]
+    pub(crate) fn plain_named(&self, o: *mut Object) -> bool {
+        unsafe { (*o).class == Class::Plain && (*o).flags & SPARSE == 0 && (*o).elems_len == 0 }
+    }
+
+    /// A new array of `values` (on the native stack, which the collector
+    /// scans): its elements' type found once, then each only written.
+    pub(crate) fn array_of(&mut self, values: &[Value]) -> Value {
+        let a = self.new_array();
+        if values.is_empty() {
+            return a;
+        }
+        let o = as_object(a);
+        unsafe {
+            self.reserve_elems(o, values.len());
+            let s = &*(*o).shape;
+            let elems = values.iter().fold(s.elems, |t, &v| t.join(FieldType::of(v)));
+            if elems != s.elems {
+                let t = self.elements_transition((*o).shape, elems);
+                crate::object::set_shape(o, t);
+            }
+            let e = (*o).elems;
+            for (i, &v) in values.iter().enumerate() {
+                crate::heap::store(e.cast::<u8>().sub(8), e.add(i), v);
+            }
+            (*o).elems_len = values.len() as u32;
+        }
+        a
+    }
+
+    /// A new array of the `n` values `at` gives (it may allocate).
+    pub(crate) fn array_of_with(&mut self, n: usize, mut at: impl FnMut(&mut Vm, usize) -> Value) -> Value {
+        let a = self.new_array();
+        let o = as_object(a);
+        unsafe {
+            self.reserve_elems(o, n);
+            for i in 0..n {
+                let v = at(self, i);
+                self.store_element(o, i, v);
+                // (What `at` makes next may collect: this one is traced.)
+                (*o).elems_len = i as u32 + 1;
+            }
+        }
+        a
     }
 
     /// A key as a property-access key value (an index as a number).
@@ -1299,6 +1385,35 @@ impl Vm {
             }
             return Ok(());
         }
+        // A plain object's own writable data property stored, or a name
+        // no object of its chain has added (`Object.assign({}, …)`), by
+        // the lookup cache. (Not `length` or `name`, which have no slot,
+        // nor what may be a canonical numeric string, which a typed array
+        // up the chain takes.)
+        if let Key::Name(name) = key
+            && is_object(o)
+            && unsafe { (*as_object(o)).class } == Class::Plain
+            && self.realms_empty()
+            && name != self.a_length
+            && name != self.a_name
+        {
+            let obj = as_object(o);
+            match self.lookup(obj, name) {
+                Some((h, slot)) if h == obj => {
+                    if unsafe { (&(*(*obj).shape).attrs())[slot as usize] } & (ACCESSOR | READ_ONLY) == 0 {
+                        self.store_field(obj, slot, v);
+                        return Ok(());
+                    }
+                }
+                None if Self::is_extensible(obj)
+                    && !matches!(self.atom_name(name).as_bytes().first(), Some(b'0'..=b'9' | b'-' | b'I' | b'N')) =>
+                {
+                    self.add_property_keyed(obj, name, v);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         if is_object(o) {
             let obj = as_object(o);
             let own = self.own_property(obj, key);
@@ -1598,6 +1713,14 @@ fn keys_array(vm: &mut Vm, o: *mut Object, all: bool) -> Result<Value> {
         let values: Vec<Value> = keys.into_iter().map(|k| vm.key_string(k)).collect();
         return crate::array::new_array_of(vm, &values);
     }
+    if vm.plain_named(o) {
+        let slots = vm.listed_slots(o, all, false).unwrap_or_default();
+        // (The shape read at each: a string made may collect, not change it.)
+        return Ok(vm.array_of_with(slots.len(), |vm, i| unsafe {
+            let a = (*(*o).shape).keys()[slots[i] as usize];
+            vm.atom_string(a)
+        }));
+    }
     let keys = vm.own_keys(o);
     let arr = vm.new_array();
     let mut values = Vec::with_capacity(keys.len());
@@ -1735,6 +1858,38 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         }
         let so = vm.to_object(src)?;
         let s = object_value(so);
+        // A plain object's data properties, read from their slots while it
+        // keeps its shape (a setter of the target's may change it); not
+        // with a symbol among its keys, which come after the strings.
+        let symbols = |vm: &Vm| unsafe { (*(*so).shape).keys().iter().any(|&a| crate::symbol::is_symbol_atom(vm, a)) };
+        if vm.plain_named(so)
+            && unsafe { !(*(*so).shape).dictionary }
+            && !symbols(vm)
+            && let Some(slots) = vm.listed_slots(so, false, true)
+        {
+            let shape = unsafe { (*so).shape };
+            let names: Vec<Atom> = slots.iter().map(|&k| unsafe { (*shape).keys()[k as usize] }).collect();
+            for (&k, &name) in slots.iter().zip(&names) {
+                vm.hold_atom(name);
+                let key = Key::Name(name);
+                // (The slot checked too: a shape freed gives its address to
+                // the next one made.)
+                let cur = unsafe { &*(*so).shape };
+                let same = std::ptr::eq(cur, shape)
+                    && cur.keys().get(k as usize) == Some(&name)
+                    && cur.attrs()[k as usize] & (ACCESSOR | DONT_ENUM) == 0;
+                let v = if same {
+                    unsafe { *Object::slot(so, cur.location(k)) }
+                } else {
+                    match crate::proxy::get_own_property(vm, so, key)? {
+                        Some(d) if d.enumerable == Some(true) => vm.get_key(s, key)?,
+                        _ => continue,
+                    }
+                };
+                vm.put_key(t, key, v)?;
+            }
+            continue;
+        }
         // (String keys, then symbols.)
         let keys = crate::proxy::own_keys(vm, so)?;
         for key in keys {
@@ -1754,6 +1909,22 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
     let o = vm.to_object(arg(a, 0))?;
     let ov = object_value(o);
+    // A plain object's data properties, read from their slots: nothing
+    // here runs user code.
+    if vm.plain_named(o)
+        && let Some(slots) = vm.listed_slots(o, false, true)
+    {
+        return Ok(vm.array_of_with(slots.len(), |vm, i| unsafe {
+            let k = slots[i];
+            let value = |o: *mut Object| *Object::slot(o, (*(*o).shape).location(k));
+            if !entries {
+                return value(o);
+            }
+            let name = vm.atom_string((*(*o).shape).keys()[k as usize]);
+            let pair = [name, value(o)];
+            vm.array_of(&pair)
+        }));
+    }
     let out = vm.new_array();
     let mut n = 0;
     for key in crate::proxy::own_keys(vm, o)? {

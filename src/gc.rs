@@ -597,7 +597,6 @@ struct WeakKept {
     kept: Vec<crate::jit::KeptBy>,
     /// The functions to retire for their age (`jit::age_functions`).
     aged: crate::jit::HashSet<*const crate::vm::Code>,
-    retired: usize,
 }
 
 /// What a collection marks.
@@ -2719,6 +2718,17 @@ impl Vm {
                             self.mark_interior(m, a);
                         }
                     }
+                    // (And what no function listed keeps: a lowering's, a
+                    // version without a snapshot's. Marked in the end
+                    // whatever is retired, they are no reason to retire a
+                    // function whose cell only they reach.)
+                    let owned: crate::jit::HashSet<usize> =
+                        st.kept.iter().flat_map(|k| k.addrs.iter().chain(&k.dispatched).copied()).collect();
+                    for a in self.heap.kept_addrs() {
+                        if !owned.contains(&a) {
+                            self.mark_interior(m, a);
+                        }
+                    }
                 }
                 let n = m.drain(&|| false);
                 if report {
@@ -2788,9 +2798,14 @@ impl Vm {
             let running: crate::jit::HashSet<*const crate::jit::JitCode> =
                 st.kept.iter().flat_map(|k| k.running.iter().copied()).collect();
             crate::jit::retire_functions(self, &gone, &running);
-            st.retired += gone.len();
             // (What is kept still, and the functions whose code stayed:
-            // none should, their versions held by a call under way alone.)
+            // none should, their versions held by a call under way alone.
+            // One that did is held from here on, so that no later round
+            // retires it again; this round, `kept_addrs` below has its
+            // cells, and the loop after marks those held before only,
+            // their caches' holders too. A stayed function's caches are
+            // left weak: their ways whose holder is dead are cleared in
+            // the last round.)
             let before = st.kept.len();
             st.kept = listed(self);
             let mut stayed = 0;

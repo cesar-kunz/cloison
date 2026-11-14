@@ -6363,7 +6363,7 @@ function churn(n) { var junk; for (var r = 0; r < n; r++) { junk = []; for (var 
 // Registered and dropped: only the registry holds them, young or old.
 for (var i = 0; i < 2000; i++) Symbol.for("k" + i);
 churn(10);
-$262.gc();
+$262.gc(); $262.gc(); $262.gc();
 churn(5);
 var bad = 0;
 for (var i = 0; i < 2000; i++) if (Symbol.keyFor(Symbol.for("k" + i)) !== "k" + i) bad++;
@@ -7224,6 +7224,20 @@ total + " " + obj.x;
     }
 }
 
+/// Run `src` below a zeroed stretch of the native stack, so that no stale
+/// word of an earlier script's frames (a cell, or an address in compiled
+/// code, which the collector reads as a frame running it) is in what the
+/// collections of `src` scan. The stretch is 512 KB of a test thread's
+/// 2 MB: under a smaller `RUST_MIN_STACK` (below 1 MB or so) the tests
+/// using this overflow their stack.
+#[inline(never)]
+fn below(vm: &mut Vm, src: &str) -> String {
+    let pad = std::hint::black_box([0usize; 1 << 16]);
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).unwrap();
+    std::hint::black_box(&pad);
+    r
+}
+
 /// Code aging (`jit::age_functions`): a function's compiled code not used
 /// for a few full collections is dropped, and compiled again if it is
 /// called later; one called directly from compiled code all along stays.
@@ -7232,13 +7246,6 @@ total + " " + obj.x;
 /// code would count as a frame running it. The expected values are Node's.
 #[test]
 fn compiled_code_idle_for_some_collections_is_dropped() {
-    #[inline(never)]
-    fn below(vm: &mut Vm, src: &str) -> String {
-        let pad = std::hint::black_box([0usize; 1 << 16]);
-        let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).unwrap();
-        std::hint::black_box(&pad);
-        r
-    }
     let warm = r#"
 function idle(n) { var s = 0; for (var i = 0; i < n; i++) s += i & 3; return s; }
 function busy(n) { return n < 2 ? n : busy(n - 1) + busy(n - 2); }
@@ -7274,6 +7281,120 @@ total;
     assert_eq!(run(6, ""), ("384000".to_string(), false, true), "`idle`'s code is dropped");
     let again = "for (var i = 0; i < 3000; i++) total += idle(20);";
     assert_eq!(run(6, again), ("474000".to_string(), true, true), "and compiled again");
+}
+
+/// A function retired at a collection while a frame runs one of its
+/// versions (`gc::weak_kept`, `jit::retire_functions`; the review of
+/// #281). `loop`, too deep to be inlined in `warm`, inlines the closure
+/// it calls, `b`, and `warm`'s code calls its version directly. From
+/// inside that call (`fire`, reached by a call with too many callees to
+/// be bound, so that no frame leaves its code for it), `loop` is lowered
+/// again for a second closure, made and dropped at a depth the
+/// collections' frames don't reach, and two collections run: the first
+/// keeps what code took since the last one, the second finds the closure
+/// dead, so `loop` is retired (and `other`, and the closure's code). The
+/// version under way stays, kept apart, with what it refers to; its call
+/// site is unbound. Then it leaves by an exit (`x.v` is a string now),
+/// which `direct_exit` finishes from the version kept. The cache of
+/// `loop`'s call lost its latest way, the dead closure's: `loop` runs
+/// from it in the interpreter and is compiled from it again, and all of
+/// it once more. The first script warms up; the second runs below a
+/// zeroed stretch of the stack (see `below`). The expected values are
+/// Node's.
+#[test]
+fn code_retired_under_a_running_frame_runs_to_its_exit() {
+    let warm = r#"
+var gcs = 0, ints = { v: 1 }, mode = 0, next = [1, 2, 3, 4, 0, 5];
+function fire() {
+  mode = 0;
+  deep(50, function () { return other(mk(10 + gcs)); });
+  $262.gc();
+  $262.gc();
+  gcs++;
+  ints.v = "s";
+}
+var acts = [function () {}, function () {}, function () {}, function () {}, function () {}, fire];
+function hook() { acts[mode](); mode = next[mode]; }
+function mk(n) {
+  return (0, eval)("(function () { var o = [" + n + "]; " +
+    "return function (x) { hook(); return o[0] + x.v; }; })()");
+}
+function loop(g, x, n) { var t = 0; for (var i = 0; i < n; i++) t += g(x); return t; }
+function inner(g, x, n) { return loop(g, x, n) + 1; }
+function outer(g, x, n) { return inner(g, x, n) + 1; }
+function warm(g, m) { var t = 0; for (var i = 0; i < m; i++) t += outer(g, ints, 5); return t; }
+function other(g) { var t = 0; for (var i = 0; i < 3000; i++) t += loop(g, ints, 5); return t; }
+function deep(n, f) { return n ? deep(n - 1, f) : f(); }
+var out = [], b = mk(2), total = 0;
+for (var k = 0; k < 20; k++) total += warm(b, 300);
+out.push(total);
+"#;
+    let rest = r#"
+mode = 5;
+out.push(warm(b, 2));
+ints.v = 1;
+out.push(warm(b, 3000));
+mode = 5;
+out.push(warm(b, 2));
+ints.v = 1;
+out.push(warm(b, 3000), gcs);
+out.join(" ");
+"#;
+    let mut vm = Vm::new();
+    vm.run(&cloison::js::compile(warm).unwrap()).unwrap();
+    assert!(vm.jit_stencils("loop").is_some() && vm.jit_stencils("warm").is_some());
+    assert_eq!((vm.jit_stats("loop").unwrap().retirements, vm.jit_retired_exits()), (0, 0));
+    assert_eq!(below(&mut vm, rest), "102000 002s2s2s2s2s1102s2s2s2s2s11 51000 002s2s2s2s2s1102s2s2s2s2s11 51000 2");
+    assert_eq!(vm.jit_stats("loop").unwrap().retirements, 2, "`loop` is retired at each round");
+    assert!(vm.jit_retired_exits() >= 1, "an exit left the version retired under its frame");
+    assert!(vm.jit_stencils("loop").is_some(), "and `loop` is compiled again");
+}
+
+/// An inline cache's way whose holder died is cleared, the ways left
+/// moved down (`gc::weak_kept`; the review of #281): `get` and `call`
+/// read through two prototypes, the latest made and dropped at a depth
+/// the collections' frames don't reach. Once it is dead (the first
+/// collection keeps what the caches took since the last one, and a
+/// prototype goes with its objects' shape), the caches answer for the
+/// prototype left and for a new one, in the interpreter and in code
+/// compiled from them. The expected values are Node's.
+#[test]
+fn a_dead_holders_cache_way_is_cleared() {
+    let warm = r#"
+var wr, out = [];
+function get(o) { return o.a; }
+function call(o) { return o.f(); }
+function run(o, n) { var t = 0; for (var i = 0; i < n; i++) t += get(o) + call(o); return t; }
+function deep(n, f) { return n ? deep(n - 1, f) : f(); }
+function proto(k) { return { a: k, f: function () { return 10 * k; } }; }
+var keep = Object.create(proto(1));
+out.push(run(keep, 20));
+deep(50, function () {
+  var p = proto(2);
+  wr = new WeakRef(p);
+  out.push(run(Object.create(p), 20));
+});
+"#;
+    let rest = r#"
+$262.gc();
+$262.gc();
+$262.gc();
+out.push(wr.deref() === undefined);
+out.push(get(keep), call(keep), run(keep, 20), run(Object.create(proto(3)), 20));
+out.push(run(keep, 5000), run(Object.create(proto(4)), 5000), get(keep), call(keep));
+out.join(" ");
+"#;
+    for jit in [false, true] {
+        // (Compiled: `run`'s loop in the first script too, the caches'
+        // holders then cells its code refers to, and it is retired.)
+        let warm = if jit { warm.replace("20)", "5000)") } else { warm.to_string() };
+        let mut vm = Vm::new();
+        vm.run(&cloison::js::compile(&warm).unwrap()).unwrap();
+        let first = if jit { "55000 110000" } else { "220 440" };
+        assert_eq!(below(&mut vm, rest), format!("{first} true 1 10 220 660 55000 220000 1 10"), "compiled: {jit}");
+        assert!(vm.jit_stencils("run").is_some());
+        assert_eq!(vm.jit_stats("run").unwrap().retirements > 0, jit, "compiled: {jit}");
+    }
 }
 
 /// A VM dropped leaves none of its compiled versions (the review of #39):

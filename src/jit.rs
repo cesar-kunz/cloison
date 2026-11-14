@@ -5604,6 +5604,16 @@ fn next_case_by_code(shape: u64, fo: *mut Object, i: &Insn) -> bool {
     shape == 0 && inline_by_code(fo, i)
 }
 
+/// Whether `inline_case` inlines call `i` to `fo` for any closure of its
+/// code: `shape` is what a polymorphic call's case implies of its receiver
+/// (`None` for a call of one callee), `alloc` the object a `new` made, and
+/// `accessor` whether it is an accessor's call. (`inline_poly` asks it of
+/// the cases before, to skip those one of them takes: one predicate, so
+/// that the two can't disagree.)
+fn case_by_code(shape: Option<u64>, alloc: u64, accessor: bool, fo: *mut Object, i: &Insn) -> bool {
+    shape.is_none_or(|shape| next_case_by_code(shape, fo, i)) && alloc == 0 && !accessor && inline_by_code(fo, i)
+}
+
 /// Whether cells of shape `s` are primitives (strings, symbols, BigInts).
 fn primitive_cell(s: u64) -> bool {
     PRIMITIVE_CELLS >> unsafe { (*(s as *const Shape)).class as u32 } & 1 != 0
@@ -10309,6 +10319,9 @@ pub struct JitStats {
     pub generalizations: u32,
     /// Times the function was lowered again (`refresh`).
     pub lowers: u32,
+    /// Times its compiled code was retired at a collection: idle, or
+    /// referring to a cell nothing else reached (`retire_functions`).
+    pub retirements: u32,
 }
 
 /// When to tier up from the interpreter. The default: 1000 loop back edges
@@ -10518,6 +10531,8 @@ pub(crate) struct Caches {
     /// Code call sites were bound to before, kept alive (see
     /// `CallSite::bind`).
     retired: Vec<Rc<JitCode>>,
+    /// Direct calls' exits that left one of them (for tests).
+    retired_exits: std::cell::Cell<u32>,
     /// Decoded code of functions inlined, with accumulator liveness after
     /// each instruction.
     decoded: HashMap<*const crate::vm::Code, Decoded>,
@@ -10547,6 +10562,11 @@ pub(crate) struct Caches {
 }
 
 impl Caches {
+    /// Direct calls' exits that left a version retired meanwhile.
+    pub(crate) fn retired_exits(&self) -> u32 {
+        self.retired_exits.get()
+    }
+
     /// Forget what was found of the codes `gone`, freed (their addresses
     /// then others').
     pub(crate) fn forget(&mut self, gone: &HashSet<*const crate::vm::Code>) {
@@ -14413,6 +14433,8 @@ impl Lowering<'_> {
                             let mut g = synth(Op::Nop, i.reg, frame, i.pc);
                             // (Any closure of its code, where its site
                             // binds to that: see `cached_callees`.)
+                            // (The low bits are the guard's flags.)
+                            debug_assert!(fo as u64 & 3 == 0 && unsafe { (*fo).code } as u64 & 3 == 0);
                             g.guard = match binds_by_code(fo) {
                                 true => unsafe { (*fo).code as u64 | CALL_CODE_GUARD },
                                 false => fo as u64,
@@ -15833,7 +15855,9 @@ impl Lowering<'_> {
         // (A case inlined for any closure of its code takes the others of
         // that code after it.)
         let taken = |k: usize| {
-            (0..k).any(|a| next_case_by_code(shapes[a], fos[a], i) && unsafe { (*fos[a]).code == (*fos[k]).code })
+            (0..k).any(|a| {
+                case_by_code(Some(shapes[a]), 0, false, fos[a], i) && unsafe { (*fos[a]).code == (*fos[k]).code }
+            })
         };
         let cases: Vec<usize> = (0..fos.len()).filter(|&k| !taken(k)).collect();
         let mut rets = Vec::new();
@@ -16346,10 +16370,8 @@ impl Lowering<'_> {
         // receiver's shape: another closure of its code may be found under
         // another, and the cases may dispatch on the shape, see
         // `inline_poly`.)
-        let by_code = hoisted.is_none_or(|(shape, _)| next_case_by_code(shape, fo, i))
-            && alloc == 0
-            && !(hoisted.is_none() && std::mem::take(&mut self.accessor_call))
-            && inline_by_code(fo, i);
+        let accessor = hoisted.is_none() && std::mem::take(&mut self.accessor_call);
+        let by_code = case_by_code(hoisted.map(|(shape, _)| shape), alloc, accessor, fo, i);
         // (Checked for by its code, the closure isn't referred to: kept,
         // each function inlining one of a TypeScript checker's held that
         // checker's program while it ran.)
@@ -16373,6 +16395,8 @@ impl Lowering<'_> {
         self.out.nregs = self.out.nregs.max(base + c.nregs as usize + extra as usize);
         let pc = i.pc;
         let mut guard = synth(Op::Nop, i.reg, frame, pc);
+        // (The low bits are the guard's flags.)
+        debug_assert!(fo as u64 & 3 == 0 && callee as u64 & 3 == 0);
         guard.guard = fo as u64;
         guard.next_case = next_case;
         if by_code {
@@ -16494,6 +16518,7 @@ impl JitFunction {
     fn retire(&mut self, versions: &mut Vec<Rc<JitCode>>, snaps: &mut Vec<Rc<Snapshot>>) {
         let Some(vm) = self.vm.as_mut() else { return };
         let before = versions.len();
+        self.stats.retirements += 1;
         versions.extend(self.versions.drain().flat_map(|(_, vs)| vs).map(|(_, c)| c));
         let left = self.stats.compiles.saturating_sub((versions.len() - before) as u32);
         let base = *self.retired_base.get_or_insert(left);
@@ -18235,6 +18260,7 @@ unsafe fn direct_exit(
                 .retired
                 .iter()
                 .find(|c| c.mem.ptr as u64 == ran)
+                .inspect(|_| vm.jit_caches.retired_exits.set(vm.jit_caches.retired_exits.get() + 1))
                 .expect("the code a direct call's exit left"),
         };
         let (frame, exit_pc) = {

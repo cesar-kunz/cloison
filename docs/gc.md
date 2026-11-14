@@ -497,7 +497,9 @@ Concurrent, with two short pauses, the marker thread doing the rest
    unmarked, and run a minor collection that *shades* as it goes: every
    old cell its roots, its survivors and its dirty cards refer to is
    marked and handed to the marker instead of traced. The Rust
-   structures' references are shaded too. Survivors are marked with the
+   structures' references are shaded too, but for the cells compiled
+   code and the inline caches refer to, which the final pause decides
+   (see "Compiled code's cells"). Survivors are marked with the
    new color, so they count as marked for the cycle.
 2. **Concurrent mark**: the marker pops cells, marks their unmarked old
    referents (a byte store of the color; the `END` byte when it traces
@@ -665,6 +667,21 @@ at each function's kept cells:
   stay, with what they and their snapshots keep. Its caches are weak like
   any other's, and the function is retired with the running versions
   parked until the frames leave them.
+
+**The start pause leaves them unshaded**, so that the concurrent marker
+doesn't make live what only compiled code refers to; the final pause
+decides, once everything else is marked. One that the program takes out
+of compiled code or a cache meanwhile is found there like any other cell
+stored while the marker runs: stored into an old cell, the barrier
+dirties its card (the cell is old and unmarked), which a minor
+collection of the cycle or the final pause scans; stored into a young
+cell, it is traced with that cell, by a minor collection (which shades
+it) or by the final pause, which marks the young cells too; left in a
+register or on a stack, the final pause's roots have it. A young cell
+compiled code or a cache takes is logged as before (what Rust
+structures took since the last collection is a root of the next,
+whichever kind), and is old after it: no collection frees a cell a
+structure refers to but the final pause, in `weak_kept`.
 
 A retired function would compile again at its next entry with its call
 caches just cleared, bail there and compile once more. It is cooled for

@@ -31,7 +31,7 @@ copy-and-patch JIT, in one small static binary.
   measured: 1.14× V8's Ignition, 2.9× SpiderMonkey's interpreter.
 - **A generational, concurrent collector** that evacuates fragmented blocks.
 - **Numbers match V8's bit for bit** (fdlibm `Math`, shortest round-trip
-  printing).
+  printing), but for `pow`, within one ulp of it.
 - **Linux** (x86-64, arm64) and **macOS** on Apple silicon; nightly Rust,
   one crate whose only runtime dependency is `libc`.
 

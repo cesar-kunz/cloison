@@ -86,7 +86,11 @@ pub(crate) fn symbol_atom(vm: &mut Vm, v: Value) -> Atom {
 
 /// Whether atom `a` is a symbol's.
 pub(crate) fn is_symbol_atom(vm: &Vm, a: Atom) -> bool {
-    vm.atom_name(a).starts_with(SYMBOL_MARK)
+    // (The mark's three bytes compared here: `starts_with` of a `char`
+    // calls `memcmp`, for each key of each object whose keys are listed.)
+    const MARK: [u8; 3] = [0xEF, 0xB7, 0x90];
+    const { assert!(SYMBOL_MARK as u32 == 0xFDD0) };
+    matches!(vm.atom_name(a).as_bytes(), [a, b, c, ..] if [*a, *b, *c] == MARK)
 }
 
 /// Whether atom `a` is a private name's (see [`new_private_symbol`]).

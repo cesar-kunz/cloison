@@ -1554,6 +1554,9 @@ fn copy_data_properties(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(target);
     }
     let src = vm.to_object(source)?;
+    if crate::props::is_object(target) && vm.copy_plain_properties(as_object(target), src)? {
+        return Ok(target);
+    }
     let keys = crate::proxy::own_keys(vm, src)?;
     for key in keys {
         // (Enumerable when reached: a getter may change that.)

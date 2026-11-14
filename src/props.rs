@@ -1370,6 +1370,40 @@ impl Vm {
         Ok(())
     }
 
+    /// `{...src}` into `target` (CopyDataProperties) where no code runs and
+    /// nothing is listed but named data properties: both plain objects,
+    /// `src` without elements, accessors or symbol keys, `target`
+    /// extensible. Its slots are read in order, with no list of keys made
+    /// nor a descriptor per key (as the general walk in
+    /// `intrinsics::copy_data_properties`, which is left the rest: `false`).
+    pub(crate) fn copy_plain_properties(&mut self, target: *mut Object, src: *mut Object) -> Result<bool> {
+        unsafe {
+            let plain = |o: *mut Object| (*o).class == Class::Plain && (*o).flags & SPARSE == 0;
+            if !plain(src) || !plain(target) || (*src).elems_len != 0 || !Self::is_extensible(target) || src == target {
+                return Ok(false);
+            }
+            // (The shape stays `src`'s: only `target` changes.)
+            let s = &*(*src).shape;
+            let listed =
+                |vm: &Vm, k: usize| s.attrs()[k] & ACCESSOR == 0 && !crate::symbol::is_symbol_atom(vm, s.keys()[k]);
+            if !(0..s.keys().len()).all(|k| listed(self, k)) {
+                return Ok(false);
+            }
+            for (k, &name) in s.keys().iter().enumerate() {
+                if s.attrs()[k] & DONT_ENUM != 0 {
+                    continue;
+                }
+                let v = *Object::slot(src, s.location(k as u32));
+                if (*(*target).shape).lookup(name).is_some() {
+                    self.create_data_property(object_value(target), Key::Name(name), v)?;
+                } else {
+                    self.add_property(target, name, v);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// `o.length` as a length (ToLength: an integer from 0 to 2^53 - 1).
     pub(crate) fn length_of(&mut self, o: Value) -> Result<f64> {
         let n = self.get(o, self.a_length)?;

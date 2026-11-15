@@ -2289,6 +2289,7 @@ impl Vm {
             m.pause();
         }
         self.short_strings.fill(Value::EMPTY);
+        self.split_cache.fill((0, 0, Value::EMPTY));
         if matches!(kind, Collection::Start | Collection::Full) {
             self.heap.finish_sweep();
             // The cells that could still refer to them are swept.

@@ -869,6 +869,69 @@ fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// [`string_split`] without a pattern's own `Symbol.split`.
 #[inline(always)]
 fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    // The same string by the same separator again (a constant's list of
+    // names, a cell's attributes in a loop, a path split at each use):
+    // the pieces made last time, in an array of its own. V8 has such a
+    // cache, for its internalized strings.
+    let key = split_key(this, a);
+    let mut seen = false;
+    if let Some((subject, sep, slot)) = key {
+        let (s, p, kept) = vm.split_cache[slot];
+        seen = s == subject && p == sep;
+        // (Another realm's arrays are of its own prototype.)
+        if seen && kept != Value::EMPTY && unsafe { (*(*as_object(kept)).shape).proto == (*vm.array_shape).proto } {
+            return Ok(array_copy(vm, kept));
+        }
+    }
+    let arr = split_uncached(vm, this, a)?;
+    if let Some((subject, sep, slot)) = key {
+        // The pieces are kept at the second split only: most strings
+        // (one built for the occasion) are split once.
+        let keep = seen && unsafe { (*as_object(arr)).elems_len as usize } <= crate::vm::SPLIT_CACHE_PIECES;
+        // (A copy: the caller may change its array.)
+        let kept = if keep { array_copy(vm, arr) } else { Value::EMPTY };
+        vm.split_cache[slot] = (subject, sep, kept);
+    }
+    Ok(arr)
+}
+
+/// [`Vm::split_cache`]'s key for `this.split(…a)` and its entry: of a
+/// string by a string or by a regular expression (its program: a
+/// literal's objects share it), without a limit. Addresses, good until
+/// the next collection, which empties the cache.
+fn split_key(this: Value, a: &[Value]) -> Option<(u64, u64, usize)> {
+    if !is_string(this) || a.get(1).is_some_and(|l| !l.is_undefined()) {
+        return None;
+    }
+    let sep = *a.first()?;
+    let sep = match regexp_of(sep) {
+        Some(re) => re as *const crate::regexp::Regex as u64,
+        None if is_string(sep) => sep.to_bits(),
+        None => return None,
+    };
+    let subject = this.to_bits();
+    let h = (subject ^ sep.rotate_left(21)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    Some((subject, sep, (h >> 40) as usize % crate::vm::SPLIT_CACHE))
+}
+
+/// A new array of the elements of `from`, an array `split` made (plain,
+/// of the array shape with its elements' type).
+fn array_copy(vm: &mut Vm, from: Value) -> Value {
+    let arr = vm.new_array();
+    let (o, from) = (as_object(arr), as_object(from));
+    unsafe {
+        let n = (*from).elems_len as usize;
+        if n > 0 {
+            vm.reserve_elems(o, n);
+            crate::object::set_shape(o, (*from).shape);
+            vm.store_elements(o, 0, (*from).elems, n);
+            (*o).elems_len = n as u32;
+        }
+    }
+    arr
+}
+
+fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     if let Some(re) = regexp_of(arg(a, 0)) {
         return regexp_split(vm, re, &u, a.get(1).copied());
@@ -2499,6 +2562,9 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let made = new_regexp(vm, &p, &f)?;
     let re = regexp_of(made).unwrap() as *const crate::regexp::Regex;
     let o = as_object(this);
+    // (The program it had may go at the end of a collection under way,
+    // and its address to another: `split`'s cache has such addresses.)
+    vm.split_cache.fill((0, 0, Value::EMPTY));
     // (`this` may be old, its `code` read by the marker thread, which
     // follows it into the `Regex` (`gc::mark_function_code`): published
     // with Release, after the `Regex`'s initialization.)

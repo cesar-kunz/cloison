@@ -402,6 +402,10 @@ pub static STUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 const SHORT_STRINGS: usize = 1024;
 const SHORT_STRING_UNITS: usize = 32;
 
+/// Entries of [`Vm::split_cache`], and the most pieces kept in one.
+pub(crate) const SPLIT_CACHE: usize = 64;
+pub(crate) const SPLIT_CACHE_PIECES: usize = 256;
+
 /// A function's code, shared by its closures.
 pub struct Code {
     pub name: String,
@@ -1347,6 +1351,12 @@ pub struct Vm {
     /// collection starts, so it holds no string the collector has found
     /// dead nor one a concurrent marking hasn't seen.
     pub(crate) short_strings: Vec<Value>,
+    /// What `split` last made of a string by a separator (a string, or a
+    /// regular expression's program), by a hash of the two: the subject's
+    /// and the separator's bits, and an array of the pieces no code has
+    /// (empty after the first split; see `builtins::split_fast`). Emptied as each collection starts, as
+    /// [`Vm::short_strings`]: the keys are addresses.
+    pub(crate) split_cache: Vec<(u64, u64, Value)>,
     pub(crate) a_to_string: Atom,
     pub(crate) a_value_of: Atom,
     /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
@@ -1622,6 +1632,7 @@ impl Vm {
             intl: crate::intl::State::default(),
             single_chars: vec![Value::EMPTY; 256],
             short_strings: vec![Value::EMPTY; SHORT_STRINGS],
+            split_cache: vec![(0, 0, Value::EMPTY); SPLIT_CACHE],
             a_to_string: Atom(0),
             a_value_of: Atom(0),
             array_push_fn: std::ptr::null_mut(),

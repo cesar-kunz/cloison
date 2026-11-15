@@ -9750,3 +9750,80 @@ join,length,0,1
 0"##;
     assert_eq!(run(src).as_deref(), Ok(want));
 }
+
+#[test]
+fn split_again_gives_the_same_pieces_in_a_new_array() {
+    // `split` keeps the pieces of a string it splits a second time by the
+    // same separator: each result is an array of its own, a limit, a
+    // recompiled expression and a `Symbol.split` of the program's go
+    // around it. What V8, SpiderMonkey and JavaScriptCore print.
+    let src = r##"
+var out=[];
+function p(x){out.push(JSON.stringify(x));}
+var s="a,b,,c";
+var r1=s.split(","), r2=s.split(",");
+p(r1===r2); r1.push("z"); r1[0]="q"; p(r2); p(s.split(","));
+r2.length=1; p(s.split(","));
+p(s.split(",",2)); p(s.split(",")); p(s.split(",",undefined)); p(s.split(",",0));
+var re=/,+/; p(s.split(re)); p(s.split(re)); var q=s.split(re); q.pop(); p(s.split(re));
+re.compile("b"); p(s.split(re)); re.compile(",", "g"); p(s.split(re));
+re.lastIndex=3; p(s.split(re));
+p(s.split(/(,)/)); p(s.split(/(,)/));
+p("".split("")); p("".split("")); p("".split(",")); p("abc".split("")); p("abc".split(""));
+p("abc".split()); p("abc".split(undefined)); p("abc".split(null)); p("1,2".split(1)); 
+for (var i=0;i<3;i++){ var t=("x"+i+"-y").split("-"); t.reverse(); p(t); p(("x"+i+"-y").split("-")); }
+var o=new String("k=v"); p(o.split("=")); p(o.split("="));
+var big=[]; for(i=0;i<600;i++)big.push(i); big=big.join(" "); p(big.split(" ").length); p(big.split(" ").length);
+var a1="1 2 3".split(" "); a1[5]=1; p("1 2 3".split(" ")); p(Object.isFrozen("1 2 3".split(" ")));
+var f="h i".split(" "); Object.freeze(f); var g="h i".split(" "); g.push(1); p(g);
+var m="m n".split(" "); m.x=1; p("m n".split(" ").x);
+RegExp.prototype[Symbol.split]=function(){return "hooked"}; p(s.split(/,/));
+delete RegExp.prototype[Symbol.split];
+String.prototype.split.call(5,"");
+p(Array.isArray(s.split(","))); p(Object.getPrototypeOf(s.split(","))===Array.prototype);
+out.join("\n")
+"##;
+    let want = r##"false
+["a","b","","c"]
+["a","b","","c"]
+["a","b","","c"]
+["a","b"]
+["a","b","","c"]
+["a","b","","c"]
+[]
+["a","b","c"]
+["a","b","c"]
+["a","b","c"]
+["a,",",,c"]
+["a","b","","c"]
+["a","b","","c"]
+["a",",","b",",","",",","c"]
+["a",",","b",",","",",","c"]
+[]
+[]
+[""]
+["a","b","c"]
+["a","b","c"]
+["abc"]
+["abc"]
+["abc"]
+["",",2"]
+["y","x0"]
+["x0","y"]
+["y","x1"]
+["x1","y"]
+["y","x2"]
+["x2","y"]
+["k","v"]
+["k","v"]
+600
+600
+["1","2","3"]
+false
+["h","i",1]
+
+"hooked"
+true
+true"##;
+    assert_eq!(run(src).as_deref(), Ok(want));
+}

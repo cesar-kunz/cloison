@@ -624,15 +624,25 @@ impl Regex {
             return None;
         }
         let mut sets = [(0, false); WINDOW];
-        let ends = self.offsets(&self.node, 1, &mut sets);
+        // (Nested repetitions can take a walk long for the pattern's size:
+        // no window past this many nodes walked.)
+        let mut budget = 20_000;
+        let ends = self.offsets(&self.node, 1, &mut sets, &mut budget);
         let len = (ends.trailing_zeros() as usize).min(WINDOW);
-        (len >= 2).then(|| Box::new(Window { sets, len }))
+        (budget > 0 && len >= 2).then(|| Box::new(Window { sets, len }))
     }
 
     /// The offsets from a match's start where `n` can end, having begun
     /// at one of the offsets `from` (bit `k`: offset `k`; bit `WINDOW`:
-    /// that or more), `sets` taking the units it can have at each.
-    fn offsets(&self, n: &Node, from: u16, sets: &mut [(u128, bool); WINDOW]) -> u16 {
+    /// that or more), `sets` taking the units it can have at each. Each
+    /// offset of `from` adds its own ends and units, whatever the others.
+    /// `budget` is the nodes it may still walk: at 0 its result means
+    /// nothing.
+    fn offsets(&self, n: &Node, from: u16, sets: &mut [(u128, bool); WINDOW], budget: &mut u32) -> u16 {
+        if *budget == 0 {
+            return from;
+        }
+        *budget -= 1;
         const ALL: u16 = (1 << (WINDOW + 1)) - 1;
         let later = |m: u16, k: usize| {
             let w = (m as u32) << k;
@@ -661,18 +671,31 @@ impl Regex {
                 unit((u128::MAX, true), all);
                 all
             }
-            Node::Group(inner, _) => self.offsets(inner, from, sets),
-            Node::Seq(nodes) => nodes.iter().fold(from, |m, n| self.offsets(n, m, sets)),
-            Node::Alt(alts) => alts.iter().fold(0, |m, n| m | self.offsets(n, from, sets)),
+            Node::Group(inner, _) => self.offsets(inner, from, sets, budget),
+            Node::Seq(nodes) => nodes.iter().fold(from, |m, n| self.offsets(n, m, sets, budget)),
+            Node::Alt(alts) => alts.iter().fold(0, |m, n| m | self.offsets(n, from, sets, budget)),
             // (Iterations past the window's size reach no new offset.)
             Node::Repeat(inner, min, max, ..) => {
                 let min = (*min).min(WINDOW as u32 + 1);
                 let max = (*max).min(min + WINDOW as u32 + 1);
-                let (mut m, mut ends) = (from, if min == 0 { from } else { 0 });
-                for i in 1..=max {
-                    m = self.offsets(inner, m, sets);
-                    if i >= min {
-                        ends |= m;
+                // The iterations it must make (the same from then on, once
+                // one leaves the offsets as they were).
+                let mut m = from;
+                for _ in 0..min {
+                    let next = self.offsets(inner, m, sets, budget);
+                    if std::mem::replace(&mut m, next) == next {
+                        return m;
+                    }
+                }
+                // Those it may: each from the offsets the one before was
+                // the first to reach, until one reaches none.
+                let (mut ends, mut new) = (m, m);
+                for _ in min..max {
+                    let next = self.offsets(inner, new, sets, budget);
+                    new = next & !ends;
+                    ends |= next;
+                    if new == 0 {
+                        break;
                     }
                 }
                 ends
@@ -3925,6 +3948,16 @@ mod tests {
         assert_eq!(w.skip(&u, 0), Some(7));
         assert_eq!(w.skip(&u, 9), Some(0));
         assert_eq!(w.skip(&u, 10), None);
+        // Nested repetitions: analyzed in time linear in their depth.
+        let nested = |n: usize, q: &str| format!("a{}b{}c", "(?:".repeat(n), format!("{q})").repeat(n));
+        let t = std::time::Instant::now();
+        assert_eq!(re(&nested(40, "*"), "").window.as_ref().map(|w| w.len), Some(2));
+        assert_eq!(re(&nested(40, "?"), "").window.as_ref().map(|w| w.len), Some(2));
+        assert_eq!(re(&nested(40, "{2}"), "").window.as_ref().map(|w| w.len), Some(WINDOW));
+        assert_eq!(re(&nested(40, "{2,3}"), "").window.as_ref().map(|w| w.len), Some(WINDOW));
+        assert_eq!(re(&nested(2, "{2}"), "").window.as_ref().map(|w| w.len), Some(6));
+        assert_eq!(re(&nested(2, "{1,2}"), "").window.as_ref().map(|w| w.len), Some(3));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
     }
 
     /// Native code leaves an attempt to the interpreter when its stack

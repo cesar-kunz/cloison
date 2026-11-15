@@ -112,6 +112,25 @@ pub(crate) trait ObjectPtr: Copy {
         unsafe { e.add(i) }
     }
 
+    /// The value in the slot at `loc` (see `Shape::location`: an in-object
+    /// slot's byte offset, or `!i` for out-of-line slot `i`), checked
+    /// against the object's in-object slots or out-of-line capacity.
+    #[inline(always)]
+    #[track_caller]
+    fn slot_value(self, loc: i32) -> Value {
+        let o = self.object_ptr();
+        if loc >= 0 {
+            let start = crate::layout::slots_offset(self.class());
+            let end = start + 8 * unsafe { Object::inline_cap(o) };
+            assert!((start..end).contains(&(loc as usize)) && loc % 8 == 0, "slot {loc} not in the object");
+            unsafe { *o.cast::<u8>().add(loc as usize).cast::<Value>() }
+        } else {
+            let i = !loc as usize;
+            assert!(i < unsafe { crate::layout::values_cap(self.props()) } as usize, "slot {loc} not in the object");
+            unsafe { *self.props().add(i) }
+        }
+    }
+
     #[inline(always)]
     fn set_flags(self, flags: u8) {
         unsafe { (*self.object_ptr()).flags = flags }

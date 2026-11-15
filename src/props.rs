@@ -341,11 +341,9 @@ impl Vm {
 
     /// `o`'s own property `name` kept in a slot, if any.
     fn own_named(&self, o: *mut Object, name: Atom) -> Option<Desc> {
-        unsafe {
-            let s = o.shape().live();
-            let slot = s.lookup(name)?;
-            Some(Desc::from_attrs(s.attrs()[slot as usize], *Object::slot(o, s.location(slot))))
-        }
+        let s = o.shape().live();
+        let slot = s.lookup(name)?;
+        Some(Desc::from_attrs(s.attrs()[slot as usize], o.slot_value(s.location(slot))))
     }
 
     /// The number of parameters of function `f`, its `length`.
@@ -1491,32 +1489,30 @@ impl Vm {
     /// nor a descriptor per key (as the general walk in
     /// `intrinsics::copy_data_properties`, which is left the rest: `false`).
     pub(crate) fn copy_plain_properties(&mut self, target: *mut Object, src: *mut Object) -> Result<bool> {
-        unsafe {
-            let plain = |o: *mut Object| o.class() == Class::Plain && o.flags() & SPARSE == 0;
-            if !plain(src) || !plain(target) || src.elems_len() != 0 || !Self::is_extensible(target) || src == target {
-                return Ok(false);
+        let plain = |o: *mut Object| o.class() == Class::Plain && o.flags() & SPARSE == 0;
+        if !plain(src) || !plain(target) || src.elems_len() != 0 || !Self::is_extensible(target) || src == target {
+            return Ok(false);
+        }
+        // (The shape stays `src`'s: only `target` changes.)
+        let s = src.shape().live();
+        // (A dictionary's buried slot is no property: skipped below,
+        // not enumerable.)
+        let hole = self.a_hole;
+        let listed = |vm: &Vm, k: usize| {
+            s.keys()[k] == hole || s.attrs()[k] & ACCESSOR == 0 && !crate::symbol::is_symbol_atom(vm, s.keys()[k])
+        };
+        if !(0..s.keys().len()).all(|k| listed(self, k)) {
+            return Ok(false);
+        }
+        for (k, &name) in s.keys().iter().enumerate() {
+            if s.attrs()[k] & DONT_ENUM != 0 {
+                continue;
             }
-            // (The shape stays `src`'s: only `target` changes.)
-            let s = src.shape().live();
-            // (A dictionary's buried slot is no property: skipped below,
-            // not enumerable.)
-            let hole = self.a_hole;
-            let listed = |vm: &Vm, k: usize| {
-                s.keys()[k] == hole || s.attrs()[k] & ACCESSOR == 0 && !crate::symbol::is_symbol_atom(vm, s.keys()[k])
-            };
-            if !(0..s.keys().len()).all(|k| listed(self, k)) {
-                return Ok(false);
-            }
-            for (k, &name) in s.keys().iter().enumerate() {
-                if s.attrs()[k] & DONT_ENUM != 0 {
-                    continue;
-                }
-                let v = *Object::slot(src, s.location(k as u32));
-                if target.shape().live().lookup(name).is_some() {
-                    self.create_data_property(object_value(target), Key::Name(name), v)?;
-                } else {
-                    self.add_property_keyed(target, name, v);
-                }
+            let v = src.slot_value(s.location(k as u32));
+            if target.shape().live().lookup(name).is_some() {
+                self.create_data_property(object_value(target), Key::Name(name), v)?;
+            } else {
+                self.add_property_keyed(target, name, v);
             }
         }
         Ok(true)
@@ -1875,7 +1871,7 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
                 let v = if attrs & (ACCESSOR | DONT_ENUM) == DONT_ENUM {
                     continue;
                 } else if attrs & ACCESSOR == 0 {
-                    unsafe { *Object::slot(so, cur.location(k)) }
+                    so.slot_value(cur.location(k))
                 } else {
                     match crate::proxy::get_own_property(vm, so, key)? {
                         Some(d) if d.enumerable == Some(true) => vm.get_key(s, key)?,
@@ -1910,9 +1906,9 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
     if vm.plain_named(o)
         && let Some(slots) = vm.listed_slots(o, false, true)
     {
-        return Ok(vm.array_of_with(slots.len(), |vm, i| unsafe {
+        return Ok(vm.array_of_with(slots.len(), |vm, i| {
             let k = slots[i];
-            let value = |o: *mut Object| *Object::slot(o, o.shape().live().location(k));
+            let value = |o: *mut Object| o.slot_value(o.shape().live().location(k));
             if !entries {
                 return value(o);
             }

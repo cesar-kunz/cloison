@@ -271,33 +271,31 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
     if !original.is_cell() || !vm.realms.is_empty() {
         return false;
     }
-    unsafe {
-        let o = Obj::of(original);
-        let ap = vm.array_prototype;
-        let s = o.shape().live();
-        if o.class() != Class::Array || s.proto != object_value(ap) || s.lookup(vm.a_constructor).is_some() {
-            return false;
-        }
-        let ps = ap.shape().live();
-        let Some(k) = ps.lookup(vm.a_constructor) else { return false };
-        if ps.attrs()[k as usize] & crate::object::ACCESSOR != 0
-            || *Object::slot(ap, ps.location(k)) != object_value(vm.array_fn)
-        {
-            return false;
-        }
-        let a = vm.array_fn;
-        let cs = a.shape().live();
-        let Some(k) = cs.lookup(vm.a_sym_species) else { return false };
-        if cs.attrs()[k as usize] & crate::object::ACCESSOR == 0 {
-            return false;
-        }
-        let pair = as_object(*Object::slot(a, cs.location(k)));
-        let g = pair.elem(0);
-        g.is_cell() && {
-            let g = as_object(g);
-            g.class() == Class::Native
-                && g.code().live().native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
-        }
+    let o = Obj::of(original);
+    let ap = vm.array_prototype;
+    let s = o.shape().live();
+    if o.class() != Class::Array || s.proto != object_value(ap) || s.lookup(vm.a_constructor).is_some() {
+        return false;
+    }
+    let ps = ap.shape().live();
+    let Some(k) = ps.lookup(vm.a_constructor) else { return false };
+    if ps.attrs()[k as usize] & crate::object::ACCESSOR != 0
+        || ap.slot_value(ps.location(k)) != object_value(vm.array_fn)
+    {
+        return false;
+    }
+    let a = vm.array_fn;
+    let cs = a.shape().live();
+    let Some(k) = cs.lookup(vm.a_sym_species) else { return false };
+    if cs.attrs()[k as usize] & crate::object::ACCESSOR == 0 {
+        return false;
+    }
+    let pair = as_object(a.slot_value(cs.location(k)));
+    let g = pair.elem(0);
+    g.is_cell() && {
+        let g = as_object(g);
+        g.class() == Class::Native
+            && g.code().live().native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
     }
 }
 

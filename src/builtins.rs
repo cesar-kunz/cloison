@@ -1577,20 +1577,18 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
     // which moves its slots). Its own shape is unique, `callee` defined
     // on it: the next ones get one of transitions, with the same keys and
     // attributes, shared.
-    unsafe {
-        let t = o.shape().live();
-        if !t.dictionary && t.keys() == [a_length, a_iter, mark, a_callee] {
-            let mut s = vm.root_shape(Class::Plain, op, 4);
-            for k in 0..4 {
-                s = vm.transition_with(s, t.keys()[k], t.attrs()[k]);
-            }
-            let e = vm.elements_transition(s, crate::object::FieldType::Any);
-            // (Both realm fields: the pair a root, the shape kept by
-            // `Vm::fixed_shapes`.)
-            if (0..4).all(|k| e.live().location(k) == t.location(k)) {
-                vm.strict_arguments_shape = e;
-                vm.strict_arguments_callee = *Object::slot(o, t.location(3));
-            }
+    let t = o.shape().live();
+    if !t.dictionary && t.keys() == [a_length, a_iter, mark, a_callee] {
+        let mut s = vm.root_shape(Class::Plain, op, 4);
+        for k in 0..4 {
+            s = vm.transition_with(s, t.keys()[k], t.attrs()[k]);
+        }
+        let e = vm.elements_transition(s, crate::object::FieldType::Any);
+        // (Both realm fields: the pair a root, the shape kept by
+        // `Vm::fixed_shapes`.)
+        if (0..4).all(|k| e.live().location(k) == t.location(k)) {
+            vm.strict_arguments_shape = e;
+            vm.strict_arguments_callee = o.slot_value(t.location(3));
         }
     }
     ov
@@ -2753,7 +2751,7 @@ fn regexp_match_into<'a>(
     let plain = plain_last_index(vm, this);
     // (`lastIndex` read and converted even when not used.)
     let li = match plain {
-        Some(o) => unsafe { *Object::slot(o, o.shape().live().location(0)) },
+        Some(o) => o.slot_value(o.shape().live().location(0)),
         None => vm.get(this, a_last)?,
     };
     // (Read and converted with no user code run: a data property holding
@@ -3914,7 +3912,7 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     // Whether slot `slot` of `h` holds `regexp_fns[i]` (a getter's from 6
     // on).
     let builtin = |vm: &Vm, h: *mut Object, slot: u32, i: usize| unsafe {
-        let v = *Object::slot(h, h.shape().live().location(slot));
+        let v = h.slot_value(h.shape().live().location(slot));
         let v = match (vm.is_accessor(h, slot), i >= 6) {
             (true, true) => *as_object(v).elems(),
             (false, false) => v,

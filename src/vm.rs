@@ -3483,25 +3483,23 @@ impl Vm {
         if crate::proxy::chain_has_proxy(self, o) {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
-        unsafe {
-            if name == self.a_length && matches!(o.class(), Class::Array | Class::String) {
-                return Ok(Value::number(self.length_field(o) as f64));
-            }
-            if name == self.a_length || name == self.a_name {
-                return self.get_slotless(o, obj, name);
-            }
-            if self.typed_numeric(o, name) {
-                return Ok(Value::UNDEFINED);
-            }
-            Ok(match self.lookup(o, name) {
-                Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = *Object::slot(h, h.shape().live().location(slot));
-                    return self.call_getter(pair, obj);
-                }
-                Some((h, slot)) => *Object::slot(h, h.shape().live().location(slot)),
-                None => return Ok(self.virtual_get(o, name)),
-            })
+        if name == self.a_length && matches!(o.class(), Class::Array | Class::String) {
+            return Ok(Value::number(self.length_field(o) as f64));
         }
+        if name == self.a_length || name == self.a_name {
+            return self.get_slotless(o, obj, name);
+        }
+        if self.typed_numeric(o, name) {
+            return Ok(Value::UNDEFINED);
+        }
+        Ok(match self.lookup(o, name) {
+            Some((h, slot)) if self.is_accessor(h, slot) => {
+                let pair = h.slot_value(h.shape().live().location(slot));
+                return self.call_getter(pair, obj);
+            }
+            Some((h, slot)) => h.slot_value(h.shape().live().location(slot)),
+            None => return Ok(self.virtual_get(o, name)),
+        })
     }
 
     /// [`Vm::get`] of a `length` or `name` (not an array's or a string's
@@ -3510,24 +3508,22 @@ impl Vm {
     /// (`virtual_before`).
     #[inline(never)]
     fn get_slotless(&mut self, o: *mut Object, obj: Value, name: Atom) -> Result<Value> {
-        unsafe {
-            if name == self.a_length && o.class() == Class::TypedArray && self.known_typed_length(o).is_some() {
-                return Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64));
+        if name == self.a_length && o.class() == Class::TypedArray && self.known_typed_length(o).is_some() {
+            return Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64));
+        }
+        let found = self.lookup(o, name);
+        if let Some((h, _)) = found
+            && let Some(v) = self.virtual_before(o, h, name)
+        {
+            return Ok(v);
+        }
+        match found {
+            Some((h, slot)) if self.is_accessor(h, slot) => {
+                let pair = h.slot_value(h.shape().live().location(slot));
+                self.call_getter(pair, obj)
             }
-            let found = self.lookup(o, name);
-            if let Some((h, _)) = found
-                && let Some(v) = self.virtual_before(o, h, name)
-            {
-                return Ok(v);
-            }
-            match found {
-                Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = *Object::slot(h, h.shape().live().location(slot));
-                    self.call_getter(pair, obj)
-                }
-                Some((h, slot)) => Ok(*Object::slot(h, h.shape().live().location(slot))),
-                None => Ok(self.virtual_get(o, name)),
-            }
+            Some((h, slot)) => Ok(h.slot_value(h.shape().live().location(slot))),
+            None => Ok(self.virtual_get(o, name)),
         }
     }
 
@@ -3744,7 +3740,7 @@ impl Vm {
     /// what `o.name` finds: its getter-setter pair.
     fn accessor(&self, o: *mut Object, name: Atom) -> Option<Value> {
         let (h, slot) = self.lookup(o, name)?;
-        self.is_accessor(h, slot).then(|| unsafe { *Object::slot(h, h.shape().live().location(slot)) })
+        self.is_accessor(h, slot).then(|| h.slot_value(h.shape().live().location(slot)))
     }
 
     /// `this.name` through an accessor `pair`'s getter (`undefined`
@@ -3794,18 +3790,16 @@ impl Vm {
         set: Option<Value>,
         attrs: u8,
     ) {
-        unsafe {
-            let s = o.shape().live();
-            let old = s.lookup(name).filter(|&k| s.attrs()[k as usize] & ACCESSOR != 0);
-            let (mut g, mut st) = (Value::UNDEFINED, Value::UNDEFINED);
-            if let Some(k) = old {
-                let pair = as_object(*Object::slot(o, s.location(k)));
-                (g, st) = (pair.elem(0), pair.elem(1));
-            }
-            let pair = self.new_array();
-            crate::vm::array_push(self, pair, &[get.unwrap_or(g), set.unwrap_or(st)]).expect("an array");
-            self.define_property(o, name, Some(pair), attrs | ACCESSOR);
+        let s = o.shape().live();
+        let old = s.lookup(name).filter(|&k| s.attrs()[k as usize] & ACCESSOR != 0);
+        let (mut g, mut st) = (Value::UNDEFINED, Value::UNDEFINED);
+        if let Some(k) = old {
+            let pair = as_object(o.slot_value(s.location(k)));
+            (g, st) = (pair.elem(0), pair.elem(1));
         }
+        let pair = self.new_array();
+        crate::vm::array_push(self, pair, &[get.unwrap_or(g), set.unwrap_or(st)]).expect("an array");
+        self.define_property(o, name, Some(pair), attrs | ACCESSOR);
     }
 
     /// For a primitive cell (a string, a symbol, a bigint) whose prototype
@@ -3835,10 +3829,10 @@ impl Vm {
         match found {
             // (A getter's `this` the primitive.)
             Some((h, slot)) if self.is_accessor(h, slot) => {
-                let pair = unsafe { *Object::slot(h, h.shape().live().location(slot)) };
+                let pair = h.slot_value(h.shape().live().location(slot));
                 self.call_getter(pair, receiver)
             }
-            Some((h, slot)) => Ok(unsafe { *Object::slot(h, h.shape().live().location(slot)) }),
+            Some((h, slot)) => Ok(h.slot_value(h.shape().live().location(slot))),
             None => Ok(self.virtual_get(p, name)),
         }
     }
@@ -3878,10 +3872,10 @@ impl Vm {
             return match self.lookup(o, name) {
                 // (A getter's `this` the primitive.)
                 Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = unsafe { *Object::slot(h, h.shape().live().location(slot)) };
+                    let pair = h.slot_value(h.shape().live().location(slot));
                     self.call_getter(pair, obj)
                 }
-                Some((h, slot)) => Ok(unsafe { *Object::slot(h, h.shape().live().location(slot)) }),
+                Some((h, slot)) => Ok(h.slot_value(h.shape().live().location(slot))),
                 None => Ok(Value::UNDEFINED),
             };
         }
@@ -4034,7 +4028,7 @@ impl Vm {
                     self.heap.note(object_value(h));
                     note_accessor(ic, o.shape(), h, self.proto_epoch);
                 }
-                return self.call_getter(*Object::slot(h, loc), obj);
+                return self.call_getter(h.slot_value(loc), obj);
             }
             self.heap.note(object_value(h));
             let e = Ic {
@@ -4053,7 +4047,7 @@ impl Vm {
                     self.interp_megas[interp_mega_index(sh, name.0)] = InterpMega { shape: sh, name: name.0, loc };
                 }
             }
-            Ok(*Object::slot(h, loc))
+            Ok(h.slot_value(loc))
         }
     }
 
@@ -4169,7 +4163,7 @@ impl Vm {
                     self.heap.note(object_value(h));
                     note_accessor(ic, old, h, self.proto_epoch);
                 }
-                return self.call_setter(*Object::slot(h, h.shape().live().location(slot)), obj, value);
+                return self.call_setter(h.slot_value(h.shape().live().location(slot)), obj, value);
             }
             if let Some(slot) = old.live().lookup(name) {
                 self.store_field(o, slot, value);
@@ -4331,7 +4325,7 @@ impl Vm {
         unsafe {
             let shape = l.shape();
             let loc = shape.live().location(slot);
-            let v = *Object::slot(l, loc);
+            let v = l.slot_value(loc);
             if v == Value::HOLE {
                 return Some(Err(Error::reference_error(format!(
                     "Cannot access '{}' before initialization",
@@ -4353,7 +4347,7 @@ impl Vm {
         let l = self.global_lexicals;
         unsafe {
             let shape = l.shape();
-            if *Object::slot(l, shape.live().location(slot)) == Value::HOLE {
+            if l.slot_value(shape.live().location(slot)) == Value::HOLE {
                 return Some(Err(Error::reference_error(format!(
                     "Cannot access '{}' before initialization",
                     self.atom_name(name)
@@ -4517,7 +4511,7 @@ impl Vm {
             let shape = g.shape();
             match shape.live().lookup(name) {
                 Some(slot) if self.is_accessor(g, slot) => {
-                    let pair = *Object::slot(g, shape.live().location(slot));
+                    let pair = g.slot_value(shape.live().location(slot));
                     return self.call_setter(pair, object_value(g), value);
                 }
                 Some(slot) => {
@@ -4660,16 +4654,14 @@ impl Vm {
     /// an object `o` is a prototype of).
     fn sparse_get(&mut self, o: *mut Object, i: u32, receiver: Value) -> Result<Option<Value>> {
         let a = self.intern_name(&i.to_string());
-        unsafe {
-            let Some(slot) = o.shape().live().lookup(a) else {
-                return Ok(None);
-            };
-            let v = *Object::slot(o, o.shape().live().location(slot));
-            if self.is_accessor(o, slot) {
-                return self.call_getter(v, receiver).map(Some);
-            }
-            Ok(Some(v))
+        let Some(slot) = o.shape().live().lookup(a) else {
+            return Ok(None);
+        };
+        let v = o.slot_value(o.shape().live().location(slot));
+        if self.is_accessor(o, slot) {
+            return self.call_getter(v, receiver).map(Some);
         }
+        Ok(Some(v))
     }
 
     /// Whether `o` has key `i` of its own: an element, or a sparse one.
@@ -4813,7 +4805,7 @@ impl Vm {
                 return true;
             }
             let kept: Vec<u32> = (0..n).filter(|&k| k != slot).collect();
-            let values: Vec<Value> = kept.iter().map(|&k| *Object::slot(o, s.location(k))).collect();
+            let values: Vec<Value> = kept.iter().map(|&k| o.slot_value(s.location(k))).collect();
             self.shape_left(s);
             for &cell in s.fields() {
                 self.field_made_mutable(&*cell);
@@ -4996,7 +4988,7 @@ impl Vm {
             }
             let n = slots.len() as u32;
             slots.compact(self.a_hole, |from, to| {
-                let v = *Object::slot(o, s.live().location(from));
+                let v = o.slot_value(s.live().location(from));
                 crate::heap::store(o.cast(), Object::slot(o, s.live().location(to)), v);
             });
             for j in slots.len() as u32..n {
@@ -6113,7 +6105,7 @@ impl Vm {
     fn released_get(&self, o: *mut Object, i: u32) -> Option<Value> {
         match self.released_binding(o, i)? {
             Binding::Upvalue(u) => Some(unsafe { *(*u).at }),
-            Binding::Scope(env, slot) => Some(unsafe { *Object::slot(env, env.shape().live().location(slot)) }),
+            Binding::Scope(env, slot) => Some(env.slot_value(env.shape().live().location(slot))),
         }
     }
 
@@ -6194,13 +6186,11 @@ impl Vm {
     /// element store's fast path fits; see [`Vm::release_mapped`]).
     fn released_mark_value(&self, o: *mut Object) -> Option<Value> {
         let mark = self.released_mark?;
-        unsafe {
-            let s = o.shape().live();
-            if o.class() != Class::Plain || s.elems_code != NO_ELEMENTS {
-                return None;
-            }
-            Some(*Object::slot(o, s.location(s.lookup(mark)?)))
+        let s = o.shape().live();
+        if o.class() != Class::Plain || s.elems_code != NO_ELEMENTS {
+            return None;
         }
+        Some(o.slot_value(s.location(s.lookup(mark)?)))
     }
 
     /// The record of mapped `arguments` object `o`, whose frame ended with
@@ -8490,7 +8480,7 @@ impl MappedArgs {
     unsafe fn value(&self, i: usize) -> Value {
         unsafe {
             match self.scope_slot(i) {
-                Some((env, slot)) => *Object::slot(env, env.shape().live().location(slot)),
+                Some((env, slot)) => env.slot_value(env.shape().live().location(slot)),
                 None => *self.regs.add(1 + i),
             }
         }

@@ -18,6 +18,7 @@
 //! ([`Vm::run_event_loop`]), between promise jobs ([`poll`]) and once
 //! they have run out.
 
+use crate::raw::ObjectPtr;
 use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex};
@@ -81,7 +82,7 @@ fn bytes_of(b: *mut Block) -> *mut u8 {
 
 /// Shared buffer `o`'s block.
 pub(crate) fn block_of(o: *mut Object) -> *mut Block {
-    unsafe { (*o).elems.cast::<u8>().sub(HEADER).cast() }
+    unsafe { o.elems().cast::<u8>().sub(HEADER).cast() }
 }
 
 /// A new reference to block `b` (an agent's buffer on it).
@@ -277,9 +278,9 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
     let o = vm.new_object_with(Class::SharedArrayBuffer, proto, 0);
     unsafe {
         (*o).elems = bytes_of(b).cast();
-        (*o).elems_len = (*b).len.load(SeqCst) as u32;
+        o.set_elems_len((*b).len.load(SeqCst) as u32);
         if growable {
-            (*o).flags |= RESIZABLE;
+            o.set_flags(o.flags() | RESIZABLE);
             *Object::aux(o) = (*b).room as u32;
             let views = crate::collections::new_weak_set(vm)?;
             (*o).code = object_value(views).to_bits() as *const crate::vm::Code;
@@ -299,7 +300,7 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
 /// buffers' (see [`read_length`]).
 fn sync_length(o: *mut Object) -> usize {
     let n = unsafe { (*block_of(o)).len.load(SeqCst) };
-    if n != unsafe { (*o).elems_len } as usize {
+    if n != o.elems_len() as usize {
         unsafe { (*o).elems_len = n as u32 };
         refresh_views(o);
     }
@@ -313,7 +314,7 @@ fn sync_length(o: *mut Object) -> usize {
 /// is (0 if detached).
 pub(crate) fn read_length(vm: &mut Vm, o: *mut Object) -> usize {
     if !is_shared(o) {
-        return unsafe { (*o).elems_len } as usize;
+        return o.elems_len() as usize;
     }
     let n = sync_length(o);
     // (After the length: the grows before the one it read are counted.)
@@ -447,7 +448,7 @@ pub(crate) fn catch_up(vm: &mut Vm) {
 }
 
 pub(crate) fn is_shared(o: *mut Object) -> bool {
-    unsafe { (*o).class == Class::SharedArrayBuffer }
+    o.class() == Class::SharedArrayBuffer
 }
 
 // ---- SharedArrayBuffer ----
@@ -585,7 +586,7 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if read_length(vm, p) < n {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the new buffer is too small"));
     }
-    unsafe { crate::racy::copy((*o).elems.cast::<u8>().add(first), (*p).elems.cast::<u8>(), n) };
+    unsafe { crate::racy::copy(o.elems().cast::<u8>().add(first), p.elems().cast::<u8>(), n) };
     Ok(out)
 }
 
@@ -669,7 +670,7 @@ enum Op {
 fn apply(o: *mut Object, k: TypedKind, i: usize, op: Op, v: u64) -> u64 {
     macro_rules! with {
         ($a:ty, $t:ty) => {{
-            let a = unsafe { <$a>::from_ptr((*o).elems.cast::<$t>().add(i)) };
+            let a = unsafe { <$a>::from_ptr(o.elems().cast::<$t>().add(i)) };
             let v = v as $t;
             (match op {
                 Op::Load => a.load(SeqCst),

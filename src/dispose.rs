@@ -18,6 +18,7 @@ use crate::builtins::{getter, link_constructor};
 use crate::interp::{call_function, to_string_units};
 use crate::object::{Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm};
 
@@ -120,7 +121,7 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
 /// `%AsyncIteratorPrototype%`: `%AsyncGeneratorPrototype%`'s prototype.
 fn async_iterator_prototype(vm: &mut Vm) -> *mut Object {
     let agp = vm.symbol_roots[crate::symbol::Root::AsyncGeneratorPrototype as usize];
-    as_object(unsafe { (*(*agp).shape).proto })
+    as_object(agp.shape().live().proto)
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -139,14 +140,14 @@ fn root(vm: &Vm, r: Root) -> Value {
 // ---- Hidden arrays ----
 
 fn elem(o: Value, i: usize) -> Value {
-    unsafe { *(*as_object(o)).elems.add(i) }
+    unsafe { *as_object(o).elems().add(i) }
 }
 
 fn put(o: Value, i: usize, v: Value) {
     let o = as_object(o);
     unsafe {
-        let at = (*o).elems.add(i);
-        crate::heap::store((*o).elems.cast::<u8>().sub(8), at, v);
+        let at = o.elems().add(i);
+        crate::heap::store(o.elems().cast::<u8>().sub(8), at, v);
     }
 }
 

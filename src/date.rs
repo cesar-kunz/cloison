@@ -4,6 +4,7 @@
 //! library's `localtime_r` (its `tm_gmtoff`), so it follows the machine's
 //! time zone, and the spec's own calendar arithmetic does the rest.
 
+use crate::raw::ObjectPtr;
 use std::ffi::CStr;
 
 use crate::interp::{call_function, to_number, to_primitive, to_primitive_default, to_string_units};
@@ -327,7 +328,7 @@ pub(crate) fn now_ms() -> f64 {
 /// The time value of `v` if it is a `Date`.
 pub(crate) fn date_value(v: Value) -> Option<f64> {
     let o = v.is_cell().then(|| as_object(v))?;
-    unsafe { ((*o).class == Class::Date).then(|| f64::from_bits((*o).code as u64)) }
+    (o.class() == Class::Date).then(|| f64::from_bits(o.code() as u64))
 }
 
 /// `Date.prototype[Symbol.toPrimitive](hint)`: OrdinaryToPrimitive,

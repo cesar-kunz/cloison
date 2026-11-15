@@ -3,6 +3,7 @@
 //! `Error` and its kinds, and the `toString`/`valueOf` methods ToPrimitive
 //! calls (`interp::to_primitive`). Installed by [`install`].
 
+use crate::raw::{Live, ObjectPtr};
 use std::borrow::Cow;
 
 use crate::interp::{to_number, to_string_units};
@@ -105,7 +106,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let apply = vm.define_native(fp, "apply", function_apply, 2, any, false);
     vm.define_native(fp, "bind", function_bind, 1, any, false);
     vm.define_native(fp, "toString", function_to_string, 0, any, false);
-    vm.function_apply = unsafe { (*apply).code };
+    vm.function_apply = apply.code();
 
     // `Number`, a conversion, and its constants.
     let number = vm.define_native(g, "Number", number_fn, 1, any, true);
@@ -879,7 +880,7 @@ fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let (s, p, kept) = vm.split_cache[slot];
         seen = s == subject && p == sep;
         // (Another realm's arrays are of its own prototype.)
-        if seen && kept != Value::EMPTY && unsafe { (*Obj::of(kept).shape()).proto == (*vm.array_shape).proto } {
+        if seen && kept != Value::EMPTY && unsafe { (*Obj::of(kept).shape()).proto == vm.array_shape.live().proto } {
             return Ok(array_copy(vm, kept));
         }
     }
@@ -920,12 +921,12 @@ fn array_copy(vm: &mut Vm, from: Value) -> Value {
     let arr = vm.new_array();
     let (o, from) = (as_object(arr), as_object(from));
     unsafe {
-        let n = (*from).elems_len as usize;
+        let n = from.elems_len() as usize;
         if n > 0 {
             vm.reserve_elems(o, n);
-            crate::object::set_shape(o, (*from).shape);
-            vm.store_elements(o, 0, (*from).elems, n);
-            (*o).elems_len = n as u32;
+            crate::object::set_shape(o, from.shape());
+            vm.store_elements(o, 0, from.elems(), n);
+            o.set_elems_len(n as u32);
         }
     }
     arr
@@ -983,12 +984,10 @@ fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 #[inline]
 fn append(vm: &mut Vm, arr: Value, v: Value) {
     let o = as_object(arr);
-    unsafe {
-        let len = (*o).elems_len as usize;
-        vm.reserve_elems(o, len + 1);
-        vm.store_element(o, len, v);
-        (*o).elems_len = len as u32 + 1;
-    }
+    let len = o.elems_len() as usize;
+    vm.reserve_elems(o, len + 1);
+    vm.store_element(o, len, v);
+    o.set_elems_len(len as u32 + 1);
 }
 
 /// `this` as a string value (itself if one).
@@ -1041,10 +1040,8 @@ fn plain_list(list: Value, holes: bool) -> Option<Vec<Value>> {
         return None;
     }
     let o = as_object(list);
-    unsafe {
-        if (*o).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 {
-            return None;
-        }
+    if o.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 {
+        return None;
     }
     let elems = unsafe { Object::elems(o) };
     if !elems.contains(&Value::EMPTY) {
@@ -1286,18 +1283,15 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
     let target = as_object(this);
     let args = a.get(1..).unwrap_or(&[]);
-    let proto = if vm.proxies_exist {
-        crate::proxy::get_prototype_of(vm, target)?
-    } else {
-        unsafe { (*(*target).shape).proto }
-    };
+    let proto =
+        if vm.proxies_exist { crate::proxy::get_prototype_of(vm, target)? } else { target.shape().live().proto };
     // Its `length` (what the target's leaves) and `name` ("bound …"): the
     // target's code's, where it has neither as a property of its own
     // making (nor deleted them); as read otherwise.
     let (a_length, a_name) = (vm.a_length, vm.a_name);
-    let plain = unsafe {
-        let s = &*(*target).shape;
-        (*target).flags & (crate::object::FN_LENGTH_DELETED | crate::object::FN_NAME_DELETED) == 0
+    let plain = {
+        let s = target.shape().live();
+        target.flags() & (crate::object::FN_LENGTH_DELETED | crate::object::FN_NAME_DELETED) == 0
             && s.lookup(a_length).is_none()
             && s.lookup(a_name).is_none()
             && !(vm.proxies_exist && crate::proxy::is_proxy(vm, target))
@@ -1305,7 +1299,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut units: Vec<u16> = Vec::with_capacity(32);
     units.extend(b"bound ".iter().map(|&c| c as u16));
     let len = if plain {
-        let code = unsafe { &*(*target).code };
+        let code = target.code().live();
         if code.name.is_ascii() {
             if !code.name.starts_with('<') {
                 units.extend(code.name.bytes().map(u16::from));
@@ -1344,7 +1338,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         vm.handles.push(name);
         let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + nslots) as u32);
         let own = vm.root_shape(Class::Native, proto, BOUND_OWN as u32);
-        let o = vm.heap.alloc_object(unsafe { &*full });
+        let o = vm.heap.alloc_object(full.live());
         unsafe {
             crate::object::set_shape(o, own);
             (*o).code = (*vm.bound_fns[ctor as usize]).code;
@@ -1372,10 +1366,8 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// Whether `o` is a bound function (of any realm).
 pub(crate) fn is_bound(o: *mut Object) -> bool {
-    unsafe {
-        (*o).class == Class::Native
-            && (*(*o).code).native.is_some_and(|f| std::ptr::fn_addr_eq(f, bound_call as NativeFn))
-    }
+    o.class() == Class::Native
+        && o.code().live().native.is_some_and(|f| std::ptr::fn_addr_eq(f, bound_call as NativeFn))
 }
 
 /// For a call of `f`: if `f` is a bound function with no arguments bound
@@ -1450,9 +1442,9 @@ pub(crate) fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Resul
         return Err(Error::type_error("Function.prototype.toString requires that 'this' be a Function"));
     }
     let o = as_object(this);
-    let code = unsafe { &*(*o).code };
+    let code = o.code().live();
     let bound = is_bound(o);
-    if unsafe { (*o).class } == Class::Function
+    if o.class() == Class::Function
         && !bound
         && let Some(u) = code.text_units()
     {
@@ -1494,11 +1486,10 @@ pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: *mu
 /// makes it with CreateUnmappedArgumentsObject), `@@iterator`, and the
 /// hidden mark `Object.prototype.toString` knows it by.
 pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
-    let unmapped = callee.is_null()
-        || unsafe {
-            let code = &*(*callee).code;
-            code.strict || !code.simple_parameters
-        };
+    let unmapped = callee.is_null() || {
+        let code = callee.code().live();
+        code.strict || !code.simple_parameters
+    };
     if !unmapped {
         // The common case: one shape (its elements of any type from the
         // start, so `arguments.length` stays monomorphic), its slots and
@@ -1514,7 +1505,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
             }
             vm.arguments_shape = vm.elements_transition(s, crate::object::FieldType::Any);
         }
-        let o = vm.heap.alloc_object(unsafe { &*vm.arguments_shape });
+        let o = vm.heap.alloc_object(vm.arguments_shape.live());
         let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
         vm.store_field(o, 0, Value::from_i32(values.len() as i32));
         vm.store_field(o, 1, values_fn.map_or(Value::UNDEFINED, object_value));
@@ -1527,7 +1518,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
                 crate::heap::store_young(o.cast(), &raw mut (*o).elems, e);
-                (*o).elems_len = values.len() as u32;
+                o.set_elems_len(values.len() as u32);
             }
         }
         return object_value(o);
@@ -1540,7 +1531,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         unsafe {
             let s = vm.strict_arguments_shape;
             crate::object::mark_shape(s);
-            let o = vm.heap.alloc_object(&*s);
+            let o = vm.heap.alloc_object(s.live());
             vm.store_field(o, 0, Value::from_i32(values.len() as i32));
             let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
             vm.store_field(o, 1, values_fn.map_or(Value::UNDEFINED, object_value));
@@ -1550,7 +1541,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
                 crate::heap::store_young(o.cast(), &raw mut (*o).elems, e);
-                (*o).elems_len = values.len() as u32;
+                o.set_elems_len(values.len() as u32);
             }
             return object_value(o);
         }
@@ -1587,7 +1578,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
     // on it: the next ones get one of transitions, with the same keys and
     // attributes, shared.
     unsafe {
-        let t = &*(*o).shape;
+        let t = o.shape().live();
         if !t.dictionary && t.keys() == [a_length, a_iter, mark, a_callee] {
             let mut s = vm.root_shape(Class::Plain, op, 4);
             for k in 0..4 {
@@ -1596,7 +1587,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
             let e = vm.elements_transition(s, crate::object::FieldType::Any);
             // (Both realm fields: the pair a root, the shape kept by
             // `Vm::fixed_shapes`.)
-            if (0..4).all(|k| (*e).location(k) == t.location(k)) {
+            if (0..4).all(|k| e.live().location(k) == t.location(k)) {
                 vm.strict_arguments_shape = e;
                 vm.strict_arguments_callee = *Object::slot(o, t.location(3));
             }
@@ -1730,14 +1721,14 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
         "Null"
     } else if this.is_cell() {
         let o = as_object(this);
-        match unsafe { (*o).class } {
+        match o.class() {
             Class::Array => "Array",
             Class::Function | Class::Native => "Function",
             Class::String => "String",
             Class::Date => "Date",
             Class::RegExp => "RegExp",
             Class::Wrapper => primitive_tag(wrapped(this).unwrap()),
-            Class::Plain if unsafe { (*o).flags } & crate::object::ERROR != 0 => "Error",
+            Class::Plain if o.flags() & crate::object::ERROR != 0 => "Error",
             Class::Plain
                 if {
                     let mark = vm.intern_name(ARGUMENTS_MARK);
@@ -2565,7 +2556,7 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
     unsafe { (*o).code = re.cast() };
     let props = [(vm.a_last_index, Value::from_i32(0)), (vm.a_regexp_source, source)];
     // The shape with both found once: then only their stores.
-    let root = unsafe { (*o).shape };
+    let root = o.shape();
     if vm.regexp_shapes.0 == root {
         unsafe { crate::object::set_shape(o, vm.regexp_shapes.1) };
         for (slot, (_, v)) in props.into_iter().enumerate() {
@@ -2578,8 +2569,8 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
         let attrs = if a == vm.a_last_index { DONT_ENUM | DONT_DELETE } else { DONT_ENUM | READ_ONLY | DONT_DELETE };
         vm.add_property_with(o, a, v, attrs);
     }
-    if unsafe { !(*root).unique && !(*(*o).shape).unique } {
-        vm.regexp_shapes = (root, unsafe { (*o).shape });
+    if !root.live().unique && !o.shape().live().unique {
+        vm.regexp_shapes = (root, o.shape());
     }
     note_realm(vm, o);
     object_value(o)
@@ -2660,7 +2651,7 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // `defineProperty` and `freeze`.)
     let a = vm.a_regexp_source;
     let source = vm.get(made, a)?;
-    if let Some(k) = unsafe { (*(*o).shape).lookup(a) } {
+    if let Some(k) = o.shape().live().lookup(a) {
         vm.store_field(o, k, source);
     }
     let a_last = vm.a_last_index;
@@ -2762,7 +2753,7 @@ fn regexp_match_into<'a>(
     let plain = plain_last_index(vm, this);
     // (`lastIndex` read and converted even when not used.)
     let li = match plain {
-        Some(o) => unsafe { *Object::slot(o, (*(*o).shape).location(0)) },
+        Some(o) => unsafe { *Object::slot(o, o.shape().live().location(0)) },
         None => vm.get(this, a_last)?,
     };
     // (Read and converted with no user code run: a data property holding
@@ -2794,7 +2785,7 @@ fn regexp_match_into<'a>(
 /// property in slot 0 it was made with: read and stored there directly.
 fn plain_last_index(vm: &Vm, this: Value) -> Option<*mut Object> {
     let o = as_object(this);
-    let sh = unsafe { &*(*o).shape };
+    let sh = o.shape().live();
     (sh.keys().first() == Some(&vm.a_last_index) && sh.attrs()[0] == DONT_ENUM | DONT_DELETE).then_some(o)
 }
 
@@ -2953,8 +2944,8 @@ fn match_array(
         };
         ty = ty.join(crate::object::FieldType::of(v));
         unsafe {
-            crate::heap::store((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), v);
-            (*o).elems_len = i as u32 + 1;
+            crate::heap::store(o.elems().cast::<u8>().sub(8), o.elems().add(i), v);
+            o.set_elems_len(i as u32 + 1);
         }
     }
     // Defined, as ECMAScript's CreateDataProperty does (no setters), along
@@ -3688,7 +3679,7 @@ fn error_stack_get(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     }
     // (Without running code: the kind by the prototype the error was made
     // with, if it still has it, and `message` if an own data property.)
-    let proto = unsafe { (*(*o).shape).proto };
+    let proto = o.shape().live().proto;
     let k = vm.error_prototypes.iter().position(|&p| object_value(p) == proto).unwrap_or(0);
     let mut s: Vec<u16> = ERROR_KINDS[k].encode_utf16().collect();
     let a_message = vm.intern_name("message");
@@ -3887,7 +3878,7 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     }
     unsafe {
         let rp = vm.regexp_prototype;
-        if Obj::of(rx).shape() == vm.regexp_shapes.1 && (*rp).shape == vm.regexp_proto_shape {
+        if Obj::of(rx).shape() == vm.regexp_shapes.1 && rp.shape() == vm.regexp_proto_shape {
             let at = |i: usize| *Object::slot(rp, vm.regexp_slots[i]);
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
             // (An accessor's slot holds its getter-setter pair.)
@@ -3923,9 +3914,9 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     // Whether slot `slot` of `h` holds `regexp_fns[i]` (a getter's from 6
     // on).
     let builtin = |vm: &Vm, h: *mut Object, slot: u32, i: usize| unsafe {
-        let v = *Object::slot(h, (*(*h).shape).location(slot));
+        let v = *Object::slot(h, h.shape().live().location(slot));
         let v = match (vm.is_accessor(h, slot), i >= 6) {
-            (true, true) => *(*as_object(v)).elems,
+            (true, true) => *as_object(v).elems(),
             (false, false) => v,
             _ => return false,
         };
@@ -3937,19 +3928,17 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
         return Ok(false);
     }
     // (Where the prototype's are, for the next time.)
-    unsafe {
-        let rp = vm.regexp_prototype;
-        let s = &*(*rp).shape;
-        let mut slots = [0; crate::vm::REGEXP_FNS];
-        for (i, slot) in slots.iter_mut().enumerate() {
-            match s.lookup(vm.regexp_atoms[i]) {
-                Some(j) if builtin(vm, rp, j, i) => *slot = s.location(j),
-                _ => return Ok(true),
-            }
+    let rp = vm.regexp_prototype;
+    let s = rp.shape().live();
+    let mut slots = [0; crate::vm::REGEXP_FNS];
+    for (i, slot) in slots.iter_mut().enumerate() {
+        match s.lookup(vm.regexp_atoms[i]) {
+            Some(j) if builtin(vm, rp, j, i) => *slot = s.location(j),
+            _ => return Ok(true),
         }
-        vm.regexp_slots = slots;
-        vm.regexp_proto_shape = (*rp).shape;
     }
+    vm.regexp_slots = slots;
+    vm.regexp_proto_shape = rp.shape();
     Ok(true)
 }
 
@@ -4315,7 +4304,7 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
     unsafe {
         let (rp, rc) = (vm.regexp_prototype, vm.regexp_constructor);
         let (ps, cs) = vm.regexp_species_shapes;
-        if Obj::of(r).shape() == vm.regexp_shapes.1 && (*rp).shape == ps && (*rc).shape == cs {
+        if Obj::of(r).shape() == vm.regexp_shapes.1 && rp.shape() == ps && rc.shape() == cs {
             let [pl, cl] = vm.regexp_species_slots;
             // (An accessor's slot holds its getter-setter pair.)
             return *Object::slot(rp, pl) == object_value(rc)
@@ -4327,11 +4316,10 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
 
 /// Whether `g` is `RegExp`'s builtin `@@species` getter.
 fn builtin_species(g: Value) -> bool {
-    g.is_cell()
-        && unsafe {
-            let g = as_object(g);
-            (*g).class == Class::Native && (*(*g).code).name == "get [Symbol.species]"
-        }
+    g.is_cell() && {
+        let g = as_object(g);
+        g.class() == Class::Native && g.code().live().name == "get [Symbol.species]"
+    }
 }
 
 /// [`species_pristine`] by lookups (the slots noted, for its quick
@@ -4349,7 +4337,7 @@ fn species_pristine_slow(vm: &mut Vm, r: Value) -> bool {
         if let Some(d) = vm.own_property(p, crate::vm::Key::Name(a_c)) {
             break d;
         }
-        let proto = unsafe { (*(*p).shape).proto };
+        let proto = p.shape().live().proto;
         if !proto.is_cell() {
             return false;
         }
@@ -4366,17 +4354,15 @@ fn species_pristine_slow(vm: &mut Vm, r: Value) -> bool {
     };
     // (Where they are, for the next time: `constructor` a data property
     // of the prototype, `@@species` an accessor of `RegExp`.)
-    unsafe {
-        let rp = vm.regexp_prototype;
-        let (ps, cs) = (&*(*rp).shape, &*(*rc).shape);
-        if let (Some(i), Some(j)) = (ps.lookup(a_c), cs.lookup(a_s))
-            && !vm.is_accessor(rp, i)
-            && vm.is_accessor(rc, j)
-        {
-            vm.regexp_species_shapes = ((*rp).shape, (*rc).shape);
-            vm.regexp_species_slots = [ps.location(i), cs.location(j)];
-            vm.regexp_species_getter = g;
-        }
+    let rp = vm.regexp_prototype;
+    let (ps, cs) = (rp.shape().live(), rc.shape().live());
+    if let (Some(i), Some(j)) = (ps.lookup(a_c), cs.lookup(a_s))
+        && !vm.is_accessor(rp, i)
+        && vm.is_accessor(rc, j)
+    {
+        vm.regexp_species_shapes = (rp.shape(), rc.shape());
+        vm.regexp_species_slots = [ps.location(i), cs.location(j)];
+        vm.regexp_species_getter = g;
     }
     true
 }

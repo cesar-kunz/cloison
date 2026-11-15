@@ -14,6 +14,7 @@
 //! are the object's flags (`SEALED`, `FROZEN`, from `Object.seal` and
 //! `Object.freeze`), as is an array's read-only `length`.
 
+use crate::raw::{Live, ObjectPtr};
 use std::cell::Cell;
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number};
@@ -95,7 +96,7 @@ impl Desc {
         let (enumerable, configurable) = (attrs & DONT_ENUM == 0, attrs & DONT_DELETE == 0);
         if attrs & ACCESSOR != 0 {
             let pair = as_object(v);
-            unsafe { Desc::accessor(*(*pair).elems, *(*pair).elems.add(1), enumerable, configurable) }
+            Desc::accessor(pair.elem(0), pair.elem(1), enumerable, configurable)
         } else {
             Desc::data(v, attrs & READ_ONLY == 0, enumerable, configurable)
         }
@@ -140,7 +141,7 @@ impl Vm {
     fn unique_shape_with(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, no_elements: bool, drop_code: bool) {
         self.leave_dictionary(o);
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let same_attrs = attrs.as_ref().is_none_or(|a| a == s.attrs());
             // (With no store's fast path for good: elements typed `Any`, so
             // no store generalizes them, which would give the shape an
@@ -178,7 +179,7 @@ impl Vm {
             if drop_code {
                 self.bump_code_epoch();
             }
-            if (*o).flags & crate::object::PROTOTYPE != 0 {
+            if o.flags() & crate::object::PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
         }
@@ -194,7 +195,7 @@ impl Vm {
     fn fix_shape(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, level: u8) {
         self.leave_dictionary(o);
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             if s.unique {
                 return self.unique_shape(o, attrs, true);
             }
@@ -245,8 +246,8 @@ impl Vm {
     /// with it, which compiled code hasn't seen (see
     /// `builtins::mapped_arguments_object`).
     pub(crate) fn no_elements_copy(&mut self, s: *const Shape) -> *const Shape {
-        debug_assert!(unsafe { !(*s).dictionary });
-        let s = unsafe { &*s };
+        debug_assert!(!s.live().dictionary);
+        let s = s.live();
         self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
@@ -291,14 +292,14 @@ impl Vm {
         self.leave_dictionary(o);
         unsafe {
             let mut elems = FieldType::None;
-            for k in 0..(*o).elems_len as usize {
-                let v = *(*o).elems.add(k);
+            for k in 0..o.elems_len() as usize {
+                let v = o.elem(k);
                 if v != Value::EMPTY {
                     elems = elems.join(FieldType::of(v));
                 }
             }
-            let s = &*(*o).shape;
-            let root = &*self.array_shape;
+            let s = o.shape().live();
+            let root = self.array_shape.live();
             if s.keys().is_empty() && s.proto == root.proto && s.capacity.get() == root.capacity.get() {
                 let t = if elems == FieldType::None {
                     self.array_shape
@@ -332,7 +333,7 @@ impl Vm {
                 dictionary: false,
             };
             crate::object::set_shape(o, self.add_shape(u));
-            if (*o).flags & crate::object::PROTOTYPE != 0 {
+            if o.flags() & crate::object::PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
         }
@@ -341,7 +342,7 @@ impl Vm {
     /// `o`'s own property `name` kept in a slot, if any.
     fn own_named(&self, o: *mut Object, name: Atom) -> Option<Desc> {
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let slot = s.lookup(name)?;
             Some(Desc::from_attrs(s.attrs()[slot as usize], *Object::slot(o, s.location(slot))))
         }
@@ -349,12 +350,12 @@ impl Vm {
 
     /// The number of parameters of function `f`, its `length`.
     fn function_length(f: *mut Object) -> Value {
-        unsafe { Value::from_i32((*(*f).code).length as i32) }
+        Value::from_i32(f.code().live().length as i32)
     }
 
     /// Function `f`'s `name`: its code's, empty for an anonymous one.
     fn function_name(&mut self, f: *mut Object) -> Value {
-        let name = unsafe { &(*(*f).code).name };
+        let name = unsafe { &(*f.code()).name };
         let name = if name.starts_with('<') { "" } else { name.as_str() };
         let u = crate::js::lex::to_units(name);
         self.new_string(&u)
@@ -386,8 +387,8 @@ impl Vm {
 
     fn own_property_inner(&mut self, o: *mut Object, key: Key) -> Option<Desc> {
         unsafe {
-            let class = (*o).class;
-            let flags = (*o).flags;
+            let class = o.class();
+            let flags = o.flags();
             match key {
                 Key::Index(i) => {
                     if let Some(u) = Self::string_of(o) {
@@ -402,18 +403,18 @@ impl Vm {
                     match class {
                         Class::TypedArray => {
                             return ((i as usize) < crate::typed::ta_length(o).unwrap_or(0)).then(|| {
-                                let kind = crate::object::TypedKind::from_u8((*o).kind);
+                                let kind = crate::object::TypedKind::from_u8(o.kind());
                                 // (An immutable buffer's: neither writable nor
                                 // configurable.)
                                 let mutable = !crate::typed::is_immutable_view(o);
-                                Desc::data(kind.load((*o).elems.cast(), i as usize), mutable, true, mutable)
+                                Desc::data(kind.load(o.elems().cast(), i as usize), mutable, true, mutable)
                             });
                         }
                         c if c.no_elements() => return None,
                         _ => {}
                     }
                     if Self::has_element(o, i) {
-                        let v = *(*o).elems.add(i as usize);
+                        let v = o.elem(i as usize);
                         return Some(Desc::data(v, flags & FROZEN == 0, true, flags & SEALED == 0));
                     }
                     if crate::far::is_far(o)
@@ -469,71 +470,69 @@ impl Vm {
     /// enumerable.
     pub(crate) fn own_keys(&mut self, o: *mut Object) -> Vec<(Key, bool)> {
         let mut out = Vec::new();
-        unsafe {
-            let class = (*o).class;
-            let s = &*(*o).shape;
-            let mut indices: Vec<u32> = Vec::new();
-            if let Some(u) = Self::string_of(o) {
-                indices.extend(0..u.len() as u32);
-            }
-            match class {
-                // (Its record made seq-cst: 10.4.5.7.)
-                Class::TypedArray => indices.extend(0..crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32),
-                Class::String => {}
-                c if c.no_elements() => {}
-                _ => {
-                    for i in 0..(*o).elems_len {
-                        if Self::has_element(o, i) {
-                            indices.push(i);
-                        }
+        let class = o.class();
+        let s = o.shape().live();
+        let mut indices: Vec<u32> = Vec::new();
+        if let Some(u) = Self::string_of(o) {
+            indices.extend(0..u.len() as u32);
+        }
+        match class {
+            // (Its record made seq-cst: 10.4.5.7.)
+            Class::TypedArray => indices.extend(0..crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32),
+            Class::String => {}
+            c if c.no_elements() => {}
+            _ => {
+                for i in 0..o.elems_len() {
+                    if Self::has_element(o, i) {
+                        indices.push(i);
                     }
                 }
             }
-            let sparse = (*o).flags & SPARSE != 0;
-            let mut far: Vec<(u32, bool)> = Vec::new();
-            if sparse {
-                for (k, &name) in s.keys().iter().enumerate() {
-                    if let Some(i) = index_of_name(self.atom_name(name)) {
-                        far.push((i, s.attrs()[k] & DONT_ENUM == 0));
-                    }
-                }
-            }
-            indices.extend(far.iter().map(|&(i, _)| i));
-            if crate::far::is_far(o) {
-                indices.extend(crate::far::keys(o));
-            }
-            indices.sort_unstable();
-            indices.dedup();
-            // (Sorted, so that each index finds its attributes in log time: a
-            // linear search per index made a sparse object's keys O(n²).)
-            far.sort_unstable_by_key(|&(i, _)| i);
-            let far_enum = |i: u32| far.binary_search_by_key(&i, |&(j, _)| j).ok().is_none_or(|at| far[at].1);
-            out.extend(indices.into_iter().map(|i| (Key::Index(i), far_enum(i))));
-            // The properties without slots (see `own_property`).
-            let flags = (*o).flags;
-            // (Not those a slot redefined: listed with the slots.)
-            let length = Self::string_of(o).is_some() || class == Class::Array;
-            if (length || matches!(class, Class::Function | Class::Native) && flags & FN_LENGTH_DELETED == 0)
-                && s.lookup(self.a_length).is_none()
-            {
-                out.push((Key::Name(self.a_length), false));
-            }
-            if matches!(class, Class::Function | Class::Native)
-                && flags & FN_NAME_DELETED == 0
-                && s.lookup(self.a_name).is_none()
-            {
-                out.push((Key::Name(self.a_name), false));
-            }
+        }
+        let sparse = o.flags() & SPARSE != 0;
+        let mut far: Vec<(u32, bool)> = Vec::new();
+        if sparse {
             for (k, &name) in s.keys().iter().enumerate() {
-                if sparse && index_of_name(self.atom_name(name)).is_some() {
-                    continue;
+                if let Some(i) = index_of_name(self.atom_name(name)) {
+                    far.push((i, s.attrs()[k] & DONT_ENUM == 0));
                 }
-                // (Symbols' keys apart: see `symbol::own_symbol_keys`.)
-                if crate::symbol::is_symbol_atom(self, name) {
-                    continue;
-                }
-                out.push((Key::Name(name), s.attrs()[k] & DONT_ENUM == 0));
             }
+        }
+        indices.extend(far.iter().map(|&(i, _)| i));
+        if crate::far::is_far(o) {
+            indices.extend(crate::far::keys(o));
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        // (Sorted, so that each index finds its attributes in log time: a
+        // linear search per index made a sparse object's keys O(n²).)
+        far.sort_unstable_by_key(|&(i, _)| i);
+        let far_enum = |i: u32| far.binary_search_by_key(&i, |&(j, _)| j).ok().is_none_or(|at| far[at].1);
+        out.extend(indices.into_iter().map(|i| (Key::Index(i), far_enum(i))));
+        // The properties without slots (see `own_property`).
+        let flags = o.flags();
+        // (Not those a slot redefined: listed with the slots.)
+        let length = Self::string_of(o).is_some() || class == Class::Array;
+        if (length || matches!(class, Class::Function | Class::Native) && flags & FN_LENGTH_DELETED == 0)
+            && s.lookup(self.a_length).is_none()
+        {
+            out.push((Key::Name(self.a_length), false));
+        }
+        if matches!(class, Class::Function | Class::Native)
+            && flags & FN_NAME_DELETED == 0
+            && s.lookup(self.a_name).is_none()
+        {
+            out.push((Key::Name(self.a_name), false));
+        }
+        for (k, &name) in s.keys().iter().enumerate() {
+            if sparse && index_of_name(self.atom_name(name)).is_some() {
+                continue;
+            }
+            // (Symbols' keys apart: see `symbol::own_symbol_keys`.)
+            if crate::symbol::is_symbol_atom(self, name) {
+                continue;
+            }
+            out.push((Key::Name(name), s.attrs()[k] & DONT_ENUM == 0));
         }
         // (A native may hold them across user code: see `Vm::held_atoms`.)
         for &(k, _) in &out {
@@ -579,7 +578,7 @@ impl Vm {
     /// (`all`: `getOwnPropertyNames`), in order; `data`: or none if one of
     /// them is an accessor.
     pub(crate) fn listed_slots(&self, o: *mut Object, all: bool, data: bool) -> Option<Vec<u32>> {
-        let s = unsafe { &*(*o).shape };
+        let s = o.shape().live();
         let mut out = Vec::with_capacity(s.keys().len());
         for (k, (&name, &attrs)) in s.keys().iter().zip(s.attrs()).enumerate() {
             if !all && attrs & DONT_ENUM != 0 || crate::symbol::is_symbol_atom(self, name) {
@@ -597,7 +596,7 @@ impl Vm {
     /// order: no elements, no index among its names, not a proxy.
     #[inline]
     pub(crate) fn plain_named(&self, o: *mut Object) -> bool {
-        unsafe { (*o).class == Class::Plain && (*o).flags & SPARSE == 0 && (*o).elems_len == 0 }
+        o.class() == Class::Plain && o.flags() & SPARSE == 0 && o.elems_len() == 0
     }
 
     /// A new array of `values` (on the native stack, which the collector
@@ -610,17 +609,17 @@ impl Vm {
         let o = as_object(a);
         unsafe {
             self.reserve_elems(o, values.len());
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let elems = values.iter().fold(s.elems, |t, &v| t.join(FieldType::of(v)));
             if elems != s.elems {
-                let t = self.elements_transition((*o).shape, elems);
+                let t = self.elements_transition(o.shape(), elems);
                 crate::object::set_shape(o, t);
             }
-            let e = (*o).elems;
+            let e = o.elems();
             for (i, &v) in values.iter().enumerate() {
                 crate::heap::store(e.cast::<u8>().sub(8), e.add(i), v);
             }
-            (*o).elems_len = values.len() as u32;
+            o.set_elems_len(values.len() as u32);
         }
         a
     }
@@ -629,14 +628,12 @@ impl Vm {
     pub(crate) fn array_of_with(&mut self, n: usize, mut at: impl FnMut(&mut Vm, usize) -> Value) -> Value {
         let a = self.new_array();
         let o = as_object(a);
-        unsafe {
-            self.reserve_elems(o, n);
-            for i in 0..n {
-                let v = at(self, i);
-                self.store_element(o, i, v);
-                // (What `at` makes next may collect: this one is traced.)
-                (*o).elems_len = i as u32 + 1;
-            }
+        self.reserve_elems(o, n);
+        for i in 0..n {
+            let v = at(self, i);
+            self.store_element(o, i, v);
+            // (What `at` makes next may collect: this one is traced.)
+            o.set_elems_len(i as u32 + 1);
         }
         a
     }
@@ -657,17 +654,15 @@ impl Vm {
 
     /// Whether `o` may get new properties.
     pub(crate) fn is_extensible(o: *mut Object) -> bool {
-        unsafe { (*o).flags & NOT_EXTENSIBLE == 0 }
+        o.flags() & NOT_EXTENSIBLE == 0
     }
 
     /// `Object.preventExtensions(o)`.
     pub(crate) fn prevent_extensions(&mut self, o: *mut Object) {
-        unsafe {
-            if (*o).flags & NOT_EXTENSIBLE != 0 {
-                return;
-            }
-            (*o).flags |= NOT_EXTENSIBLE;
+        if o.flags() & NOT_EXTENSIBLE != 0 {
+            return;
         }
+        o.set_flags(o.flags() | NOT_EXTENSIBLE);
         self.fix_shape(o, None, 0);
     }
 
@@ -675,43 +670,41 @@ impl Vm {
     pub(crate) fn seal(&mut self, o: *mut Object, freeze: bool) {
         // (First: a dictionary shape's buried slots go, see `Vm::dict_compact`.)
         self.leave_dictionary(o);
-        unsafe {
-            let s = &*(*o).shape;
-            // (Not private names' properties, which stay as they are.)
-            let attrs: Vec<u8> = s
-                .attrs()
-                .iter()
-                .zip(s.keys().iter())
-                .map(|(&a, &key)| {
-                    if crate::symbol::is_private_atom(self, key) {
-                        return a;
-                    }
-                    let mut a = a | DONT_DELETE;
-                    if freeze && a & ACCESSOR == 0 {
-                        a |= READ_ONLY;
-                    }
-                    a
-                })
-                .collect();
-            (*o).flags |= NOT_EXTENSIBLE | SEALED;
-            // Read-only elements only affect other objects' stores when
-            // this object is on their prototype chain.
-            if freeze
-                && (*o).flags & crate::object::PROTOTYPE != 0
-                && ((*o).elems_len > 0 || (*o).flags & SPARSE != 0 || crate::far::is_far(o))
-            {
-                self.protect_indices();
-            }
-            if freeze {
-                self.unmap_arguments(o);
-                (*o).flags |= FROZEN;
-                // (The bit is a function's `FN_LENGTH_DELETED`.)
-                if (*o).class == Class::Array {
-                    (*o).flags |= LENGTH_READ_ONLY;
+        let s = o.shape().live();
+        // (Not private names' properties, which stay as they are.)
+        let attrs: Vec<u8> = s
+            .attrs()
+            .iter()
+            .zip(s.keys().iter())
+            .map(|(&a, &key)| {
+                if crate::symbol::is_private_atom(self, key) {
+                    return a;
                 }
-            }
-            self.fix_shape(o, Some(attrs), 1 + freeze as u8);
+                let mut a = a | DONT_DELETE;
+                if freeze && a & ACCESSOR == 0 {
+                    a |= READ_ONLY;
+                }
+                a
+            })
+            .collect();
+        o.set_flags(o.flags() | NOT_EXTENSIBLE | SEALED);
+        // Read-only elements only affect other objects' stores when
+        // this object is on their prototype chain.
+        if freeze
+            && o.flags() & crate::object::PROTOTYPE != 0
+            && (o.elems_len() > 0 || o.flags() & SPARSE != 0 || crate::far::is_far(o))
+        {
+            self.protect_indices();
         }
+        if freeze {
+            self.unmap_arguments(o);
+            o.set_flags(o.flags() | FROZEN);
+            // (The bit is a function's `FN_LENGTH_DELETED`.)
+            if o.class() == Class::Array {
+                o.set_flags(o.flags() | LENGTH_READ_ONLY);
+            }
+        }
+        self.fix_shape(o, Some(attrs), 1 + freeze as u8);
     }
 
     /// A prototype has an indexed accessor or a read-only element, or is a
@@ -731,21 +724,21 @@ impl Vm {
     /// read-only element, or is a typed array or a string object, stores
     /// through objects inheriting from it must use [`Vm::set_new_element`].
     pub(crate) fn protect_prototype_indices(&mut self, o: *mut Object) {
-        debug_assert!(unsafe { (*o).flags & crate::object::PROTOTYPE != 0 });
+        debug_assert!((o.flags() & crate::object::PROTOTYPE != 0));
         // Do not use `own_keys` here: a typed array's keys include each of
         // its elements, and promoting a large typed array must not
         // allocate or sort all of them. Dense and far elements share the
         // object's frozen flag; indexed properties with their own attributes
         // are the sparse shape keys.
-        let protected = unsafe {
-            let flags = (*o).flags;
-            let dense_or_far = flags & FROZEN != 0 && ((*o).elems_len != 0 || crate::far::is_far(o));
+        let protected = {
+            let flags = o.flags();
+            let dense_or_far = flags & FROZEN != 0 && (o.elems_len() != 0 || crate::far::is_far(o));
             // A typed array takes an inherited store of an index outside
             // its length (doing nothing: its [[Set]]); a string object's
             // characters are read-only.
-            let typed = (*o).class == Class::TypedArray;
+            let typed = o.class() == Class::TypedArray;
             let chars = Self::string_of(o).is_some_and(|u| !u.is_empty());
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let sparse = flags & SPARSE != 0
                 && s.keys().iter().zip(s.attrs()).any(|(&name, &attrs)| {
                     index_of_name(self.atom_name(name)).is_some() && attrs & (ACCESSOR | READ_ONLY) != 0
@@ -811,7 +804,7 @@ impl Vm {
     }
 
     fn define_own_property_inner(&mut self, o: *mut Object, key: Key, d: &Desc) -> Result<bool> {
-        let class = unsafe { (*o).class };
+        let class = o.class();
         if class == Class::Array && key == Key::Name(self.a_length) {
             return self.define_array_length(o, d);
         }
@@ -896,7 +889,7 @@ impl Vm {
     /// `cur` being what it was.
     fn store_own(&mut self, o: *mut Object, key: Key, full: Desc, cur: Option<Desc>) -> Result<bool> {
         unsafe {
-            let class = (*o).class;
+            let class = o.class();
             match key {
                 Key::Index(i) => {
                     if Self::string_of(o).is_some_and(|u| (i as usize) < u.len()) {
@@ -904,7 +897,7 @@ impl Vm {
                         return Ok(true);
                     }
                     // (An array whose `length` is read-only doesn't grow.)
-                    if class == Class::Array && i >= crate::far::array_length(o) && (*o).flags & LENGTH_READ_ONLY != 0 {
+                    if class == Class::Array && i >= crate::far::array_length(o) && o.flags() & LENGTH_READ_ONLY != 0 {
                         return Ok(false);
                     }
                     match class {
@@ -920,17 +913,17 @@ impl Vm {
                             if !valid || full.is_accessor() || full.attrs() != 0 {
                                 return Ok(false);
                             }
-                            let kind = crate::object::TypedKind::from_u8((*o).kind);
+                            let kind = crate::object::TypedKind::from_u8(o.kind());
                             let v = crate::typed::to_element(self, kind, full.value.unwrap())?;
-                            kind.store_value((*o).elems.cast(), i as usize, v);
+                            kind.store_value(o.elems().cast(), i as usize, v);
                             return Ok(true);
                         }
                         _ => {}
                     }
-                    let plain = full.attrs() == 0 && (*o).flags & (SEALED | FROZEN) == 0;
-                    let named = (*o).flags & SPARSE != 0 && {
+                    let plain = full.attrs() == 0 && o.flags() & (SEALED | FROZEN) == 0;
+                    let named = o.flags() & SPARSE != 0 && {
                         let a = self.intern_name(&i.to_string());
-                        (*(*o).shape).lookup(a).is_some()
+                        o.shape().live().lookup(a).is_some()
                     };
                     let far = class != Class::Array && self.sparse_key(o, i);
                     if plain && !far {
@@ -944,21 +937,20 @@ impl Vm {
                     // A named property, its element slot a hole. An accessor
                     // or read-only one matters to other objects only when it
                     // is on their prototype chain.
-                    if (*o).flags & crate::object::PROTOTYPE != 0
-                        && (full.is_accessor() || full.writable == Some(false))
+                    if o.flags() & crate::object::PROTOTYPE != 0 && (full.is_accessor() || full.writable == Some(false))
                     {
                         self.protect_indices();
                     }
                     if class == Class::Array && i >= crate::far::array_length(o) {
                         self.grow_elements(o, i as usize + 1)?;
                     }
-                    if i < (*o).elems_len && Self::has_element(o, i) {
-                        crate::layout::store_word((*o).elems.add(i as usize), Value::EMPTY);
+                    if i < o.elems_len() && Self::has_element(o, i) {
+                        o.set_elem(i as usize, Value::EMPTY);
                     }
                     if crate::far::is_far(o) {
                         crate::far::remove(o, i);
                     }
-                    (*o).flags |= SPARSE;
+                    o.set_flags(o.flags() | SPARSE);
                     if !far {
                         self.slow_elements(o);
                     }
@@ -968,7 +960,7 @@ impl Vm {
                 }
                 Key::Name(a) => {
                     if let Some(cur) = cur
-                        && (*(*o).shape).lookup(a).is_none()
+                        && o.shape().live().lookup(a).is_none()
                     {
                         // A property without a slot (a function's `length`,
                         // …) gets one if it changes; a string's or an
@@ -1004,21 +996,21 @@ impl Vm {
         unsafe {
             // (Past an array's dense elements: far if it is, or if they
             // would be too sparse: see `far::Density`.)
-            if (*o).class == Class::Array
-                && i >= (*o).elems_len
+            if o.class() == Class::Array
+                && i >= o.elems_len()
                 && (crate::far::is_far(o) || crate::far::goes_far(self, o, i as usize + 1, 1))
             {
                 if !crate::far::is_far(o) {
-                    crate::far::make_far(self, o, (*o).elems_len);
+                    crate::far::make_far(self, o, o.elems_len());
                 }
                 crate::far::set(self, o, i, v);
                 return;
             }
-            if i >= (*o).elems_len {
+            if i >= o.elems_len() {
                 self.reserve_elems(o, i as usize + 1);
-                let at = (*o).elems.add((*o).elems_len as usize);
-                self.heap.fill_values(at, i.saturating_sub((*o).elems_len) as usize, Value::EMPTY);
-                (*o).elems_len = i + 1;
+                let at = o.elems().add(o.elems_len() as usize);
+                self.heap.fill_values(at, i.saturating_sub(o.elems_len()) as usize, Value::EMPTY);
+                o.set_elems_len(i + 1);
             }
             self.store_element(o, i as usize, v);
         }
@@ -1038,10 +1030,10 @@ impl Vm {
             return Ok(());
         }
         unsafe {
-            let len = (*o).elems_len as usize;
+            let len = o.elems_len() as usize;
             self.reserve_elems(o, n);
-            self.heap.fill_values((*o).elems.add(len), n.saturating_sub(len), Value::EMPTY);
-            (*o).elems_len = n as u32;
+            self.heap.fill_values(o.elems().add(len), n.saturating_sub(len), Value::EMPTY);
+            o.set_elems_len(n as u32);
         }
         Ok(())
     }
@@ -1049,7 +1041,7 @@ impl Vm {
     /// `Object.defineProperty(array, "length", d)` (ArraySetLength).
     pub(crate) fn define_array_length(&mut self, o: *mut Object, d: &Desc) -> Result<bool> {
         unsafe {
-            let read_only = (*o).flags & LENGTH_READ_ONLY != 0;
+            let read_only = o.flags() & LENGTH_READ_ONLY != 0;
             if d.is_accessor() || d.configurable == Some(true) || d.enumerable == Some(true) {
                 return Ok(false);
             }
@@ -1078,13 +1070,13 @@ impl Vm {
                     // Truncate, from the end, stopping at an element
                     // that can't be deleted.
                     let mut stop = n;
-                    if (*o).flags & SEALED != 0 {
+                    if o.flags() & SEALED != 0 {
                         stop = old_len;
-                    } else if (*o).flags & SPARSE != 0 {
+                    } else if o.flags() & SPARSE != 0 {
                         // The index names at `n` or past it, from the
                         // highest (not each index: a far array's length
                         // may be 2^32 - 1).
-                        let s = &*(*o).shape;
+                        let s = o.shape().live();
                         let mut named: Vec<(u32, Atom)> = s
                             .keys()
                             .iter()
@@ -1092,7 +1084,7 @@ impl Vm {
                             .collect();
                         named.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
                         for (k, a) in named {
-                            let s = &*(*o).shape;
+                            let s = o.shape().live();
                             if let Some(slot) = s.lookup(a) {
                                 if s.attrs()[slot as usize] & DONT_DELETE != 0 {
                                     stop = k + 1;
@@ -1106,13 +1098,13 @@ impl Vm {
                         crate::far::truncate(o, stop);
                         crate::far::maybe_dense(self, o);
                     } else {
-                        let at = (*o).elems.add(stop as usize);
+                        let at = o.elems().add(stop as usize);
                         self.heap.fill_values(at, old_len.saturating_sub(stop) as usize, Value::EMPTY);
-                        (*o).elems_len = stop;
+                        o.set_elems_len(stop);
                     }
                     if stop != n {
                         if d.writable == Some(false) {
-                            (*o).flags |= LENGTH_READ_ONLY;
+                            o.set_flags(o.flags() | LENGTH_READ_ONLY);
                             self.slow_elements(o);
                         }
                         return Ok(false);
@@ -1120,7 +1112,7 @@ impl Vm {
                 }
             }
             if d.writable == Some(false) {
-                (*o).flags |= LENGTH_READ_ONLY;
+                o.set_flags(o.flags() | LENGTH_READ_ONLY);
                 self.slow_elements(o);
             }
             Ok(true)
@@ -1137,71 +1129,69 @@ impl Vm {
     }
 
     fn delete_own_inner(&mut self, o: *mut Object, key: Key) -> bool {
-        unsafe {
-            let class = (*o).class;
-            match key {
-                Key::Index(i) => {
-                    if Self::string_of(o).is_some_and(|u| (i as usize) < u.len()) {
+        let class = o.class();
+        match key {
+            Key::Index(i) => {
+                if Self::string_of(o).is_some_and(|u| (i as usize) < u.len()) {
+                    return false;
+                }
+                match class {
+                    Class::String => return i >= o.elems_len(),
+                    Class::TypedArray => return i as usize >= crate::typed::ta_length(o).unwrap_or(0),
+                    c if c.no_elements() => return true,
+                    _ => {}
+                }
+                if i < o.elems_len() && Self::has_element(o, i) {
+                    if o.flags() & SEALED != 0 {
                         return false;
                     }
-                    match class {
-                        Class::String => return i >= (*o).elems_len,
-                        Class::TypedArray => return i as usize >= crate::typed::ta_length(o).unwrap_or(0),
-                        c if c.no_elements() => return true,
-                        _ => {}
-                    }
-                    if i < (*o).elems_len && Self::has_element(o, i) {
-                        if (*o).flags & SEALED != 0 {
-                            return false;
-                        }
-                        crate::layout::store_word((*o).elems.add(i as usize), Value::EMPTY);
-                        return true;
-                    }
-                    if crate::far::is_far(o) && crate::far::has(o, i) {
-                        if (*o).flags & SEALED != 0 {
-                            return false;
-                        }
-                        crate::far::remove(o, i);
-                        return true;
-                    }
-                    if (*o).flags & SPARSE != 0 {
-                        let a = self.intern_name(&i.to_string());
-                        return self.delete_named(o, a);
-                    }
-                    true
+                    o.set_elem(i as usize, Value::EMPTY);
+                    return true;
                 }
-                Key::Name(a) => {
-                    if self.typed_numeric(o, a) {
-                        return true;
+                if crate::far::is_far(o) && crate::far::has(o, i) {
+                    if o.flags() & SEALED != 0 {
+                        return false;
                     }
-                    if (*(*o).shape).lookup(a).is_none() {
-                        if o == self.global {
-                            return self.delete_global(a);
-                        }
-                        if matches!(class, Class::Function | Class::Native) {
-                            if (a == self.a_length || a == self.a_name) && (*o).flags & (SEALED | FROZEN) != 0 {
-                                return false;
-                            }
-                            if a == self.a_length {
-                                (*o).flags |= FN_LENGTH_DELETED;
-                            } else if a == self.a_name {
-                                (*o).flags |= FN_NAME_DELETED;
-                            }
-                            return true;
-                        }
-                        let length = a == self.a_length && (Self::string_of(o).is_some() || class == Class::Array);
-                        return !length;
+                    crate::far::remove(o, i);
+                    return true;
+                }
+                if o.flags() & SPARSE != 0 {
+                    let a = self.intern_name(&i.to_string());
+                    return self.delete_named(o, a);
+                }
+                true
+            }
+            Key::Name(a) => {
+                if self.typed_numeric(o, a) {
+                    return true;
+                }
+                if o.shape().live().lookup(a).is_none() {
+                    if o == self.global {
+                        return self.delete_global(a);
                     }
-                    let deleted = self.delete_named(o, a);
-                    if deleted && matches!(class, Class::Function | Class::Native) {
+                    if matches!(class, Class::Function | Class::Native) {
+                        if (a == self.a_length || a == self.a_name) && o.flags() & (SEALED | FROZEN) != 0 {
+                            return false;
+                        }
                         if a == self.a_length {
-                            (*o).flags |= FN_LENGTH_DELETED;
+                            o.set_flags(o.flags() | FN_LENGTH_DELETED);
                         } else if a == self.a_name {
-                            (*o).flags |= FN_NAME_DELETED;
+                            o.set_flags(o.flags() | FN_NAME_DELETED);
                         }
+                        return true;
                     }
-                    deleted
+                    let length = a == self.a_length && (Self::string_of(o).is_some() || class == Class::Array);
+                    return !length;
                 }
+                let deleted = self.delete_named(o, a);
+                if deleted && matches!(class, Class::Function | Class::Native) {
+                    if a == self.a_length {
+                        o.set_flags(o.flags() | FN_LENGTH_DELETED);
+                    } else if a == self.a_name {
+                        o.set_flags(o.flags() | FN_NAME_DELETED);
+                    }
+                }
+                deleted
             }
         }
     }
@@ -1211,7 +1201,7 @@ impl Vm {
     pub(crate) fn set_prototype_of(&mut self, o: *mut Object, proto: Value) -> bool {
         self.leave_dictionary(o);
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             if s.proto == proto {
                 return true;
             }
@@ -1229,7 +1219,7 @@ impl Vm {
                 self.make_prototype(as_object(proto));
             }
             if s.class == Class::TypedArray {
-                crate::typed::note_proto(self, (*o).kind, proto);
+                crate::typed::note_proto(self, o.kind(), proto);
             }
             self.shape_left(s);
             let u = Shape {
@@ -1401,7 +1391,7 @@ impl Vm {
             let obj = as_object(o);
             match self.lookup(obj, name) {
                 Some((h, slot)) if h == obj => {
-                    if unsafe { (&(*(*obj).shape).attrs())[slot as usize] } & (ACCESSOR | READ_ONLY) == 0 {
+                    if unsafe { (&(*obj.shape()).attrs())[slot as usize] } & (ACCESSOR | READ_ONLY) == 0 {
                         self.store_field(obj, slot, v);
                         return Ok(());
                     }
@@ -1431,10 +1421,10 @@ impl Vm {
                     let inherited = self.inherited_property(obj, key);
                     let made = || {
                         !Self::is_extensible(obj)
-                            || matches!(key, Key::Index(i) if unsafe {
-                                (*obj).class == Class::Array
+                            || matches!(key, Key::Index(i) if {
+                                obj.class() == Class::Array
                                     && i >= crate::far::array_length(obj)
-                                    && (*obj).flags & LENGTH_READ_ONLY != 0
+                                    && obj.flags() & LENGTH_READ_ONLY != 0
                             })
                     };
                     match inherited {
@@ -1457,13 +1447,13 @@ impl Vm {
 
     /// `key`'s property on `o`'s prototype chain, `o` excluded.
     fn inherited_property(&mut self, o: *mut Object, key: Key) -> Option<Desc> {
-        let mut p = unsafe { (*(*o).shape).proto };
+        let mut p = o.shape().live().proto;
         while p.is_cell() {
             let po = as_object(p);
             if let Some(d) = self.own_property(po, key) {
                 return Some(d);
             }
-            p = unsafe { (*(*po).shape).proto };
+            p = po.shape().live().proto;
         }
         None
     }
@@ -1482,7 +1472,7 @@ impl Vm {
         let obj = as_object(o);
         // (A big table's new key makes no shape: `Vm::keyed_table`.)
         if let Key::Name(a) = key
-            && unsafe { (*obj).class == Class::Plain && (*(*obj).shape).lookup(a).is_none() }
+            && (obj.class() == Class::Plain && obj.shape().live().lookup(a).is_none())
         {
             self.keyed_table(obj, a);
         }
@@ -1502,12 +1492,12 @@ impl Vm {
     /// `intrinsics::copy_data_properties`, which is left the rest: `false`).
     pub(crate) fn copy_plain_properties(&mut self, target: *mut Object, src: *mut Object) -> Result<bool> {
         unsafe {
-            let plain = |o: *mut Object| (*o).class == Class::Plain && (*o).flags & SPARSE == 0;
-            if !plain(src) || !plain(target) || (*src).elems_len != 0 || !Self::is_extensible(target) || src == target {
+            let plain = |o: *mut Object| o.class() == Class::Plain && o.flags() & SPARSE == 0;
+            if !plain(src) || !plain(target) || src.elems_len() != 0 || !Self::is_extensible(target) || src == target {
                 return Ok(false);
             }
             // (The shape stays `src`'s: only `target` changes.)
-            let s = &*(*src).shape;
+            let s = src.shape().live();
             // (A dictionary's buried slot is no property: skipped below,
             // not enumerable.)
             let hole = self.a_hole;
@@ -1522,7 +1512,7 @@ impl Vm {
                     continue;
                 }
                 let v = *Object::slot(src, s.location(k as u32));
-                if (*(*target).shape).lookup(name).is_some() {
+                if target.shape().live().lookup(name).is_some() {
                     self.create_data_property(object_value(target), Key::Name(name), v)?;
                 } else {
                     self.add_property_keyed(target, name, v);
@@ -1717,8 +1707,8 @@ fn keys_array(vm: &mut Vm, o: *mut Object, all: bool) -> Result<Value> {
     if vm.plain_named(o) {
         let slots = vm.listed_slots(o, all, false).unwrap_or_default();
         // (The shape read at each: a string made may collect, not change it.)
-        return Ok(vm.array_of_with(slots.len(), |vm, i| unsafe {
-            let a = (*(*o).shape).keys()[slots[i] as usize];
+        return Ok(vm.array_of_with(slots.len(), |vm, i| {
+            let a = o.shape().live().keys()[slots[i] as usize];
             vm.atom_string(a)
         }));
     }
@@ -1804,7 +1794,7 @@ fn object_freeze(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     if is_object(o) {
         let obj = as_object(o);
-        if unsafe { (*obj).class == Class::TypedArray } && crate::typed::ta_length(obj).unwrap_or(0) > 0 {
+        if (obj.class() == Class::TypedArray) && crate::typed::ta_length(obj).unwrap_or(0) > 0 {
             return Err(Error::type_error("Cannot freeze array buffer views with elements"));
         }
         vm.seal(obj, true);
@@ -1864,14 +1854,14 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         // with a symbol among its keys, which come after the strings. All
         // its names are walked, each one's enumerability read at its
         // turn: a setter may have made a later one enumerable.
-        let symbols = |vm: &Vm| unsafe { (*(*so).shape).keys().iter().any(|&a| crate::symbol::is_symbol_atom(vm, a)) };
+        let symbols = |vm: &Vm| so.shape().live().keys().iter().any(|&a| crate::symbol::is_symbol_atom(vm, a));
         if vm.plain_named(so)
-            && unsafe { !(*(*so).shape).dictionary }
+            && (!so.shape().live().dictionary)
             && !symbols(vm)
             && let Some(slots) = vm.listed_slots(so, true, true)
         {
-            let shape = unsafe { (*so).shape };
-            let names: Vec<Atom> = slots.iter().map(|&k| unsafe { (*shape).keys()[k as usize] }).collect();
+            let shape = so.shape();
+            let names: Vec<Atom> = slots.iter().map(|&k| shape.live().keys()[k as usize]).collect();
             // (Held before any setter runs: one may delete a later name
             // and collect, and the atom freed be another name's.)
             names.iter().for_each(|&name| vm.hold_atom(name));
@@ -1879,7 +1869,7 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
                 let key = Key::Name(name);
                 // (The slot checked too: a shape freed gives its address to
                 // the next one made.)
-                let cur = unsafe { &*(*so).shape };
+                let cur = so.shape().live();
                 let same = std::ptr::eq(cur, shape) && cur.keys().get(k as usize) == Some(&name);
                 let attrs = if same { cur.attrs()[k as usize] } else { ACCESSOR };
                 let v = if attrs & (ACCESSOR | DONT_ENUM) == DONT_ENUM {
@@ -1922,11 +1912,11 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
     {
         return Ok(vm.array_of_with(slots.len(), |vm, i| unsafe {
             let k = slots[i];
-            let value = |o: *mut Object| *Object::slot(o, (*(*o).shape).location(k));
+            let value = |o: *mut Object| *Object::slot(o, o.shape().live().location(k));
             if !entries {
                 return value(o);
             }
-            let name = vm.atom_string((*(*o).shape).keys()[k as usize]);
+            let name = vm.atom_string(o.shape().live().keys()[k as usize]);
             let pair = [name, value(o)];
             vm.array_of(&pair)
         }));

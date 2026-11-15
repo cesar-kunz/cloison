@@ -39,6 +39,7 @@ use crate::object::{
     object_value,
 };
 use crate::props::{is_callable, is_object};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, string_units};
 
@@ -117,22 +118,22 @@ pub(crate) fn species_constructor(vm: &mut Vm, o: Value, default: Value) -> Resu
 // ---- Buffers ----
 
 pub(crate) fn is_detached(b: *mut Object) -> bool {
-    unsafe { (*b).flags & DETACHED != 0 }
+    b.flags() & DETACHED != 0
 }
 
 pub(crate) fn is_resizable(b: *mut Object) -> bool {
-    unsafe { (*b).flags & RESIZABLE != 0 }
+    b.flags() & RESIZABLE != 0
 }
 
 /// Whether buffer `b` is immutable.
 pub(crate) fn is_immutable(b: *mut Object) -> bool {
-    !is_resizable(b) && unsafe { (*b).code } as *mut Object == b
+    !is_resizable(b) && b.code() as *mut Object == b
 }
 
 /// Whether view `o` (a typed array or a `DataView`) is of an immutable
 /// buffer.
 pub(crate) fn is_immutable_view(o: *mut Object) -> bool {
-    unsafe { (*o).flags & IMMUTABLE_VIEW != 0 }
+    o.flags() & IMMUTABLE_VIEW != 0
 }
 
 /// A TypeError unless view `o` is of a mutable buffer (ValidateTypedArray
@@ -156,7 +157,7 @@ fn make_immutable(vm: &mut Vm, b: *mut Object) {
 
 /// A view's buffer.
 pub(crate) fn buffer_of(o: *mut Object) -> *mut Object {
-    unsafe { (*o).code as *mut Object }
+    o.code() as *mut Object
 }
 
 /// Whether view `o`'s bytes are a shared buffer's, which other agents may
@@ -175,9 +176,9 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
     let o = vm.new_object_with(Class::ArrayBuffer, abp, 0);
     unsafe {
         (*o).elems = vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast();
-        (*o).elems_len = n as u32;
+        o.set_elems_len(n as u32);
         if let Some(max) = max {
-            (*o).flags |= RESIZABLE;
+            o.set_flags(o.flags() | RESIZABLE);
             *Object::aux(o) = max as u32;
             let views = crate::collections::new_weak_set(vm)?;
             (*o).code = object_value(views).to_bits() as *const crate::vm::Code;
@@ -190,7 +191,7 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
 /// value).
 pub(crate) fn immutable_bytes(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
     let b = new_buffer_max(vm, bytes.len(), None)?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*b).elems.cast::<u8>(), bytes.len()) };
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.elems().cast::<u8>(), bytes.len()) };
     make_immutable(vm, b);
     new_view(vm, TypedKind::U8, b, 0, Some(bytes.len()))
 }
@@ -203,7 +204,7 @@ pub(crate) fn new_buffer(vm: &mut Vm, n: usize) -> *mut Object {
 /// Record view `v` of resizable buffer `b` (see the module's docs).
 fn register(vm: &mut Vm, b: *mut Object, v: Value) -> Result<()> {
     if is_resizable(b) {
-        let views = as_object(Value::from_bits(unsafe { (*b).code } as u64));
+        let views = as_object(Value::from_bits(b.code() as u64));
         crate::collections::weak_set_insert(vm, views, v)?;
     }
     Ok(())
@@ -215,11 +216,11 @@ pub(crate) fn refresh_views(b: *mut Object) {
     if !is_resizable(b) {
         return;
     }
-    let views = as_object(Value::from_bits(unsafe { (*b).code } as u64));
+    let views = as_object(Value::from_bits(b.code() as u64));
     crate::collections::weak_set_each(views, |v| {
         let v = as_object(v);
         unsafe {
-            (*v).elems_len = if (*v).class == Class::TypedArray {
+            (*v).elems_len = if v.class() == Class::TypedArray {
                 ta_length(v).unwrap_or(0) as u32
             } else {
                 view_byte_length(v).unwrap_or(0) as u32
@@ -238,10 +239,8 @@ pub(crate) fn detach(vm: &mut Vm, b: *mut Object) -> Result<()> {
     if is_immutable(b) {
         return Err(Error::type_error("Cannot detach an immutable ArrayBuffer"));
     }
-    unsafe {
-        (*b).elems_len = 0;
-        (*b).flags |= DETACHED;
-    }
+    b.set_elems_len(0);
+    b.set_flags(b.flags() | DETACHED);
     if !is_resizable(b) && !vm.views_detached {
         vm.views_detached = true;
         vm.bump_code_epoch();
@@ -252,7 +251,7 @@ pub(crate) fn detach(vm: &mut Vm, b: *mut Object) -> Result<()> {
 
 /// A view's byte offset in its buffer.
 pub(crate) fn offset_of(o: *mut Object) -> usize {
-    unsafe { (*o).elems.cast::<u8>().offset_from((*buffer_of(o)).elems.cast::<u8>()) as usize }
+    unsafe { o.elems().cast::<u8>().offset_from((*buffer_of(o)).elems.cast::<u8>()) as usize }
 }
 
 /// A typed array's length, `None` if out of bounds (or its buffer
@@ -262,7 +261,7 @@ pub(crate) fn ta_length(o: *mut Object) -> Option<usize> {
     if is_detached(b) {
         return None;
     }
-    let (len, off, size) = (unsafe { (*b).elems_len } as usize, offset_of(o), kind_of(o).size());
+    let (len, off, size) = (b.elems_len() as usize, offset_of(o), kind_of(o).size());
     match unsafe { *Object::aux(o) } {
         TRACKING => (off <= len).then(|| (len - off) / size),
         n => (off + n as usize * size <= len).then_some(n as usize),
@@ -276,7 +275,7 @@ pub(crate) fn view_byte_length(o: *mut Object) -> Option<usize> {
     if is_detached(b) {
         return None;
     }
-    let (len, off) = (unsafe { (*b).elems_len } as usize, offset_of(o));
+    let (len, off) = (b.elems_len() as usize, offset_of(o));
     match unsafe { *Object::aux(o) } {
         TRACKING => (off <= len).then(|| len - off),
         n => (off + n as usize <= len).then_some(n as usize),
@@ -303,20 +302,20 @@ pub(crate) fn make_view(
         if class == Class::TypedArray {
             (*o).kind = k as u8;
         }
-        (*o).elems = (*b).elems.cast::<u8>().add(offset).cast();
+        (*o).elems = b.elems().cast::<u8>().add(offset).cast();
         (*o).code = b.cast();
         *Object::aux(o) = len.map_or(TRACKING, |n| n as u32);
         (*o).elems_len =
             if class == Class::TypedArray { ta_length(o) } else { view_byte_length(o) }.unwrap_or(0) as u32;
         if is_immutable(b) {
-            (*o).flags |= IMMUTABLE_VIEW;
+            o.set_flags(o.flags() | IMMUTABLE_VIEW);
         }
     }
     // (A fixed-length view's length can't change: its buffer never
     // shrinks, so it stays in bounds. One longer than `i32::MAX` is
     // fixed-length, no resizable buffer being that long (`MAX_RESIZABLE`):
     // its length stays one compiled code can't box, or 0 once detached.)
-    let long = class == Class::TypedArray && unsafe { (*o).elems_len } > i32::MAX as u32;
+    let long = class == Class::TypedArray && o.elems_len() > i32::MAX as u32;
     if long || len.is_none() && is_resizable(b) && crate::shared::is_shared(b) {
         unsafe { (*o).flags |= RUNTIME_LENGTH };
         // (Compiled code that read a known typed array's length unchecked
@@ -343,7 +342,7 @@ fn read_view_length(vm: &mut Vm, o: *mut Object) {
     fn read(vm: &mut Vm, o: *mut Object) {
         crate::shared::read_length(vm, buffer_of(o));
     }
-    if unsafe { (*o).flags } & RUNTIME_LENGTH != 0 {
+    if o.flags() & RUNTIME_LENGTH != 0 {
         read(vm, o);
     }
 }
@@ -378,17 +377,12 @@ pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
     // array makes it one; one is checked where code is compiled, and a
     // change to it moves the prototype epoch.)
     if !vm.typed_length_unusual {
-        let usual = proto.is_cell()
-            && vm.realms.is_empty()
-            && as_object(proto) == vm.typed_prototypes[k as usize]
-            && unsafe {
-                let p = as_object(proto);
-                let s = &*(*p).shape;
-                (*p).flags & crate::object::PROTOTYPE != 0
-                    || !s.dictionary
-                        && s.lookup(vm.a_length).is_none()
-                        && s.proto == object_value(vm.typed_array_prototype)
-            };
+        let usual = proto.is_cell() && vm.realms.is_empty() && as_object(proto) == vm.typed_prototypes[k as usize] && {
+            let p = as_object(proto);
+            let s = p.shape().live();
+            p.flags() & crate::object::PROTOTYPE != 0
+                || !s.dictionary && s.lookup(vm.a_length).is_none() && s.proto == object_value(vm.typed_array_prototype)
+        };
         if !usual {
             vm.typed_length_unusual();
         }
@@ -454,7 +448,7 @@ fn buffer_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value>
         } else if is_resizable(b) {
             *Object::aux(b)
         } else {
-            (*b).elems_len
+            b.elems_len()
         }
     };
     Ok(Value::number(n as f64))
@@ -482,11 +476,11 @@ fn buffer_resize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::range_error("ArrayBuffer.prototype.resize: beyond maxByteLength"));
     }
     unsafe {
-        let old = (*b).elems_len as usize;
+        let old = b.elems_len() as usize;
         if n > old {
-            std::ptr::write_bytes((*b).elems.cast::<u8>().add(old), 0, n - old);
+            std::ptr::write_bytes(b.elems().cast::<u8>().add(old), 0, n - old);
         }
-        (*b).elems_len = n as u32;
+        b.set_elems_len(n as u32);
     }
     refresh_views(b);
     Ok(Value::UNDEFINED)
@@ -499,7 +493,7 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the buffer is detached"));
     }
-    let len = unsafe { (*b).elems_len } as usize;
+    let len = b.elems_len() as usize;
     let first = relative(integer(vm, arg(a, 0))?, len);
     let end = arg(a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
@@ -520,16 +514,16 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if o == b {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the species returned the same buffer"));
     }
-    if (unsafe { (*o).elems_len } as usize) < n {
+    if (o.elems_len() as usize) < n {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the new buffer is too small"));
     }
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the buffer is detached"));
     }
-    let current = unsafe { (*b).elems_len } as usize;
+    let current = b.elems_len() as usize;
     if first < current {
         let count = n.min(current - first);
-        unsafe { std::ptr::copy((*b).elems.cast::<u8>().add(first), (*o).elems.cast::<u8>(), count) };
+        unsafe { std::ptr::copy(b.elems().cast::<u8>().add(first), o.elems().cast::<u8>(), count) };
     }
     Ok(out)
 }
@@ -540,7 +534,7 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<Value> {
     let b = this_buffer(this, if fixed { "transferToFixedLength" } else { "transfer" })?;
     let n = match arg(a, 0) {
-        v if v.is_undefined() => (unsafe { (*b).elems_len }) as usize,
+        v if v.is_undefined() => (b.elems_len()) as usize,
         v => to_index(vm, v)?,
     };
     if is_detached(b) || is_immutable(b) {
@@ -551,8 +545,8 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
         return Err(Error::range_error("ArrayBuffer.prototype.transfer: beyond maxByteLength"));
     }
     let out = new_buffer_max(vm, n, max)?;
-    let count = n.min(unsafe { (*b).elems_len } as usize);
-    unsafe { std::ptr::copy_nonoverlapping((*b).elems.cast::<u8>(), (*out).elems.cast::<u8>(), count) };
+    let count = n.min(b.elems_len() as usize);
+    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.elems().cast::<u8>(), count) };
     detach(vm, b)?;
     Ok(object_value(out))
 }
@@ -562,7 +556,7 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
 fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let b = this_buffer(this, "transferToImmutable")?;
     let n = match arg(a, 0) {
-        v if v.is_undefined() => (unsafe { (*b).elems_len }) as usize,
+        v if v.is_undefined() => (b.elems_len()) as usize,
         v => to_index(vm, v)?,
     };
     if is_detached(b) || is_immutable(b) {
@@ -571,8 +565,8 @@ fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
         ));
     }
     let out = new_buffer_max(vm, n, None)?;
-    let count = n.min(unsafe { (*b).elems_len } as usize);
-    unsafe { std::ptr::copy_nonoverlapping((*b).elems.cast::<u8>(), (*out).elems.cast::<u8>(), count) };
+    let count = n.min(b.elems_len() as usize);
+    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.elems().cast::<u8>(), count) };
     detach(vm, b)?;
     make_immutable(vm, out);
     Ok(object_value(out))
@@ -586,7 +580,7 @@ fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.sliceToImmutable: the buffer is detached"));
     }
-    let len = unsafe { (*b).elems_len } as usize;
+    let len = b.elems_len() as usize;
     let first = relative(integer(vm, arg(a, 0))?, len);
     let end = arg(a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
@@ -594,11 +588,11 @@ fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.sliceToImmutable: the buffer is detached"));
     }
-    if first + n > unsafe { (*b).elems_len } as usize {
+    if first + n > b.elems_len() as usize {
         return Err(Error::range_error("ArrayBuffer.prototype.sliceToImmutable: the buffer shrank"));
     }
     let out = new_buffer_max(vm, n, None)?;
-    unsafe { std::ptr::copy_nonoverlapping((*b).elems.cast::<u8>().add(first), (*out).elems.cast::<u8>(), n) };
+    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>().add(first), out.elems().cast::<u8>(), n) };
     make_immutable(vm, out);
     Ok(object_value(out))
 }
@@ -624,7 +618,7 @@ fn buffer_is_view(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 // ---- Typed arrays ----
 
 pub(crate) fn kind_of(o: *mut Object) -> TypedKind {
-    TypedKind::from_u8(unsafe { (*o).kind })
+    TypedKind::from_u8(o.kind())
 }
 
 fn this_typed(this: Value) -> Result<*mut Object> {
@@ -671,7 +665,7 @@ pub(crate) fn to_element(vm: &mut Vm, k: TypedKind, v: Value) -> Result<Value> {
 /// `o[i]` (`! Get`): its element, `undefined` past its length.
 fn get(o: *mut Object, i: usize) -> Value {
     match ta_length(o) {
-        Some(n) if i < n => unsafe { kind_of(o).load((*o).elems.cast(), i) },
+        Some(n) if i < n => unsafe { kind_of(o).load(o.elems().cast(), i) },
         _ => Value::UNDEFINED,
     }
 }
@@ -679,7 +673,7 @@ fn get(o: *mut Object, i: usize) -> Value {
 /// Element `i` of `o` set to `v`, already converted, if within its length.
 fn put(o: *mut Object, i: usize, v: Value) {
     if ta_length(o).is_some_and(|n| i < n) {
-        unsafe { kind_of(o).store_value((*o).elems.cast(), i, v) };
+        unsafe { kind_of(o).store_value(o.elems().cast(), i, v) };
     }
 }
 
@@ -700,7 +694,7 @@ fn set_all(vm: &mut Vm, o: *mut Object, at: usize, values: &[Value]) -> Result<(
     for (i, &v) in values.iter().enumerate() {
         if v.is_number() && !k.is_big() {
             if at + i < len {
-                unsafe { k.store_value((*o).elems.cast(), at + i, v) };
+                unsafe { k.store_value(o.elems().cast(), at + i, v) };
             }
         } else {
             set(vm, o, at + i, v)?;
@@ -716,17 +710,17 @@ fn set_all(vm: &mut Vm, o: *mut Object, at: usize, values: &[Value]) -> Result<(
 fn set_from(vm: &mut Vm, o: *mut Object, at: usize, src: Value, n: usize) -> Result<()> {
     let k = kind_of(o);
     let s = as_object(src);
-    let plain = |s: *mut Object| unsafe {
-        (*s).class == Class::Array && (*s).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0
+    let plain = |s: *mut Object| {
+        s.class() == Class::Array && s.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0
     };
     let mut direct = !k.is_big() && plain(s);
     let mut len = ta_length(o).unwrap_or(0);
     for i in 0..n {
-        if direct && i < unsafe { (*s).elems_len } as usize {
-            let v = unsafe { *(*s).elems.add(i) };
+        if direct && i < s.elems_len() as usize {
+            let v = s.elem(i);
             if v.is_number() {
                 if at + i < len {
-                    unsafe { k.store_value((*o).elems.cast(), at + i, v) };
+                    unsafe { k.store_value(o.elems().cast(), at + i, v) };
                 }
                 continue;
             }
@@ -744,7 +738,7 @@ fn set_from(vm: &mut Vm, o: *mut Object, at: usize, src: Value, n: usize) -> Res
 fn fill_range(o: *mut Object, s: usize, e: usize, v: Value) {
     let k = kind_of(o);
     unsafe {
-        let p = (*o).elems.cast::<u8>();
+        let p = o.elems().cast::<u8>();
         k.store_value(p, s, v);
         if shares(o) {
             (s + 1..e).for_each(|i| k.store_value(p, i, v));
@@ -775,7 +769,7 @@ fn find(o: *mut Object, lo: usize, hi: usize, x: Value, back: bool, zero: bool) 
     }
     use crate::racy::load;
     let k = kind_of(o);
-    let p = unsafe { (*o).elems.cast::<u8>().cast_const() };
+    let p = o.elems().cast::<u8>().cast_const();
     if k.is_big() {
         if !crate::bigint::is_bigint(x) {
             return None;
@@ -884,7 +878,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         return allocate(vm, k, n);
     }
     let fo = as_object(first);
-    match unsafe { (*fo).class } {
+    match fo.class() {
         Class::TypedArray => {
             let Some(n) = ta_length_seq_cst(vm, fo) else {
                 return Err(Error::type_error("Cannot construct from a detached or out of bounds typed array"));
@@ -901,15 +895,15 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
             let o = as_object(out);
             if sk == k {
                 // (Its bytes, as they are.)
-                let (from, to) = unsafe { ((*fo).elems.cast::<u8>(), (*o).elems.cast::<u8>()) };
+                let (from, to) = (fo.elems().cast::<u8>(), o.elems().cast::<u8>());
                 unsafe { crate::racy::copy_if(shares(fo), from, to, n * k.size()) };
                 return Ok(out);
             }
             vm.handle_scope(|vm| {
                 vm.handles.push(out);
                 for i in 0..n {
-                    let v = unsafe { sk.load((*fo).elems.cast(), i) };
-                    unsafe { k.store_value((*o).elems.cast(), i, v) };
+                    let v = unsafe { sk.load(fo.elems().cast(), i) };
+                    unsafe { k.store_value(o.elems().cast(), i, v) };
                 }
             });
             Ok(out)
@@ -1096,13 +1090,12 @@ fn typed_length_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// Whether `v` is `get %TypedArray%.prototype.length` (any realm's): for a
 /// typed array receiver, its length (0 if detached or out of bounds).
 pub(crate) fn is_length_getter(v: Value) -> bool {
-    v.is_cell()
-        && unsafe {
-            let o = as_object(v);
-            (*o).class == Class::Native
-                && !(*o).code.is_null()
-                && (*(*o).code).native.is_some_and(|g| g as usize == (typed_length_getter as NativeFn) as usize)
-        }
+    v.is_cell() && {
+        let o = as_object(v);
+        o.class() == Class::Native
+            && !o.code().is_null()
+            && o.code().live().native.is_some_and(|g| g as usize == (typed_length_getter as NativeFn) as usize)
+    }
 }
 
 /// `get %TypedArray%.prototype[Symbol.toStringTag]`: the kind's name.
@@ -1153,7 +1146,7 @@ fn typed_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let n = (count as usize * size).min(limit.saturating_sub(from)).min(limit.saturating_sub(to));
         if n > 0 {
             unsafe {
-                let base = (*o).elems.cast::<u8>();
+                let base = o.elems().cast::<u8>();
                 crate::racy::copy_if(shares(o), base.add(from), base.add(to), n);
             }
         }
@@ -1392,7 +1385,7 @@ fn typed_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     }
     let size = kind_of(o).size();
     unsafe {
-        let p = (*o).elems.cast::<u8>();
+        let p = o.elems().cast::<u8>();
         if size == 1 {
             std::slice::from_raw_parts_mut(p, len).reverse();
         } else {
@@ -1432,26 +1425,26 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         let offset = offset as usize;
         if sk == k {
-            let (from, to) = unsafe { ((*s).elems.cast::<u8>(), (*o).elems.cast::<u8>().add(offset * k.size())) };
+            let (from, to) = unsafe { (s.elems().cast::<u8>(), o.elems().cast::<u8>().add(offset * k.size())) };
             unsafe { crate::racy::copy_if(shares(s) || shares(o), from, to, n * k.size()) };
             return Ok(Value::UNDEFINED);
         }
         // (Each converted in place where the two don't share bytes.)
-        let (from, to) = unsafe { ((*s).elems as usize, (*o).elems as usize + offset * k.size()) };
+        let (from, to) = (s.elems() as usize, o.elems() as usize + offset * k.size());
         if !k.is_big() && (from + n * sk.size() <= to || to + n * k.size() <= from) {
             for i in 0..n {
-                unsafe { k.store_value((*o).elems.cast(), offset + i, sk.load((*s).elems.cast(), i)) };
+                unsafe { k.store_value(o.elems().cast(), offset + i, sk.load(s.elems().cast(), i)) };
             }
             return Ok(Value::UNDEFINED);
         }
         // (Read them all first: the source may share the bytes.)
         return vm.handle_scope(|vm| {
-            let values: Vec<Value> = (0..n).map(|i| unsafe { sk.load((*s).elems.cast(), i) }).collect();
+            let values: Vec<Value> = (0..n).map(|i| unsafe { sk.load(s.elems().cast(), i) }).collect();
             if sk.is_big() {
                 vm.handles.extend_from_slice(&values);
             }
             for (i, v) in values.into_iter().enumerate() {
-                unsafe { k.store_value((*o).elems.cast(), offset + i, v) };
+                unsafe { k.store_value(o.elems().cast(), offset + i, v) };
             }
             Ok(Value::UNDEFINED)
         });
@@ -1485,7 +1478,7 @@ fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             // (Byte by byte, first to last, as the spec has it: where `out`
             // views the same bytes, not as `memmove` would.)
             unsafe {
-                let (from, to) = ((*o).elems.cast::<u8>().add(s * size), (*out).elems.cast::<u8>());
+                let (from, to) = (o.elems().cast::<u8>().add(s * size), out.elems().cast::<u8>());
                 for b in 0..n.min(room) {
                     crate::racy::store::<1>(to.add(b), crate::racy::load::<1>(from.add(b)));
                 }
@@ -1694,7 +1687,7 @@ pub(crate) fn typed_values(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Valu
 pub(crate) fn elements(vm: &mut Vm, o: *mut Object) -> Option<Vec<Value>> {
     let n = ta_length_seq_cst(vm, o)?;
     let k = kind_of(o);
-    Some((0..n).map(|i| unsafe { k.load((*o).elems.cast(), i) }).collect())
+    Some((0..n).map(|i| unsafe { k.load(o.elems().cast(), i) }).collect())
 }
 
 pub(crate) fn install(vm: &mut Vm) {

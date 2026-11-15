@@ -9,6 +9,7 @@
 //! multiplication, Knuth's long division, two's complement for the
 //! bitwise operators.
 
+use crate::raw::ObjectPtr;
 use std::cmp::Ordering;
 
 use crate::object::{Class, Obj, Object, as_object, object_value};
@@ -515,8 +516,8 @@ pub(crate) fn is_bigint(v: Value) -> bool {
 pub(crate) fn big_of(v: Value) -> Big {
     unsafe {
         let o = as_object(v);
-        let n = (*o).elems_len as usize;
-        let limbs = if n == 0 { &[][..] } else { std::slice::from_raw_parts((*o).elems.cast::<u32>(), n) };
+        let n = o.elems_len() as usize;
+        let limbs = if n == 0 { &[][..] } else { std::slice::from_raw_parts(o.elems().cast::<u32>(), n) };
         Big { neg: *Object::aux(o) == 1, mag: limbs.to_vec() }
     }
 }
@@ -532,11 +533,11 @@ pub(crate) fn new_bigint(vm: &mut Vm, b: Big) -> Value {
             std::ptr::copy_nonoverlapping(b.mag.as_ptr(), p, b.mag.len());
             (*o).elems = p.cast();
         }
-        (*o).elems_len = b.mag.len() as u32;
+        o.set_elems_len(b.mag.len() as u32);
         // (Its class's root shape takes no element store: see
         // `Vm::root_shape`. Not a unique shape of its own, which would
         // never be freed.)
-        (*o).flags |= crate::object::NOT_EXTENSIBLE;
+        o.set_flags(o.flags() | crate::object::NOT_EXTENSIBLE);
     }
     object_value(o)
 }

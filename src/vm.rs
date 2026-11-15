@@ -4,6 +4,7 @@
 //! The interpreter reaches it through each frame's header (see
 //! `src/interp.rs`), which holds the frame's [`Code`] and the `Vm`.
 
+use crate::raw::{Live, ObjectPtr};
 use std::cell::{Cell, RefCell, UnsafeCell};
 // FxHash: interning the builtins' names at startup was mostly SipHash.
 use crate::jit::{HashMap, HashSet};
@@ -199,8 +200,8 @@ pub use crate::layout::NO_ELEMENTS;
 pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
     unsafe {
         // (A BigInt kind's as anything else's: its loads allocate.)
-        let kind = if (*o).class == Class::TypedArray && crate::object::TypedKind::from_u8((*o).kind).compiled() {
-            (*o).kind as u32 + 1
+        let kind = if o.class() == Class::TypedArray && crate::object::TypedKind::from_u8(o.kind()).compiled() {
+            o.kind() as u32 + 1
         } else {
             u32::MAX
         };
@@ -297,7 +298,7 @@ impl CtorProto {
 /// properties one has (at least 1); that capacity.
 fn shrink_root(root: *const Shape) -> u32 {
     fn walk(s: *const Shape, f: &mut dyn FnMut(&Shape)) {
-        let s = unsafe { &*s };
+        let s = s.live();
         f(s);
         for &(_, _, t) in s.transitions.borrow().iter() {
             walk(t, f);
@@ -308,10 +309,10 @@ fn shrink_root(root: *const Shape) -> u32 {
     }
     let mut most = 1;
     walk(root, &mut |s| most = most.max(s.keys().len() as u32));
-    if most < unsafe { (*root).capacity.get() } {
+    if most < root.live().capacity.get() {
         walk(root, &mut |s| s.capacity.set(most));
     }
-    unsafe { (*root).capacity.get() }
+    root.live().capacity.get()
 }
 
 /// `v` as stored in a field of type `ft`: in one typed `Num`, an int32 as
@@ -329,7 +330,7 @@ pub(crate) fn as_field(ft: FieldType, v: Value) -> Value {
 unsafe fn install(ic: *mut Ic, e: Ic) -> bool {
     unsafe {
         // (Nor a dictionary shape, changed in place: see `Shape::dictionary`.)
-        if !e.shape.is_null() && (*e.shape).dictionary {
+        if !e.shape.is_null() && e.shape.live().dictionary {
             return false;
         }
         for k in 0..IC_WAYS {
@@ -1723,8 +1724,8 @@ impl Vm {
         // Functions' `prototype` isn't enumerable nor configurable;
         // prototypes' `constructor` isn't enumerable.
         vm.function_shape = vm.transition_with(root, vm.a_prototype, DONT_ENUM | DONT_DELETE);
-        unsafe {
-            let s = &*vm.function_shape;
+        {
+            let s = vm.function_shape.live();
             vm.function_prototype_loc = s.location(s.lookup(vm.a_prototype).expect("functions' prototype"));
         }
         // (Arrows' and methods': no `prototype`, the same capacity, so
@@ -1749,7 +1750,7 @@ impl Vm {
         vm.array_pop_fn = vm.define_native(ap, "pop", crate::array::array_pop, 0, crate::jit::Ty::Any, false);
         let fp = vm.function_prototype;
         let call = vm.define_native(fp, "call", function_call, 1, crate::jit::Ty::Any, false);
-        vm.function_call = unsafe { (*call).code };
+        vm.function_call = call.code();
         vm.function_call_fn = call;
         // The constructors, with `prototype` and `constructor` links.
         let g = vm.global;
@@ -2047,7 +2048,7 @@ impl Vm {
         }
         self.symbols.keys().for_each(|&a| keep(a));
         for &o in self.symbol_registry.values() {
-            let a = unsafe { (*o).elems_len };
+            let a = o.elems_len();
             if a != crate::symbol::NO_ATOM {
                 keep(Atom(a));
             }
@@ -2144,7 +2145,7 @@ impl Vm {
             }
             let s = e.root.get();
             if !s.is_null() {
-                unsafe { (*s).mark.store(epoch, std::sync::atomic::Ordering::Relaxed) };
+                s.live().mark.store(epoch, std::sync::atomic::Ordering::Relaxed);
             }
             true
         });
@@ -2162,7 +2163,7 @@ impl Vm {
     pub(crate) fn sweep_shapes(&mut self, from: u32) {
         use std::sync::atomic::Ordering::Relaxed;
         let mut t = std::time::Instant::now();
-        let live = |s: *const Shape| unsafe { (*s).pinned.get() || (*s).mark.load(Relaxed) >= from };
+        let live = |s: *const Shape| s.live().pinned.get() || s.live().mark.load(Relaxed) >= from;
         let (keep, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.shapes).into_iter().partition(|s| live(&**s));
         self.shapes = keep;
         if !dead.is_empty() {
@@ -2393,7 +2394,7 @@ impl Vm {
             .eval_cache
             .get_mut(&hash?)?
             .iter_mut()
-            .find(|e| e.place == place && *e.source == *source && unsafe { (*e.code).realm } == realm)?;
+            .find(|e| e.place == place && *e.source == *source && e.code.live().realm == realm)?;
         e.used = uses;
         e.recent = true;
         Some(e)
@@ -2599,7 +2600,7 @@ impl Vm {
     /// slots extend `shape`'s table in place if `shape` has all of it (see
     /// `Slots::with`).
     pub(crate) fn transition_with(&mut self, shape: *const Shape, name: Atom, attrs: u8) -> *const Shape {
-        let s = unsafe { &*shape };
+        let s = shape.live();
         if !s.unique
             && !s.fixed
             && let Some(t) = self.find_transition(s, name, attrs)
@@ -2688,12 +2689,12 @@ impl Vm {
     /// transition (which would skip the epoch bump).
     pub(crate) fn make_prototype(&mut self, o: *mut Object) {
         unsafe {
-            if (*o).flags & PROTOTYPE != 0 {
+            if o.flags() & PROTOTYPE != 0 {
                 return;
             }
             // (V8 makes a prototype fast again: `ReoptimizeIfPrototype`.)
             self.leave_dictionary(o);
-            (*o).flags |= PROTOTYPE;
+            o.set_flags(o.flags() | PROTOTYPE);
             // (A proxy's traps may take any new element's store, and give
             // any symbol's method.)
             if self.proxies_exist && crate::proxy::is_proxy(self, o) {
@@ -2703,7 +2704,7 @@ impl Vm {
             } else {
                 self.protect_prototype_indices(o);
             }
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             // The object leaves `s` (for a copy of its own).
             self.shape_left_stable(s);
             self.unique_left(s);
@@ -2766,7 +2767,7 @@ impl Vm {
 
     pub(crate) fn new_object_with(&mut self, class: Class, proto: Value, capacity: u32) -> *mut Object {
         let s = self.root_shape(class, proto, capacity);
-        self.heap.alloc_object(unsafe { &*s })
+        self.heap.alloc_object(s.live())
     }
 
     /// A plain object with prototype `proto`.
@@ -2776,7 +2777,7 @@ impl Vm {
     }
 
     pub fn new_array(&mut self) -> Value {
-        object_value(self.heap.alloc_object(unsafe { &*self.array_shape }))
+        object_value(self.heap.alloc_object(self.array_shape.live()))
     }
 
     /// Add property `name` (which `o` must not have) with `value`, and
@@ -2807,7 +2808,7 @@ impl Vm {
     /// quarter slower. (V8 normalizes past 128 properties out of the
     /// object, past 12 on a keyed store: `Map::TooManyFastProperties`.)
     pub(crate) fn keyed_table(&mut self, o: *mut Object, name: Atom) {
-        let s = unsafe { &*(*o).shape };
+        let s = o.shape().live();
         if !s.dictionary
             && s.keys().len() >= dictionary_at()
             && self.may_be_dictionary(o)
@@ -2819,7 +2820,7 @@ impl Vm {
 
     /// `add_property` with attributes `attrs`.
     pub(crate) fn add_property_with(&mut self, o: *mut Object, name: Atom, value: Value, attrs: u8) -> u32 {
-        let new = self.transition_with(unsafe { (*o).shape }, name, attrs);
+        let new = self.transition_with(o.shape(), name, attrs);
         self.add_property_shaped(o, new, value)
     }
 
@@ -2832,8 +2833,8 @@ impl Vm {
             if i >= old {
                 let cap = (old * 2).max(4).max(i + 1);
                 let p = self.heap.alloc_values(cap as usize);
-                if !(*o).props.is_null() {
-                    std::ptr::copy_nonoverlapping((*o).props, p, old as usize);
+                if !o.props().is_null() {
+                    std::ptr::copy_nonoverlapping(o.props(), p, old as usize);
                 }
                 crate::heap::store_young(o.cast(), &raw mut (*o).props, p);
             }
@@ -2844,14 +2845,14 @@ impl Vm {
     /// with `value`: its slot.
     pub(crate) fn add_property_shaped(&mut self, o: *mut Object, new: *const Shape, value: Value) -> u32 {
         unsafe {
-            let ns = &*new;
+            let ns = new.live();
             let slot = ns.keys().len() as u32 - 1;
             if slot >= ns.capacity.get() {
                 self.reserve_props(o, slot - ns.capacity.get());
             }
             crate::object::set_shape(o, new);
             self.store_field(o, slot, value);
-            if (*o).flags & PROTOTYPE != 0 {
+            if o.flags() & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
                 self.bump_code_epoch();
             }
@@ -2864,11 +2865,11 @@ impl Vm {
     /// function, whose constant fields compiled code folds; on other
     /// objects, once the field is made mutable (see `FieldCell`).
     fn may_cache_store(&mut self, o: *mut Object, slot: u32) -> bool {
-        let cell = unsafe { (*(*o).shape).field_cell(slot) };
+        let cell = o.shape().live().field_cell(slot);
         if !cell.is_constant() {
             return true;
         }
-        if o == self.global || o == self.global_lexicals || unsafe { (*o).class } == Class::Function {
+        if o == self.global || o == self.global_lexicals || o.class() == Class::Function {
             return false;
         }
         self.field_made_mutable(cell);
@@ -2882,7 +2883,7 @@ impl Vm {
     pub(crate) fn bump_code_epoch(&mut self) {
         self.code_epoch = self.code_epoch.wrapping_add(1);
         for &c in &self.jitted {
-            let c = unsafe { &*c };
+            let c = c.live();
             c.field_deps.set(c.field_deps.get().wrapping_add(1));
         }
     }
@@ -2903,8 +2904,8 @@ impl Vm {
     pub(crate) fn shape_left(&mut self, s: &Shape) {
         self.shape_left_stable(s);
         let mut p: *const Shape = s;
-        while !p.is_null() && unsafe { !(*p).left.get() } {
-            let shape = unsafe { &*p };
+        while !p.is_null() && (!p.live().left.get()) {
+            let shape = p.live();
             shape.left.set(true);
             if shape.lineage_relied.replace(false) {
                 self.field_epoch = self.field_epoch.wrapping_add(1);
@@ -2928,7 +2929,7 @@ impl Vm {
     /// go through an inline cache whose check passed must use this.
     pub(crate) fn store_field(&mut self, o: *mut Object, slot: u32, value: Value) {
         unsafe {
-            let shape = &*(*o).shape;
+            let shape = o.shape().live();
             let cell = &*shape.fields()[slot as usize];
             let at = Object::slot(o, shape.location(slot));
             let value = as_field(cell.get(), value);
@@ -2937,7 +2938,7 @@ impl Vm {
             let unchanged = *at == value;
             if cell.get().join(FieldType::of(value)) == cell.get()
                 && (unchanged || !cell.is_constant() || *at == Value::UNDEFINED)
-                && (unchanged || (*o).flags & PROTOTYPE == 0)
+                && (unchanged || o.flags() & PROTOTYPE == 0)
             {
                 crate::heap::store(o.cast(), at, value);
                 return;
@@ -2950,7 +2951,7 @@ impl Vm {
     #[inline(never)]
     fn store_field_slow(&mut self, o: *mut Object, slot: u32, value: Value) {
         unsafe {
-            let shape = &*(*o).shape;
+            let shape = o.shape().live();
             let cell = &*shape.fields()[slot as usize];
             let old = cell.get();
             let new = old.join(FieldType::of(value));
@@ -2976,7 +2977,7 @@ impl Vm {
             // A prototype's slots whose values compiled code folded hold
             // them while the prototype epoch holds (`relied_slots`); every
             // store to one comes here (inline caches don't cache them).
-            if (*o).flags & PROTOTYPE != 0 && *at != value {
+            if o.flags() & PROTOTYPE != 0 && *at != value {
                 self.prototype_slot_changed(at);
             }
             crate::heap::store(o.cast(), at, value);
@@ -3080,10 +3081,10 @@ impl Vm {
                 unsafe {
                     if *(p as *const u64) & 1 == 0 {
                         let o = p as *mut Object;
-                        let shape = (*o).shape;
+                        let shape = o.shape();
                         if shape != last.0 {
                             let at = slots.entry(shape).or_insert_with(|| {
-                                let s = &*shape;
+                                let s = shape.live();
                                 (0..s.fields().len() as u32)
                                     .filter(|&i| cells.contains(&s.fields()[i as usize]))
                                     .map(|i| s.location(i))
@@ -3094,7 +3095,7 @@ impl Vm {
                         }
                         for &l in last.1.iter() {
                             debug_assert!(
-                                (l as usize) < crate::layout::slots_offset((*o).class) + 8 * Object::inline_cap(o),
+                                (l as usize) < crate::layout::slots_offset(o.class()) + 8 * Object::inline_cap(o),
                                 "slot {l} past the object at {p:#x}"
                             );
                             let v = Object::slot(o, l);
@@ -3151,7 +3152,7 @@ impl Vm {
     /// [`MAX_ELEM_SHAPES`] objects' shapes, elements of objects of another
     /// are of any type.
     pub(crate) fn elements_transition(&mut self, shape: *const Shape, elems: FieldType) -> *const Shape {
-        let s = unsafe { &*shape };
+        let s = shape.live();
         // (A dictionary shape's elements are `Any`: none.)
         debug_assert!(!s.dictionary);
         if !s.unique && !s.fixed {
@@ -3205,10 +3206,10 @@ impl Vm {
     /// shape whose elements' type `value` fits (see `Shape::elems`).
     pub(crate) fn store_element(&mut self, o: *mut Object, i: usize, value: Value) {
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let elems = s.elems.join(FieldType::of(value));
             if elems != s.elems {
-                let t = self.elements_transition((*o).shape, elems);
+                let t = self.elements_transition(o.shape(), elems);
                 // For the `array_push` stencils (see `Shape::push_key`).
                 if !s.unique && s.class == crate::object::Class::Array {
                     if s.elems == FieldType::None {
@@ -3222,7 +3223,7 @@ impl Vm {
                 }
                 crate::object::set_shape(o, t);
             }
-            crate::heap::store((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), value);
+            crate::heap::store(o.elems().cast::<u8>().sub(8), o.elems().add(i), value);
         }
     }
 
@@ -3231,12 +3232,12 @@ impl Vm {
     /// value that fits `o`'s elements' type is only written.
     pub(crate) fn store_elements(&mut self, o: *mut Object, at: usize, from: *const Value, n: usize) {
         unsafe {
-            let e = (*o).elems;
+            let e = o.elems();
             let fwd = from >= e.add(at).cast_const();
             for k in 0..n {
                 let i = if fwd { k } else { n - 1 - k };
                 let v = *from.add(i);
-                let s = &*(*o).shape;
+                let s = o.shape().live();
                 if v == Value::EMPTY || s.elems.join(FieldType::of(v)) == s.elems {
                     crate::heap::store(e.cast::<u8>().sub(8), e.add(at + i), v);
                 } else {
@@ -3249,8 +3250,8 @@ impl Vm {
     /// The object holding `name` on `o`'s prototype chain (`o` included),
     /// and its slot there.
     pub(crate) fn lookup(&self, o: *mut Object, name: Atom) -> Option<(*mut Object, u32)> {
-        let shape = unsafe { (*o).shape };
-        if unsafe { (*shape).dictionary } {
+        let shape = o.shape();
+        if shape.live().dictionary {
             return self.lookup_uncached(o, name);
         }
         let e = &self.lookups[lookup_index(shape, name)];
@@ -3300,50 +3301,47 @@ impl Vm {
             return;
         }
         let o = as_object(o);
-        unsafe {
-            if (*o).class != Class::Plain || (*o).flags & PROTOTYPE != 0 || o == self.global || (*(*o).shape).dictionary
-            {
+        if o.class() != Class::Plain || o.flags() & PROTOTYPE != 0 || o == self.global || o.shape().live().dictionary {
+            return;
+        }
+        let new = o.shape();
+        let e = if new == old {
+            let Some(slot) = old.live().lookup(name) else { return };
+            if old.live().field_cell(slot).is_constant() {
                 return;
             }
-            let new = (*o).shape;
-            let e = if new == old {
-                let Some(slot) = (*old).lookup(name) else { return };
-                if (*old).field_cell(slot).is_constant() {
-                    return;
-                }
-                MegaStore {
-                    shape: old as u64,
-                    name: name.0,
-                    ft: (*old).field_type(slot).encode(),
-                    loc: (*old).location(slot),
-                    ..MegaStore::EMPTY
-                }
-            } else {
-                if (*old).unique || (*new).unique || (*new).parent != old {
-                    return;
-                }
-                let Some(slot) = (*new).lookup(name) else { return };
-                MegaStore {
-                    shape: old as u64,
-                    name: name.0,
-                    epoch: self.proto_epoch,
-                    ft: (*new).field_type(slot).encode(),
-                    new_shape: new as u64,
-                    loc: (*new).location(slot),
-                    _pad: 0,
-                }
-            };
-            self.mega_stores[0].new_shape = &raw const self.proto_epoch as u64;
-            // Two ways: the entry's own, and its neighbour's (`mega_pair`),
-            // which the entry there moves to (as JSC's megamorphic cache
-            // moves its primary entry to its secondary table).
-            let k = mega_index(old as u64, name.0);
-            let here = self.mega_stores[k];
-            if here.shape != 0 && (here.shape, here.name) != (e.shape, e.name) {
-                self.mega_stores[mega_pair(k)] = here;
+            MegaStore {
+                shape: old as u64,
+                name: name.0,
+                ft: old.live().field_type(slot).encode(),
+                loc: old.live().location(slot),
+                ..MegaStore::EMPTY
             }
-            self.mega_stores[k] = e;
+        } else {
+            if old.live().unique || new.live().unique || new.live().parent != old {
+                return;
+            }
+            let Some(slot) = new.live().lookup(name) else { return };
+            MegaStore {
+                shape: old as u64,
+                name: name.0,
+                epoch: self.proto_epoch,
+                ft: new.live().field_type(slot).encode(),
+                new_shape: new as u64,
+                loc: new.live().location(slot),
+                _pad: 0,
+            }
+        };
+        self.mega_stores[0].new_shape = &raw const self.proto_epoch as u64;
+        // Two ways: the entry's own, and its neighbour's (`mega_pair`),
+        // which the entry there moves to (as JSC's megamorphic cache
+        // moves its primary entry to its secondary table).
+        let k = mega_index(old as u64, name.0);
+        let here = self.mega_stores[k];
+        if here.shape != 0 && (here.shape, here.name) != (e.shape, e.name) {
+            self.mega_stores[mega_pair(k)] = here;
         }
+        self.mega_stores[k] = e;
     }
 
     /// The address of [`MegaEntry`] table `Vm::megas`'s entry 1, as
@@ -3360,15 +3358,15 @@ impl Vm {
             return;
         }
         let o = as_object(o);
-        if unsafe { (*o).class == Class::TypedArray || (*(*o).shape).dictionary } {
+        if o.class() == Class::TypedArray || o.shape().live().dictionary {
             return;
         }
         let Some((h, slot)) = self.lookup(o, name) else { return };
         if self.is_accessor(h, slot) || name == self.a_name && self.virtual_before(o, h, name).is_some() {
             return;
         }
-        let shape = unsafe { (*o).shape } as u64;
-        let loc = unsafe { (*(*h).shape).location(slot) };
+        let shape = o.shape() as u64;
+        let loc = h.shape().live().location(slot);
         let (off, addr) = if h == o {
             (if loc >= 0 { loc } else { !(!loc * 8) }, 0)
         } else {
@@ -3383,7 +3381,7 @@ impl Vm {
     fn lookup_uncached(&self, o: *mut Object, name: Atom) -> Option<(*mut Object, u32)> {
         let mut o = o;
         loop {
-            let s = unsafe { &*(*o).shape };
+            let s = o.shape().live();
             if let Some(slot) = s.lookup(name) {
                 return Some((o, slot));
             }
@@ -3486,7 +3484,7 @@ impl Vm {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
         unsafe {
-            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
+            if name == self.a_length && matches!(o.class(), Class::Array | Class::String) {
                 return Ok(Value::number(self.length_field(o) as f64));
             }
             if name == self.a_length || name == self.a_name {
@@ -3497,10 +3495,10 @@ impl Vm {
             }
             Ok(match self.lookup(o, name) {
                 Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = *Object::slot(h, (*(*h).shape).location(slot));
+                    let pair = *Object::slot(h, h.shape().live().location(slot));
                     return self.call_getter(pair, obj);
                 }
-                Some((h, slot)) => *Object::slot(h, (*(*h).shape).location(slot)),
+                Some((h, slot)) => *Object::slot(h, h.shape().live().location(slot)),
                 None => return Ok(self.virtual_get(o, name)),
             })
         }
@@ -3513,7 +3511,7 @@ impl Vm {
     #[inline(never)]
     fn get_slotless(&mut self, o: *mut Object, obj: Value, name: Atom) -> Result<Value> {
         unsafe {
-            if name == self.a_length && (*o).class == Class::TypedArray && self.known_typed_length(o).is_some() {
+            if name == self.a_length && o.class() == Class::TypedArray && self.known_typed_length(o).is_some() {
                 return Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64));
             }
             let found = self.lookup(o, name);
@@ -3524,10 +3522,10 @@ impl Vm {
             }
             match found {
                 Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = *Object::slot(h, (*(*h).shape).location(slot));
+                    let pair = *Object::slot(h, h.shape().live().location(slot));
                     self.call_getter(pair, obj)
                 }
-                Some((h, slot)) => Ok(*Object::slot(h, (*(*h).shape).location(slot))),
+                Some((h, slot)) => Ok(*Object::slot(h, h.shape().live().location(slot))),
                 None => Ok(self.virtual_get(o, name)),
             }
         }
@@ -3539,7 +3537,7 @@ impl Vm {
     /// Whether `name` is a canonical numeric string and `o` a typed array
     /// (see `typed::canonical_numeric`).
     pub(crate) fn typed_numeric(&self, o: *mut Object, name: Atom) -> bool {
-        (unsafe { (*o).class == Class::TypedArray }) && crate::typed::canonical_numeric(self.atom_name(name))
+        (o.class() == Class::TypedArray) && crate::typed::canonical_numeric(self.atom_name(name))
     }
 
     /// An array's, a string's or a typed array's `length` (a typed array's
@@ -3547,12 +3545,10 @@ impl Vm {
     /// its store's: see `far`; a growable shared buffer's view's read from
     /// its block, as the getter would: see `typed::ta_length_seq_cst`).
     pub(crate) fn length_field(&mut self, o: *mut Object) -> u32 {
-        unsafe {
-            if (*o).class == Class::TypedArray {
-                return crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32;
-            }
-            crate::far::array_length(o)
+        if o.class() == Class::TypedArray {
+            return crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32;
         }
+        crate::far::array_length(o)
     }
 
     /// A slotless `length` or `name` (as `virtual_get` reads it) of `o`
@@ -3574,7 +3570,7 @@ impl Vm {
             if let Some(v) = self.virtual_own(p, name) {
                 return Some(v);
             }
-            let proto = unsafe { (*(*p).shape).proto };
+            let proto = p.shape().live().proto;
             if !proto.is_cell() {
                 return None;
             }
@@ -3587,7 +3583,7 @@ impl Vm {
     /// reaches, if [`Vm::typed_lengths`] knows its shape does.
     #[inline(always)]
     pub(crate) fn known_typed_length(&self, o: *mut Object) -> Option<*mut Object> {
-        let s = unsafe { (*o).shape };
+        let s = o.shape();
         let e = self.typed_lengths[typed_length_index(s)];
         (e.shape == s && e.epoch == self.proto_epoch && !s.is_null()).then_some(e.holder)
     }
@@ -3599,12 +3595,12 @@ impl Vm {
     #[inline(never)]
     fn note_typed_length(&mut self, o: *mut Object, holder: *mut Object, at: *mut Value) {
         unsafe {
-            if (*(*o).shape).dictionary {
+            if o.shape().live().dictionary {
                 return;
             }
             let mut p = o;
             while p != holder {
-                let proto = (*(*p).shape).proto;
+                let proto = p.shape().live().proto;
                 if !proto.is_cell() {
                     return;
                 }
@@ -3613,12 +3609,12 @@ impl Vm {
             }
             // (Made prototypes may have new shapes: the slot again.)
             let Some((h, slot)) = self.lookup(o, self.a_length) else { return };
-            let at2 = Object::slot(h, (*(*h).shape).location(slot));
+            let at2 = Object::slot(h, h.shape().live().location(slot));
             if h != holder || at2 != at {
                 return;
             }
             self.relied_slots.insert(at as usize);
-            let s = (*o).shape;
+            let s = o.shape();
             self.typed_lengths[typed_length_index(s)] = TypedLength { shape: s, holder, epoch: self.proto_epoch };
         }
     }
@@ -3633,19 +3629,17 @@ impl Vm {
 
     /// `o`'s own slotless `length` or `name` (see `virtual_get`).
     pub(crate) fn virtual_own(&mut self, o: *mut Object, name: Atom) -> Option<Value> {
-        unsafe {
-            let class = (*o).class;
-            if name == self.a_length && matches!(class, Class::Array | Class::String) {
-                return Some(Value::number(self.length_field(o) as f64));
-            }
-            if (name == self.a_length || name == self.a_name)
-                && matches!(class, Class::Function | Class::Native | Class::Wrapper)
-                && let Some(d) = self.own_property(o, Key::Name(name))
-            {
-                return Some(d.value.unwrap_or(Value::UNDEFINED));
-            }
-            None
+        let class = o.class();
+        if name == self.a_length && matches!(class, Class::Array | Class::String) {
+            return Some(Value::number(self.length_field(o) as f64));
         }
+        if (name == self.a_length || name == self.a_name)
+            && matches!(class, Class::Function | Class::Native | Class::Wrapper)
+            && let Some(d) = self.own_property(o, Key::Name(name))
+        {
+            return Some(d.value.unwrap_or(Value::UNDEFINED));
+        }
+        None
     }
 
     #[cold]
@@ -3655,22 +3649,20 @@ impl Vm {
         }
         let mut p = o;
         loop {
-            unsafe {
-                let class = (*p).class;
-                if name == self.a_length && matches!(class, Class::Array | Class::String) {
-                    return Value::number(self.length_field(p) as f64);
-                }
-                if matches!(class, Class::Function | Class::Native | Class::Wrapper)
-                    && let Some(d) = self.own_property(p, Key::Name(name))
-                {
-                    return d.value.unwrap_or(Value::UNDEFINED);
-                }
-                let proto = (*(*p).shape).proto;
-                if !proto.is_cell() {
-                    return Value::UNDEFINED;
-                }
-                p = as_object(proto);
+            let class = p.class();
+            if name == self.a_length && matches!(class, Class::Array | Class::String) {
+                return Value::number(self.length_field(p) as f64);
             }
+            if matches!(class, Class::Function | Class::Native | Class::Wrapper)
+                && let Some(d) = self.own_property(p, Key::Name(name))
+            {
+                return d.value.unwrap_or(Value::UNDEFINED);
+            }
+            let proto = p.shape().live().proto;
+            if !proto.is_cell() {
+                return Value::UNDEFINED;
+            }
+            p = as_object(proto);
         }
     }
 
@@ -3683,22 +3675,20 @@ impl Vm {
         }
         let mut p = o;
         loop {
-            unsafe {
-                let class = (*p).class;
-                if name == self.a_length && matches!(class, Class::Array | Class::String) {
-                    return true;
-                }
-                if matches!(class, Class::Function | Class::Native | Class::Wrapper)
-                    && self.own_property(p, Key::Name(name)).is_some()
-                {
-                    return true;
-                }
-                let proto = (*(*p).shape).proto;
-                if !proto.is_cell() {
-                    return false;
-                }
-                p = as_object(proto);
+            let class = p.class();
+            if name == self.a_length && matches!(class, Class::Array | Class::String) {
+                return true;
             }
+            if matches!(class, Class::Function | Class::Native | Class::Wrapper)
+                && self.own_property(p, Key::Name(name)).is_some()
+            {
+                return true;
+            }
+            let proto = p.shape().live().proto;
+            if !proto.is_cell() {
+                return false;
+            }
+            p = as_object(proto);
         }
     }
 
@@ -3747,20 +3737,20 @@ impl Vm {
     }
 
     pub(crate) fn is_accessor(&self, h: *mut Object, slot: u32) -> bool {
-        unsafe { (&(*(*h).shape).attrs())[slot as usize] & ACCESSOR != 0 }
+        unsafe { (&(*h.shape()).attrs())[slot as usize] & ACCESSOR != 0 }
     }
 
     /// The accessor property `name` of `o` or its prototypes, if that is
     /// what `o.name` finds: its getter-setter pair.
     fn accessor(&self, o: *mut Object, name: Atom) -> Option<Value> {
         let (h, slot) = self.lookup(o, name)?;
-        self.is_accessor(h, slot).then(|| unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })
+        self.is_accessor(h, slot).then(|| unsafe { *Object::slot(h, h.shape().live().location(slot)) })
     }
 
     /// `this.name` through an accessor `pair`'s getter (`undefined`
     /// without one).
     fn call_getter(&mut self, pair: Value, this: Value) -> Result<Value> {
-        let g = unsafe { *(*as_object(pair)).elems };
+        let g = unsafe { *as_object(pair).elems() };
         if g.is_undefined() {
             return Ok(Value::UNDEFINED);
         }
@@ -3771,7 +3761,7 @@ impl Vm {
     /// `this.name = value` through an accessor `pair`'s setter (nothing
     /// without one: sloppy mode).
     fn call_setter(&mut self, pair: Value, this: Value, value: Value) -> Result<()> {
-        let s = unsafe { *(*as_object(pair)).elems.add(1) };
+        let s = unsafe { *as_object(pair).elems().add(1) };
         if s.is_undefined() {
             self.store_failed = true;
             return Ok(());
@@ -3805,12 +3795,12 @@ impl Vm {
         attrs: u8,
     ) {
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let old = s.lookup(name).filter(|&k| s.attrs()[k as usize] & ACCESSOR != 0);
             let (mut g, mut st) = (Value::UNDEFINED, Value::UNDEFINED);
             if let Some(k) = old {
                 let pair = as_object(*Object::slot(o, s.location(k)));
-                (g, st) = (*(*pair).elems, *(*pair).elems.add(1));
+                (g, st) = (pair.elem(0), pair.elem(1));
             }
             let pair = self.new_array();
             crate::vm::array_push(self, pair, &[get.unwrap_or(g), set.unwrap_or(st)]).expect("an array");
@@ -3822,13 +3812,13 @@ impl Vm {
     /// is another realm's, the current realm's (whose properties a
     /// primitive has).
     fn realm_proto(&self, o: *mut Object) -> Option<*mut Object> {
-        let p = match unsafe { (*o).class } {
+        let p = match o.class() {
             Class::String => self.string_prototype,
             Class::Symbol => self.symbol_roots[crate::symbol::Root::SymbolPrototype as usize],
             Class::BigInt => self.bigint_prototype,
             _ => return None,
         };
-        (unsafe { (*(*o).shape).proto } != object_value(p)).then_some(p)
+        (o.shape().live().proto != object_value(p)).then_some(p)
     }
 
     /// `p.[[Get]](name, receiver)`.
@@ -3845,10 +3835,10 @@ impl Vm {
         match found {
             // (A getter's `this` the primitive.)
             Some((h, slot)) if self.is_accessor(h, slot) => {
-                let pair = unsafe { *Object::slot(h, (*(*h).shape).location(slot)) };
+                let pair = unsafe { *Object::slot(h, h.shape().live().location(slot)) };
                 self.call_getter(pair, receiver)
             }
-            Some((h, slot)) => Ok(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) }),
+            Some((h, slot)) => Ok(unsafe { *Object::slot(h, h.shape().live().location(slot)) }),
             None => Ok(self.virtual_get(p, name)),
         }
     }
@@ -3888,10 +3878,10 @@ impl Vm {
             return match self.lookup(o, name) {
                 // (A getter's `this` the primitive.)
                 Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = unsafe { *Object::slot(h, (*(*h).shape).location(slot)) };
+                    let pair = unsafe { *Object::slot(h, h.shape().live().location(slot)) };
                     self.call_getter(pair, obj)
                 }
-                Some((h, slot)) => Ok(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) }),
+                Some((h, slot)) => Ok(unsafe { *Object::slot(h, h.shape().live().location(slot)) }),
                 None => Ok(Value::UNDEFINED),
             };
         }
@@ -3921,38 +3911,36 @@ impl Vm {
             }
             return Ok(());
         }
-        unsafe {
-            if (*o).class == Class::Array && name == self.a_length {
-                return self.set_array_length(o, value);
-            }
-            // A string is a primitive: stores to it do nothing, but call
-            // setters.
-            if (*o).class == Class::String {
-                return self.set_string(obj, o, name, value);
-            }
-            // (A typed array's numeric property that is no index: the
-            // value converted, then nothing.)
-            if self.typed_numeric(o, name) {
-                let kind = crate::object::TypedKind::from_u8((*o).kind);
-                crate::typed::to_element(self, kind, value)?;
-                return Ok(());
-            }
-            if self.read_only(o, name) {
-                self.store_failed = true;
-                return Ok(());
-            }
-            if let Some(pair) = self.accessor(o, name) {
-                return self.call_setter(pair, obj, value);
-            }
-            match (*(*o).shape).lookup(name) {
-                Some(slot) => self.store_field(o, slot, value),
-                None => {
-                    if (*o).flags & crate::object::NOT_EXTENSIBLE != 0 {
-                        self.store_failed = true;
-                        return Ok(());
-                    }
-                    self.add_property_keyed(o, name, value);
+        if o.class() == Class::Array && name == self.a_length {
+            return self.set_array_length(o, value);
+        }
+        // A string is a primitive: stores to it do nothing, but call
+        // setters.
+        if o.class() == Class::String {
+            return self.set_string(obj, o, name, value);
+        }
+        // (A typed array's numeric property that is no index: the
+        // value converted, then nothing.)
+        if self.typed_numeric(o, name) {
+            let kind = crate::object::TypedKind::from_u8(o.kind());
+            crate::typed::to_element(self, kind, value)?;
+            return Ok(());
+        }
+        if self.read_only(o, name) {
+            self.store_failed = true;
+            return Ok(());
+        }
+        if let Some(pair) = self.accessor(o, name) {
+            return self.call_setter(pair, obj, value);
+        }
+        match o.shape().live().lookup(name) {
+            Some(slot) => self.store_field(o, slot, value),
+            None => {
+                if o.flags() & crate::object::NOT_EXTENSIBLE != 0 {
+                    self.store_failed = true;
+                    return Ok(());
                 }
+                self.add_property_keyed(o, name, value);
             }
         }
         Ok(())
@@ -4004,7 +3992,7 @@ impl Vm {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
         unsafe {
-            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
+            if name == self.a_length && matches!(o.class(), Class::Array | Class::String) {
                 // Recorded for the JIT (`jit::Prop::Length`); no shape, so
                 // the interpreter's hit path never takes it.
                 *ic = Ic { loc: LENGTH_LOC, ..Ic::EMPTY };
@@ -4023,12 +4011,12 @@ impl Vm {
                 // cached.)
                 if name == self.a_length || name == self.a_name {
                     let v = self.virtual_get(o, name);
-                    if !v.is_undefined() || matches!((*o).class, Class::Function | Class::Native | Class::Wrapper) {
+                    if !v.is_undefined() || matches!(o.class(), Class::Function | Class::Native | Class::Wrapper) {
                         return Ok(v);
                     }
                 }
                 let e = Ic {
-                    shape: (*o).shape,
+                    shape: o.shape(),
                     holder: self.missing_holder,
                     new_shape: std::ptr::null(),
                     loc: crate::object::HEADER_BYTES as i32,
@@ -4039,18 +4027,18 @@ impl Vm {
                 }
                 return Ok(Value::UNDEFINED);
             };
-            let loc = (*(*h).shape).location(slot);
+            let loc = h.shape().live().location(slot);
             // A getter's: called, never cached (noted for the JIT).
             if self.is_accessor(h, slot) {
                 if h != o {
                     self.heap.note(object_value(h));
-                    note_accessor(ic, (*o).shape, h, self.proto_epoch);
+                    note_accessor(ic, o.shape(), h, self.proto_epoch);
                 }
                 return self.call_getter(*Object::slot(h, loc), obj);
             }
             self.heap.note(object_value(h));
             let e = Ic {
-                shape: (*o).shape,
+                shape: o.shape(),
                 holder: if h == o { std::ptr::null_mut() } else { h },
                 new_shape: std::ptr::null(),
                 loc,
@@ -4060,8 +4048,8 @@ impl Vm {
                 self.megamorphic.insert(ic as usize);
                 // (An own data property: in the interpreter's megamorphic
                 // cache, for the next receivers of this shape.)
-                if h == o && !(*(*o).shape).dictionary {
-                    let sh = (*o).shape;
+                if h == o && !o.shape().live().dictionary {
+                    let sh = o.shape();
                     self.interp_megas[interp_mega_index(sh, name.0)] = InterpMega { shape: sh, name: name.0, loc };
                 }
             }
@@ -4078,7 +4066,7 @@ impl Vm {
     #[inline(never)]
     fn named_miss_slotless(&mut self, ic: *mut Ic, o: *mut Object, name: Atom) -> Option<Result<Value>> {
         unsafe {
-            let typed = name == self.a_length && (*o).class == Class::TypedArray;
+            let typed = name == self.a_length && o.class() == Class::TypedArray;
             if typed && let Some(h) = self.known_typed_length(o) {
                 // (Not over a site's arrays' `length`: the interpreter's
                 // and the JIT's `get_length` take both.)
@@ -4086,11 +4074,11 @@ impl Vm {
                 if w.loc != LENGTH_LOC
                     && !(w.loc == ACCESSOR_LOC
                         && w.holder == h
-                        && w.new_shape == (*o).shape
+                        && w.new_shape == o.shape()
                         && w.epoch == self.proto_epoch)
                 {
                     self.heap.note(object_value(h));
-                    note_accessor(ic, (*o).shape, h, self.proto_epoch);
+                    note_accessor(ic, o.shape(), h, self.proto_epoch);
                 }
                 return Some(Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64)));
             }
@@ -4099,10 +4087,10 @@ impl Vm {
                 return Some(Ok(v));
             }
             if typed && h != o && self.is_accessor(h, slot) {
-                let at = Object::slot(h, (*(*h).shape).location(slot));
+                let at = Object::slot(h, h.shape().live().location(slot));
                 if crate::typed::is_length_getter(*(*as_object(*at)).elems) {
                     self.heap.note(object_value(h));
-                    note_accessor(ic, (*o).shape, h, self.proto_epoch);
+                    note_accessor(ic, o.shape(), h, self.proto_epoch);
                     self.note_typed_length(o, h, at);
                     return Some(Ok(Value::number(crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as f64)));
                 }
@@ -4150,14 +4138,14 @@ impl Vm {
             return Ok(());
         }
         unsafe {
-            let old = (*o).shape;
-            if (*o).class == Class::Array && name == self.a_length {
+            let old = o.shape();
+            if o.class() == Class::Array && name == self.a_length {
                 return self.set_array_length(o, value);
             }
             // A store to a read-only property, own or inherited, does
             // nothing (and isn't cached, so it stays slow); strict code's
             // throws (see `store_failed`).
-            if (*o).class == Class::String {
+            if o.class() == Class::String {
                 return self.set_string(obj, o, name, value);
             }
             // An object literal's property past a prototype's setter or
@@ -4181,20 +4169,20 @@ impl Vm {
                     self.heap.note(object_value(h));
                     note_accessor(ic, old, h, self.proto_epoch);
                 }
-                return self.call_setter(*Object::slot(h, (*(*h).shape).location(slot)), obj, value);
+                return self.call_setter(*Object::slot(h, h.shape().live().location(slot)), obj, value);
             }
-            if let Some(slot) = (*old).lookup(name) {
+            if let Some(slot) = old.live().lookup(name) {
                 self.store_field(o, slot, value);
                 // Stores to a prototype stay on this path, which bumps the
                 // epoch (see `store_field`), as do those to a constant field
                 // of a function's.
-                if (*o).flags & PROTOTYPE != 0 || !self.may_cache_store(o, slot) {
+                if o.flags() & PROTOTYPE != 0 || !self.may_cache_store(o, slot) {
                     return Ok(());
                 }
                 let e = Ic {
                     shape: old,
-                    holder: (*old).field_type(slot).encode() as *mut Object,
-                    loc: (*old).location(slot),
+                    holder: old.live().field_type(slot).encode() as *mut Object,
+                    loc: old.live().location(slot),
                     ..Ic::EMPTY
                 };
                 if install(ic, e) {
@@ -4202,22 +4190,22 @@ impl Vm {
                 }
                 return Ok(());
             }
-            if (*o).flags & crate::object::NOT_EXTENSIBLE != 0 {
+            if o.flags() & crate::object::NOT_EXTENSIBLE != 0 {
                 self.store_failed = true;
                 return Ok(());
             }
             let slot = self.add_property(o, name, value);
-            let new = (*o).shape;
+            let new = o.shape();
             // (Out of line too: the fast paths check there is room, see
             // `interp::has_room`. Without, an initializer adding properties
             // past the constructor's slots (Box2D's `b2Contact.Reset`) missed
             // at every store, and compiled code left at each.)
-            if !(*old).unique {
+            if !old.live().unique {
                 let e = Ic {
                     shape: old,
-                    holder: (*new).field_type(slot).encode() as *mut Object,
+                    holder: new.live().field_type(slot).encode() as *mut Object,
                     new_shape: new,
-                    loc: (*new).location(slot),
+                    loc: new.live().location(slot),
                     epoch: self.proto_epoch,
                 };
                 if install(ic, e) {
@@ -4235,7 +4223,7 @@ impl Vm {
             return self.virtual_read_only(o, name, std::ptr::null_mut());
         };
         // (A slot-less one nearer than the slot shadows it.)
-        unsafe { self.virtual_read_only(o, name, h) || (&(*(*h).shape).attrs())[slot as usize] & READ_ONLY != 0 }
+        unsafe { self.virtual_read_only(o, name, h) || (&(*h.shape()).attrs())[slot as usize] & READ_ONLY != 0 }
     }
 
     /// Whether `o` or a prototype of it before `until` has `name` with no
@@ -4245,29 +4233,27 @@ impl Vm {
         if name != self.a_length && name != self.a_name {
             return false;
         }
-        unsafe {
-            while o != until {
-                // (Not one a slot of its own redefined.)
-                let own = (*(*o).shape).lookup(name).is_none()
-                    && match (*o).class {
-                        Class::Function | Class::Native => {
-                            name == self.a_length && (*o).flags & crate::object::FN_LENGTH_DELETED == 0
-                                || name == self.a_name && (*o).flags & crate::object::FN_NAME_DELETED == 0
-                        }
-                        Class::Wrapper => {
-                            name == self.a_length && wrapped(object_value(o)).and_then(string_units).is_some()
-                        }
-                        _ => false,
-                    };
-                if own {
-                    return true;
-                }
-                let proto = (*(*o).shape).proto;
-                if !proto.is_cell() {
-                    return false;
-                }
-                o = as_object(proto);
+        while o != until {
+            // (Not one a slot of its own redefined.)
+            let own = o.shape().live().lookup(name).is_none()
+                && match o.class() {
+                    Class::Function | Class::Native => {
+                        name == self.a_length && o.flags() & crate::object::FN_LENGTH_DELETED == 0
+                            || name == self.a_name && o.flags() & crate::object::FN_NAME_DELETED == 0
+                    }
+                    Class::Wrapper => {
+                        name == self.a_length && wrapped(object_value(o)).and_then(string_units).is_some()
+                    }
+                    _ => false,
+                };
+            if own {
+                return true;
             }
+            let proto = o.shape().live().proto;
+            if !proto.is_cell() {
+                return false;
+            }
+            o = as_object(proto);
         }
         false
     }
@@ -4278,7 +4264,7 @@ impl Vm {
     /// its own (no shared transition leads to it).
     pub(crate) fn define_property(&mut self, o: *mut Object, name: Atom, value: Option<Value>, attrs: u8) {
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let Some(slot) = s.lookup(name) else {
                 self.add_property_with(o, name, value.unwrap_or(Value::UNDEFINED), attrs);
                 return;
@@ -4316,7 +4302,7 @@ impl Vm {
                 };
                 crate::object::set_shape(o, self.add_shape(u));
                 self.bump_code_epoch();
-                if (*o).flags & PROTOTYPE != 0 {
+                if o.flags() & PROTOTYPE != 0 {
                     self.proto_epoch = self.proto_epoch.wrapping_add(1);
                 }
             }
@@ -4329,7 +4315,7 @@ impl Vm {
     /// The slot of the global scope's block-scoped binding `name` in
     /// `global_lexicals`, if a script declared one.
     pub(crate) fn global_lexical_slot(&self, name: Atom) -> Option<u32> {
-        unsafe { (*(*self.global_lexicals).shape).lookup(name) }
+        self.global_lexicals.shape().live().lookup(name)
     }
 
     /// A global name's load (GetBindingValue) finding the global scope's
@@ -4343,8 +4329,8 @@ impl Vm {
         let slot = self.global_lexical_slot(name)?;
         let l = self.global_lexicals;
         unsafe {
-            let shape = (*l).shape;
-            let loc = (*shape).location(slot);
+            let shape = l.shape();
+            let loc = shape.live().location(slot);
             let v = *Object::slot(l, loc);
             if v == Value::HOLE {
                 return Some(Err(Error::reference_error(format!(
@@ -4366,14 +4352,14 @@ impl Vm {
         let slot = self.global_lexical_slot(name)?;
         let l = self.global_lexicals;
         unsafe {
-            let shape = (*l).shape;
-            if *Object::slot(l, (*shape).location(slot)) == Value::HOLE {
+            let shape = l.shape();
+            if *Object::slot(l, shape.live().location(slot)) == Value::HOLE {
                 return Some(Err(Error::reference_error(format!(
                     "Cannot access '{}' before initialization",
                     self.atom_name(name)
                 ))));
             }
-            if (*shape).attrs()[slot as usize] & READ_ONLY != 0 {
+            if shape.live().attrs()[slot as usize] & READ_ONLY != 0 {
                 let n = self.atom_name(name);
                 return Some(Err(Error::type_error(format!("Assignment to constant variable '{n}'."))));
             }
@@ -4381,8 +4367,8 @@ impl Vm {
             if self.may_cache_store(l, slot) {
                 *ic = Ic {
                     shape,
-                    holder: (*shape).field_type(slot).encode() as *mut Object,
-                    loc: (*shape).location(slot),
+                    holder: shape.live().field_type(slot).encode() as *mut Object,
+                    loc: shape.live().location(slot),
                     ..Ic::EMPTY
                 };
             }
@@ -4397,7 +4383,7 @@ impl Vm {
         let l = self.global_lexicals;
         let slot = self.global_lexical_slot(name).expect("declared by its script");
         unsafe {
-            crate::layout::store_word(Object::slot(l, (*(*l).shape).location(slot)), Value::UNDEFINED);
+            crate::layout::store_word(Object::slot(l, l.shape().live().location(slot)), Value::UNDEFINED);
         }
         self.store_field(l, slot, value);
     }
@@ -4512,7 +4498,7 @@ impl Vm {
         // Not the global's own, past a proxy on its prototype chain: the
         // proxy's `has` says if it exists, the store is [[Set]] on the global
         // (its `set` trap).
-        if unsafe { (*(*g).shape).lookup(name).is_none() } && crate::proxy::chain_has_proxy(self, g) {
+        if g.shape().live().lookup(name).is_none() && crate::proxy::chain_has_proxy(self, g) {
             if code.strict && !self.has_global(name)? {
                 return Err(Error::reference_error(format!("{} is not defined", self.atom_name(name))));
             }
@@ -4528,10 +4514,10 @@ impl Vm {
             return Ok(());
         }
         unsafe {
-            let shape = (*g).shape;
-            match (*shape).lookup(name) {
+            let shape = g.shape();
+            match shape.live().lookup(name) {
                 Some(slot) if self.is_accessor(g, slot) => {
-                    let pair = *Object::slot(g, (*shape).location(slot));
+                    let pair = *Object::slot(g, shape.live().location(slot));
                     return self.call_setter(pair, object_value(g), value);
                 }
                 Some(slot) => {
@@ -4541,8 +4527,8 @@ impl Vm {
                     }
                     *ic = Ic {
                         shape,
-                        holder: (*shape).field_type(slot).encode() as *mut Object,
-                        loc: (*shape).location(slot),
+                        holder: shape.live().field_type(slot).encode() as *mut Object,
+                        loc: shape.live().location(slot),
                         ..Ic::EMPTY
                     };
                 }
@@ -4639,11 +4625,8 @@ impl Vm {
         }
         let mut o = as_object(v);
         loop {
-            let proto = if self.proxies_exist {
-                crate::proxy::get_prototype_of(self, o)?
-            } else {
-                unsafe { (*(*o).shape).proto }
-            };
+            let proto =
+                if self.proxies_exist { crate::proxy::get_prototype_of(self, o)? } else { o.shape().live().proto };
             if !proto.is_cell() {
                 return Ok(false);
             }
@@ -4664,13 +4647,11 @@ impl Vm {
     /// a hole (strings and typed arrays have none; buffers no elements).
     /// (A sparse object's far keys are named properties: [`Vm::sparse_get`].)
     pub(crate) fn has_element(o: *mut Object, i: u32) -> bool {
-        unsafe {
-            match (*o).class {
-                Class::String => i < (*o).elems_len,
-                Class::TypedArray => (i as usize) < crate::typed::ta_length(o).unwrap_or(0),
-                c if c.no_elements() => false,
-                _ => i < (*o).elems_len && *(*o).elems.add(i as usize) != Value::EMPTY,
-            }
+        match o.class() {
+            Class::String => i < o.elems_len(),
+            Class::TypedArray => (i as usize) < crate::typed::ta_length(o).unwrap_or(0),
+            c if c.no_elements() => false,
+            _ => i < o.elems_len() && o.elem(i as usize) != Value::EMPTY,
         }
     }
 
@@ -4680,10 +4661,10 @@ impl Vm {
     fn sparse_get(&mut self, o: *mut Object, i: u32, receiver: Value) -> Result<Option<Value>> {
         let a = self.intern_name(&i.to_string());
         unsafe {
-            let Some(slot) = (*(*o).shape).lookup(a) else {
+            let Some(slot) = o.shape().live().lookup(a) else {
                 return Ok(None);
             };
-            let v = *Object::slot(o, (*(*o).shape).location(slot));
+            let v = *Object::slot(o, o.shape().live().location(slot));
             if self.is_accessor(o, slot) {
                 return self.call_getter(v, receiver).map(Some);
             }
@@ -4694,13 +4675,13 @@ impl Vm {
     /// Whether `o` has key `i` of its own: an element, or a sparse one.
     pub(crate) fn has_own_index(&mut self, o: *mut Object, i: u32) -> bool {
         Self::has_element(o, i)
-            || unsafe { (*o).class == Class::Wrapper }
+            || (o.class() == Class::Wrapper)
                 && string_units(wrapped(object_value(o)).unwrap()).is_some_and(|u| (i as usize) < u.len())
             || crate::far::is_far(o) && crate::far::has(o, i)
-            || unsafe {
-                (*o).flags & crate::object::SPARSE != 0 && {
+            || {
+                o.flags() & crate::object::SPARSE != 0 && {
                     let a = self.intern_name(&i.to_string());
-                    (*(*o).shape).lookup(a).is_some()
+                    o.shape().live().lookup(a).is_some()
                 }
             }
     }
@@ -4729,20 +4710,18 @@ impl Vm {
             Key::Name(a) if self.typed_numeric(o, a) => Ok(false),
             Key::Name(a) => Ok(self.lookup(o, a).is_some() || self.virtual_has(o, a)),
             Key::Index(i) => loop {
-                unsafe {
-                    if (*o).class != Class::String && self.has_own_index(o, i) {
-                        return Ok(true);
-                    }
-                    // (A typed array's indices are its own, or none.)
-                    if (*o).class == Class::TypedArray {
-                        return Ok(false);
-                    }
-                    let proto = (*(*o).shape).proto;
-                    if !proto.is_cell() {
-                        return Ok(false);
-                    }
-                    o = as_object(proto);
+                if o.class() != Class::String && self.has_own_index(o, i) {
+                    return Ok(true);
                 }
+                // (A typed array's indices are its own, or none.)
+                if o.class() == Class::TypedArray {
+                    return Ok(false);
+                }
+                let proto = o.shape().live().proto;
+                if !proto.is_cell() {
+                    return Ok(false);
+                }
+                o = as_object(proto);
             },
         }
     }
@@ -4784,7 +4763,7 @@ impl Vm {
             return false;
         }
         let g = self.global;
-        if unsafe { (*(*g).shape).lookup(name).is_none() } && self.script_declared.contains(&name) {
+        if g.shape().live().lookup(name).is_none() && self.script_declared.contains(&name) {
             return false;
         }
         self.delete_named(g, name)
@@ -4792,9 +4771,9 @@ impl Vm {
 
     pub(crate) fn delete_named(&mut self, o: *mut Object, name: Atom) -> bool {
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let Some(slot) = s.lookup(name) else {
-                return !(name == self.a_length && matches!((*o).class, Class::Array | Class::String));
+                return !(name == self.a_length && matches!(o.class(), Class::Array | Class::String));
             };
             if s.attrs()[slot as usize] & DONT_DELETE != 0 {
                 return false;
@@ -4811,7 +4790,7 @@ impl Vm {
             if !s.dictionary && s.unique && self.may_be_dictionary(o) {
                 self.to_dictionary(o);
             }
-            if (*(*o).shape).dictionary {
+            if o.shape().live().dictionary {
                 self.dict_remove(o, slot);
                 return true;
             }
@@ -4874,12 +4853,12 @@ impl Vm {
             let new = self.add_shape(u);
             crate::object::set_shape(o, new);
             for (k, v) in values.into_iter().enumerate() {
-                let at = Object::slot(o, (*new).location(k as u32));
+                let at = Object::slot(o, new.live().location(k as u32));
                 // (Out of line, a `Num` field may still hold an int32.)
-                let v = as_field((*new).field_type(k as u32), v);
+                let v = as_field(new.live().field_type(k as u32), v);
                 crate::heap::store(o.cast(), at, v);
             }
-            if (*o).flags & PROTOTYPE != 0 {
+            if o.flags() & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
                 self.bump_code_epoch();
             }
@@ -4893,25 +4872,23 @@ impl Vm {
     /// no flags, and the parent the same but for that slot (its slot
     /// table a prefix of `s`'s, as a transition makes it).
     fn parent_without_last(&self, o: *mut Object, s: &Shape) -> Option<*const Shape> {
-        unsafe {
-            if s.unique || s.dictionary || s.fixed || (*o).flags & !crate::object::EXTERNAL != 0 || s.parent.is_null() {
-                return None;
-            }
-            let p = &*s.parent;
-            let n = s.keys().len();
-            (p.keys().len() + 1 == n
-                && !p.unique
-                && !p.dictionary
-                && !p.fixed
-                && p.class == s.class
-                && p.proto.to_bits() == s.proto.to_bits()
-                && p.elems == s.elems
-                && p.capacity.get() == s.capacity.get()
-                // (Most often the same table, not compared: a table of
-                // 200,000 keys emptied from its last took 17 s.)
-                && s.slots.starts_with(&p.slots))
-            .then_some(s.parent)
+        if s.unique || s.dictionary || s.fixed || o.flags() & !crate::object::EXTERNAL != 0 || s.parent.is_null() {
+            return None;
         }
+        let p = s.parent.live();
+        let n = s.keys().len();
+        (p.keys().len() + 1 == n
+            && !p.unique
+            && !p.dictionary
+            && !p.fixed
+            && p.class == s.class
+            && p.proto.to_bits() == s.proto.to_bits()
+            && p.elems == s.elems
+            && p.capacity.get() == s.capacity.get()
+            // (Most often the same table, not compared: a table of
+            // 200,000 keys emptied from its last took 17 s.)
+            && s.slots.starts_with(&p.slots))
+        .then_some(s.parent)
     }
 
     /// Whether `o` may go to dictionary mode: a plain object, not a
@@ -4920,12 +4897,10 @@ impl Vm {
     /// extensible, sealed, frozen, elements with attributes: rare, and
     /// their shapes are made by `props`).
     fn may_be_dictionary(&self, o: *mut Object) -> bool {
-        unsafe {
-            (*o).class == Class::Plain
-                && (*o).flags & !crate::object::EXTERNAL == 0
-                && o != self.global
-                && o != self.global_lexicals
-        }
+        o.class() == Class::Plain
+            && o.flags() & !crate::object::EXTERNAL == 0
+            && o != self.global
+            && o != self.global_lexicals
     }
 
     /// The field cell of dictionary shapes' slots.
@@ -4946,7 +4921,7 @@ impl Vm {
     /// it has: its values stay where they are.
     fn to_dictionary(&mut self, o: *mut Object) {
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             self.shape_left(s);
             for &cell in s.fields() {
                 self.field_made_mutable(&*cell);
@@ -4993,15 +4968,15 @@ impl Vm {
     /// kept past twice the properties).
     fn dict_remove(&mut self, o: *mut Object, k: u32) {
         unsafe {
-            let s = (*o).shape;
-            let n = (*s).keys().len() as u32;
+            let s = o.shape();
+            let n = s.live().keys().len() as u32;
             let slots = Shape::dictionary_slots(s);
             slots.bury(k, self.a_hole);
             for j in slots.len() as u32..n {
-                crate::layout::store_word(Object::slot(o, (*s).location(j)), Value::UNDEFINED);
+                crate::layout::store_word(Object::slot(o, s.live().location(j)), Value::UNDEFINED);
             }
             if slots.len() == n as usize {
-                crate::layout::store_word(Object::slot(o, (*s).location(k)), Value::UNDEFINED);
+                crate::layout::store_word(Object::slot(o, s.live().location(k)), Value::UNDEFINED);
             }
             if slots.holes() > DICTIONARY_HOLES && 2 * slots.holes() as usize > slots.len() {
                 self.dict_compact(o);
@@ -5014,18 +4989,18 @@ impl Vm {
     /// copied to another shape too, which has none buried.)
     fn dict_compact(&mut self, o: *mut Object) {
         unsafe {
-            let s = (*o).shape;
+            let s = o.shape();
             let slots = Shape::dictionary_slots(s);
             if slots.holes() == 0 {
                 return;
             }
             let n = slots.len() as u32;
             slots.compact(self.a_hole, |from, to| {
-                let v = *Object::slot(o, (*s).location(from));
-                crate::heap::store(o.cast(), Object::slot(o, (*s).location(to)), v);
+                let v = *Object::slot(o, s.live().location(from));
+                crate::heap::store(o.cast(), Object::slot(o, s.live().location(to)), v);
             });
             for j in slots.len() as u32..n {
-                crate::layout::store_word(Object::slot(o, (*s).location(j)), Value::UNDEFINED);
+                crate::layout::store_word(Object::slot(o, s.live().location(j)), Value::UNDEFINED);
             }
         }
     }
@@ -5036,11 +5011,11 @@ impl Vm {
     /// don't share a table that changes.
     pub(crate) fn leave_dictionary(&mut self, o: *mut Object) {
         unsafe {
-            if !(*(*o).shape).dictionary {
+            if !o.shape().live().dictionary {
                 return;
             }
             self.dict_compact(o);
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let fields: Vec<*const FieldCell> = (0..s.keys().len())
                 .map(|_| {
                     let c = self.new_field_cell();
@@ -5100,7 +5075,7 @@ impl Vm {
         // A string's atom, once found, is kept in it (`Object::string_atom`,
         // a flat string's): a key looked up again isn't converted and hashed
         // again (PdfJS's `map[command]`).
-        let flat = |key: Value| string_len(key).is_some() && unsafe { !(*as_object(key)).elems.is_null() };
+        let flat = |key: Value| string_len(key).is_some() && (!as_object(key).elems().is_null());
         if flat(key) {
             let cached = unsafe { Object::string_atom(as_object(key)) };
             if cached != 0 {
@@ -5222,11 +5197,11 @@ impl Vm {
                 // A typed array's elements are all there is at an index (no
                 // holes, nothing inherited), on the receiver or on its chain;
                 // a buffer has none. Their `elems` are bytes.
-                match (*o).class {
+                match o.class() {
                     Class::TypedArray => {
                         return Ok(if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
-                            let kind = crate::object::TypedKind::from_u8((*o).kind);
-                            kind.load((*o).elems.cast(), i as usize)
+                            let kind = crate::object::TypedKind::from_u8(o.kind());
+                            kind.load(o.elems().cast(), i as usize)
                         } else {
                             Value::UNDEFINED
                         });
@@ -5234,8 +5209,8 @@ impl Vm {
                     c if c.no_elements() => return Ok(Value::UNDEFINED),
                     _ => {}
                 }
-                if i < (*o).elems_len && (*o).class != Class::String {
-                    let v = *(*o).elems.add(i as usize);
+                if i < o.elems_len() && o.class() != Class::String {
+                    let v = o.elem(i as usize);
                     if v != Value::EMPTY {
                         return Ok(v);
                     }
@@ -5245,12 +5220,12 @@ impl Vm {
                 {
                     return Ok(v);
                 }
-                if (*o).flags & crate::object::SPARSE != 0
+                if o.flags() & crate::object::SPARSE != 0
                     && let Some(v) = self.sparse_get(o, i, obj)?
                 {
                     return Ok(v);
                 }
-                let proto = (*(*o).shape).proto;
+                let proto = o.shape().live().proto;
                 if !proto.is_cell() {
                     return Ok(Value::UNDEFINED);
                 }
@@ -5281,17 +5256,15 @@ impl Vm {
             return None;
         }
         let o = as_object(obj);
-        unsafe {
-            // (A function's too: its constant fields, which stores
-            // don't cache, come here once given up. Box2D's never set
-            // `b2Distance.b2_gjkCalls`, `++`ed: `NaN`, stored at every
-            // call, kept it constant, and each call exited there.)
-            if !matches!((*o).class, Class::Plain | Class::Array | Class::Function)
-                || (*o).flags & crate::object::PROTOTYPE != 0
-                || o == self.global
-            {
-                return None;
-            }
+        // (A function's too: its constant fields, which stores
+        // don't cache, come here once given up. Box2D's never set
+        // `b2Distance.b2_gjkCalls`, `++`ed: `NaN`, stored at every
+        // call, kept it constant, and each call exited there.)
+        if !matches!(o.class(), Class::Plain | Class::Array | Class::Function)
+            || o.flags() & crate::object::PROTOTYPE != 0
+            || o == self.global
+        {
+            return None;
         }
         if self.accessor(o, name).is_some() {
             return None;
@@ -5315,7 +5288,7 @@ impl Vm {
             return None;
         };
         if let Some(pair) = self.accessor(holder, name) {
-            let g = unsafe { *(*as_object(pair)).elems };
+            let g = unsafe { *as_object(pair).elems() };
             if g.is_cell() && Obj::of(g).class() != Class::Native {
                 return None;
             }
@@ -5359,7 +5332,7 @@ impl Vm {
         unsafe {
             // A string's characters can't be changed; a typed array stores
             // within its length only (a buffer has no elements).
-            match (*o).class {
+            match o.class() {
                 Class::String => {
                     self.store_failed = true;
                     return Ok(());
@@ -5373,10 +5346,10 @@ impl Vm {
                     }
                     // (Converted first: the conversion may detach or
                     // shrink its buffer.)
-                    let kind = crate::object::TypedKind::from_u8((*o).kind);
+                    let kind = crate::object::TypedKind::from_u8(o.kind());
                     let v = crate::typed::to_element(self, kind, value)?;
                     if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
-                        kind.store_value((*o).elems.cast(), i as usize, v);
+                        kind.store_value(o.elems().cast(), i as usize, v);
                     }
                     return Ok(());
                 }
@@ -5394,28 +5367,28 @@ impl Vm {
             }
             // Far past the elements of an object that isn't an array (a
             // map keyed by numbers): a named property, not as many holes.
-            if (*o).class != Class::Array && self.sparse_key(o, i) {
-                (*o).flags |= crate::object::SPARSE;
+            if o.class() != Class::Array && self.sparse_key(o, i) {
+                o.set_flags(o.flags() | crate::object::SPARSE);
                 let a = self.intern_name(&i.to_string());
                 return self.set(obj, a, value);
             }
             // Past an array's dense elements: far if it is, or if the
             // store would leave it too sparse (see `far::Density`).
-            if (*o).class == Class::Array
-                && i >= (*o).elems_len
+            if o.class() == Class::Array
+                && i >= o.elems_len()
                 && (crate::far::is_far(o) || crate::far::goes_far(self, o, i as usize + 1, 1))
             {
                 return self.set_far(obj, o, i, value);
             }
-            if (*o).flags & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
+            if o.flags() & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
                 return self.set_keyed_flagged(obj, o, i, value);
             }
-            if i >= (*o).elems_len {
+            if i >= o.elems_len() {
                 self.reserve_elems(o, i as usize + 1);
-                for j in (*o).elems_len..i {
-                    crate::layout::store_word((*o).elems.add(j as usize), Value::EMPTY);
+                for j in o.elems_len()..i {
+                    o.set_elem(j as usize, Value::EMPTY);
                 }
-                (*o).elems_len = i + 1;
+                o.set_elems_len(i + 1);
             }
             self.store_element(o, i as usize, value);
         }
@@ -5432,7 +5405,7 @@ impl Vm {
         if self.own_property(o, Key::Index(i)).is_some() {
             return Ok(false);
         }
-        let mut p = unsafe { (*(*o).shape).proto };
+        let mut p = o.shape().live().proto;
         while p.is_cell() {
             let po = as_object(p);
             if let Some(d) = self.own_property(po, Key::Index(i)) {
@@ -5453,10 +5426,10 @@ impl Vm {
             }
             // (TypedArray [[Set]] for another receiver: an index that isn't
             // valid stops there, the store done.)
-            if unsafe { (*po).class } == Class::TypedArray {
+            if po.class() == Class::TypedArray {
                 return Ok(true);
             }
-            p = unsafe { (*(*po).shape).proto };
+            p = po.shape().live().proto;
         }
         Ok(false)
     }
@@ -5468,32 +5441,30 @@ impl Vm {
     #[cold]
     fn set_far(&mut self, obj: Value, o: *mut Object, i: u32, value: Value) -> Result<()> {
         use crate::object::{FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, SPARSE};
-        unsafe {
-            let flags = (*o).flags;
-            if flags & SPARSE != 0 {
-                let a = self.intern_name(&i.to_string());
-                if (*(*o).shape).lookup(a).is_some() {
-                    return self.set(obj, a, value);
-                }
+        let flags = o.flags();
+        if flags & SPARSE != 0 {
+            let a = self.intern_name(&i.to_string());
+            if o.shape().live().lookup(a).is_some() {
+                return self.set(obj, a, value);
             }
-            let far = crate::far::is_far(o);
-            if far && crate::far::has(o, i) {
-                if flags & FROZEN != 0 {
-                    self.store_failed = true;
-                } else {
-                    crate::far::insert(self, o, i, value);
-                }
-                return Ok(());
-            }
-            if flags & NOT_EXTENSIBLE != 0 || i >= crate::far::array_length(o) && flags & LENGTH_READ_ONLY != 0 {
-                self.store_failed = true;
-                return Ok(());
-            }
-            if !far {
-                crate::far::make_far(self, o, (*o).elems_len);
-            }
-            crate::far::set(self, o, i, value);
         }
+        let far = crate::far::is_far(o);
+        if far && crate::far::has(o, i) {
+            if flags & FROZEN != 0 {
+                self.store_failed = true;
+            } else {
+                crate::far::insert(self, o, i, value);
+            }
+            return Ok(());
+        }
+        if flags & NOT_EXTENSIBLE != 0 || i >= crate::far::array_length(o) && flags & LENGTH_READ_ONLY != 0 {
+            self.store_failed = true;
+            return Ok(());
+        }
+        if !far {
+            crate::far::make_far(self, o, o.elems_len());
+        }
+        crate::far::set(self, o, i, value);
         Ok(())
     }
 
@@ -5504,45 +5475,41 @@ impl Vm {
     #[cold]
     fn set_keyed_flagged(&mut self, obj: Value, o: *mut Object, i: u32, value: Value) -> Result<()> {
         use crate::object::{FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, SPARSE};
-        unsafe {
-            let flags = (*o).flags;
-            if (*o).class == Class::Wrapper
-                && string_units(wrapped(obj).unwrap()).is_some_and(|u| (i as usize) < u.len())
-            {
+        let flags = o.flags();
+        if o.class() == Class::Wrapper && string_units(wrapped(obj).unwrap()).is_some_and(|u| (i as usize) < u.len()) {
+            self.store_failed = true;
+            return Ok(());
+        }
+        if flags & SPARSE != 0 {
+            let a = self.intern_name(&i.to_string());
+            if o.shape().live().lookup(a).is_some() {
+                return self.set(obj, a, value);
+            }
+        }
+        if Self::has_element(o, i) {
+            if flags & FROZEN != 0 || !self.writable_element(o, i) {
                 self.store_failed = true;
                 return Ok(());
-            }
-            if flags & SPARSE != 0 {
-                let a = self.intern_name(&i.to_string());
-                if (*(*o).shape).lookup(a).is_some() {
-                    return self.set(obj, a, value);
-                }
-            }
-            if Self::has_element(o, i) {
-                if flags & FROZEN != 0 || !self.writable_element(o, i) {
-                    self.store_failed = true;
-                    return Ok(());
-                }
-                self.store_element(o, i as usize, value);
-                return Ok(());
-            }
-            if flags & NOT_EXTENSIBLE != 0 {
-                self.store_failed = true;
-                return Ok(());
-            }
-            if i >= (*o).elems_len {
-                if (*o).class == Class::Array && flags & LENGTH_READ_ONLY != 0 {
-                    self.store_failed = true;
-                    return Ok(());
-                }
-                self.reserve_elems(o, i as usize + 1);
-                for j in (*o).elems_len..i {
-                    crate::layout::store_word((*o).elems.add(j as usize), Value::EMPTY);
-                }
-                (*o).elems_len = i + 1;
             }
             self.store_element(o, i as usize, value);
+            return Ok(());
         }
+        if flags & NOT_EXTENSIBLE != 0 {
+            self.store_failed = true;
+            return Ok(());
+        }
+        if i >= o.elems_len() {
+            if o.class() == Class::Array && flags & LENGTH_READ_ONLY != 0 {
+                self.store_failed = true;
+                return Ok(());
+            }
+            self.reserve_elems(o, i as usize + 1);
+            for j in o.elems_len()..i {
+                o.set_elem(j as usize, Value::EMPTY);
+            }
+            o.set_elems_len(i + 1);
+        }
+        self.store_element(o, i as usize, value);
         Ok(())
     }
 
@@ -5552,7 +5519,7 @@ impl Vm {
         // A read-only length fails before anything (OrdinarySet: the
         // property isn't writable), even set to what it is, and without
         // converting the value.
-        if unsafe { (*o).flags } & crate::object::LENGTH_READ_ONLY != 0 {
+        if o.flags() & crate::object::LENGTH_READ_ONLY != 0 {
             self.store_failed = true;
             return Ok(());
         }
@@ -5560,7 +5527,7 @@ impl Vm {
         if !(d >= 0.0 && d <= u32::MAX as f64 && d.fract() == 0.0) {
             return Err(Error::range_error("Invalid array length"));
         }
-        if unsafe { (*o).flags } & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
+        if o.flags() & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
             let d = crate::props::Desc { value: Some(value), ..Default::default() };
             // (Short of what it was set to: a non-configurable element
             // stops it, a TypeError in strict code.)
@@ -5570,30 +5537,26 @@ impl Vm {
             return Ok(());
         }
         let n = d as usize;
-        unsafe {
-            let len = (*o).elems_len as usize;
-            if n > len && crate::far::goes_far(self, o, n, 0) {
-                crate::far::make_far(self, o, n as u32);
-                return Ok(());
-            }
-            if n > len {
-                self.reserve_elems(o, n);
-            }
-            for i in n.min(len)..n.max(len) {
-                crate::layout::store_word((*o).elems.add(i), Value::EMPTY);
-            }
-            (*o).elems_len = n as u32;
+        let len = o.elems_len() as usize;
+        if n > len && crate::far::goes_far(self, o, n, 0) {
+            crate::far::make_far(self, o, n as u32);
+            return Ok(());
         }
+        if n > len {
+            self.reserve_elems(o, n);
+        }
+        for i in n.min(len)..n.max(len) {
+            o.set_elem(i, Value::EMPTY);
+        }
+        o.set_elems_len(n as u32);
         Ok(())
     }
 
     /// Reallocate `o`'s elements to just their count (room for 4 at
     /// least): what was past them freed at the next collection.
     pub(crate) fn shrink_elems(&mut self, o: *mut Object) {
-        unsafe {
-            let len = (*o).elems_len as usize;
-            self.move_elems(o, len.max(4), len);
-        }
+        let len = o.elems_len() as usize;
+        self.move_elems(o, len.max(4), len);
     }
 
     /// Move `o`'s first `len` elements to a new cell with room for `cap`
@@ -5603,7 +5566,7 @@ impl Vm {
             let far = crate::far::is_far(o);
             let e = self.heap.alloc_values_from(cap + far as usize, len);
             if len > 0 {
-                std::ptr::copy_nonoverlapping((*o).elems, e, len);
+                std::ptr::copy_nonoverlapping(o.elems(), e, len);
             }
             if far {
                 *e.add(cap) = *crate::far::store_slot(o);
@@ -5619,7 +5582,7 @@ impl Vm {
     /// TypeScript enum's flags (`NodeFlags[1 << 24] = "…"`, each key twice
     /// the last) doubled the elements up to 2^30, out of memory.
     pub(crate) fn sparse_key(&self, o: *mut Object, i: u32) -> bool {
-        let len = unsafe { (*o).elems_len } as usize;
+        let len = o.elems_len() as usize;
         let i = i as usize;
         i >= len && (i > len * 2 + SPARSE_GAP || crate::far::goes_far(self, o, i + 1, 1))
     }
@@ -5632,7 +5595,7 @@ impl Vm {
             }
             let cap = n.max(old * 2).max(4);
             u32::try_from(cap + 1).expect("array too large");
-            let len = if (*o).elems.is_null() { 0 } else { (*o).elems_len as usize };
+            let len = if o.elems().is_null() { 0 } else { o.elems_len() as usize };
             self.move_elems(o, cap, len);
         }
     }
@@ -5692,8 +5655,8 @@ impl Vm {
         let o = as_object(v);
         if self.plain_named(o) && self.chain_lists_nothing(o) {
             let slots = self.listed_slots(o, false, false).unwrap_or_default();
-            return self.array_of_with(slots.len(), |vm, i| unsafe {
-                let a = (*(*o).shape).keys()[slots[i] as usize];
+            return self.array_of_with(slots.len(), |vm, i| {
+                let a = o.shape().live().keys()[slots[i] as usize];
                 vm.atom_string(a)
             });
         }
@@ -5709,7 +5672,7 @@ impl Vm {
                     keys.push(key);
                 }
             }
-            let proto = unsafe { (*(*o).shape).proto };
+            let proto = o.shape().live().proto;
             if !proto.is_cell() {
                 break;
             }
@@ -5723,10 +5686,10 @@ impl Vm {
     /// `for … in` lists: each a plain object without elements whose names
     /// are all not enumerable.
     fn chain_lists_nothing(&self, o: *mut Object) -> bool {
-        let mut p = unsafe { (*(*o).shape).proto };
+        let mut p = o.shape().live().proto;
         while p.is_cell() {
             let o = as_object(p);
-            let s = unsafe { &*(*o).shape };
+            let s = o.shape().live();
             if !self.plain_named(o) || s.attrs().iter().any(|&a| a & DONT_ENUM == 0) {
                 return false;
             }
@@ -5812,7 +5775,7 @@ impl Vm {
             debug_assert!(4 * words >= len);
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
             (*o).elems = data.cast();
-            (*o).elems_len = u32::try_from(len).expect("string too long");
+            o.set_elems_len(u32::try_from(len).expect("string too long"));
             object_value(o)
         }
     }
@@ -5822,7 +5785,8 @@ impl Vm {
     fn alloc_string(&mut self, words: usize) -> *mut Object {
         let o = self.heap.alloc(crate::heap::object_bytes(1 + words)).cast::<Object>();
         unsafe {
-            o.cast::<[u64; crate::layout::HEADER_WORDS]>().write(crate::object::object_header(&*self.string_shape));
+            o.cast::<[u64; crate::layout::HEADER_WORDS]>()
+                .write(crate::object::object_header(self.string_shape.live()));
             Object::set_string_words(o, words);
         }
         o
@@ -5850,7 +5814,7 @@ impl Vm {
             // The room past the units zero, not what memory held.
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
             (*o).elems = data.cast();
-            (*o).elems_len = u32::try_from(len).expect("string too long");
+            o.set_elems_len(u32::try_from(len).expect("string too long"));
             object_value(o)
         }
     }
@@ -5933,7 +5897,7 @@ impl Vm {
         unsafe {
             let o = self.alloc_string(0);
             (*o).elems = std::ptr::null_mut();
-            (*o).elems_len = u32::try_from(len).expect("string too long");
+            o.set_elems_len(u32::try_from(len).expect("string too long"));
             (*o).props = as_object(a).cast();
             (*o).code = as_object(b).cast();
             object_value(o)
@@ -5954,13 +5918,13 @@ impl Vm {
         }
         unsafe {
             let p = as_object(parent);
-            if (*p).class != Class::String || (*p).elems.is_null() {
+            if p.class() != Class::String || p.elems().is_null() {
                 return None;
             }
-            let units = (*p).elems as usize;
+            let units = p.elems() as usize;
             // A slice's parent is its root's: one level only.
-            let root = if !(*p).props.is_null() { (*p).props.cast::<Object>() } else { p };
-            let ru = (*root).elems as usize;
+            let root = if !p.props().is_null() { p.props().cast::<Object>() } else { p };
+            let ru = root.elems() as usize;
             // The cell holding the root's units: itself, or the buffer a
             // flattening made (past its header word).
             let cell = if ru == root as usize + STRING_UNITS { root as usize } else { ru - 8 };
@@ -5970,7 +5934,7 @@ impl Vm {
             }
             let o = self.alloc_string(0);
             (*o).elems = (units + 2 * s) as *mut Value;
-            (*o).elems_len = (e - s) as u32;
+            o.set_elems_len((e - s) as u32);
             (*o).props = root.cast();
             Some(object_value(o))
         }
@@ -6032,7 +5996,7 @@ impl Vm {
 
     /// The shape a closure of `callee` gets.
     fn closure_shape(&self, callee: *const Code) -> *const Shape {
-        match unsafe { (*callee).kind } {
+        match callee.live().kind {
             4 if !self.generator_function_shape.is_null() => self.generator_function_shape,
             6 if !self.async_generator_function_shape.is_null() => self.async_generator_function_shape,
             5 if !self.async_function_shape.is_null() => self.async_function_shape,
@@ -6045,8 +6009,8 @@ impl Vm {
     fn closure_prototype(&mut self, f: *mut Object) -> Value {
         // (Live in a marking under way: the closure may be allocated
         // black, untraced.)
-        crate::gc::mark_code(unsafe { (*f).code });
-        let made = unsafe { &(*(*f).code).closures_made };
+        crate::gc::mark_code(f.code());
+        let made = unsafe { &(*f.code()).closures_made };
         made.set(made.get().saturating_add(1).min(2));
         // A second closure: compiled code that took the first one's
         // upvalues for its own (as its only closure's) mustn't run for it.
@@ -6055,7 +6019,7 @@ impl Vm {
         // `formals`.) Only that code is lowered again: calls straight into
         // it check for the first closure (`jit::CallSite::closure`); sites
         // bound to the code come once there are two.
-        let code = unsafe { &*(*f).code };
+        let code = f.code().live();
         if made.get() == 2 && code.upvalues_folded.replace(false) {
             code.field_deps.set(code.field_deps.get().wrapping_add(1));
             // And the calls bound to that code already: those to any
@@ -6068,12 +6032,12 @@ impl Vm {
             }
         }
         // (An arrow's, a method's or an async function's: none.)
-        if matches!(unsafe { (*(*f).code).kind }, 1 | 5) {
+        if matches!(f.code().live().kind, 1 | 5) {
             return object_value(f);
         }
         // (A generator function's: a `%GeneratorPrototype%` object; an
         // async one's, an `%AsyncGeneratorPrototype%` one.)
-        let kind = unsafe { (*(*f).code).kind };
+        let kind = f.code().live().kind;
         if kind == 4 || kind == 6 {
             let root = if kind == 6 {
                 crate::symbol::Root::AsyncGeneratorPrototype
@@ -6086,7 +6050,7 @@ impl Vm {
             self.store_field(f, 0, object_value(p));
             return object_value(f);
         }
-        let p = self.heap.alloc_object(unsafe { &*self.proto_object_shape });
+        let p = self.heap.alloc_object(self.proto_object_shape.live());
         self.store_field(p, 0, object_value(f));
         self.store_field(f, 0, object_value(p));
         object_value(f)
@@ -6149,7 +6113,7 @@ impl Vm {
     fn released_get(&self, o: *mut Object, i: u32) -> Option<Value> {
         match self.released_binding(o, i)? {
             Binding::Upvalue(u) => Some(unsafe { *(*u).at }),
-            Binding::Scope(env, slot) => Some(unsafe { *Object::slot(env, (*(*env).shape).location(slot)) }),
+            Binding::Scope(env, slot) => Some(unsafe { *Object::slot(env, env.shape().live().location(slot)) }),
         }
     }
 
@@ -6181,9 +6145,9 @@ impl Vm {
                 *on = false;
             }
         } else if let Some(r) = self.released_record(o)
-            && 1 + i < unsafe { (*r).elems_len }
+            && 1 + i < r.elems_len()
         {
-            unsafe { crate::layout::store_word((*r).elems.add(1 + i as usize), Value::EMPTY) };
+            r.set_elem(1 + i as usize, Value::EMPTY);
         }
     }
 
@@ -6200,7 +6164,7 @@ impl Vm {
                 m.mapped.len() as u32
             }
             None => match self.released_record(o) {
-                Some(r) => unsafe { (*r).elems_len - 1 },
+                Some(r) => r.elems_len() - 1,
                 None => return,
             },
         };
@@ -6208,14 +6172,14 @@ impl Vm {
             if let Some(v) = self.mapped_get(o, i) {
                 if Self::has_element(o, i) {
                     unsafe {
-                        let at = (*o).elems.add(i as usize);
+                        let at = o.elems().add(i as usize);
                         crate::heap::store(o.cast(), at, v);
                     }
-                } else if unsafe { (*o).flags } & crate::object::SPARSE != 0 {
+                } else if o.flags() & crate::object::SPARSE != 0 {
                     // (Kept as a named property: see `hide_element`.)
                     let a = self.intern_name(&i.to_string());
-                    if let Some(slot) = unsafe { (*(*o).shape).lookup(a) }
-                        && unsafe { (*(*o).shape).attrs()[slot as usize] } & crate::object::ACCESSOR == 0
+                    if let Some(slot) = o.shape().live().lookup(a)
+                        && (o.shape().live().attrs()[slot as usize]) & crate::object::ACCESSOR == 0
                     {
                         self.store_field(o, slot, v);
                     }
@@ -6231,8 +6195,8 @@ impl Vm {
     fn released_mark_value(&self, o: *mut Object) -> Option<Value> {
         let mark = self.released_mark?;
         unsafe {
-            let s = &*(*o).shape;
-            if (*o).class != Class::Plain || s.elems_code != NO_ELEMENTS {
+            let s = o.shape().live();
+            if o.class() != Class::Plain || s.elems_code != NO_ELEMENTS {
                 return None;
             }
             Some(*Object::slot(o, s.location(s.lookup(mark)?)))
@@ -6250,22 +6214,20 @@ impl Vm {
     /// frame ended with index `i` mapped and it still is.
     fn released_binding(&self, o: *mut Object, i: u32) -> Option<Binding> {
         let r = self.released_record(o)?;
-        unsafe {
-            if 1 + i >= (*r).elems_len {
-                return None;
-            }
-            let e = *(*r).elems.add(1 + i as usize);
-            if e == Value::EMPTY {
-                return None;
-            }
-            let env = *(*r).elems;
-            if env.is_cell() {
-                let env = as_object(env);
-                let slot = (*(*env).shape).lookup(Atom(e.as_i32_unchecked() as u32))?;
-                Some(Binding::Scope(env, slot))
-            } else {
-                Some(Binding::Upvalue((e.to_bits() + 8) as *mut Upvalue))
-            }
+        if 1 + i >= r.elems_len() {
+            return None;
+        }
+        let e = r.elem(1 + i as usize);
+        if e == Value::EMPTY {
+            return None;
+        }
+        let env = r.elem(0);
+        if env.is_cell() {
+            let env = as_object(env);
+            let slot = env.shape().live().lookup(Atom(e.as_i32_unchecked() as u32))?;
+            Some(Binding::Scope(env, slot))
+        } else {
+            Some(Binding::Upvalue((e.to_bits() + 8) as *mut Upvalue))
         }
     }
 
@@ -6290,10 +6252,10 @@ impl Vm {
             // `keep_mapped`.)
             unsafe { (*o).flags &= !crate::object::MAPPED };
             for (i, &on) in m.mapped.iter().enumerate() {
-                if on && (i as u32) < unsafe { (*o).elems_len } {
+                if on && (i as u32) < o.elems_len() {
                     unsafe {
                         let v = m.value(i);
-                        let at = (*o).elems.add(i);
+                        let at = o.elems().add(i);
                         crate::heap::store(o.cast(), at, v);
                     }
                 }
@@ -6351,13 +6313,13 @@ impl Vm {
                     *e.add(1 + i) = b;
                 }
                 crate::heap::store_young(r.cast(), &raw mut (*r).elems, e);
-                (*r).elems_len = n as u32;
+                r.set_elems_len(n as u32);
             }
             for &(i, _) in &kept {
                 self.hide_element(o, i as u32);
             }
             object_value(r)
-        } else if unsafe { (*o).shape } == self.mapped_arguments_shape {
+        } else if o.shape() == self.mapped_arguments_shape {
             unsafe { crate::object::set_shape(o, self.arguments_shape) };
             return;
         } else {
@@ -6371,7 +6333,7 @@ impl Vm {
                 a
             }
         };
-        if let Some(slot) = unsafe { (*(*o).shape).lookup(mark) } {
+        if let Some(slot) = o.shape().live().lookup(mark) {
             self.store_field(o, slot, record);
         }
     }
@@ -6389,12 +6351,12 @@ impl Vm {
             return;
         }
         unsafe {
-            let at = (*o).elems.add(i as usize);
+            let at = o.elems().add(i as usize);
             let v = *at;
             crate::layout::store_word(at, Value::EMPTY);
-            (*o).flags |= crate::object::SPARSE;
+            o.set_flags(o.flags() | crate::object::SPARSE);
             let a = self.intern_name(&i.to_string());
-            let attrs = if (*o).flags & crate::object::SEALED != 0 { DONT_DELETE } else { 0 };
+            let attrs = if o.flags() & crate::object::SEALED != 0 { DONT_DELETE } else { 0 };
             self.add_property_with(o, a, v, attrs);
         }
     }
@@ -6552,7 +6514,7 @@ impl Vm {
     pub(crate) fn add_properties(&mut self, o: *mut Object, names: &[Atom], values: &[Value], attrs: u8) {
         self.leave_dictionary(o);
         unsafe {
-            let s = &*(*o).shape;
+            let s = o.shape().live();
             let n = s.keys().len() + names.len();
             if names.contains(&self.a_sym_has_instance) {
                 self.has_instance_defined = true;
@@ -6595,13 +6557,13 @@ impl Vm {
                 dictionary: false,
             });
             // Out-of-line room for the slots past the object's capacity.
-            let cap = (*new).capacity.get() as usize;
+            let cap = new.live().capacity.get() as usize;
             let old = Object::props_cap(o) as usize;
             if n > cap && n - cap > old {
                 let want = (n - cap).max(old * 2).max(4);
                 let p = self.heap.alloc_values(want);
-                if !(*o).props.is_null() {
-                    std::ptr::copy_nonoverlapping((*o).props, p, old);
+                if !o.props().is_null() {
+                    std::ptr::copy_nonoverlapping(o.props(), p, old);
                 }
                 crate::heap::store_young(o.cast(), &raw mut (*o).props, p);
             }
@@ -6610,7 +6572,7 @@ impl Vm {
             for (k, &v) in values.iter().enumerate() {
                 self.store_field(o, (first + k) as u32, v);
             }
-            if (*o).flags & PROTOTYPE != 0 {
+            if o.flags() & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
                 self.bump_code_epoch();
             }
@@ -6623,15 +6585,15 @@ impl Vm {
         let s = self.ctor_root(f);
         // (Given to an object a full marking under way may not trace.)
         unsafe { crate::object::mark_shape(s) };
-        object_value(self.heap.alloc_object(unsafe { &*s }))
+        object_value(self.heap.alloc_object(s.live()))
     }
 
     /// The shape `new f` gives `this` now: the root for `f.prototype` and
     /// `f`'s in-object capacity.
     pub(crate) fn ctor_root(&mut self, f: *mut Object) -> *const Shape {
         unsafe {
-            debug_assert_eq!((*f).class, Class::Function);
-            let code = &*(*f).code;
+            debug_assert_eq!(f.class(), Class::Function);
+            let code = f.code().live();
             // A bytecode function's slot 0 is always `prototype`.
             let p = *f.cast::<u8>().add(crate::layout::slots_offset(Class::Function)).cast::<Value>();
             let proto = if p.is_cell() {
@@ -6645,7 +6607,7 @@ impl Vm {
             if let Some(e) = self.ctor_proto(code, proto) {
                 let e = &*e;
                 let mut s = e.root.get();
-                if s.is_null() || (*s).capacity.get() != e.cap.get() {
+                if s.is_null() || s.live().capacity.get() != e.cap.get() {
                     s = if e.settled() {
                         self.root_shape(Class::Plain, proto, e.cap.get())
                     } else {
@@ -6657,7 +6619,7 @@ impl Vm {
             }
             let cap = code.ctor_capacity.get();
             let mut s = code.ctor_shape.get();
-            if s.is_null() || (*s).proto != proto || (*s).capacity.get() != cap {
+            if s.is_null() || s.live().proto != proto || s.live().capacity.get() != cap {
                 s = if code.ctor_settled.get() {
                     self.root_shape(Class::Plain, proto, cap)
                 } else {
@@ -6699,7 +6661,7 @@ impl Vm {
             let root = code.ctor_shape.get();
             Box::new(CtorProto {
                 cap: Cell::new(if first { code.ctor_capacity.get() } else { MAX_INLINE_CAPACITY }),
-                root: Cell::new(if first && !root.is_null() && unsafe { (*root).proto } == proto {
+                root: Cell::new(if first && !root.is_null() && root.live().proto == proto {
                     root
                 } else {
                     std::ptr::null()
@@ -6716,8 +6678,8 @@ impl Vm {
         if !code.ctor_settled.replace(true) {
             settle(code);
         }
-        let shape = unsafe { (*this).shape };
-        let n = unsafe { (*shape).keys().len() } as u32;
+        let shape = this.shape();
+        let n = shape.live().keys().len() as u32;
         let cap = match Self::shared_proto(code, this) {
             Some(e) if !e.settled() => {
                 e.made.set(e.made.get() + 1);
@@ -6734,7 +6696,7 @@ impl Vm {
         }
         let seen = code.ctor_result.get();
         // (A dictionary shape changes in place: as many.)
-        if unsafe { (*shape).dictionary } {
+        if shape.live().dictionary {
             code.ctor_result.set(MANY_SHAPES);
         } else if seen.is_null() {
             code.ctor_result.set(shape);
@@ -6751,7 +6713,7 @@ impl Vm {
         }
         unsafe {
             let vm = &mut *crate::interp::current_vm();
-            vm.ctor_proto(code, (*(*this).shape).proto).map(|e| &*e)
+            vm.ctor_proto(code, (*this.shape()).proto).map(|e| &*e)
         }
     }
 
@@ -6822,23 +6784,21 @@ impl Vm {
         args.iter().for_each(|&a| self.check_own(a, "Vm::call_other"));
         if f.is_cell() {
             let o = as_object(f);
-            unsafe {
-                if (*o).class == Class::Native {
-                    // (A native calling natives, as iterator helpers' chains
-                    // or a proxy's of proxies do, recurses natively alone.)
-                    crate::interp::check_native_stack(self)?;
-                    let native = (*(*o).code).native.unwrap();
-                    if !self.realms.is_empty() && (*(*o).code).realm != self.realm {
-                        return crate::realm::run_in(self, (*(*o).code).realm, |vm| {
-                            vm.constructing = false;
-                            vm.callee = o;
-                            vm.run_native(|vm| native(vm, this, args))
-                        });
-                    }
-                    self.constructing = false;
-                    self.callee = o;
-                    return self.run_native(|vm| native(vm, this, args));
+            if o.class() == Class::Native {
+                // (A native calling natives, as iterator helpers' chains
+                // or a proxy's of proxies do, recurses natively alone.)
+                crate::interp::check_native_stack(self)?;
+                let native = o.code().live().native.unwrap();
+                if !self.realms.is_empty() && o.code().live().realm != self.realm {
+                    return crate::realm::run_in(self, o.code().live().realm, |vm| {
+                        vm.constructing = false;
+                        vm.callee = o;
+                        vm.run_native(|vm| native(vm, this, args))
+                    });
                 }
+                self.constructing = false;
+                self.callee = o;
+                return self.run_native(|vm| native(vm, this, args));
             }
         }
         Err(Error::type_error(format!("{} is not a function", shown(f))))
@@ -6854,25 +6814,23 @@ impl Vm {
         args.iter().for_each(|&a| self.check_own(a, "Vm::construct_other"));
         if f.is_cell() {
             let o = as_object(f);
-            unsafe {
-                if (*o).class == Class::Native && (*(*o).code).constructs {
-                    crate::interp::check_native_stack(self)?;
-                    let native = (*(*o).code).native.unwrap();
-                    if !self.realms.is_empty() && (*(*o).code).realm != self.realm {
-                        return crate::realm::run_in(self, (*(*o).code).realm, |vm| {
-                            vm.constructing = true;
-                            vm.callee = o;
-                            let r = vm.run_native(|vm| native(vm, Value::UNDEFINED, args));
-                            vm.constructing = false;
-                            r
-                        });
-                    }
-                    self.constructing = true;
-                    self.callee = o;
-                    let r = self.run_native(|vm| native(vm, Value::UNDEFINED, args));
-                    self.constructing = false;
-                    return r;
+            if o.class() == Class::Native && o.code().live().constructs {
+                crate::interp::check_native_stack(self)?;
+                let native = o.code().live().native.unwrap();
+                if !self.realms.is_empty() && o.code().live().realm != self.realm {
+                    return crate::realm::run_in(self, o.code().live().realm, |vm| {
+                        vm.constructing = true;
+                        vm.callee = o;
+                        let r = vm.run_native(|vm| native(vm, Value::UNDEFINED, args));
+                        vm.constructing = false;
+                        r
+                    });
                 }
+                self.constructing = true;
+                self.callee = o;
+                let r = self.run_native(|vm| native(vm, Value::UNDEFINED, args));
+                self.constructing = false;
+                return r;
             }
         }
         Err(Error::type_error(format!("{} is not a constructor", shown(f))))
@@ -6886,7 +6844,7 @@ impl Vm {
         let p: *const Code = &*b;
         self.codes.push(b);
         self.code_set.insert(p as usize);
-        crate::gc::code_bytes(unsafe { (*p).footprint() });
+        crate::gc::code_bytes(p.live().footprint());
         if self.heap.gc.code_full() {
             self.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -7004,7 +6962,7 @@ impl Vm {
         for &n in &declared {
             let a = self.intern_name(n);
             if !module.function_names.contains(n)
-                && unsafe { (*(*g).shape).lookup(a).is_none() }
+                && g.shape().live().lookup(a).is_none()
                 && self.lookup(g, a).is_some()
                 && extensible
             {
@@ -7028,7 +6986,7 @@ impl Vm {
             let vars = declared.iter().copied().filter(|n| !module.function_names.contains(n));
             for n in functions.chain(vars) {
                 let a = self.intern_name(n);
-                if unsafe { (*(*g).shape).lookup(a).is_none() } {
+                if g.shape().live().lookup(a).is_none() {
                     self.declare_global(a, attrs);
                 }
             }
@@ -7044,8 +7002,8 @@ impl Vm {
     fn declare_global(&mut self, name: Atom, attrs: u8) {
         let g = self.global;
         unsafe {
-            let new = self.transition_with((*g).shape, name, attrs);
-            let ns = &*new;
+            let new = self.transition_with(g.shape(), name, attrs);
+            let ns = new.live();
             let slot = ns.keys().len() as u32 - 1;
             if slot >= ns.capacity.get() {
                 self.reserve_props(g, slot - ns.capacity.get());
@@ -7057,7 +7015,7 @@ impl Vm {
                 // (A field another global's shape typed: a realm's.)
                 self.store_field(g, slot, Value::UNDEFINED);
             }
-            if (*g).flags & PROTOTYPE != 0 {
+            if g.flags() & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
                 self.bump_code_epoch();
             }
@@ -7075,8 +7033,8 @@ impl Vm {
         let l = self.global_lexicals;
         let attrs = DONT_DELETE | if constant { READ_ONLY } else { 0 };
         unsafe {
-            let new = self.transition_with((*l).shape, name, attrs);
-            let ns = &*new;
+            let new = self.transition_with(l.shape(), name, attrs);
+            let ns = new.live();
             let slot = ns.keys().len() as u32 - 1;
             if slot >= ns.capacity.get() {
                 self.reserve_props(l, slot - ns.capacity.get());
@@ -7088,7 +7046,7 @@ impl Vm {
         }
         let g = self.global;
         unsafe {
-            let s = &*(*g).shape;
+            let s = g.shape().live();
             let Some(slot) = s.lookup(name) else {
                 return;
             };
@@ -7118,7 +7076,7 @@ impl Vm {
             };
             crate::object::set_shape(g, self.add_shape(u));
             self.bump_code_epoch();
-            if (*g).flags & PROTOTYPE != 0 {
+            if g.flags() & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
         }
@@ -7138,7 +7096,7 @@ impl Vm {
     /// a syntax error (or what the code generator doesn't support) is
     /// thrown at its call, and it stays a stub.
     pub(crate) fn compile_lazy(&mut self, code: *const Code) -> Result<()> {
-        let c = unsafe { &*code };
+        let c = code.live();
         let mut module = crate::js::compile_lazy(c.lazy.as_ref().expect("a stub")).map_err(|e| {
             if e.contains("unsupported") {
                 Error(format!("unsupported: in eval'd code: {e}"), None)
@@ -7245,15 +7203,15 @@ impl Vm {
                     // (unchanged) and storing to `mark`.
                     let c = into.cast_mut();
                     unsafe {
-                        debug_assert_eq!((*c).nparams, f.nparams);
+                        debug_assert_eq!(c.live().nparams, f.nparams);
                         // Its upvalues in the stub's order: the names its
                         // closures captured, declared again in that order (see
                         // `js::compile_lazy`). The stub's sources, where they
                         // are in its parent, stay; the new ones are where they
                         // are in the wrapper declaring them.
                         debug_assert_eq!((&(*c).upvalues).len(), f.upvalues.len());
-                        debug_assert_eq!((*c).lazy.as_ref().map(|l| l.upvalues.len()), Some(f.upvalues.len()));
-                        let before = (*c).footprint();
+                        debug_assert_eq!(c.live().lazy.as_ref().map(|l| l.upvalues.len()), Some(f.upvalues.len()));
+                        let before = c.live().footprint();
                         (*c).bytecode = bytecode;
                         (*c).nregs = f.nregs;
                         (*c).ics = Default::default();
@@ -7265,10 +7223,10 @@ impl Vm {
                         (*c).arguments_escape = f.arguments_escape;
                         (*c).simple_parameters = f.simple_parameters;
                         (*c).interpreted = interpreted;
-                        (*c).calls_left.set(calls_left);
-                        (*c).loop_budget.set(loop_budget);
+                        c.live().calls_left.set(calls_left);
+                        c.live().loop_budget.set(loop_budget);
                         (*c).lazy = None;
-                        crate::gc::code_bytes((*c).footprint().saturating_sub(before));
+                        crate::gc::code_bytes(c.live().footprint().saturating_sub(before));
                     }
                     return into;
                 }
@@ -8121,18 +8079,16 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
         }
         _ => args.to_vec(),
     };
-    unsafe {
-        vm.reserve_elems(o, elems.len());
-        for (i, &v) in elems.iter().enumerate() {
-            // Holes don't type the elements.
-            if v == Value::EMPTY {
-                crate::layout::store_word((*o).elems.add(i), v);
-            } else {
-                vm.store_element(o, i, v);
-            }
+    vm.reserve_elems(o, elems.len());
+    for (i, &v) in elems.iter().enumerate() {
+        // Holes don't type the elements.
+        if v == Value::EMPTY {
+            o.set_elem(i, v);
+        } else {
+            vm.store_element(o, i, v);
         }
-        (*o).elems_len = elems.len() as u32;
     }
+    o.set_elems_len(elems.len() as u32);
     Ok(a)
 }
 
@@ -8527,14 +8483,14 @@ impl MappedArgs {
         if env.is_null() {
             return None;
         }
-        let slot = unsafe { (*(*env).shape).lookup(*self.scope.1.get(i)?) }?;
+        let slot = (env.shape().live().lookup(*self.scope.1.get(i)?))?;
         Some((env, slot))
     }
 
     unsafe fn value(&self, i: usize) -> Value {
         unsafe {
             match self.scope_slot(i) {
-                Some((env, slot)) => *Object::slot(env, (*(*env).shape).location(slot)),
+                Some((env, slot)) => *Object::slot(env, env.shape().live().location(slot)),
                 None => *self.regs.add(1 + i),
             }
         }
@@ -8590,18 +8546,16 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
         return array_push_generic(vm, this, args);
     }
     let o = as_object(this);
-    unsafe {
-        if (*o).flags & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
-            return array_push_flagged(vm, this, args);
-        }
-        let len = (*o).elems_len as usize;
-        vm.reserve_elems(o, len + args.len());
-        for (i, &v) in args.iter().enumerate() {
-            vm.store_element(o, len + i, v);
-        }
-        (*o).elems_len = (len + args.len()) as u32;
-        Ok(Value::from_i32((*o).elems_len as i32))
+    if o.flags() & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
+        return array_push_flagged(vm, this, args);
     }
+    let len = o.elems_len() as usize;
+    vm.reserve_elems(o, len + args.len());
+    for (i, &v) in args.iter().enumerate() {
+        vm.store_element(o, len + i, v);
+    }
+    o.set_elems_len((len + args.len()) as u32);
+    Ok(Value::from_i32(o.elems_len() as i32))
 }
 
 /// `push` onto an array with elements that have attributes, or that
@@ -8701,18 +8655,18 @@ pub(crate) fn string_prefix(v: Value, n: usize) -> Vec<u16> {
             if left == 0 {
                 break;
             }
-            if (*s).elems.is_null() {
+            if s.elems().is_null() {
                 // (The second piece only if the first is short: so the
                 // stack stays as deep as `n`, not as the chain `s += c`
                 // makes.)
-                let (a, b) = ((*s).props.cast::<Object>(), (*s).code as *mut Object);
-                if ((*a).elems_len as usize) < left {
+                let (a, b) = (s.props().cast::<Object>(), s.code() as *mut Object);
+                if (a.elems_len() as usize) < left {
                     stack.push(b);
                 }
                 stack.push(a);
             } else {
-                let k = ((*s).elems_len as usize).min(left);
-                out.extend_from_slice(std::slice::from_raw_parts((*s).elems.cast::<u16>(), k));
+                let k = (s.elems_len() as usize).min(left);
+                out.extend_from_slice(std::slice::from_raw_parts(s.elems().cast::<u16>(), k));
             }
         }
     }
@@ -8728,13 +8682,13 @@ pub(crate) fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
     }
     let o = as_object(v);
     unsafe {
-        if (*o).class != Class::String {
+        if o.class() != Class::String {
             return None;
         }
-        if (*o).elems.is_null() {
+        if o.elems().is_null() {
             flatten(o);
         }
-        Some(std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize))
+        Some(std::slice::from_raw_parts(o.elems().cast::<u16>(), o.elems_len() as usize))
     }
 }
 
@@ -8745,12 +8699,12 @@ fn units_in_place<'a>(v: Value) -> Option<std::borrow::Cow<'a, [u16]>> {
     let n = string_len(v)?;
     let o = as_object(v);
     unsafe {
-        if (*o).elems.is_null() {
+        if o.elems().is_null() {
             let mut units = vec![0u16; n];
             copy_units(o, units.as_mut_ptr());
             Some(std::borrow::Cow::Owned(units))
         } else {
-            Some(std::borrow::Cow::Borrowed(std::slice::from_raw_parts((*o).elems.cast::<u16>(), n)))
+            Some(std::borrow::Cow::Borrowed(std::slice::from_raw_parts(o.elems().cast::<u16>(), n)))
         }
     }
 }
@@ -8817,14 +8771,14 @@ pub(crate) fn push_string(out: &mut Vec<u16>, s: Value) -> Result<()> {
     }
     let o = as_object(s);
     unsafe {
-        if (*o).class != Class::String {
+        if o.class() != Class::String {
             return Ok(());
         }
-        check_string_len(out.len() + (*o).elems_len as usize)?;
-        if (*o).elems.is_null() {
+        check_string_len(out.len() + o.elems_len() as usize)?;
+        if o.elems().is_null() {
             flatten(o);
         }
-        out.extend_from_slice(std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize));
+        out.extend_from_slice(std::slice::from_raw_parts(o.elems().cast::<u16>(), o.elems_len() as usize));
     }
     Ok(())
 }
@@ -8843,7 +8797,7 @@ unsafe fn flatten(o: *mut Object) {
             "a string made flat outside its VM's run"
         );
         let vm = &mut *vm;
-        let len = (*o).elems_len as usize;
+        let len = o.elems_len() as usize;
         // Padded to whole words, and one more (copies read past the end).
         let buf = vm.heap.alloc_bytes(8 * (len.div_ceil(4) + 1)).cast::<u16>();
         copy_units(o, buf);
@@ -8870,16 +8824,16 @@ unsafe fn flatten(o: *mut Object) {
 /// (iteratively: `s += c` makes a chain as long as the string).
 unsafe fn copy_units(o: *mut Object, buf: *mut u16) {
     unsafe {
-        let len = (*o).elems_len as usize;
+        let len = o.elems_len() as usize;
         let mut at = 0;
-        let mut stack: Vec<*mut Object> = vec![(*o).code as *mut Object, (*o).props.cast::<Object>()];
+        let mut stack: Vec<*mut Object> = vec![o.code() as *mut Object, o.props().cast::<Object>()];
         while let Some(s) = stack.pop() {
-            if (*s).elems.is_null() {
-                stack.push((*s).code as *mut Object);
-                stack.push((*s).props.cast::<Object>());
+            if s.elems().is_null() {
+                stack.push(s.code() as *mut Object);
+                stack.push(s.props().cast::<Object>());
             } else {
-                let n = (*s).elems_len as usize;
-                std::ptr::copy_nonoverlapping((*s).elems.cast::<u16>(), buf.add(at), n);
+                let n = s.elems_len() as usize;
+                std::ptr::copy_nonoverlapping(s.elems().cast::<u16>(), buf.add(at), n);
                 at += n;
             }
         }
@@ -9280,7 +9234,7 @@ out.join();"#;
     fn cons(vm: &mut Vm) -> Value {
         let src = "'x'.repeat(40) + 'y'.repeat(40)";
         let s = vm.run(&crate::js::compile(src).unwrap()).unwrap();
-        assert!(unsafe { (*as_object(s)).elems.is_null() });
+        assert!(as_object(s).elems().is_null());
         s
     }
 

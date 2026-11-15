@@ -12,6 +12,7 @@
 use crate::interp::{call_function, to_boolean};
 use crate::object::{Atom, Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units};
 
@@ -73,7 +74,7 @@ pub(crate) const NO_ATOM: u32 = u32::MAX;
 /// atoms and symbols kept for good took 215 MB.)
 pub(crate) fn symbol_atom(vm: &mut Vm, v: Value) -> Atom {
     let o = as_object(v);
-    let a = unsafe { (*o).elems_len };
+    let a = o.elems_len();
     if a != NO_ATOM {
         return Atom(a);
     }
@@ -141,11 +142,11 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     let o = vm.new_object_with(Class::Symbol, proto, 0);
     unsafe {
         (*o).code = desc.to_bits() as *const crate::vm::Code;
-        (*o).elems_len = atom.map_or(NO_ATOM, |a| a.0);
+        o.set_elems_len(atom.map_or(NO_ATOM, |a| a.0));
         // (Its class's root shape takes no element store: see
         // `Vm::root_shape`. Not a unique shape of its own, which would
         // never be freed.)
-        (*o).flags |= crate::object::NOT_EXTENSIBLE;
+        o.set_flags(o.flags() | crate::object::NOT_EXTENSIBLE);
     }
     if let Some(a) = atom {
         vm.symbols.insert(a, o);
@@ -254,7 +255,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
 
 /// `o`'s own symbol-keyed properties' symbols, in order.
 pub(crate) fn own_symbol_keys(vm: &mut Vm, o: *mut Object) -> Vec<Value> {
-    let keys: Vec<Atom> = unsafe { (*(*o).shape).keys().to_vec() };
+    let keys: Vec<Atom> = o.shape().live().keys().to_vec();
     keys.into_iter()
         .filter(|&a| is_symbol_atom(vm, a) && !is_private_atom(vm, a))
         .filter_map(|a| atom_symbol(vm, a))
@@ -413,7 +414,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(ap, a_iter, object_value(values), DONT_ENUM);
     // (`%TypedArray%`'s `@@species`: the kinds' constructors' prototype.)
     if let Some(&c) = vm.typed_constructors.first() {
-        let ta = as_object(unsafe { (*(*c).shape).proto });
+        let ta = as_object(c.shape().live().proto);
         define_getter(vm, ta, Key::Name(a_species), "[Symbol.species]", return_this);
         crate::typed::install_symbols(vm);
     }
@@ -523,7 +524,7 @@ pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value
     if !s.is_null() {
         unsafe {
             crate::object::mark_shape(s);
-            let o = vm.heap.alloc_object(&*s);
+            let o = vm.heap.alloc_object(s.live());
             vm.store_field(o, 0, value);
             vm.store_field(o, 1, Value::from_bool(done));
             return Ok(object_value(o));
@@ -533,13 +534,11 @@ pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value
     let (a_value, a_done) = (vm.a_value, vm.a_done);
     vm.create_data_property(o, Key::Name(a_value), value)?;
     vm.create_data_property(o, Key::Name(a_done), Value::from_bool(done))?;
-    unsafe {
-        let s = Obj::of(o).shape();
-        if !(*s).dictionary && (*s).keys() == [a_value, a_done] && (*s).attrs().iter().all(|&a| a == 0) {
-            // (A realm's field: `Vm::fixed_shapes` keeps it, and the
-            // collector its ancestors.)
-            vm.iter_result_shape = s;
-        }
+    let s = Obj::of(o).shape();
+    if !s.live().dictionary && s.live().keys() == [a_value, a_done] && s.live().attrs().iter().all(|&a| a == 0) {
+        // (A realm's field: `Vm::fixed_shapes` keeps it, and the
+        // collector its ancestors.)
+        vm.iter_result_shape = s;
     }
     Ok(o)
 }
@@ -566,18 +565,18 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     // its element read directly, unless a hole (a prototype's then).
     unsafe {
         let st = as_object(state);
-        if (*st).class == Class::Array && (*st).flags & crate::far::FAR == 0 && (*st).elems_len == 3 {
-            let e = (*st).elems;
+        if st.class() == Class::Array && st.flags() & crate::far::FAR == 0 && st.elems_len() == 3 {
+            let e = st.elems();
             let (target, i, kind) = (*e, *e.add(1), *e.add(2));
             if target.is_cell() && i.is_int32() && kind == Value::from_i32(1) {
                 let t = as_object(target);
                 let n = i.as_i32_unchecked();
-                if (*t).class == Class::Array && (*t).flags & crate::far::FAR == 0 && (0..i32::MAX).contains(&n) {
-                    if n as u32 >= (*t).elems_len {
+                if t.class() == Class::Array && t.flags() & crate::far::FAR == 0 && (0..i32::MAX).contains(&n) {
+                    if n as u32 >= t.elems_len() {
                         vm.store_element(st, 0, Value::UNDEFINED);
                         return Ok(None);
                     }
-                    let v = *(*t).elems.add(n as usize);
+                    let v = t.elem(n as usize);
                     if v != Value::EMPTY && v != Value::HOLE {
                         vm.store_element(st, 1, Value::from_i32(n + 1));
                         return Ok(Some(v));
@@ -593,7 +592,7 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     let i = vm.get_keyed(state, Value::from_i32(1))?.as_number().unwrap_or(0.0);
     let kind = vm.get_keyed(state, Value::from_i32(2))?.as_number().unwrap_or(1.0) as i32;
     let o = as_object(target);
-    let len = if unsafe { (*o).class } == Class::TypedArray {
+    let len = if o.class() == Class::TypedArray {
         // (Its record made seq-cst: 23.1.5.1.)
         match crate::typed::ta_length_seq_cst(vm, o) {
             Some(n) => n as f64,
@@ -818,12 +817,10 @@ pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Result<Option<Vec<u16>>> {
 /// for must be: a builtin runs in its own realm (§10.3.1), and what it
 /// makes (an iterator, an entry's array) has that realm's prototypes.
 fn is_native(vm: &Vm, f: Value, n: NativeFn) -> bool {
-    f.is_cell()
-        && Obj::of(f).class() == Class::Native
-        && unsafe {
-            let c = Obj::of(f).code();
-            !c.is_null() && (*c).native.is_some_and(|g| g as usize == n as usize) && (*c).realm == vm.realm
-        }
+    f.is_cell() && Obj::of(f).class() == Class::Native && {
+        let c = Obj::of(f).code();
+        !c.is_null() && c.live().native.is_some_and(|g| g as usize == n as usize) && c.live().realm == vm.realm
+    }
 }
 
 /// The iteration protector's bits: arrays iterate by the builtins
@@ -880,7 +877,7 @@ fn protector_again(vm: &mut Vm) -> u8 {
         while !o.is_null() {
             proxied |= crate::proxy::is_proxy(vm, o);
             vm.make_prototype(o);
-            let p = unsafe { (*(*o).shape).proto };
+            let p = o.shape().live().proto;
             o = if p.is_cell() { as_object(p) } else { std::ptr::null_mut() };
         }
     }
@@ -889,7 +886,7 @@ fn protector_again(vm: &mut Vm) -> u8 {
         if vm.is_accessor(h, slot) {
             return None;
         }
-        let at = unsafe { Object::slot(h, (*(*h).shape).location(slot)) };
+        let at = unsafe { Object::slot(h, h.shape().live().location(slot)) };
         vm.relied_slots.insert(at as usize);
         Some(unsafe { *at })
     };
@@ -943,10 +940,10 @@ fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
         return false;
     }
     let o = as_object(v);
-    if unsafe { (*(*o).shape).proto } != object_value(vm.array_prototype) {
+    if o.shape().live().proto != object_value(vm.array_prototype) {
         return false;
     }
-    if unsafe { (*(*o).shape).lookup(vm.a_sym_iterator).is_some() } {
+    if o.shape().live().lookup(vm.a_sym_iterator).is_some() {
         return false;
     }
     protector(vm) & ITER_ARRAY != 0
@@ -963,17 +960,15 @@ fn iterates_as_typed(vm: &mut Vm, v: Value) -> bool {
     }
     let o = Obj::of(v);
     let kp = vm.typed_prototypes[o.kind() as usize];
-    unsafe {
-        let (s, ks) = (&*o.shape(), &*(*kp).shape);
-        if s.proto != object_value(kp)
-            || s.dictionary
-            || ks.dictionary
-            || s.lookup(vm.a_sym_iterator).is_some()
-            || ks.lookup(vm.a_sym_iterator).is_some()
-            || ks.proto != object_value(vm.typed_array_prototype)
-        {
-            return false;
-        }
+    let (s, ks) = (o.shape().live(), kp.shape().live());
+    if s.proto != object_value(kp)
+        || s.dictionary
+        || ks.dictionary
+        || s.lookup(vm.a_sym_iterator).is_some()
+        || ks.lookup(vm.a_sym_iterator).is_some()
+        || ks.proto != object_value(vm.typed_array_prototype)
+    {
+        return false;
     }
     protector(vm) & ITER_TYPED != 0
 }
@@ -991,11 +986,11 @@ pub(crate) fn dense_values(vm: &mut Vm, v: Value, m: Value) -> Option<Vec<Value>
     }
     let s = as_object(v);
     unsafe {
-        let n = (*s).elems_len as usize;
+        let n = s.elems_len() as usize;
         if crate::far::is_far(s) || vm.length_field(s) as usize != n {
             return None;
         }
-        let values = std::slice::from_raw_parts((*s).elems, n);
+        let values = std::slice::from_raw_parts(s.elems(), n);
         (!values.contains(&Value::EMPTY)).then(|| values.to_vec())
     }
 }
@@ -1027,7 +1022,7 @@ unsafe fn fast_open_other(vm: &mut Vm, slots: *mut Value) -> bool {
             return false;
         }
         let o = as_object(v);
-        let (bit, proto) = match (*o).class {
+        let (bit, proto) = match o.class() {
             Class::String => {
                 if protector(vm) & ITER_STRING == 0 {
                     return false;
@@ -1039,8 +1034,8 @@ unsafe fn fast_open_other(vm: &mut Vm, slots: *mut Value) -> bool {
             Class::Set => (ITER_SET, crate::collections::Proto::Set),
             _ => return false,
         };
-        if (*(*o).shape).proto != object_value(vm.collection_prototypes[proto as usize])
-            || (*(*o).shape).lookup(vm.a_sym_iterator).is_some()
+        if o.shape().live().proto != object_value(vm.collection_prototypes[proto as usize])
+            || o.shape().live().lookup(vm.a_sym_iterator).is_some()
             || protector(vm) & bit == 0
         {
             return false;
@@ -1083,34 +1078,32 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
         return false;
     }
     let (d, s) = (as_object(dst), as_object(src));
-    unsafe {
-        if (*d).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 || crate::far::is_far(d) {
-            return false;
-        }
-        // (A typed array's, loaded.)
-        if iterates_as_typed(vm, src) {
-            let Some(values) = crate::typed::elements(vm, s) else { return false };
-            let (len, n) = ((*d).elems_len as usize, values.len());
-            if len + n >= 1 << 28 {
-                return false;
-            }
-            vm.reserve_elems(d, len + n);
-            vm.store_elements(d, len, values.as_ptr(), n);
-            (*d).elems_len = (len + n) as u32;
-            return true;
-        }
-        if !iterates_as_array(vm, src) || crate::far::is_far(s) {
-            return false;
-        }
-        let n = (*s).elems_len as usize;
-        if vm.length_field(s) as usize != n || (0..n).any(|i| *(*s).elems.add(i) == Value::EMPTY) {
-            return false;
-        }
-        let len = (*d).elems_len as usize;
-        vm.reserve_elems(d, len + n);
-        vm.store_elements(d, len, (*s).elems, n);
-        (*d).elems_len = (len + n) as u32;
+    if d.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 || crate::far::is_far(d) {
+        return false;
     }
+    // (A typed array's, loaded.)
+    if iterates_as_typed(vm, src) {
+        let Some(values) = crate::typed::elements(vm, s) else { return false };
+        let (len, n) = (d.elems_len() as usize, values.len());
+        if len + n >= 1 << 28 {
+            return false;
+        }
+        vm.reserve_elems(d, len + n);
+        vm.store_elements(d, len, values.as_ptr(), n);
+        d.set_elems_len((len + n) as u32);
+        return true;
+    }
+    if !iterates_as_array(vm, src) || crate::far::is_far(s) {
+        return false;
+    }
+    let n = s.elems_len() as usize;
+    if vm.length_field(s) as usize != n || (0..n).any(|i| s.elem(i) == Value::EMPTY) {
+        return false;
+    }
+    let len = d.elems_len() as usize;
+    vm.reserve_elems(d, len + n);
+    vm.store_elements(d, len, s.elems(), n);
+    d.set_elems_len((len + n) as u32);
     true
 }
 
@@ -1127,12 +1120,10 @@ pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Option
     if i >= vm.length_field(o) {
         return Ok(None);
     }
-    unsafe {
-        if i < (*o).elems_len {
-            let v = *(*o).elems.add(i as usize);
-            if v != Value::EMPTY {
-                return Ok(Some(v));
-            }
+    if i < o.elems_len() {
+        let v = o.elem(i as usize);
+        if v != Value::EMPTY {
+            return Ok(Some(v));
         }
     }
     vm.get_keyed(a, Value::number(i as f64)).map(Some)

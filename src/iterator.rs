@@ -16,6 +16,7 @@
 use crate::interp::{call_function, to_boolean, to_number};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, READ_ONLY, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
+use crate::raw::ObjectPtr;
 use crate::symbol::{close, iter_result};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm};
@@ -250,7 +251,7 @@ fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: V
 fn state_of(this: Value, wrap: bool, what: &str) -> Result<Value> {
     if this.is_cell() && Obj::of(this).class() == Class::IteratorHelper {
         let state = Value::from_bits(Obj::of(this).code() as u64);
-        let kind = unsafe { *(*as_object(state)).elems };
+        let kind = unsafe { *as_object(state).elems() };
         if (kind == Value::from_i32(WRAP)) == wrap {
             return Ok(state);
         }

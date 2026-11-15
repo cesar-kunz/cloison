@@ -66,6 +66,7 @@ mod normalize;
 mod promise;
 pub mod props;
 mod proxy;
+mod raw;
 mod realm;
 mod reflect;
 pub mod regexp;

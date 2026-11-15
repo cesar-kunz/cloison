@@ -87,6 +87,7 @@ use crate::bigint::BinOp as BigOp;
 use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Obj, Object, as_object, object_value};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::{NumberTag, Value};
 use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, is_string, string_len, string_units};
 
@@ -285,8 +286,8 @@ macro_rules! handlers {
                         stack_overflow($regs);
                         tail!(op_unwind, Value::EMPTY)
                     }
-                    let left = (*callee).calls_left.get() - 1;
-                    (*callee).calls_left.set(left);
+                    let left = callee.live().calls_left.get() - 1;
+                    callee.live().calls_left.set(left);
                     if left < 0 {
                         let e = enter_compiled(new);
                         match e.kind {
@@ -297,7 +298,7 @@ macro_rules! handlers {
                             _ => {}
                         }
                     }
-                    jump_to!((*callee).bytecode.as_ptr(), Value::UNDEFINED, new)
+                    jump_to!(callee.live().bytecode.as_ptr(), Value::UNDEFINED, new)
                 }};
             }
             // `$e`, a conversion that may call a bytecode `valueOf` or
@@ -611,8 +612,8 @@ handlers! {
         let code: *const Code = header(regs, CODE);
         if !code.is_null() {
             let left = (*regs.sub(BUDGET)).to_bits() as i64;
-            if left != (*code).loop_budget.get() {
-                (*code).loop_budget.set(left);
+            if left != code.live().loop_budget.get() {
+                code.live().loop_budget.set(left);
             }
         }
         let flags = (*regs.sub(FLAGS)).to_bits();
@@ -920,7 +921,7 @@ handlers! {
             if code.is_null() {
                 return Value::EMPTY;
             }
-            let base = (*code).bytecode.as_ptr();
+            let base = code.live().bytecode.as_ptr();
             let at = pc.offset_from(base) as u32;
             if let Some(&(_, _, h)) = (&(*code).handlers)
                 .iter()
@@ -967,12 +968,12 @@ handlers! {
     // stub's (`this` and the parameters) `undefined`.
     fn op_compile_lazy(pc, acc, regs, tag) {
         let code = frame_code(regs);
-        let old = (*code).nregs as usize;
+        let old = code.live().nregs as usize;
         if let Err(e) = with_top(regs, None, |vm| vm.compile_lazy(code)) {
             (*frame_vm(regs)).error = Some(e);
             tail!(op_unwind, Value::EMPTY)
         }
-        let n = (*code).nregs as usize;
+        let n = code.live().nregs as usize;
         if regs.add(n) > (*frame_vm(regs)).stack_end {
             (*frame_vm(regs)).error = Some(Error::range_error("Maximum call stack size exceeded"));
             tail!(op_unwind, Value::EMPTY)
@@ -980,9 +981,9 @@ handlers! {
         for i in old..n {
             *regs.add(i) = Value::UNDEFINED;
         }
-        set_header(regs, ICS, (*code).ics().as_ptr());
-        *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
-        jump_to!((*code).bytecode.as_ptr(), Value::UNDEFINED, regs)
+        set_header(regs, ICS, code.live().ics().as_ptr());
+        *regs.sub(BUDGET) = Value::from_bits(code.live().loop_budget.get() as u64);
+        jump_to!(code.live().bytecode.as_ptr(), Value::UNDEFINED, regs)
     }
 
     // `g.apply(x, arguments)` with the frame's arguments: `g` called with
@@ -1008,7 +1009,7 @@ handlers! {
         // not bound, `prototype` where the shape has it) and no proxies:
         // the prototype walk alone.
         let vm = frame_vm(regs);
-        if is_cell(tag, acc) && (*as_object(acc)).shape == (*vm).function_shape && !(*vm).proxies_exist {
+        if is_cell(tag, acc) && as_object(acc).shape() == (*vm).function_shape && !(*vm).proxies_exist {
             let p = *Object::slot(as_object(acc), (*vm).function_prototype_loc);
             if crate::props::is_object(p) {
                 let v = *reg(pc, 1, regs);
@@ -1016,7 +1017,7 @@ handlers! {
                 if crate::props::is_object(v) {
                     let mut o = as_object(v);
                     loop {
-                        let proto = (*(*o).shape).proto;
+                        let proto = o.shape().live().proto;
                         if !proto.is_cell() {
                             break;
                         }
@@ -1195,7 +1196,7 @@ handlers! {
             Ok(g) => {
                 *reg(pc, 1, regs) = g;
                 let code = frame_code(regs);
-                let at = pc.add(Op::InitialYield.size()).offset_from((*code).bytecode.as_ptr()) as usize;
+                let at = pc.add(Op::InitialYield.size()).offset_from(code.live().bytecode.as_ptr()) as usize;
                 crate::generator::suspend(&mut *frame_vm(regs), g, regs, code, at, false);
                 tail!(op_return, g)
             }
@@ -1212,7 +1213,7 @@ handlers! {
             let g = crate::generator::create(vm, f)?;
             *reg(pc, 1, regs) = g;
             let code = frame_code(regs);
-            let at = pc.add(Op::AsyncStart.size()).offset_from((*code).bytecode.as_ptr()) as usize;
+            let at = pc.add(Op::AsyncStart.size()).offset_from(code.live().bytecode.as_ptr()) as usize;
             crate::generator::suspend(vm, g, regs, code, at, false);
             crate::generator::async_start(vm, g)
         });
@@ -1228,7 +1229,7 @@ handlers! {
     fn op_yield(pc, acc, regs, tag) {
         let g = *reg(pc, 1, regs);
         let code = frame_code(regs);
-        let at = pc.add(Op::Yield.size()).offset_from((*code).bytecode.as_ptr()) as usize;
+        let at = pc.add(Op::Yield.size()).offset_from(code.live().bytecode.as_ptr()) as usize;
         crate::generator::suspend(&mut *frame_vm(regs), g, regs, code, at, true);
         tail!(op_return, acc)
     }
@@ -1691,8 +1692,8 @@ handlers! {
         let o = as_object(*reg(pc, 1, regs));
         let ic = ic_at(regs, pc, 2);
         // An array's or a string's `length` (cached without a shape).
-        if (*ic).loc == LENGTH_LOC && matches!((*o).class, Class::Array | Class::String) && (*o).flags & crate::far::FAR == 0 {
-            next!(any, Op::GetNamed.size(), Value::from_i32((*o).elems_len as i32))
+        if (*ic).loc == LENGTH_LOC && matches!(o.class(), Class::Array | Class::String) && o.flags() & crate::far::FAR == 0 {
+            next!(any, Op::GetNamed.size(), Value::from_i32(o.elems_len() as i32))
         }
         for k in 1..IC_WAYS {
             let w = ic.add(k);
@@ -1727,7 +1728,7 @@ handlers! {
         let vm = &mut *frame_vm(regs);
         let code = &*frame_code(regs);
         let name = *(&code.ic_names).get_unchecked(index_at(pc, 2) as usize);
-        let sh = (*o).shape;
+        let sh = o.shape();
         let e = *(&vm.interp_megas).get_unchecked(crate::vm::interp_mega_index(sh, name.0));
         if e.shape == sh && e.name == name.0 && vm.megamorphic.contains(&(ic as usize)) {
             code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
@@ -1824,8 +1825,8 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(acc) {
             let o = as_object(obj);
             let i = acc.as_i32_unchecked() as u32;
-            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
-                let v = *(*o).elems.add(i as usize);
+            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+                let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     next!(any, Op::GetKeyed.size(), v)
                 }
@@ -1839,8 +1840,8 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let i = raw_i32(acc) as u32;
-            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
-                let v = *(*o).elems.add(i as usize);
+            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+                let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     next!(any, Op::GetKeyed.size(), v)
                 }
@@ -1855,12 +1856,12 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(key) {
             let o = as_object(obj);
             let i = key.as_i32_unchecked() as u32;
-            if i < (*o).elems_len
-                && fits_field(tag, (*(*o).shape).elems_code, acc)
-                && (*(*o).elems.add(i as usize) != Value::EMPTY || !(*frame_vm(regs)).indices_protected)
+            if i < o.elems_len()
+                && fits_field(tag, o.shape().live().elems_code, acc)
+                && (*o.elems().add(i as usize) != Value::EMPTY || !(*frame_vm(regs)).indices_protected)
             {
-                let at = (*o).elems.add(i as usize);
-                crate::heap::store((*o).elems.cast::<u8>().sub(8), at, acc);
+                let at = o.elems().add(i as usize);
+                crate::heap::store(o.elems().cast::<u8>().sub(8), at, acc);
                 next!(any, Op::SetKeyed.size(), acc)
             }
         }
@@ -1888,13 +1889,13 @@ handlers! {
         // Room reserved by `CreateArray`, plain elements, and a value of
         // their type: stored in place, no call.
         let o = as_object(a);
-        let len = (*o).elems_len;
-        if len < Object::elems_cap(o) && (*o).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0 {
-            let s = &*(*o).shape;
+        let len = o.elems_len();
+        if len < Object::elems_cap(o) && o.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0 {
+            let s = o.shape().live();
             if s.elems.join(crate::object::FieldType::of(acc)) == s.elems {
-                let at = (*o).elems.add(len as usize);
-                crate::heap::store((*o).elems.cast::<u8>().sub(8), at, acc);
-                (*o).elems_len = len + 1;
+                let at = o.elems().add(len as usize);
+                crate::heap::store(o.elems().cast::<u8>().sub(8), at, acc);
+                o.set_elems_len(len + 1);
                 next!(any, Op::PushLiteral.size(), Value::from_i32(len as i32 + 1))
             }
         }
@@ -1931,7 +1932,7 @@ handlers! {
 
     fn op_call(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+        if is_cell(tag, f) && as_object(f).class() == Class::Function {
             note_callee(regs, ic_at(regs, pc, 4), as_object(f));
             let w = reg(pc, 2, regs);
             enter!(as_object(f), *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
@@ -1941,11 +1942,11 @@ handlers! {
 
     fn op_call_undefined(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+        if is_cell(tag, f) && as_object(f).class() == Class::Function {
             note_callee(regs, ic_at(regs, pc, 4), as_object(f));
             let args = reg(pc, 2, regs);
             // Sloppy mode: `this` is the global object; strict: `undefined`.
-            let this = if (*(*as_object(f)).code).strict {
+            let this = if (*as_object(f).code()).strict {
                 Value::UNDEFINED
             } else {
                 object_value((*frame_vm(regs)).global)
@@ -1957,8 +1958,8 @@ handlers! {
 
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && (*as_object(f)).class == Class::Function && (*(*as_object(f)).code).constructor() {
-            let this = if (*(*as_object(f)).code).kind == 3 {
+        if is_cell(tag, f) && as_object(f).class() == Class::Function && (*as_object(f).code()).constructor() {
+            let this = if (*as_object(f).code()).kind == 3 {
                 // (A derived class's `this` is its base's, from `super()`.)
                 Value::HOLE
             } else {
@@ -2078,7 +2079,7 @@ handlers! {
     fn slow_get_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         // (A typed array's `length`: see `typed_get_named`.)
-        if is_cell(tag, obj) && (*as_object(obj)).class == Class::TypedArray {
+        if is_cell(tag, obj) && as_object(obj).class() == Class::TypedArray {
             tail!(typed_get_named, acc)
         }
         let r = with_top(regs, None, |vm| vm.get_named_miss(&*frame_code(regs), index_at(pc, 2), obj));
@@ -2099,7 +2100,7 @@ handlers! {
         let code = &*frame_code(regs);
         let ic = ic_at(regs, pc, 2);
         if *(&code.ic_names).get_unchecked(index_at(pc, 2) as usize) == vm.a_length
-            && (*o).flags & crate::object::RUNTIME_LENGTH == 0
+            && o.flags() & crate::object::RUNTIME_LENGTH == 0
             && let Some(h) = vm.known_typed_length(o)
             && ((*ic).loc == LENGTH_LOC || (*ic).loc == crate::vm::ACCESSOR_LOC && (*ic).holder == h)
         {
@@ -2134,14 +2135,14 @@ handlers! {
             let o = as_object(obj);
             let i = acc.as_i32_unchecked() as u32;
             let ic = ic_at(regs, pc, 2);
-            if (*o).class == Class::TypedArray
-                && i < (*o).elems_len
+            if o.class() == Class::TypedArray
+                && i < o.elems_len()
                 && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(o)))
                 && (*ic).loc == crate::vm::BYTES_LOC
-                && (*ic).epoch == (*o).kind as u32 + 1
+                && (*ic).epoch == o.kind() as u32 + 1
             {
-                let kind = crate::object::TypedKind::from_u8((*o).kind);
-                next!(any, Op::GetKeyed.size(), kind.load((*o).elems.cast(), i as usize))
+                let kind = crate::object::TypedKind::from_u8(o.kind());
+                next!(any, Op::GetKeyed.size(), kind.load(o.elems().cast(), i as usize))
             }
         }
         let r = with_top(regs, None, |vm| {
@@ -2179,24 +2180,24 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(key) && acc.is_number() {
             let o = as_object(obj);
             let i = key.as_i32_unchecked() as u32;
-            if (*o).class == Class::TypedArray
-                && i < (*o).elems_len
+            if o.class() == Class::TypedArray
+                && i < o.elems_len()
                 && (!(*frame_vm(regs)).views_detached
                     || !crate::typed::is_detached(crate::typed::buffer_of(o)) && !crate::typed::is_immutable_view(o))
-                && !crate::object::TypedKind::from_u8((*o).kind).is_big()
+                && !crate::object::TypedKind::from_u8(o.kind()).is_big()
             {
                 crate::vm::note_bytes(ic_at(regs, pc, 3), o);
-                let kind = crate::object::TypedKind::from_u8((*o).kind);
+                let kind = crate::object::TypedKind::from_u8(o.kind());
                 if tag.is_int32(acc) {
-                    kind.store_i32((*o).elems.cast(), i as usize, acc.as_i32_unchecked());
+                    kind.store_i32(o.elems().cast(), i as usize, acc.as_i32_unchecked());
                 } else {
-                    kind.store((*o).elems.cast(), i as usize, acc.to_number());
+                    kind.store(o.elems().cast(), i as usize, acc.to_number());
                 }
                 next!(any, Op::SetKeyed.size(), acc)
             }
             // An append, noted for the JIT (unless the site met bytes).
             let ic = ic_at(regs, pc, 3);
-            if (*o).class == Class::Array && i == (*o).elems_len && (*ic).loc == 0 {
+            if o.class() == Class::Array && i == o.elems_len() && (*ic).loc == 0 {
                 (*ic).loc = crate::vm::APPEND_LOC;
             }
         }
@@ -2925,8 +2926,8 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(acc) {
             let o = as_object(obj);
             let i = acc.as_i32_unchecked() as u32;
-            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
-                let v = *(*o).elems.add(i as usize);
+            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+                let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     star!(Op::GetKeyed.size(), v)
                 }
@@ -2940,8 +2941,8 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let i = raw_i32(acc) as u32;
-            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
-                let v = *(*o).elems.add(i as usize);
+            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+                let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     star!(Op::GetKeyed.size(), v)
                 }
@@ -3432,7 +3433,7 @@ pub(crate) fn create_closure(regs: *mut Value, i: u32) -> Value {
             return (*frame_vm(regs)).new_closure(callee);
         }
         // Upvalues of this frame's registers: closed when it ends.
-        if (*callee).upvalues.iter().any(|&(local, _)| local) {
+        if callee.live().upvalues.iter().any(|&(local, _)| local) {
             *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
         }
         let current: *const crate::object::Object = header(regs, FUNC);
@@ -3596,7 +3597,7 @@ fn raw_units(v: Value) -> Option<(*const u16, usize)> {
         return None;
     }
     let o = as_object(v);
-    unsafe { ((*o).class == Class::String).then(|| ((*o).elems.cast::<u16>().cast_const(), (*o).elems_len as usize)) }
+    (o.class() == Class::String).then(|| (o.elems().cast::<u16>().cast_const(), o.elems_len() as usize))
 }
 
 /// `i`'s decimal string.
@@ -4540,7 +4541,7 @@ const NO_TOP: &str = "calling a function from here (compiled code)";
 #[inline(always)]
 fn replays(f: Value) -> bool {
     let o = as_object(f);
-    unsafe { (*o).class == Class::Native && (*(*o).code).reads_only }
+    o.class() == Class::Native && o.code().live().reads_only
 }
 
 /// Whether `native` only reads: one of the built-ins' `toString` and
@@ -4670,9 +4671,9 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
         }
         vm.safepoint(top);
         let fo = as_object(f);
-        let callee = (*fo).code;
+        let callee = fo.code();
         let new = top.add(HEADER);
-        let n = (*callee).nregs as usize;
+        let n = callee.live().nregs as usize;
         // (Past the compiled calls' limit, the callee is interpreted: its
         // calls take no native stack.)
         if new.add(n) > vm.stack_end || native_stack_exhausted(vm) {
@@ -4680,8 +4681,8 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
         }
         write_frame_header(vm, new, callee, std::ptr::null(), std::ptr::null_mut(), 0);
         set_header(new, FUNC, fo);
-        *new = if (*callee).strict { this } else { sloppy_this(vm, this) };
-        let k = args.len().min((*callee).nparams as usize);
+        *new = if callee.live().strict { this } else { sloppy_this(vm, this) };
+        let k = args.len().min(callee.live().nparams as usize);
         for i in 0..k {
             *new.add(1 + i) = args[i];
         }
@@ -4727,7 +4728,7 @@ pub(crate) fn run_script_with(
             return Err(Error::unsupported("eval from here (compiled code)"));
         }
         let new = top.add(HEADER);
-        let n = (*code).nregs as usize;
+        let n = code.live().nregs as usize;
         if new.add(n) > vm.stack_end || native_stack_low(vm) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
@@ -4739,11 +4740,11 @@ pub(crate) fn run_script_with(
         }
         let saved = vm.native_top;
         vm.native_top = std::ptr::null_mut();
-        let v = drive(vm, (*code).bytecode.as_ptr(), Value::UNDEFINED, new);
+        let v = drive(vm, code.live().bytecode.as_ptr(), Value::UNDEFINED, new);
         vm.native_top = saved;
         // It has run, for good: its caches go (see `Code::release`).
         if !again {
-            (*code).release(&mut vm.heap);
+            code.live().release(&mut vm.heap);
         }
         if v == Value::EMPTY {
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("eval")));
@@ -4914,7 +4915,7 @@ unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: *mut Object) {
     unsafe {
         let old = (*ic).holder;
         if old != f {
-            if !old.is_null() && (*old).code != (*f).code {
+            if !old.is_null() && old.code() != f.code() {
                 keep_callee(ic, old, f);
             }
             (*ic).holder = f;
@@ -4984,7 +4985,7 @@ unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
 /// Whether `f` is a leaf native (`Code::leaf`).
 #[inline(always)]
 unsafe fn is_leaf(tag: NumberTag, f: Value) -> bool {
-    unsafe { is_cell(tag, f) && (*as_object(f)).class == Class::Native && (*(*as_object(f)).code).leaf }
+    unsafe { is_cell(tag, f) && as_object(f).class() == Class::Native && (*as_object(f).code()).leaf }
 }
 
 /// A call of leaf native `f` (`is_leaf`) whose arguments let it run as
@@ -4995,18 +4996,18 @@ unsafe fn is_leaf(tag: NumberTag, f: Value) -> bool {
 unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value, argc: usize) -> Option<Value> {
     unsafe {
         let o = as_object(f);
-        let code = (*o).code;
+        let code = o.code();
         let args = std::slice::from_raw_parts(args, argc);
         if args.iter().any(|a| a.is_cell()) {
             return None;
         }
         let vm = &mut *frame_vm(regs);
-        if !vm.realms.is_empty() && (*code).realm != vm.realm {
+        if !vm.realms.is_empty() && code.live().realm != vm.realm {
             return None;
         }
         vm.constructing = false;
         vm.callee = o;
-        (*code).native.unwrap()(vm, this, args).ok()
+        code.live().native.unwrap()(vm, this, args).ok()
     }
 }
 
@@ -5028,14 +5029,14 @@ unsafe fn push_frame(
     unsafe {
         let vm = frame_vm(regs);
         let new = regs.add((*frame_code(regs)).nregs as usize + HEADER);
-        let n = (*callee).nregs as usize;
+        let n = callee.live().nregs as usize;
         if new.add(n) > (*vm).stack_end {
             return std::ptr::null_mut();
         }
-        *new.sub(BUDGET) = Value::from_bits((*callee).loop_budget.get() as u64);
+        *new.sub(BUDGET) = Value::from_bits(callee.live().loop_budget.get() as u64);
         clear_osr(new);
         set_header(new, CODE, callee);
-        set_header(new, ICS, (*callee).ics().as_ptr());
+        set_header(new, ICS, callee.live().ics().as_ptr());
         set_header(new, VM, vm);
         set_header(new, RET_PC, ret);
         set_header(new, CALLER, regs);
@@ -5043,10 +5044,10 @@ unsafe fn push_frame(
         set_header(new, FUNC, fo);
         // Sloppy mode: a primitive `this` is boxed (a string, a symbol or a
         // bigint is a cell).
-        *new = if (*callee).strict || crate::props::is_object(this) { this } else { sloppy_this(vm, this) };
+        *new = if callee.live().strict || crate::props::is_object(this) { this } else { sloppy_this(vm, this) };
         // Scalar loops: counts are small, and vectorized ones would bloat
         // the handler with prologues and remainders.
-        let k = argc.min((*callee).nparams as usize);
+        let k = argc.min(callee.live().nparams as usize);
         for i in 0..k {
             *new.add(1 + i) = *args.add(i);
             core::arch::asm!("", options(nomem, nostack, preserves_flags));
@@ -5240,17 +5241,17 @@ pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -
 /// be in range.
 pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error> {
     unsafe {
-        let n = (*code).nregs as usize;
+        let n = code.live().nregs as usize;
         if HEADER + n > vm.stack.len() {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         let regs = vm.stack.as_mut_ptr().add(HEADER);
         // (Its own: none if it must stay interpreted, as with exception
         // handlers.)
-        *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
+        *regs.sub(BUDGET) = Value::from_bits(code.live().loop_budget.get() as u64);
         clear_osr(regs);
         set_header(regs, CODE, code);
-        set_header(regs, ICS, (*code).ics().as_ptr());
+        set_header(regs, ICS, code.live().ics().as_ptr());
         set_header(regs, VM, vm as *mut Vm);
         set_header(regs, RET_PC, std::ptr::null::<u8>());
         set_header(regs, CALLER, std::ptr::null::<Value>());
@@ -5259,7 +5260,7 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
         for i in 1..n {
             *regs.add(i) = Value::UNDEFINED;
         }
-        let v = drive(vm, (*code).bytecode.as_ptr(), Value::UNDEFINED, regs);
+        let v = drive(vm, code.live().bytecode.as_ptr(), Value::UNDEFINED, regs);
         match vm.error.take() {
             Some(e) => Err(e),
             None => Ok(v),
@@ -5451,10 +5452,10 @@ pub(crate) unsafe fn write_frame_header(
     flags: u64,
 ) {
     unsafe {
-        *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
+        *regs.sub(BUDGET) = Value::from_bits(code.live().loop_budget.get() as u64);
         clear_osr(regs);
         set_header(regs, CODE, code);
-        set_header(regs, ICS, (*code).ics().as_ptr());
+        set_header(regs, ICS, code.live().ics().as_ptr());
         set_header(regs, VM, vm as *const Vm);
         set_header(regs, RET_PC, ret);
         set_header(regs, CALLER, caller);
@@ -5629,19 +5630,19 @@ pub(crate) unsafe fn call_from_jit(
             }
         }
         let fo = as_object(fv);
-        let callee = (*fo).code;
+        let callee = fo.code();
         // (A `Call` the JIT made of `f.call(that, …)` passes `that`.)
         let this = if op == Op::Construct {
             // (A derived class's `this` is its base's, from `super()`, as
             // `op_construct` has it.)
-            if (*callee).kind == 3 { Value::HOLE } else { vm.construct_this(fo) }
-        } else if (*callee).strict {
+            if callee.live().kind == 3 { Value::HOLE } else { vm.construct_this(fo) }
+        } else if callee.live().strict {
             this
         } else {
             sloppy_this(vm, this)
         };
         let new = regs.add(frame);
-        let n = (*callee).nregs as usize;
+        let n = callee.live().nregs as usize;
         if new.add(n) > vm.stack_end {
             return throw(vm, Error::range_error("Maximum call stack size exceeded"));
         }
@@ -5656,7 +5657,7 @@ pub(crate) unsafe fn call_from_jit(
         write_frame_header(vm, new, callee, std::ptr::null(), regs, flags);
         set_header(new, FUNC, fo);
         *new = this;
-        let k = argc.min((*callee).nparams as usize);
+        let k = argc.min(callee.live().nparams as usize);
         for i in 0..k {
             *new.add(1 + i) = *args.add(i);
         }
@@ -5687,24 +5688,24 @@ unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags
 /// [`run_new_frame`]'s body.
 unsafe fn run_new_frame_js(vm: &mut Vm, callee: *const Code, new: *mut Value, flags: u64) -> Value {
     unsafe {
-        let mut start = Resume { regs: new, pc: (*callee).bytecode.as_ptr(), acc: Value::UNDEFINED };
+        let mut start = Resume { regs: new, pc: callee.live().bytecode.as_ptr(), acc: Value::UNDEFINED };
         if !vm.realms.is_empty() {
-            (*callee).calls_left.set(0);
-            return run_in_realm(vm, &*callee, new, start);
+            callee.live().calls_left.set(0);
+            return run_in_realm(vm, callee.live(), new, start);
         }
         // A hot callee runs compiled; an exit resumes in the interpreter.
         // So does one compiled before (for direct calls, say: a function
         // without loops has no countdown, and a site that stopped calling
         // it directly waits for it to compile again), unless its start
         // can't be entered anymore.
-        let left = (*callee).calls_left.get() - 1;
-        (*callee).calls_left.set(left);
+        let left = callee.live().calls_left.get() - 1;
+        callee.live().calls_left.set(left);
         if left < 0 {
-            regrant(&*callee);
+            regrant(callee.live());
         }
-        if left < 0 || !(*callee).calls_interpret.get() && (*callee).jit.borrow().is_some() {
-            match crate::jit::vm_run(vm, &*callee, new, 0, Value::UNDEFINED) {
-                VmRun::NotCompiled => not_compiled(&*callee),
+        if left < 0 || !callee.live().calls_interpret.get() && callee.live().jit.borrow().is_some() {
+            match crate::jit::vm_run(vm, callee.live(), new, 0, Value::UNDEFINED) {
+                VmRun::NotCompiled => not_compiled(callee.live()),
                 VmRun::Interpret => {}
                 VmRun::Returned(v) => {
                     return if flags == CONSTRUCT { construct_result(new, v) } else { v };

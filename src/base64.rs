@@ -10,6 +10,7 @@
 use crate::interp::to_boolean;
 use crate::object::{Class, Object, TypedKind, as_object, object_value};
 use crate::props::is_object;
+use crate::raw::ObjectPtr;
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units};
 
@@ -56,7 +57,7 @@ fn length_of(vm: &mut Vm, o: *mut Object) -> Result<usize> {
 fn bytes_of(vm: &mut Vm, o: *mut Object) -> Result<Vec<u8>> {
     let n = length_of(vm, o)?;
     let mut bytes = vec![0; n];
-    unsafe { crate::racy::copy((*o).elems.cast::<u8>(), bytes.as_mut_ptr(), n) };
+    unsafe { crate::racy::copy(o.elems().cast::<u8>(), bytes.as_mut_ptr(), n) };
     Ok(bytes)
 }
 
@@ -242,7 +243,7 @@ fn decode_hex(s: &[u16], max: usize) -> Decoded {
 /// A new `Uint8Array` of `bytes`.
 fn new_uint8_array(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
     let ta = crate::typed::allocate(vm, TypedKind::U8, bytes.len())?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*as_object(ta)).elems.cast::<u8>(), bytes.len()) };
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), as_object(ta).elems().cast::<u8>(), bytes.len()) };
     Ok(ta)
 }
 
@@ -271,7 +272,7 @@ fn from_hex(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn written(vm: &mut Vm, o: *mut Object, d: Decoded) -> Result<Value> {
     // (A decoding runs no code: `o` is as it was checked.)
     assert!(d.bytes.len() <= length_of(vm, o)?);
-    unsafe { crate::racy::copy(d.bytes.as_ptr(), (*o).elems.cast::<u8>(), d.bytes.len()) };
+    unsafe { crate::racy::copy(d.bytes.as_ptr(), o.elems().cast::<u8>(), d.bytes.len()) };
     if let Some(e) = d.error {
         return Err(e);
     }

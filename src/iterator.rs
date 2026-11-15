@@ -14,7 +14,7 @@
 //! return completion at its `yield`.
 
 use crate::interp::{call_function, to_boolean, to_number};
-use crate::object::{Class, DONT_DELETE, DONT_ENUM, READ_ONLY, as_object, object_value};
+use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, READ_ONLY, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
 use crate::symbol::{close, iter_result};
 use crate::value::Value;
@@ -248,8 +248,8 @@ fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: V
 
 /// The state of `this`, a helper (`wrap`: a wrapper), else a TypeError.
 fn state_of(this: Value, wrap: bool, what: &str) -> Result<Value> {
-    if this.is_cell() && unsafe { (*as_object(this)).class } == Class::IteratorHelper {
-        let state = Value::from_bits(unsafe { (*as_object(this)).code } as u64);
+    if this.is_cell() && Obj::of(this).class() == Class::IteratorHelper {
+        let state = Value::from_bits(Obj::of(this).code() as u64);
         let kind = unsafe { *(*as_object(state)).elems };
         if (kind == Value::from_i32(WRAP)) == wrap {
             return Ok(state);
@@ -783,7 +783,7 @@ fn chunks(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let size = size_arg(vm, it, arg(a, 0))?;
     let next = next_method(vm, it)?;
     let h = new_helper(vm, CHUNKS, it, next, Value::number(size), Value::from_i32(0))?;
-    let state = Value::from_bits(unsafe { (*as_object(h)).code } as u64);
+    let state = Value::from_bits(Obj::of(h).code() as u64);
     let buffer = crate::array::new_array_of(vm, &[])?;
     set(vm, state, INNER, buffer)?;
     set(vm, state, INNER_NEXT, Value::FALSE)?;
@@ -805,7 +805,7 @@ fn windows(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     };
     let next = next_method(vm, it)?;
     let h = new_helper(vm, WINDOWS, it, next, Value::number(size), Value::from_i32(partial as i32))?;
-    let state = Value::from_bits(unsafe { (*as_object(h)).code } as u64);
+    let state = Value::from_bits(Obj::of(h).code() as u64);
     let buffer = crate::array::new_array_of(vm, &[])?;
     set(vm, state, INNER, buffer)?;
     set(vm, state, INNER_NEXT, Value::FALSE)?;
@@ -869,7 +869,7 @@ fn new_zip(vm: &mut Vm, iters: &[(Value, Value)], keys: Value, mode: i32, paddin
     let nexts: Vec<Value> = iters.iter().map(|p| p.1).collect();
     let (its, nexts) = (crate::array::new_array_of(vm, &its)?, crate::array::new_array_of(vm, &nexts)?);
     let h = new_helper(vm, ZIP, its, nexts, keys, Value::from_i32(mode))?;
-    let state = Value::from_bits(unsafe { (*as_object(h)).code } as u64);
+    let state = Value::from_bits(Obj::of(h).code() as u64);
     let padding = crate::array::new_array_of(vm, padding)?;
     let open = crate::array::new_array_of(vm, &vec![Value::TRUE; iters.len()])?;
     set(vm, state, INNER, padding)?;

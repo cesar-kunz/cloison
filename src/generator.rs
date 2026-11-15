@@ -13,7 +13,7 @@
 //! `[state, registers, pc, function, mode]`.
 
 use crate::interp::{native_stack_low, write_frame_header};
-use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, as_object, object_value};
+use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
 
@@ -53,11 +53,7 @@ pub(crate) const RETURN: i32 = 2;
 /// [`regs_at`]). (An array for the cells and another for the registers at
 /// each suspension took a pending `async` call 4 cells, of 9.)
 fn state_of(g: Value) -> Option<*mut Value> {
-    if g.is_cell() && unsafe { (*as_object(g)).class } == Class::Generator {
-        Some(unsafe { (*as_object(g)).code } as *mut Value)
-    } else {
-        None
-    }
+    if g.is_cell() && Obj::of(g).class() == Class::Generator { Some(Obj::of(g).code() as *mut Value) } else { None }
 }
 
 /// Cells of a generator's state before its registers: an async
@@ -184,7 +180,7 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     }
     if state == SUSPENDED_START && mode != NEXT {
         set(vm, st, STATE, Value::from_i32(COMPLETED));
-        clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
+        clear_regs(st, Obj::of(get(vm, st, FUNCTION)).code());
     }
     if get(vm, st, STATE).as_i32_unchecked() == COMPLETED {
         return match mode {
@@ -197,19 +193,19 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     set(vm, st, MODE, Value::from_i32(mode));
     let f = get(vm, st, FUNCTION);
     let pc = get(vm, st, PC).as_i32_unchecked() as usize;
-    let r = unsafe { run(vm, as_object(f), regs_at(st, (*as_object(f)).code), pc, v) };
+    let r = unsafe { run(vm, as_object(f), regs_at(st, Obj::of(f).code()), pc, v) };
     match r {
         Ok(out) => {
             let yielded = get(vm, st, STATE).as_i32_unchecked() == SUSPENDED_YIELD;
             if !yielded {
                 set(vm, st, STATE, Value::from_i32(COMPLETED));
-                clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
+                clear_regs(st, Obj::of(get(vm, st, FUNCTION)).code());
             }
             Ok((out, !yielded))
         }
         Err(e) => {
             set(vm, st, STATE, Value::from_i32(COMPLETED));
-            clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
+            clear_regs(st, Obj::of(get(vm, st, FUNCTION)).code());
             Err(e)
         }
     }
@@ -360,7 +356,7 @@ fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
         // (AsyncGeneratorAwaitReturn), what it settles to the result.
         if state == SUSPENDED_START {
             set(vm, st, STATE, Value::from_i32(COMPLETED));
-            clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
+            clear_regs(st, Obj::of(get(vm, st, FUNCTION)).code());
         }
         set(vm, st, AG_YIELD, AWAITING_RETURN);
         match crate::promise::await_coroutine(vm, v, g) {

@@ -86,7 +86,7 @@
 use crate::bigint::BinOp as BigOp;
 use crate::bytecode::Op;
 use crate::jit::VmRun;
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
 use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, is_string, string_len, string_units};
 
@@ -3061,8 +3061,8 @@ fn strict_fast(tag: NumberTag, a: Value, b: Value) -> Option<bool> {
     // Two cells are equal only as strings or BigInts.
     if a.is_cell()
         && b.is_cell()
-        && unsafe { (*as_object(a)).class == (*as_object(b)).class }
-        && matches!(unsafe { (*as_object(a)).class }, Class::String | Class::BigInt)
+        && (Obj::of(a).class() == Obj::of(b).class())
+        && matches!(Obj::of(a).class(), Class::String | Class::BigInt)
     {
         return None;
     }
@@ -3757,7 +3757,7 @@ pub(crate) fn to_boolean(v: Value) -> bool {
         !u.is_empty()
     } else {
         // Objects are truthy, BigInts but 0n.
-        v == Value::TRUE || v.is_cell() && !(is_bigint(v) && unsafe { (*as_object(v)).elems_len } == 0)
+        v == Value::TRUE || v.is_cell() && !(is_bigint(v) && Obj::of(v).elems_len() == 0)
     }
 }
 
@@ -3941,8 +3941,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 if !crate::props::is_callable(m) {
                     return fail(vm, Error::type_error("Symbol.toPrimitive is not a function"));
                 }
-                if (vm.native_top.is_null() && (*as_object(m)).class != Class::Native)
-                    || (vm.conv_replays && !replays(m))
+                if (vm.native_top.is_null() && Obj::of(m).class() != Class::Native) || (vm.conv_replays && !replays(m))
                 {
                     vm.conv_redo = true;
                     return Value::UNDEFINED;
@@ -3979,7 +3978,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
             if !m.is_cell() {
                 continue;
             }
-            let r = match (*as_object(m)).class {
+            let r = match Obj::of(m).class() {
                 // (Not the next method either: it may throw, and the redo
                 // would throw that.)
                 Class::Function if vm.native_top.is_null() => {
@@ -3994,7 +3993,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 Class::Native if !vm.realms.is_empty() => vm.call_other(m, v, &[]),
                 Class::Native => {
                     vm.callee = as_object(m);
-                    let native = (*(*as_object(m)).code).native.unwrap();
+                    let native = (*Obj::of(m).code()).native.unwrap();
                     vm.run_native(|vm| native(vm, v, &[]))
                 }
                 Class::Function => call_function(vm, m, v, &[]),
@@ -4592,12 +4591,10 @@ fn is_no_top(vm: &Vm, e: &Error) -> bool {
 /// VM stack's free top, which the runtime code that may get here records
 /// (`Vm::native_top`, see [`with_top`]), run to completion.
 pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate::vm::Result<Value> {
-    unsafe {
-        if !f.is_cell() || !matches!((*as_object(f)).class, Class::Function | Class::Native) {
-            return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(f))));
-        }
-        with_args_on_stack(vm, args, |vm, args| call_function_on(vm, f, this, args))
+    if !f.is_cell() || !matches!(Obj::of(f).class(), Class::Function | Class::Native) {
+        return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(f))));
     }
+    with_args_on_stack(vm, args, |vm, args| call_function_on(vm, f, this, args))
 }
 
 /// Whether `args` lie in the VM stack.
@@ -4652,7 +4649,7 @@ pub(crate) fn with_args_on_stack(
 #[inline(always)]
 fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate::vm::Result<Value> {
     unsafe {
-        if (*as_object(f)).class == Class::Native {
+        if Obj::of(f).class() == Class::Native {
             if vm.conv_replays && !replays(f) {
                 // (Recognized as such only there: see `is_no_top`.)
                 debug_assert!(vm.native_top.is_null());
@@ -4866,8 +4863,8 @@ pub(crate) unsafe fn frame_args(vm: &mut Vm, regs: *mut Value, spread: &mut Vec<
 /// is what the call calls.
 pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
     unsafe {
-        let is = |v: Value, c: Class| v.is_cell() && (*as_object(v)).class == c;
-        (is(f, Class::Native) && (*as_object(f)).code == (*vm).function_apply && is(this, Class::Function))
+        let is = |v: Value, c: Class| v.is_cell() && Obj::of(v).class() == c;
+        (is(f, Class::Native) && Obj::of(f).code() == (*vm).function_apply && is(this, Class::Function))
             .then(|| as_object(this))
     }
 }
@@ -4899,8 +4896,8 @@ unsafe fn box_this(vm: *mut Vm, this: Value) -> Value {
 /// is what the call calls.
 pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
     unsafe {
-        let is = |v: Value, c: Class| v.is_cell() && (*as_object(v)).class == c;
-        (is(f, Class::Native) && (*as_object(f)).code == (*vm).function_call && is(this, Class::Function))
+        let is = |v: Value, c: Class| v.is_cell() && Obj::of(v).class() == c;
+        (is(f, Class::Native) && Obj::of(f).code() == (*vm).function_call && is(this, Class::Function))
             .then(|| as_object(this))
     }
 }
@@ -5588,7 +5585,7 @@ pub(crate) unsafe fn call_from_jit(
         {
             (fv, this) = (object_value(fo), that);
         }
-        let bytecode = fv.is_cell() && (*as_object(fv)).class == Class::Function;
+        let bytecode = fv.is_cell() && Obj::of(fv).class() == Class::Function;
         // `f.apply(that, list)`'s arguments (alive until the call returns).
         let spread: Vec<Value>;
         if !bytecode {

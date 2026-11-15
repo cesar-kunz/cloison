@@ -10,7 +10,7 @@
 //! bits (traced: see `gc`).
 
 use crate::interp::{call_function, to_boolean};
-use crate::object::{Atom, Class, DONT_ENUM, Object, as_object, object_value};
+use crate::object::{Atom, Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units};
@@ -61,7 +61,7 @@ fn arg(a: &[Value], i: usize) -> Value {
 
 /// Whether `v` is a symbol.
 pub(crate) fn is_symbol(v: Value) -> bool {
-    v.is_cell() && unsafe { (*as_object(v)).class } == Class::Symbol
+    v.is_cell() && Obj::of(v).class() == Class::Symbol
 }
 
 /// A symbol's `elems_len` until it is a property key: no atom yet.
@@ -119,12 +119,12 @@ pub(crate) fn atom_symbol(vm: &Vm, a: Atom) -> Option<Value> {
 
 /// Whether symbol `v` is in `Symbol.for`'s registry.
 pub(crate) fn is_registered(v: Value) -> bool {
-    unsafe { (*as_object(v)).flags & crate::object::REGISTERED_SYMBOL != 0 }
+    Obj::of(v).flags() & crate::object::REGISTERED_SYMBOL != 0
 }
 
 /// A symbol's description (`undefined` or a string).
 pub(crate) fn description(v: Value) -> Value {
-    Value::from_bits(unsafe { (*as_object(v)).code } as u64)
+    Value::from_bits(Obj::of(v).code() as u64)
 }
 
 /// A new symbol, its key atom named `name` (a new one if `None`).
@@ -534,7 +534,7 @@ pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value
     vm.create_data_property(o, Key::Name(a_value), value)?;
     vm.create_data_property(o, Key::Name(a_done), Value::from_bool(done))?;
     unsafe {
-        let s = (*as_object(o)).shape;
+        let s = Obj::of(o).shape();
         if !(*s).dictionary && (*s).keys() == [a_value, a_done] && (*s).attrs().iter().all(|&a| a == 0) {
             // (A realm's field: `Vm::fixed_shapes` keeps it, and the
             // collector its ancestors.)
@@ -545,8 +545,8 @@ pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value
 }
 
 fn iterator_state(this: Value, what: &str) -> Result<Value> {
-    if this.is_cell() && unsafe { (*as_object(this)).class } == Class::ArrayIterator {
-        return Ok(Value::from_bits(unsafe { (*as_object(this)).code } as u64));
+    if this.is_cell() && Obj::of(this).class() == Class::ArrayIterator {
+        return Ok(Value::from_bits(Obj::of(this).code() as u64));
     }
     Err(Error::type_error(format!("{what} called on an incompatible receiver")))
 }
@@ -738,10 +738,7 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     }
     // (The builtin array iterator's step, its result object unobservable:
     // fresh, its own data properties read back at once.)
-    if is_native(vm, next, array_iterator_next)
-        && it.is_cell()
-        && unsafe { (*as_object(it)).class } == Class::ArrayIterator
-    {
+    if is_native(vm, next, array_iterator_next) && it.is_cell() && Obj::of(it).class() == Class::ArrayIterator {
         return array_step(vm, it);
     }
     let r = call_function(vm, next, it, &[])?;
@@ -822,9 +819,9 @@ pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Result<Option<Vec<u16>>> {
 /// makes (an iterator, an entry's array) has that realm's prototypes.
 fn is_native(vm: &Vm, f: Value, n: NativeFn) -> bool {
     f.is_cell()
-        && unsafe { (*as_object(f)).class } == Class::Native
+        && Obj::of(f).class() == Class::Native
         && unsafe {
-            let c = (*as_object(f)).code;
+            let c = Obj::of(f).code();
             !c.is_null() && (*c).native.is_some_and(|g| g as usize == n as usize) && (*c).realm == vm.realm
         }
 }
@@ -942,7 +939,7 @@ fn protector_again(vm: &mut Vm) -> u8 {
 /// `next()` would.
 #[inline]
 fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
-    if !v.is_cell() || unsafe { (*as_object(v)).class } != Class::Array {
+    if !v.is_cell() || Obj::of(v).class() != Class::Array {
         return false;
     }
     let o = as_object(v);
@@ -961,13 +958,13 @@ fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
 /// [`ITER_TYPED`]. (A kind's prototype may not be flagged one, so its own
 /// shape is looked at here.)
 fn iterates_as_typed(vm: &mut Vm, v: Value) -> bool {
-    if !v.is_cell() || unsafe { (*as_object(v)).class } != Class::TypedArray {
+    if !v.is_cell() || Obj::of(v).class() != Class::TypedArray {
         return false;
     }
-    let o = as_object(v);
-    let kp = vm.typed_prototypes[unsafe { (*o).kind } as usize];
+    let o = Obj::of(v);
+    let kp = vm.typed_prototypes[o.kind() as usize];
     unsafe {
-        let (s, ks) = (&*(*o).shape, &*(*kp).shape);
+        let (s, ks) = (&*o.shape(), &*(*kp).shape);
         if s.proto != object_value(kp)
             || s.dictionary
             || ks.dictionary
@@ -1073,7 +1070,7 @@ pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()>
 /// Whether `IteratorOpen`'s state starting at `v` is one of
 /// [`fast_open`]'s (a record is a plain object).
 pub(crate) fn is_open_state(v: Value) -> bool {
-    v.is_cell() && matches!(unsafe { (*as_object(v)).class }, Class::Array | Class::String | Class::CollectionIterator)
+    v.is_cell() && matches!(Obj::of(v).class(), Class::Array | Class::String | Class::CollectionIterator)
 }
 
 /// `src`'s elements appended to array `dst`, as iterating `src` would
@@ -1120,7 +1117,7 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
 /// Whether `v`, the first register of an `IteratorOpen` state, makes it
 /// an array's (`[array, index]`).
 pub(crate) fn is_open_array(v: Value) -> bool {
-    v.is_cell() && unsafe { (*as_object(v)).class } == Class::Array
+    v.is_cell() && Obj::of(v).class() == Class::Array
 }
 
 /// Element `i` of array `a` as `%ArrayIteratorPrototype%.next` gives it,
@@ -1179,7 +1176,7 @@ pub(crate) unsafe fn iterator_next(vm: &mut Vm, slots: *mut Value) -> Result<Val
 unsafe fn iterator_next_other(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
     unsafe {
         let s = *slots;
-        match (*as_object(s)).class {
+        match Obj::of(s).class() {
             Class::String => {
                 let i = (*slots.add(1)).as_i32_unchecked() as usize;
                 let u = string_units(s).expect("a string");
@@ -1222,13 +1219,13 @@ pub(crate) fn open_state_close(vm: &mut Vm, a: &[Value]) -> Result<()> {
     if protector(vm) & ITER_NO_RETURN != 0 {
         return Ok(());
     }
-    let it = match unsafe { (*as_object(a[0])).class } {
+    let it = match Obj::of(a[0]).class() {
         Class::CollectionIterator => a[0],
         Class::String => new_iterator(vm, a[0], 3, Root::StringIteratorPrototype)?,
         _ => new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?,
     };
-    if unsafe { (*as_object(it)).class } == Class::ArrayIterator {
-        let state = Value::from_bits(unsafe { (*as_object(it)).code } as u64);
+    if Obj::of(it).class() == Class::ArrayIterator {
+        let state = Value::from_bits(Obj::of(it).code() as u64);
         vm.set_keyed(state, Value::from_i32(1), a[1])?;
     }
     close(vm, it)

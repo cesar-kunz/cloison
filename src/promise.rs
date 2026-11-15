@@ -23,7 +23,7 @@ use crate::builtins::{caught, is_class, link_constructor, make_error, run_source
 use crate::collections::iterate;
 use crate::interp::{call_function, to_string_units};
 use crate::jit::Ty;
-use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
+use crate::object::{Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push};
@@ -305,9 +305,9 @@ fn is_intrinsic(vm: &Vm, v: Value) -> bool {
 fn is_constructor(v: Value) -> bool {
     v.is_cell()
         && unsafe {
-            match (*as_object(v)).class {
+            match Obj::of(v).class() {
                 Class::Function => true,
-                Class::Native => (*(*as_object(v)).code).constructs,
+                Class::Native => (*Obj::of(v).code()).constructs,
                 _ => false,
             }
         }
@@ -393,7 +393,7 @@ pub(crate) fn binding_accessor(vm: &mut Vm, setter: bool, data: &[Value]) -> Val
 
 /// Whether `v` is a direct `eval`'s binding's getter.
 pub(crate) fn is_binding_get(vm: &Vm, v: Value) -> bool {
-    crate::builtins::is_class(v, Class::Native) && unsafe { (*as_object(v)).code == (*root(vm, Root::BindingGet)).code }
+    crate::builtins::is_class(v, Class::Native) && unsafe { Obj::of(v).code() == (*root(vm, Root::BindingGet)).code }
 }
 
 pub(crate) fn slot(o: *mut Object, i: usize) -> Value {
@@ -708,7 +708,7 @@ fn run_job(vm: &mut Vm, job: &[Value; JOB]) -> Result<()> {
     let cap = Cap { promise: job[1], resolve: job[2], reject: job[3] };
     let (handler, argument) = (job[4], job[5]);
     // (An `await`'s coroutine: see `await_coroutine`.)
-    if handler.is_cell() && unsafe { (*as_object(handler)).class } == Class::Generator {
+    if handler.is_cell() && Obj::of(handler).class() == Class::Generator {
         let mode = if tag == FULFILLED { crate::generator::NEXT } else { crate::generator::THROW };
         return crate::generator::async_step(vm, handler, mode, argument);
     }

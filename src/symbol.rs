@@ -318,6 +318,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // (A private name's, as `is_private_atom` tells them; theirs are numbered.)
     vm.a_hole = vm.intern_name(&format!("{SYMBOL_MARK}#hole"));
     vm.a_sym_species = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.species"));
+    vm.a_sym_spreadable = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.isConcatSpreadable"));
     vm.a_sym_to_string_tag = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.toStringTag"));
     vm.a_sym_to_primitive = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.toPrimitive"));
     vm.a_sym_has_instance = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.hasInstance"));

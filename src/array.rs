@@ -92,6 +92,21 @@ fn dense(vm: &Vm, o: *mut Object) -> bool {
     unsafe { (*o).class == Class::Array && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0 && plain_protos(vm, o) }
 }
 
+/// Whether `o` is an `arguments` object as it was made, but for its
+/// elements' and `length`'s values (`builtins::arguments_object_of`'s
+/// common one, its elements not its function's parameters), with nothing
+/// indexed on `Object.prototype`: its elements read directly, as `dense`'s
+/// (`slice.call(arguments)`, `forEach.call(arguments, …)`).
+fn plain_arguments(vm: &Vm, o: *mut Object) -> bool {
+    unsafe {
+        (*o).shape == vm.arguments_shape
+            && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0
+            && (*(*vm.object_prototype).shape).proto.is_null()
+            && (*vm.object_prototype).elems_len == 0
+            && (*vm.object_prototype).flags & crate::object::SPARSE == 0
+    }
+}
+
 /// Whether `o`'s prototypes are `Array.prototype` then `Object.prototype`
 /// with nothing indexed (`dense`'s condition on them).
 fn plain_protos(vm: &Vm, o: *mut Object) -> bool {
@@ -147,7 +162,7 @@ fn key(i: f64) -> Key {
 /// `o`'s element `i`, `has` saying whether it is there (`HasProperty`).
 fn element(vm: &mut Vm, o: Value, i: f64) -> Result<(bool, Value)> {
     let obj = as_object(o);
-    if dense(vm, obj) && i < u32::MAX as f64 {
+    if (dense(vm, obj) || plain_arguments(vm, obj)) && i < u32::MAX as f64 {
         unsafe {
             let i = i as u32;
             if i < (*obj).elems_len {
@@ -185,6 +200,15 @@ fn set_length(vm: &mut Vm, o: Value, n: f64) -> Result<()> {
 
 /// `this` as an object, and its length.
 fn this_object(vm: &mut Vm, this: Value) -> Result<(Value, f64)> {
+    // (An ordinary array's length is its elements' count.)
+    if this.is_cell() {
+        let o = as_object(this);
+        unsafe {
+            if (*o).class == Class::Array && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0 {
+                return Ok((this, (*o).elems_len as f64));
+            }
+        }
+    }
     let o = object_value(vm.to_object(this)?);
     let len = vm.length_of(o)?;
     Ok((o, len))
@@ -206,8 +230,7 @@ fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
     }
     let a = vm.new_array();
     if n > 0.0 {
-        let a_length = vm.a_length;
-        vm.set(a, a_length, Value::number(n))?;
+        vm.set_array_length(as_object(a), Value::number(n))?;
     }
     Ok(a)
 }
@@ -231,7 +254,7 @@ fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
         }
     }
     if crate::props::is_object(c) {
-        let a_species = vm.intern_name(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
+        let a_species = vm.a_sym_species;
         c = vm.get(c, a_species)?;
         if c.is_null() {
             c = Value::UNDEFINED;
@@ -296,7 +319,7 @@ fn spreadable(vm: &mut Vm, v: Value) -> Result<bool> {
     if !crate::props::is_object(v) {
         return Ok(false);
     }
-    let a = vm.intern_name(&format!("{}Symbol.isConcatSpreadable", crate::symbol::SYMBOL_MARK));
+    let a = vm.a_sym_spreadable;
     let s = vm.get(v, a)?;
     if !s.is_undefined() {
         return Ok(to_boolean(s));
@@ -367,6 +390,23 @@ pub(crate) fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
 
 /// `CreateDataPropertyOrThrow(o, i, v)`.
 fn create(vm: &mut Vm, o: Value, i: f64, v: Value) -> Result<()> {
+    // An ordinary array's element within its length (a hole `map`'s
+    // result has for each) or the next one: stored.
+    let obj = as_object(o);
+    unsafe {
+        if (*obj).class == Class::Array && (*obj).flags & !(EXTERNAL | PROTOTYPE) == 0 {
+            let len = (*obj).elems_len as f64;
+            if i <= len && i < (1 << 24) as f64 {
+                let i = i as usize;
+                if i as f64 == len {
+                    vm.reserve_elems(obj, i + 1);
+                    (*obj).elems_len = i as u32 + 1;
+                }
+                vm.store_element(obj, i, v);
+                return Ok(());
+            }
+        }
+    }
     vm.create_data_property(o, key(i), v)
 }
 
@@ -538,13 +578,16 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 let oo = as_object(out);
                 let at = (*oo).elems_len as usize;
                 vm.reserve_elems(oo, at + m);
-                for i in 0..m {
-                    let v = *(*obj).elems.add(i);
-                    if v == Value::EMPTY {
-                        crate::layout::store_word((*oo).elems.add(at + i), Value::EMPTY);
-                    } else {
-                        vm.store_element(oo, at + i, v);
-                    }
+                // (As `slice`: the result takes the item's elements' type
+                // at once.)
+                let want = (*(*oo).shape).elems.join((*(*obj).shape).elems);
+                if want != (*(*oo).shape).elems {
+                    crate::object::set_shape(oo, vm.elements_transition((*oo).shape, want));
+                }
+                if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
+                    vm.heap.move_values((*obj).elems, (*oo).elems.add(at), m);
+                } else {
+                    vm.store_elements(oo, at, (*obj).elems, m);
                 }
                 (*oo).elems_len = (at + m) as u32;
             }
@@ -737,12 +780,14 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let k = relative(arg(a, 0), len, 0.0);
     let end = relative(arg(a, 1), len, len);
     let count = (end - k).max(0.0);
-    let out = species_create(vm, o, count)?;
+    // (A plain array's result isn't given its length, of holes, to have
+    // every one written over: the copy below sets it, or the loop's end.)
+    let out = if species_pristine(vm, o) { vm.new_array() } else { species_create(vm, o, count)? };
     // (The arguments' conversions and the species lookup may have run
     // code that changed the length: the fast path only over the one
     // measured. A species may return `o` itself: the copy then overlaps.)
     if out != o
-        && dense(vm, as_object(o))
+        && (dense(vm, as_object(o)) || plain_arguments(vm, as_object(o)))
         && dense(vm, as_object(out))
         && unsafe { (*as_object(o)).elems_len } as f64 == len
     {

@@ -9827,3 +9827,165 @@ true
 true"##;
     assert_eq!(run(src).as_deref(), Ok(want));
 }
+
+#[test]
+fn array_builtins_fast_paths_agree_with_the_engines() {
+    // `slice`, `concat`, `map` and `filter` writing a plain array's
+    // elements directly, `arguments` read as an array, bound functions'
+    // argument lists; and what goes around them: holes, a species, a
+    // frozen result, an array changed by its callback. What V8,
+    // SpiderMonkey and JavaScriptCore print.
+    let src = r##"
+var out = [];
+function p(x) { out.push(JSON.stringify(x)); }
+function t(f) { try { p(f()); } catch (e) { p(e.name); } }
+function holes(a) { var s = ''; for (var i = 0; i < a.length; i++) s += (i in a) ? '1' : '0'; return s + ':' + a.length; }
+// slice
+p([1,2,3,4].slice(1)); p([1,2,3,4].slice(-2)); p([1,2,3,4].slice(1,-1)); p([1,2,3].slice(5)); p([].slice());
+p(holes([1,,3,,5].slice(1))); p(holes([,,].slice())); p([1.5,2,'a',{}].slice(1,3));
+var far = []; far[100000] = 1; far[3] = 2; p(holes(far.slice(2, 6))); p(far.slice(99999).length);
+(function () { p(Array.prototype.slice.call(arguments)); p(Array.prototype.slice.call(arguments, 1)); })(1, 'b', null);
+(function () { arguments.length = 2; p(Array.prototype.slice.call(arguments)); })(1, 2, 3);
+(function () { arguments.length = 5; p(holes(Array.prototype.slice.call(arguments))); })(1, 2, 3);
+(function () { delete arguments[1]; p(holes(Array.prototype.slice.call(arguments))); })(1, 2, 3);
+(function (a, b) { a = 9; p(Array.prototype.slice.call(arguments)); arguments[1] = 8; p(b); })(1, 2, 3);
+(function (a, b) { 'use strict'; a = 9; p(Array.prototype.slice.call(arguments)); })(1, 2, 3);
+(function () { Object.defineProperty(arguments, 0, { get: function () { return 'g'; } }); p(Array.prototype.slice.call(arguments)); })(1, 2);
+(function () { var n = 0; Array.prototype.forEach.call(arguments, function (x, i) { n += x * (i + 1); }); p(n); })(1, 2, 3);
+(function () { p(Array.prototype.map.call(arguments, function (x) { return x * 2; })); })(1, 2, 3);
+(function () { p(Array.prototype.concat.call(arguments, [1]).length); })(1, 2, 3);
+Object.prototype[1] = 'proto';
+(function () { delete arguments[1]; p(Array.prototype.slice.call(arguments)); })(1, 2, 3);
+p(holes([1,,3].slice())); p([1,,3].slice()[1]);
+delete Object.prototype[1];
+p(Array.prototype.slice.call('abc', 1)); p(Array.prototype.slice.call({ length: 3, 0: 'x', 2: 'z' }));
+// species
+class A extends Array {}
+var sub = A.from([1,2,3]); p(sub.slice(1) instanceof A); p(sub.map(function (x) { return x; }) instanceof A);
+p(sub.filter(function () { return true; }) instanceof A); p(sub.concat([4]) instanceof A);
+var sp = [1,2,3]; sp.constructor = { [Symbol.species]: function (n) { return { length: 0, made: n }; } };
+p(sp.slice(1)); p(sp.map(function (x) { return x + 1; })); p(sp.filter(function (x) { return x > 1; })); p(sp.concat([9]));
+var self = [1,2,3,4]; self.constructor = { [Symbol.species]: function () { return self; } };
+p(self.slice(1)); 
+var fz = [1,2,3]; fz.constructor = { [Symbol.species]: function (n) { return Object.freeze(new Array(n)); } };
+t(function () { return fz.map(function (x) { return x; }); }); t(function () { return fz.slice(0, 2); });
+var ne = [1,2,3]; ne.constructor = { [Symbol.species]: function () { return Object.preventExtensions([]); } };
+t(function () { return ne.filter(function () { return true; }); }); t(function () { return ne.concat([1]); });
+// map / filter / every / some / forEach
+p([1,2,3].map(function (x, i, a) { return x * i + a.length; })); p(holes([1,,3].map(function (x) { return x; })));
+p([1,2,3,4].filter(function (x) { return x & 1; })); p([].map(function () { return 1; })); p([1.5,'a'].map(String));
+p([1,2,3].map(function (x) { return x > 1 ? 'big' : x + 0.5; }));
+var grow = [1,2,3]; p(grow.map(function (x, i) { if (i == 0) grow.push(9); return x; })); p(grow);
+var shrink = [1,2,3,4]; p(holes(shrink.map(function (x, i) { if (i == 0) shrink.length = 2; return x; })));
+var del = [1,2,3,4]; p(del.filter(function (x, i) { if (i == 0) delete del[2]; return true; }));
+t(function () { return [1].map(); }); t(function () { return [1].filter(3); }); t(function () { return [].forEach(); });
+p([1,2,3].every(function (x) { return x < 3; })); p([1,2,3].some(function (x) { return x > 2; }));
+var th = []; [1,2].forEach(function (x) { th.push(this.k + x); }, { k: 10 }); p(th);
+// concat
+p([1,2].concat([3,4])); p([1,2].concat(3, [4, [5]])); p(holes([1,,3].concat([,5]))); p([].concat()); p([1.5].concat(['a'], [{}], [2]));
+p([1,2].concat([0.5])); p(['a'].concat([1,2])); p(holes([].concat(far).slice(0, 5)));
+var spr = { length: 2, 0: 'a', 1: 'b' }; spr[Symbol.isConcatSpreadable] = true; p([1].concat(spr));
+var nospr = [1,2]; nospr[Symbol.isConcatSpreadable] = false; p([0].concat(nospr).length);
+Array.prototype[Symbol.isConcatSpreadable] = false; p([1].concat([2]).length); delete Array.prototype[Symbol.isConcatSpreadable];
+p([1].concat([2]).length);
+var big = []; for (var i = 0; i < 40; i++) big.push(i); p(big.concat(big).length); p(big.slice(3, 37).length);
+// bound functions
+function f(a, b, c) { return [this && this.k, a, b, c, arguments.length]; }
+var b1 = f.bind({ k: 1 }, 'x'); p(b1('y')); p(b1()); p(b1(1, 2, 3, 4)); p(b1.length); p(b1.name);
+var b2 = b1.bind(null, 'y', 'z'); p(b2('w')); p(b2.length); p(b2.name);
+var many = f.bind.apply(f, [{ k: 2 }].concat(big)); p(many(1).slice(0, 4)); p(many.apply(null, big)[4]);
+function C(a, b) { this.s = a + b; } var BC = C.bind(null, 1); p(new BC(2).s); p(new BC(2) instanceof C); p('prototype' in BC);
+p(f.bind().call({ k: 5 })[0] === undefined);
+// Constructor replaced after
+Array.prototype.constructor = function () { return { length: 0, other: true }; };
+p([1,2].slice()); p([1,2].map(function (x) { return x; })); 
+out.join("\n")
+"##;
+    let want = r##"[2,3,4]
+[3,4]
+[2,3]
+[]
+[]
+"0101:4"
+"00:2"
+[2,"a"]
+"0100:4"
+2
+[1,"b",null]
+["b",null]
+[1,2]
+"11100:5"
+"101:3"
+[9,2,3]
+8
+[1,2,3]
+["g",2]
+14
+[2,4,6]
+2
+[1,"proto",3]
+"111:3"
+"proto"
+["b","c"]
+["x",null,"z"]
+true
+true
+true
+true
+{"0":2,"1":3,"length":2,"made":2}
+{"0":2,"1":3,"2":4,"length":0,"made":3}
+{"0":2,"1":3,"length":0,"made":0}
+{"0":1,"1":2,"2":3,"3":9,"length":4,"made":0}
+[2,3,4]
+"TypeError"
+"TypeError"
+"TypeError"
+"TypeError"
+[3,5,9]
+"101:3"
+[1,3]
+[]
+["1.5","a"]
+[1.5,"big","big"]
+[1,2,3]
+[1,2,3,9]
+"1100:4"
+[1,2,4]
+"TypeError"
+"TypeError"
+"TypeError"
+false
+true
+[11,12]
+[1,2,3,4]
+[1,2,3,4,[5]]
+"10101:5"
+[]
+[1.5,"a",{},2]
+[1,2,0.5]
+["a",1,2]
+"00010:5"
+[1,"a","b"]
+2
+2
+2
+80
+34
+[1,"x","y",null,2]
+[1,"x",null,null,1]
+[1,"x",1,2,5]
+2
+"bound f"
+[1,"x","y","z",4]
+0
+"bound bound f"
+[2,0,1,2]
+80
+3
+true
+false
+true
+[1,2]
+[1,2]"##;
+    assert_eq!(run(src).as_deref(), Ok(want));
+}

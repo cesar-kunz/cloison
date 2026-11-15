@@ -1860,12 +1860,14 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let s = object_value(so);
         // A plain object's data properties, read from their slots while it
         // keeps its shape (a setter of the target's may change it); not
-        // with a symbol among its keys, which come after the strings.
+        // with a symbol among its keys, which come after the strings. All
+        // its names are walked, each one's enumerability read at its
+        // turn: a setter may have made a later one enumerable.
         let symbols = |vm: &Vm| unsafe { (*(*so).shape).keys().iter().any(|&a| crate::symbol::is_symbol_atom(vm, a)) };
         if vm.plain_named(so)
             && unsafe { !(*(*so).shape).dictionary }
             && !symbols(vm)
-            && let Some(slots) = vm.listed_slots(so, false, true)
+            && let Some(slots) = vm.listed_slots(so, true, true)
         {
             let shape = unsafe { (*so).shape };
             let names: Vec<Atom> = slots.iter().map(|&k| unsafe { (*shape).keys()[k as usize] }).collect();
@@ -1877,10 +1879,11 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
                 // (The slot checked too: a shape freed gives its address to
                 // the next one made.)
                 let cur = unsafe { &*(*so).shape };
-                let same = std::ptr::eq(cur, shape)
-                    && cur.keys().get(k as usize) == Some(&name)
-                    && cur.attrs()[k as usize] & (ACCESSOR | DONT_ENUM) == 0;
-                let v = if same {
+                let same = std::ptr::eq(cur, shape) && cur.keys().get(k as usize) == Some(&name);
+                let attrs = if same { cur.attrs()[k as usize] } else { ACCESSOR };
+                let v = if attrs & (ACCESSOR | DONT_ENUM) == DONT_ENUM {
+                    continue;
+                } else if attrs & ACCESSOR == 0 {
                     unsafe { *Object::slot(so, cur.location(k)) }
                 } else {
                     match crate::proxy::get_own_property(vm, so, key)? {

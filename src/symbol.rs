@@ -845,6 +845,9 @@ pub(crate) const ITER_SET: u8 = 8;
 /// ...and strings (`String.prototype[@@iterator]` and
 /// `%StringIteratorPrototype%.next`).
 pub(crate) const ITER_STRING: u8 = 16;
+/// ...and typed arrays (`%TypedArray%.prototype[@@iterator]` its builtin
+/// `values`, and the array iterator's `next`).
+pub(crate) const ITER_TYPED: u8 = 32;
 
 /// The iteration protector, V8's `ArrayIteratorLookupChain` (or
 /// JavaScriptCore's array iterator protocol watchpoint): bits that hold
@@ -874,7 +877,8 @@ fn protector_again(vm: &mut Vm) -> u8 {
     // A proxy on one may run code for any lookup, which `Vm::lookup`
     // doesn't: then no bits.)
     let mut proxied = false;
-    for start in [vm.array_prototype, vm.string_prototype, mp, sp].into_iter().chain(iterators) {
+    let tap = vm.typed_array_prototype;
+    for start in [vm.array_prototype, vm.string_prototype, mp, sp, tap].into_iter().chain(iterators) {
         let mut o = start;
         while !o.is_null() {
             proxied |= crate::proxy::is_proxy(vm, o);
@@ -917,6 +921,9 @@ fn protector_again(vm: &mut Vm) -> u8 {
     if builtins(vm, vm.string_prototype, Some(string_iterator), sip, string_iterator_next) {
         bits |= ITER_STRING;
     }
+    if builtins(vm, tap, Some(crate::typed::typed_values), aip, array_iterator_next) {
+        bits |= ITER_TYPED;
+    }
     if iterators.iter().all(|&p| vm.lookup(p, vm.a_return).is_none()) {
         bits |= ITER_NO_RETURN;
     }
@@ -946,6 +953,53 @@ fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
         return false;
     }
     protector(vm) & ITER_ARRAY != 0
+}
+
+/// Whether `v` iterates as a typed array by the builtins: one of its
+/// kind's own prototype, which has %TypedArray%.prototype's
+/// `@@iterator` as it has none nor `v`, while the [`protector`] has
+/// [`ITER_TYPED`]. (A kind's prototype may not be flagged one, so its own
+/// shape is looked at here.)
+fn iterates_as_typed(vm: &mut Vm, v: Value) -> bool {
+    if !v.is_cell() || unsafe { (*as_object(v)).class } != Class::TypedArray {
+        return false;
+    }
+    let o = as_object(v);
+    let kp = vm.typed_prototypes[unsafe { (*o).kind } as usize];
+    unsafe {
+        let (s, ks) = (&*(*o).shape, &*(*kp).shape);
+        if s.proto != object_value(kp)
+            || s.dictionary
+            || ks.dictionary
+            || s.lookup(vm.a_sym_iterator).is_some()
+            || ks.lookup(vm.a_sym_iterator).is_some()
+            || ks.proto != object_value(vm.typed_array_prototype)
+        {
+            return false;
+        }
+    }
+    protector(vm) & ITER_TYPED != 0
+}
+
+/// The values iterating `v` gives, when it is an array with no holes or
+/// a typed array in bounds that the builtins iterate: nothing of the
+/// iteration is observable then.
+pub(crate) fn dense_values(vm: &mut Vm, v: Value) -> Option<Vec<Value>> {
+    if iterates_as_typed(vm, v) {
+        return crate::typed::elements(vm, as_object(v));
+    }
+    if !iterates_as_array(vm, v) {
+        return None;
+    }
+    let s = as_object(v);
+    unsafe {
+        let n = (*s).elems_len as usize;
+        if crate::far::is_far(s) || vm.length_field(s) as usize != n {
+            return None;
+        }
+        let values = std::slice::from_raw_parts((*s).elems, n);
+        (!values.contains(&Value::EMPTY)).then(|| values.to_vec())
+    }
 }
 
 /// `IteratorOpen`'s states with no iterator record, tried in
@@ -1027,15 +1081,27 @@ pub(crate) fn is_open_state(v: Value) -> bool {
 /// `CloneFastJSArray`): whether it was. Nothing collects meanwhile
 /// (allocation never does), so the elements are read in place.
 pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
-    if !iterates_as_array(vm, src) || !is_open_array(dst) {
+    if !is_open_array(dst) {
         return false;
     }
     let (d, s) = (as_object(dst), as_object(src));
     unsafe {
-        if (*d).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0
-            || crate::far::is_far(d)
-            || crate::far::is_far(s)
-        {
+        if (*d).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 || crate::far::is_far(d) {
+            return false;
+        }
+        // (A typed array's, loaded.)
+        if iterates_as_typed(vm, src) {
+            let Some(values) = crate::typed::elements(vm, s) else { return false };
+            let (len, n) = ((*d).elems_len as usize, values.len());
+            if len + n >= 1 << 28 {
+                return false;
+            }
+            vm.reserve_elems(d, len + n);
+            vm.store_elements(d, len, values.as_ptr(), n);
+            (*d).elems_len = (len + n) as u32;
+            return true;
+        }
+        if !iterates_as_array(vm, src) || crate::far::is_far(s) {
             return false;
         }
         let n = (*s).elems_len as usize;

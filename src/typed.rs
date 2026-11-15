@@ -691,6 +691,139 @@ fn set(vm: &mut Vm, o: *mut Object, i: usize, v: Value) -> Result<()> {
     Ok(())
 }
 
+/// `o[at + i] = values[i]` for each (TypedArraySetElement): a number is
+/// stored at once (nothing runs, so `o`'s length is as it was), another
+/// value converted first.
+fn set_all(vm: &mut Vm, o: *mut Object, at: usize, values: &[Value]) -> Result<()> {
+    let k = kind_of(o);
+    let mut len = ta_length(o).unwrap_or(0);
+    for (i, &v) in values.iter().enumerate() {
+        if v.is_number() && !k.is_big() {
+            if at + i < len {
+                unsafe { k.store_value((*o).elems.cast(), at + i, v) };
+            }
+        } else {
+            set(vm, o, at + i, v)?;
+            len = ta_length(o).unwrap_or(0);
+        }
+    }
+    Ok(())
+}
+
+/// `o[at + i] = src[i]` for `i` below `n`, each read (`Get`) then stored
+/// (TypedArraySetElement): a plain array's number read in place and
+/// stored at once, while it is one (a conversion may run code).
+fn set_from(vm: &mut Vm, o: *mut Object, at: usize, src: Value, n: usize) -> Result<()> {
+    let k = kind_of(o);
+    let s = as_object(src);
+    let plain = |s: *mut Object| unsafe {
+        (*s).class == Class::Array && (*s).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0
+    };
+    let mut direct = !k.is_big() && plain(s);
+    let mut len = ta_length(o).unwrap_or(0);
+    for i in 0..n {
+        if direct && i < unsafe { (*s).elems_len } as usize {
+            let v = unsafe { *(*s).elems.add(i) };
+            if v.is_number() {
+                if at + i < len {
+                    unsafe { k.store_value((*o).elems.cast(), at + i, v) };
+                }
+                continue;
+            }
+        }
+        let v = vm.get_keyed(src, Value::number(i as f64))?;
+        set(vm, o, at + i, v)?;
+        direct = !k.is_big() && plain(s);
+        len = ta_length(o).unwrap_or(0);
+    }
+    Ok(())
+}
+
+/// Elements `s..e` of `o` (within its length, `s < e`) set to `v`, already
+/// converted: the first stored, its bytes then copied over the rest.
+fn fill_range(o: *mut Object, s: usize, e: usize, v: Value) {
+    let k = kind_of(o);
+    unsafe {
+        let p = (*o).elems.cast::<u8>();
+        k.store_value(p, s, v);
+        if shares(o) {
+            (s + 1..e).for_each(|i| k.store_value(p, i, v));
+            return;
+        }
+        let (size, base) = (k.size(), p.add(s * k.size()));
+        let total = (e - s) * size;
+        if size == 1 {
+            std::ptr::write_bytes(base, *base, total);
+            return;
+        }
+        let mut done = size;
+        while done < total {
+            let n = done.min(total - done);
+            std::ptr::copy_nonoverlapping(base, base.add(done), n);
+            done += n;
+        }
+    }
+}
+
+/// The first of `o`'s elements `lo..hi` (within its length; the last, if
+/// `back`) equal to `x`: strictly, or as SameValueZero (`zero`: a NaN
+/// finds a NaN). The elements are compared as they are stored where
+/// that tells: an integer kind's against `x`'s bytes of that kind.
+fn find(o: *mut Object, lo: usize, hi: usize, x: Value, back: bool, zero: bool) -> Option<usize> {
+    fn first(lo: usize, hi: usize, back: bool, f: impl Fn(usize) -> bool) -> Option<usize> {
+        if back { (lo..hi).rev().find(|&i| f(i)) } else { (lo..hi).find(|&i| f(i)) }
+    }
+    use crate::racy::load;
+    let k = kind_of(o);
+    let p = unsafe { (*o).elems.cast::<u8>().cast_const() };
+    if k.is_big() {
+        if !crate::bigint::is_bigint(x) {
+            return None;
+        }
+        return first(lo, hi, back, |i| crate::interp::strict_equals(unsafe { k.load(p, i) }, x));
+    }
+    if !x.is_number() {
+        return None;
+    }
+    let d = x.to_number();
+    unsafe {
+        match k {
+            TypedKind::F32 | TypedKind::F64 | TypedKind::F16 if d.is_nan() => {
+                if !zero {
+                    return None;
+                }
+                first(lo, hi, back, |i| k.load(p, i).to_number().is_nan())
+            }
+            TypedKind::F64 => first(lo, hi, back, |i| f64::from_bits(load::<8>(p.add(i * 8))) == d),
+            TypedKind::F32 => first(lo, hi, back, |i| f32::from_bits(load::<4>(p.add(i * 4)) as u32) as f64 == d),
+            TypedKind::F16 => first(lo, hi, back, |i| k.load(p, i).to_number() == d),
+            _ => {
+                // An integer kind's: `d` stored as one, if that is `d`.
+                let mut word = 0u64;
+                let w = (&raw mut word).cast::<u8>();
+                k.store(w, 0, d);
+                if k.load(w, 0).to_number() != d {
+                    return None;
+                }
+                match k.size() {
+                    1 => {
+                        let b = load::<1>(w);
+                        first(lo, hi, back, |i| load::<1>(p.add(i)) == b)
+                    }
+                    2 => {
+                        let b = load::<2>(w);
+                        first(lo, hi, back, |i| load::<2>(p.add(i * 2)) == b)
+                    }
+                    _ => {
+                        let b = load::<4>(w);
+                        first(lo, hi, back, |i| load::<4>(p.add(i * 4)) == b)
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The intrinsic constructor of kind `k`.
 fn constructor_of(vm: &mut Vm, k: TypedKind) -> Result<Value> {
     Ok(object_value(vm.typed_constructors[k as usize]))
@@ -766,6 +899,12 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
             }
             let out = allocate(vm, k, n)?;
             let o = as_object(out);
+            if sk == k {
+                // (Its bytes, as they are.)
+                let (from, to) = unsafe { ((*fo).elems.cast::<u8>(), (*o).elems.cast::<u8>()) };
+                unsafe { crate::racy::copy_if(shares(fo), from, to, n * k.size()) };
+                return Ok(out);
+            }
             vm.handle_scope(|vm| {
                 vm.handles.push(out);
                 for i in 0..n {
@@ -799,9 +938,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
                     let values = iterate_with(vm, first, m)?;
                     let out = allocate(vm, k, values.len())?;
                     vm.handles.push(out);
-                    for (i, &v) in values.iter().enumerate() {
-                        set(vm, as_object(out), i, v)?;
-                    }
+                    set_all(vm, as_object(out), 0, &values)?;
                     Ok(out)
                 });
             }
@@ -809,10 +946,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
             let out = allocate(vm, k, n)?;
             vm.handle_scope(|vm| {
                 vm.handles.push(out);
-                for i in 0..n {
-                    let v = vm.get_keyed(first, Value::number(i as f64))?;
-                    set(vm, as_object(out), i, v)?;
-                }
+                set_from(vm, as_object(out), 0, first, n)?;
                 Ok(out)
             })
         }
@@ -859,6 +993,11 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, n: Option
 /// The values of iterating `v` with its `@@iterator` method `m` (rooted
 /// in `Vm::handles`: the caller's in a handle scope).
 fn iterate_with(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
+    // (An array or a typed array the builtins iterate: its elements.)
+    if let Some(values) = crate::symbol::dense_values(vm, v) {
+        vm.handles.extend_from_slice(&values);
+        return Ok(values);
+    }
     let it = call_function(vm, m, v, &[])?;
     if !is_object(it) {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
@@ -906,6 +1045,12 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         };
         let o = create_from(vm, this, &[Value::number(n as f64)], Some(n))?;
         vm.handles.push(object_value(o));
+        // (`Set(o, i, v, true)` of a typed array's index is
+        // TypedArraySetElement.)
+        if let (Some(v), true) = (&values, f.is_undefined()) {
+            set_all(vm, o, 0, v)?;
+            return Ok(object_value(o));
+        }
         for i in 0..n {
             let v = match &values {
                 Some(v) => v[i],
@@ -1078,8 +1223,9 @@ fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let Some(len) = ta_length(o) else {
         return Err(Error::type_error("Cannot perform fill on a detached or out of bounds typed array"));
     };
-    for i in s..e.min(len) {
-        put(o, i, v);
+    let e = e.min(len);
+    if s < e {
+        fill_range(o, s, e, v);
     }
     Ok(this)
 }
@@ -1123,7 +1269,10 @@ fn typed_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
     let Some(start) = from_index(vm, arg(a, 1), len)? else { return Ok(Value::FALSE) };
     let x = arg(a, 0);
-    Ok(Value::from_bool((start..len).any(|i| crate::collections::same_value_zero(get(o, i), x))))
+    // (An element past its length now, the conversion having run code,
+    // is undefined.)
+    let now = ta_length(o).unwrap_or(0).min(len);
+    Ok(Value::from_bool(find(o, start.min(now), now, x, false, true).is_some() || x.is_undefined() && now < len))
 }
 
 fn typed_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1134,7 +1283,7 @@ fn typed_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let Some(start) = from_index(vm, arg(a, 1), len)? else { return Ok(Value::from_i32(-1)) };
     let x = arg(a, 0);
     let n = ta_length(o).unwrap_or(0).min(len);
-    let found = (start..n).find(|&i| crate::interp::strict_equals(get(o, i), x));
+    let found = find(o, start.min(n), n, x, false, false);
     Ok(Value::number(found.map_or(-1.0, |i| i as f64)))
 }
 
@@ -1153,7 +1302,7 @@ fn typed_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
     let x = arg(a, 0);
     let now = ta_length(o).unwrap_or(0);
-    let found = (0..=k as usize).rev().find(|&i| i < now && crate::interp::strict_equals(get(o, i), x));
+    let found = find(o, 0, (k as usize + 1).min(now), x, true, false);
     Ok(Value::number(found.map_or(-1.0, |i| i as f64)))
 }
 
@@ -1233,10 +1382,24 @@ fn typed_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn typed_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     writable_view(o)?;
-    for i in 0..len / 2 {
-        let (x, y) = (get(o, i), get(o, len - 1 - i));
-        put(o, i, y);
-        put(o, len - 1 - i, x);
+    if shares(o) {
+        for i in 0..len / 2 {
+            let (x, y) = (get(o, i), get(o, len - 1 - i));
+            put(o, i, y);
+            put(o, len - 1 - i, x);
+        }
+        return Ok(this);
+    }
+    let size = kind_of(o).size();
+    unsafe {
+        let p = (*o).elems.cast::<u8>();
+        if size == 1 {
+            std::slice::from_raw_parts_mut(p, len).reverse();
+        } else {
+            for i in 0..len / 2 {
+                std::ptr::swap_nonoverlapping(p.add(i * size), p.add((len - 1 - i) * size), size);
+            }
+        }
     }
     Ok(this)
 }
@@ -1273,6 +1436,14 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             unsafe { crate::racy::copy_if(shares(s) || shares(o), from, to, n * k.size()) };
             return Ok(Value::UNDEFINED);
         }
+        // (Each converted in place where the two don't share bytes.)
+        let (from, to) = unsafe { ((*s).elems as usize, (*o).elems as usize + offset * k.size()) };
+        if !k.is_big() && (from + n * sk.size() <= to || to + n * k.size() <= from) {
+            for i in 0..n {
+                unsafe { k.store_value((*o).elems.cast(), offset + i, sk.load((*s).elems.cast(), i)) };
+            }
+            return Ok(Value::UNDEFINED);
+        }
         // (Read them all first: the source may share the bytes.)
         return vm.handle_scope(|vm| {
             let values: Vec<Value> = (0..n).map(|i| unsafe { sk.load((*s).elems.cast(), i) }).collect();
@@ -1290,11 +1461,7 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if offset == f64::INFINITY || n + offset > len as f64 {
         return Err(Error::range_error("offset is out of bounds"));
     }
-    let offset = offset as usize;
-    for i in 0..n as usize {
-        let v = vm.get_keyed(src, Value::number(i as f64))?;
-        set(vm, o, offset + i, v)?;
-    }
+    set_from(vm, o, offset as usize, src, n as usize)?;
     Ok(Value::UNDEFINED)
 }
 
@@ -1517,6 +1684,19 @@ fn typed_iterator<const K: i32>(vm: &mut Vm, this: Value, _: &[Value]) -> Result
     crate::symbol::array_iterator(vm, this, K)
 }
 
+/// `%TypedArray%.prototype.values`, `[@@iterator]` too (one function,
+/// for `symbol::protector` to tell).
+pub(crate) fn typed_values(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    typed_iterator::<1>(vm, this, a)
+}
+
+/// Typed array `o`'s elements, if in bounds.
+pub(crate) fn elements(vm: &mut Vm, o: *mut Object) -> Option<Vec<Value>> {
+    let n = ta_length_seq_cst(vm, o)?;
+    let k = kind_of(o);
+    Some((0..n).map(|i| unsafe { k.load((*o).elems.cast(), i) }).collect())
+}
+
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
@@ -1583,7 +1763,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("with", typed_with, 2),
         ],
     );
-    vm.define_native(shared, "values", typed_iterator::<1>, 0, any, false);
+    vm.define_native(shared, "values", typed_values, 0, any, false);
     // (`toString` is `Array.prototype.toString` itself.)
     let a_to_string = vm.intern_name("toString");
     let to_string = vm.get(object_value(vm.array_prototype), a_to_string).unwrap_or(Value::UNDEFINED);

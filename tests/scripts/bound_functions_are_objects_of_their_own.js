@@ -1,4 +1,4 @@
-// expect: ["length","name"]|{"value":2,"writable":false,"enumerable":false,"configurable":true}|{"value":"bound f","writable":false,"enumerable":false,"configurable":true}|1,p,q,r,4|1,p,q,,2|3 0|1,1,2,3,11|false|function () { [native code] }|bound bound f 1 1,p,q,r,3|6 bound renamed|null|0|0 [bound ]|0 [bound ]|bound get w|bound |bound |bound max|1|bound [d]|true|true|[1,2,true,"P",true,true,true]|[1,2,true,true]|true|[1,5,1,true,true,true]|[1,9,true,true]|[[1,2,3],[1,2,4],true]|[[1,2,9],true,true]|5 string|true|true|true|true|true|[1,2,"1,p,q,r,4",["extra","other"]]|1,p,z,,2|true|thrown|length,name 2 bound acc|0,a0,0,z,3|2500,a2500,2500,z,3|5000,a5000,5000,z,3|7500,a7500,7500,z,3|215|1,m,1,0,4;1,m,2,1,4;1,m,3,2,4|1,1,2,,2 1,1,,,1|[object Function] function
+// expect: ["length","name"]|{"value":2,"writable":false,"enumerable":false,"configurable":true}|{"value":"bound f","writable":false,"enumerable":false,"configurable":true}|1,p,q,r,4|1,p,q,,2|3 0|1,1,2,3,11|false|function () { [native code] }|bound bound f 1 1,p,q,r,3|6 bound renamed|null|0|0 [bound ]|0 [bound ]|bound get w|bound |bound |bound max|1|bound [d]|true|true|[1,2,true,"P",true,true,true]|[1,2,true,true]|true|[1,5,1,true,true,true]|[1,9,true,true]|[[1,2,3],[1,2,4],true]|[[1,2,9],true,true]|5 string|true|true|true|true|true|[1,2,"1,p,q,r,4",["extra","other"]]|1,p,z,,2|true|thrown|length,name 2 bound acc|0,a0,0,z,3|2500,a2500,2500,z,3|5000,a5000,5000,z,3|7500,a7500,7500,z,3|215|1,m,1,0,4;1,m,2,1,4;1,m,3,2,4|1,1,2,,2 1,1,,,1|[object Function] function|70001:0:69999:x 0 bound big|3:1:undefined:undefined|2001
 // A bound function: its own properties, prototype, calls and constructions.
 var out = [];
 function show(v) { out.push(typeof v === 'string' ? v : JSON.stringify(v) === undefined ? String(v) : JSON.stringify(v)); }
@@ -97,4 +97,12 @@ show(sum);
 show([1, 2, 3].map(f.bind(o, 'm')).join(';'));
 show(f.bind(o).apply(null, [1, 2]) + ' ' + Function.prototype.call.bind(f)(o, 1));
 show(Object.prototype.toString.call(g) + ' ' + typeof g);
+// Many bound arguments: past what an object holds in its slots.
+var big = (function () { return arguments.length + ':' + arguments[0] + ':' + arguments[69999] + ':' + arguments[70000]; });
+var many = big.bind.apply(big, [null].concat(Array.from({ length: 70000 }, (_, i) => i)));
+show(many('x') + ' ' + many.length + ' ' + many.name);
+var two = big.bind(null, 1, undefined);
+show(two('y'));
+function Cnt() { this.n = arguments.length; }
+show(new (Cnt.bind.apply(Cnt, Array(2001)))(1).n);
 out.join('|');

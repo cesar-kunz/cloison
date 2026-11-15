@@ -1271,6 +1271,10 @@ fn run_source_code(vm: &mut Vm, src: &crate::js::lex::Source) -> Result<Value> {
 /// before its hidden ones: the target, `this`, and the bound arguments.
 const BOUND_OWN: usize = 2;
 
+/// The most bound arguments a bound function holds in its slots: more are
+/// in an array, in the first argument's slot, the second's `EMPTY`.
+const BOUND_INLINE: usize = 1024;
+
 /// `f.bind(that, …args)`: a function calling `f` with `this` `that` and
 /// `args` before its own (BoundFunctionCreate). A native closure (see
 /// `promise::native_closure`) of [`bound_call`], with `f`, `that` and
@@ -1331,10 +1335,14 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if vm.bound_fns[ctor as usize].is_null() {
         vm.bound_fns[ctor as usize] = vm.native_function("", bound_call, 0, crate::jit::Ty::Any, ctor);
     }
+    let many = args.len() > BOUND_INLINE;
+    let nslots = if many { 2 } else { args.len() };
     vm.handle_scope(|vm| {
+        let list = if many { crate::array::new_array_of(vm, a.get(1..).unwrap_or(&[]))? } else { Value::EMPTY };
+        vm.handles.push(list);
         let name = vm.new_string(&units);
         vm.handles.push(name);
-        let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + args.len()) as u32);
+        let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + nslots) as u32);
         let own = vm.root_shape(Class::Native, proto, BOUND_OWN as u32);
         let o = vm.heap.alloc_object(unsafe { &*full });
         unsafe {
@@ -1344,8 +1352,13 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             // after the allocations.)
             crate::promise::set_slot(o, BOUND_OWN, this);
             crate::promise::set_slot(o, BOUND_OWN + 1, arg(a, 0));
-            for (i, &v) in a.get(1..).unwrap_or(&[]).iter().enumerate() {
-                crate::promise::set_slot(o, BOUND_OWN + 2 + i, v);
+            if many {
+                crate::promise::set_slot(o, BOUND_OWN + 2, vm.handles[vm.handles.len() - 2]);
+                crate::promise::set_slot(o, BOUND_OWN + 3, Value::EMPTY);
+            } else {
+                for (i, &v) in a.get(1..).unwrap_or(&[]).iter().enumerate() {
+                    crate::promise::set_slot(o, BOUND_OWN + 2 + i, v);
+                }
             }
         }
         vm.handles.push(object_value(o));
@@ -1413,6 +1426,12 @@ fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     }
     // (Copied to the VM stack before any safepoint: see
     // `interp::with_args_on_stack`.)
+    if bound == 2 && crate::promise::slot(o, BOUND_OWN + 3) == Value::EMPTY {
+        // (Its own array, plain and without holes.)
+        let mut all = apply_list_fast(crate::promise::slot(o, BOUND_OWN + 2)).unwrap_or_default();
+        all.extend_from_slice(args);
+        return run(vm, &all);
+    }
     let slots = (0..bound).map(|i| crate::promise::slot(o, BOUND_OWN + 2 + i));
     let n = bound + args.len();
     let mut few = [Value::UNDEFINED; 8];

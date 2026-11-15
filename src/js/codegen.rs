@@ -1373,16 +1373,32 @@ fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
     if explicit_declarations(p, f).contains(&name) || name == "arguments" && arguments_object(p, f) {
         return None;
     }
-    let within = |mut g: usize| loop {
-        if g == f {
-            return true;
+    // (Each function's references looked up its chain of functions, once
+    // for the program: a scan of them all per function took 1.5 s of
+    // CyberChef's 30 MB.)
+    let used = p.names_used.get_or_init(|| {
+        let mut used = vec![false; p.functions.len()];
+        for g in 0..p.functions.len() {
+            let mut refs = None;
+            let mut q = g;
+            loop {
+                let func = &p.functions[q];
+                if func.binds_name
+                    && let Some(n) = func.name.as_deref()
+                    && !used[q]
+                    && refs.get_or_insert_with(|| references(&p.functions[g])).contains(&n)
+                {
+                    used[q] = true;
+                }
+                match func.parent {
+                    Some(up) => q = up,
+                    None => break,
+                }
+            }
         }
-        match p.functions[g].parent {
-            Some(q) => g = q,
-            None => return false,
-        }
-    };
-    (0..p.functions.len()).any(|g| within(g) && references(&p.functions[g]).contains(&name)).then_some(name)
+        used
+    });
+    used[f].then_some(name)
 }
 
 /// Whether function `f`'s code may see its `arguments` and parameters

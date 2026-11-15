@@ -291,6 +291,7 @@ fn parse_pass<'a>(
             eval_new_target: eval.is_some_and(|(.., new_target, _, _)| new_target),
             eval_live_this: eval.is_some_and(|(.., live)| live),
             own_names: Vec::new(),
+            names_used: std::cell::OnceCell::new(),
             imports: std::mem::take(&mut p.imports),
             module: module.map(|_| std::mem::take(&mut p.info)),
         },

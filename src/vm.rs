@@ -1282,8 +1282,9 @@ pub struct Vm {
     /// Scripts' (not `eval`s') `var` and function names: their globals
     /// can't be deleted.
     pub(crate) script_declared: crate::jit::HashSet<Atom>,
-    /// `Function.prototype.bind`'s JS helper, once made.
-    pub(crate) bind_helper: Value,
+    /// Bound functions' templates, once made: one that calls only, one
+    /// that constructs too (see `builtins::function_bind`).
+    pub(crate) bound_fns: [*mut Object; 2],
     /// `Array.fromAsync`'s JS helper, once made.
     pub(crate) from_async_helper: Value,
     /// `dispose`'s prototypes and helpers (see `dispose::Root`).
@@ -1311,7 +1312,6 @@ pub struct Vm {
     /// Names of `RegExp` objects' and `exec` results' properties.
     pub(crate) a_last_index: Atom,
     /// A bound function's target, a hidden key (see `function_bind`).
-    pub(crate) a_bound_target: Atom,
     pub(crate) a_source: Atom,
     /// A `RegExp`'s source, a hidden key (its `source` is the prototype's
     /// accessor).
@@ -1601,7 +1601,7 @@ impl Vm {
             regexp_species_slots: [0; 2],
             regexp_species_getter: Value::UNDEFINED,
             boolean_prototype: std::ptr::null_mut(),
-            bind_helper: Value::UNDEFINED,
+            bound_fns: [std::ptr::null_mut(); 2],
             from_async_helper: Value::UNDEFINED,
             dispose_roots: Vec::new(),
             modules: Default::default(),
@@ -1614,7 +1614,6 @@ impl Vm {
             match_shapes: Vec::new(),
             regexp_shapes: (std::ptr::null(), std::ptr::null()),
             a_last_index: Atom(0),
-            a_bound_target: Atom(0),
             a_source: Atom(0),
             a_regexp_source: Atom(0),
             a_index: Atom(0),
@@ -1687,7 +1686,6 @@ impl Vm {
         vm.a_to_string = vm.intern_name("toString");
         vm.a_value_of = vm.intern_name("valueOf");
         vm.a_last_index = vm.intern_name("lastIndex");
-        vm.a_bound_target = vm.intern_name("\u{FDD0}BoundTarget");
         vm.a_source = vm.intern_name("source");
         vm.a_regexp_source = vm.intern_name("\u{FDD0}Source");
         vm.a_index = vm.intern_name("index");
@@ -4658,9 +4656,7 @@ impl Vm {
     /// The function bound function `f` calls, if `f` is one.
     pub(crate) fn bound_target(&self, f: Value) -> Option<Value> {
         let o = as_object(f);
-        let s = unsafe { &*(*o).shape };
-        let slot = s.lookup(self.a_bound_target)?;
-        Some(unsafe { *Object::slot(o, s.location(slot)) })
+        crate::builtins::is_bound(o).then(|| crate::builtins::bound_target(o))
     }
 
     /// Whether `o` has element `i` of its own: within the length, and not
@@ -4794,22 +4790,12 @@ impl Vm {
     }
 
     pub(crate) fn delete_named(&mut self, o: *mut Object, name: Atom) -> bool {
-        self.remove_named(o, name, false)
-    }
-
-    /// Remove property `name` of `o` even if not configurable (as a bound
-    /// function's `prototype`, which it shouldn't have).
-    pub(crate) fn force_delete_named(&mut self, o: *mut Object, name: Atom) -> bool {
-        self.remove_named(o, name, true)
-    }
-
-    fn remove_named(&mut self, o: *mut Object, name: Atom, force: bool) -> bool {
         unsafe {
             let s = &*(*o).shape;
             let Some(slot) = s.lookup(name) else {
                 return !(name == self.a_length && matches!((*o).class, Class::Array | Class::String));
             };
-            if !force && s.attrs()[slot as usize] & DONT_DELETE != 0 {
+            if s.attrs()[slot as usize] & DONT_DELETE != 0 {
                 return false;
             }
             // An ordinary object deleting again (its shape unique: a
@@ -7583,10 +7569,10 @@ impl Vm {
         .chain(self.error_prototypes.iter().copied())
         .chain(self.shadow_roots.iter().copied())
         .chain(self.intl_roots.iter().copied())
+        .chain(self.bound_fns.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)
         .collect();
-        v.push(self.bind_helper);
         v.push(self.from_async_helper);
         v.extend_from_slice(&self.dispose_roots);
         v.extend(self.modules.roots());
@@ -7650,6 +7636,7 @@ impl Vm {
             &mut self.error_prototypes[..],
             &mut self.shadow_roots[..],
             &mut self.intl_roots[..],
+            &mut self.bound_fns[..],
         ] {
             for o in v {
                 f(Root::Object(o));
@@ -7659,8 +7646,7 @@ impl Vm {
             f(Root::Object(&mut m.o));
             f(Root::Object(&mut m.scope.0));
         }
-        for v in [&mut self.bind_helper, &mut self.from_async_helper, &mut self.legacy_match.0, &mut self.legacy_input]
-        {
+        for v in [&mut self.from_async_helper, &mut self.legacy_match.0, &mut self.legacy_input] {
             f(Root::Value(v));
         }
         for v in self.dispose_roots.iter_mut().chain(self.single_chars.iter_mut()) {

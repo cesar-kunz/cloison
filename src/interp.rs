@@ -2295,6 +2295,11 @@ handlers! {
         }
         record_callee(pc, regs, tag);
         (*ic).loc = 0;
+        // A bound function of a bytecode one, with no arguments bound: its
+        // target, entered here with the bound `this`.
+        if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
+            enter!(fo, that, w.add(1), argc, 0, Op::Call.size())
+        }
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
         let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Call.size(), r)
@@ -2304,6 +2309,9 @@ handlers! {
     #[inline(never)]
     fn slow_call_undefined_other(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
+        if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
+            enter!(fo, that, reg(pc, 2, regs), *pc.add(3) as usize, 0, Op::CallUndefined.size())
+        }
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
         let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::CallUndefined.size(), r)
@@ -5573,6 +5581,13 @@ pub(crate) unsafe fn call_from_jit(
         } else {
             op
         };
+        // A bound function with no bound arguments: its target, called with
+        // the bound `this`.
+        if op != Op::Construct
+            && let Some((fo, that)) = crate::builtins::unwrap_bound(vm, fv)
+        {
+            (fv, this) = (object_value(fo), that);
+        }
         let bytecode = fv.is_cell() && (*as_object(fv)).class == Class::Function;
         // `f.apply(that, list)`'s arguments (alive until the call returns).
         let spread: Vec<Value>;

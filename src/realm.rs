@@ -247,7 +247,7 @@ realm_fields! {
     regexp_fns: [*mut Object; crate::vm::REGEXP_FNS] = [NULL; crate::vm::REGEXP_FNS] => regexp_fns;
     dispose_roots: Vec<Value> = Vec::new() => dispose_roots;
     abstract_source: Vec<Value> = Vec::new() => modules.abstract_source;
-    bind_helper: Value = Value::UNDEFINED => bind_helper;
+    bound_fns: [*mut Object; 2] = [NULL; 2] => bound_fns;
     from_async_helper: Value = Value::UNDEFINED => from_async_helper;
     legacy_match: (Value, crate::regexp::Captures) = (Value::EMPTY, Vec::new()) => legacy_match;
     legacy_input: Value = Value::EMPTY => legacy_input;

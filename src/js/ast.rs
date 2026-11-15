@@ -64,6 +64,9 @@ pub struct Program<'a> {
     /// named function expression's own name (`asm::LazyFn::own_names`),
     /// parameters of the wrapper `js::compile_lazy` makes, but immutable.
     pub own_names: Vec<Name>,
+    /// By function, whether it or a function nested in it refers to its
+    /// name: `codegen::own_name`'s, worked out once for them all.
+    pub names_used: std::cell::OnceCell<Vec<bool>>,
     /// A module's imported bindings, by their new names (see
     /// [`Import`]).
     pub imports: std::collections::HashMap<Name, Import>,

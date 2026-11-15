@@ -1306,6 +1306,24 @@ fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut k = relative(arg(a, 1), len, 0.0);
     let end = relative(arg(a, 2), len, len);
     let v = arg(a, 0);
+    // A plain array's elements, holes too (nothing indexed above it to
+    // see a store), written in place: the first takes the elements to a
+    // type the value fits, the rest are it again.
+    let obj = as_object(o);
+    if dense(vm, obj) && k < end && end <= unsafe { (*obj).elems_len } as f64 {
+        let (from, to) = (k as usize, end as usize);
+        vm.store_element(obj, from, v);
+        unsafe {
+            let e = (*obj).elems;
+            if !v.is_cell() {
+                // (No reference: nothing for the barrier.)
+                (from + 1..to).for_each(|i| crate::layout::store_word(e.add(i), v));
+            } else {
+                (from + 1..to).for_each(|i| crate::heap::store(e.cast::<u8>().sub(8), e.add(i), v));
+            }
+        }
+        return Ok(o);
+    }
     while k < end {
         put(vm, o, k, v)?;
         k += 1.0;

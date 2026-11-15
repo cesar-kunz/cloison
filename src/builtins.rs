@@ -1333,26 +1333,31 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// A bound function's call: `[f, that, bound args, args]`.
 fn bound_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    // (The list rooted while it is made, a getter maybe running; the call
-    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
-    let all = vm.handle_scope(|vm| {
-        let mut all = crate::array::apply_list(vm, a[2])?;
-        all.extend(crate::array::apply_list(vm, a[3])?);
-        Ok::<_, crate::vm::Error>(all)
-    })?;
-    crate::interp::call_function(vm, a[0], a[1], &all)
+    // (The call takes the list onto the VM stack first: see
+    // `interp::with_args_on_stack`.)
+    bound_args(a[2], a[3], |all| crate::interp::call_function(vm, a[0], a[1], all))
+}
+
+/// The arguments of a bound function's call, to `f`: those bound then
+/// the call's, both arrays of the bind helper's that no code sees (the
+/// first `function_bind`'s, the other a rest parameter's), without holes.
+fn bound_args<R>(bound: Value, rest: Value, f: impl FnOnce(&[Value]) -> R) -> R {
+    let (b, r) = unsafe { (Object::elems(as_object(bound)), Object::elems(as_object(rest))) };
+    let n = b.len() + r.len();
+    let mut few = [Value::UNDEFINED; 16];
+    if n <= few.len() {
+        few[..b.len()].copy_from_slice(b);
+        few[b.len()..n].copy_from_slice(r);
+        return f(&few[..n]);
+    }
+    f(&[b, r].concat())
 }
 
 /// A bound function's construction: `[f, bound args, args, new.target]`.
 fn bound_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    // (The list rooted while it is made, a getter maybe running; the call
-    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
-    let all = vm.handle_scope(|vm| {
-        let mut all = crate::array::apply_list(vm, a[1])?;
-        all.extend(crate::array::apply_list(vm, a[2])?);
-        Ok::<_, crate::vm::Error>(all)
-    })?;
-    crate::intrinsics::construct_with(vm, a[0], &all, a[3])
+    // (The call takes the list onto the VM stack first: see
+    // `interp::with_args_on_stack`.)
+    bound_args(a[1], a[2], |all| crate::intrinsics::construct_with(vm, a[0], all, a[3]))
 }
 
 /// `Function.prototype.toString`: a function's source text, or (a native,

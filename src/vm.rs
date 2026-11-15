@@ -1176,6 +1176,7 @@ pub struct Vm {
     /// private name's atom, of no symbol.
     pub(crate) a_hole: Atom,
     pub(crate) a_sym_species: Atom,
+    pub(crate) a_sym_spreadable: Atom,
     pub(crate) a_sym_to_string_tag: Atom,
     pub(crate) a_sym_to_primitive: Atom,
     /// Some object has had a `Symbol.toPrimitive` property, or a proxy
@@ -1566,6 +1567,7 @@ impl Vm {
             a_sym_iterator: Atom(0),
             a_hole: Atom(0),
             a_sym_species: Atom(0),
+            a_sym_spreadable: Atom(0),
             a_sym_to_string_tag: Atom(0),
             a_sym_to_primitive: Atom(0),
             to_primitive_defined: false,
@@ -5561,7 +5563,7 @@ impl Vm {
 
     /// `a.length = value`: truncated (the elements past it removed) or
     /// grown with holes.
-    fn set_array_length(&mut self, o: *mut Object, value: Value) -> Result<()> {
+    pub(crate) fn set_array_length(&mut self, o: *mut Object, value: Value) -> Result<()> {
         // A read-only length fails before anything (OrdinarySet: the
         // property isn't writable), even set to what it is, and without
         // converting the value.

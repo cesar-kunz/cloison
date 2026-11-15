@@ -920,14 +920,12 @@ fn split_key(this: Value, a: &[Value]) -> Option<(u64, u64, usize)> {
 fn array_copy(vm: &mut Vm, from: Value) -> Value {
     let arr = vm.new_array();
     let (o, from) = (as_object(arr), as_object(from));
-    unsafe {
-        let n = from.elems_len() as usize;
-        if n > 0 {
-            vm.reserve_elems(o, n);
-            crate::object::set_shape(o, from.shape());
-            vm.store_elements(o, 0, from.elems(), n);
-            o.set_elems_len(n as u32);
-        }
+    let n = from.elems_len() as usize;
+    if n > 0 {
+        vm.reserve_elems(o, n);
+        crate::object::set_shape(o, from.shape());
+        vm.store_elements(o, 0, from.elems(), n);
+        o.set_elems_len(n as u32);
     }
     arr
 }
@@ -1398,7 +1396,7 @@ fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     let o = vm.callee;
     let constructing = vm.constructing;
     let (target, this) = (crate::promise::slot(o, BOUND_OWN), crate::promise::slot(o, BOUND_OWN + 1));
-    let bound = unsafe { Object::inline_cap(o) } - BOUND_OWN - 2;
+    let bound = Object::inline_cap(o) - BOUND_OWN - 2;
     let nt = if !constructing {
         Value::EMPTY
     } else if vm.native_new_target.0 == object_value(o) {
@@ -1472,7 +1470,7 @@ pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: *mu
         if vm.mapped_arguments_shape.is_null() {
             vm.mapped_arguments_shape = vm.no_elements_copy(s);
         }
-        unsafe { crate::object::set_shape(as_object(o), vm.mapped_arguments_shape) };
+        crate::object::set_shape(as_object(o), vm.mapped_arguments_shape);
     } else {
         vm.slow_elements(as_object(o));
     }
@@ -2556,7 +2554,7 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
     // The shape with both found once: then only their stores.
     let root = o.shape();
     if vm.regexp_shapes.0 == root {
-        unsafe { crate::object::set_shape(o, vm.regexp_shapes.1) };
+        crate::object::set_shape(o, vm.regexp_shapes.1);
         for (slot, (_, v)) in props.into_iter().enumerate() {
             vm.store_field(o, slot as u32, v);
         }
@@ -2963,7 +2961,7 @@ fn match_array(
             (e, a, b, c)
         }
     };
-    unsafe { crate::object::set_shape(o, elems) };
+    crate::object::set_shape(o, elems);
     vm.add_property_shaped(o, with_index, Value::from_i32(caps[0].unwrap().0 as i32));
     vm.add_property_shaped(o, with_input, input);
     // `groups`: with named groups, each one's match.

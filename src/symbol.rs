@@ -522,13 +522,11 @@ pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value
     // stored (V8's iterator result map, JSC's iteratorResultObjectStructure).
     let s = vm.iter_result_shape;
     if !s.is_null() {
-        unsafe {
-            crate::object::mark_shape(s);
-            let o = vm.heap.alloc_object(s.live());
-            vm.store_field(o, 0, value);
-            vm.store_field(o, 1, Value::from_bool(done));
-            return Ok(object_value(o));
-        }
+        crate::object::mark_shape(s);
+        let o = vm.heap.alloc_object(s.live());
+        vm.store_field(o, 0, value);
+        vm.store_field(o, 1, Value::from_bool(done));
+        return Ok(object_value(o));
     }
     let o = object_value(vm.new_object(object_value(vm.object_prototype)));
     let (a_value, a_done) = (vm.a_value, vm.a_done);

@@ -12712,7 +12712,7 @@ fn apply_replacement(out: &mut Lowered, a: usize, plan: Replacement) {
     out.insns[a].native = 3;
     for (i, shape, regs) in plan.live {
         // (An exit allocates the object with it.)
-        unsafe { crate::object::pin_shape(shape) };
+        crate::object::pin_shape(shape);
         let fields = (0..shape.live().keys().len()).map(h).collect();
         // Before the objects replaced earlier: one may hold this one in a
         // field (a slot register this allocation writes). (Not the other

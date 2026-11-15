@@ -1752,7 +1752,7 @@ handlers! {
                     if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*ic).loc) {
                         tail!(slow_set_named, acc)
                     }
-                    crate::object::set_shape(o, new);
+                    crate::object::set_shape_unchecked(o, new);
                 }
                 let at = Object::slot(o, (*ic).loc);
                 let v = as_named(tag, (*ic).holder as u64, acc);
@@ -1779,7 +1779,7 @@ handlers! {
                         if (*w).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*w).loc) {
                             break;
                         }
-                        crate::object::set_shape(o, new);
+                        crate::object::set_shape_unchecked(o, new);
                     }
                     let at = Object::slot(o, (*w).loc);
                     let v = as_named(tag, (*w).holder as u64, acc);
@@ -1808,7 +1808,7 @@ handlers! {
                     if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*ic).loc) {
                         tail!(slow_set_named, acc)
                     }
-                    crate::object::set_shape(o, new);
+                    crate::object::set_shape_unchecked(o, new);
                 }
                 crate::layout::store_word(Object::slot(o, (*ic).loc), as_named(tag, (*ic).holder as u64, acc));
                 next!(any, Op::SetNamed.size(), acc)

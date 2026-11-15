@@ -1155,7 +1155,7 @@ fn element_done(vm: &mut Vm, me: *mut Object, v: Value) -> Result<Value> {
     put(s, 0, Value::from_i32(remaining));
     if remaining == 0 {
         let any = me.code() == unsafe { (*root(vm, Root::AnyElement)).code };
-        let result = if unsafe { Object::inline_cap(me) } > KEYS {
+        let result = if Object::inline_cap(me) > KEYS {
             keyed_result(vm, slot(me, KEYS), values)?
         } else if any {
             aggregate_error(vm, values)
@@ -1175,7 +1175,7 @@ fn take_element(vm: &mut Vm) -> Option<*mut Object> {
         return None;
     }
     set_slot(me, CALLED, Value::TRUE);
-    if unsafe { Object::inline_cap(me) } > PARTNER && slot(me, PARTNER).is_cell() {
+    if Object::inline_cap(me) > PARTNER && slot(me, PARTNER).is_cell() {
         set_slot(as_object(slot(me, PARTNER)), CALLED, Value::TRUE);
     }
     Some(me)

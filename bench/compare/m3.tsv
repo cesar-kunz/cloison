@@ -108,3 +108,25 @@ sm	array element (int)	bytes	8.0
 sm	array element (int)	bytes_at_2n	8.9
 qjs	array element (int)	bytes	11.2
 qjs	array element (int)	bytes_at_2n	16.8
+cloison	empty {}	bytes	50.8
+cloison	empty {}	bytes_at_2n	50.7
+cloison	{a,b,c} literal	bytes	80.5
+cloison	{a,b,c} literal	bytes_at_2n	83.1
+cloison	ctor, 3 fields	bytes	64.9
+cloison	ctor, 3 fields	bytes_at_2n	83.0
+cloison	{10 props} literal	bytes	161.5
+cloison	{10 props} literal	bytes_at_2n	156.5
+cloison	array [i,i,i]	bytes	84.7
+cloison	array [i,i,i]	bytes_at_2n	84.4
+cloison	array of 3 doubles	bytes	114.4
+cloison	array of 3 doubles	bytes_at_2n	99.3
+cloison	closure	bytes	189.0
+cloison	closure	bytes_at_2n	191.8
+cloison	string, 16 chars	bytes	84.9
+cloison	string, 16 chars	bytes_at_2n	101.0
+cloison	heap double	bytes	0.0
+cloison	heap double	bytes_at_2n	0.1
+cloison	Map entry	bytes	110.0
+cloison	Map entry	bytes_at_2n	106.3
+cloison	array element (int)	bytes	16.9
+cloison	array element (int)	bytes_at_2n	17.1

@@ -13,10 +13,11 @@ console, CyberChef (Apache-2.0), PCjs (MIT) booting FreeDOS, TiddlyWiki
 a reference run.
 
 Measured on the host and engine builds of [octane.md](octane.md) (cloison
-of 2026-11-14, the other engines on 2026-11-11),
+of 2026-11-15, the other engines on 2026-11-11),
 by `scripts/compare/webapps.py` (results in `bench/compare/webapps.tsv`):
 one run per engine and app, the process's wall time from start to exit and
-its peak RSS. cloison's runs are at a load of 2 to 10; the other engines' at
+its peak RSS. cloison's runs are at a load of 2 to 10 (Octane's runs
+alongside); the other engines' at
 15 to 40 (other users' jobs on the shared host), so their times may be
 somewhat pessimistic. cloison runs its `intl` build (TypeScript's
 completions need `Intl.Collator`, Univer `Intl.Segmenter`).
@@ -28,14 +29,15 @@ in a geomean, and a geomean over fewer apps says how many.
 ## In short
 
 - cloison runs the 15 apps correctly, with or without its JIT.
-- **Interpreted, it is the fastest interpreter measured**: 1.04× V8's
-  Ignition, 1.32× JavaScriptCore's LLInt, 1.7× QuickJS and ARK, 2.7×
+- **Interpreted, it is the fastest interpreter measured**: 1.09× V8's
+  Ignition, 1.39× JavaScriptCore's LLInt, 1.8× QuickJS and ARK, 2.9×
   SpiderMonkey's interpreter (each over the apps both run), and first of
   all the interpreters on pdf.js, JSNES, ECharts, CyberChef, BeepBox,
   PCjs and SiYuan.
-- **With its JIT it is twice as fast as ARK's JIT**, and about 5 to 6
-  times slower than V8, JavaScriptCore and SpiderMonkey (Univer 6 to 7).
-- The JIT gains less here than on Octane (1.26× over the interpreter,
+- **With its JIT it is twice as fast as ARK's JIT**, and about 5 times
+  slower than V8, JavaScriptCore and SpiderMonkey (4.6 to 5.4; Univer 4.6
+  to 6.5).
+- The JIT gains less here than on Octane (1.29× over the interpreter,
   geomean): compiled code exits to the interpreter at an instruction that
   has no stencil, and generators and async functions run interpreted.
 
@@ -43,43 +45,43 @@ in a geomean, and a geomean over fewer apps says how many.
 
 | | cloison | V8 | JSC | SpiderMonkey | ARK JIT |
 |---|---:|---:|---:|---:|---:|
-| excalidraw | 57.9 | 9.77 | 9.40 | 9.81 | ✗ |
-| pdfjs | 83.9 | 11.8 | 9.70 | 12.2 | ✗ |
-| typescript | 80.9 | 12.5 | 16.9 | 19.1 | ✗ |
-| jsnes | 55.4 | 9.00 | 9.07 | 15.0 | 125 |
-| sass | 52.0 | 7.23 | 8.05 | 10.7 | 73.3 |
-| sheetjs | 65.4 | 13.6 | 14.6 | 13.8 | 684 |
-| echarts | 58.2 | 8.28 | 9.83 | 10.3 | 88.1 |
-| mathjax | 19.0 | 3.23 | 3.65 | 3.77 | 24.4 |
-| snap | 61.1 | 10.2 | 8.34 | 11.0 | ✗ |
-| cyberchef | 24.0 | 7.18 | 9.60 | 6.80 | ✗ |
-| beepbox | 15.5 | 2.24 | 2.91 | 2.33 | 29.2 |
-| pcjs | 33.5 | 4.10 | 2.89 | 5.57 | 36.9 |
-| univer | 444 | 76.3 | 66.1 | 93.6 | ✗ |
-| siyuan | 43.3 | 9.09 | 8.85 | 10.1 | 79.2 |
-| tiddlywiki | 35.5 | 8.22 | ≠ | 9.80 | ✗ |
-| **geomean** | **51.1** | **8.73** | **9.01** (14) | **10.4** | **76.3** (8) |
+| excalidraw | 54.3 | 9.77 | 9.40 | 9.81 | ✗ |
+| pdfjs | 82.8 | 11.8 | 9.70 | 12.2 | ✗ |
+| typescript | 79.3 | 12.5 | 16.9 | 19.1 | ✗ |
+| jsnes | 45.9 | 9.00 | 9.07 | 15.0 | 125 |
+| sass | 49.9 | 7.23 | 8.05 | 10.7 | 73.3 |
+| sheetjs | 63.1 | 13.6 | 14.6 | 13.8 | 684 |
+| echarts | 50.4 | 8.28 | 9.83 | 10.3 | 88.1 |
+| mathjax | 17.6 | 3.23 | 3.65 | 3.77 | 24.4 |
+| snap | 55.3 | 10.2 | 8.34 | 11.0 | ✗ |
+| cyberchef | 17.1 | 7.18 | 9.60 | 6.80 | ✗ |
+| beepbox | 15.4 | 2.24 | 2.91 | 2.33 | 29.2 |
+| pcjs | 33.3 | 4.10 | 2.89 | 5.57 | 36.9 |
+| univer | 427 | 76.3 | 66.1 | 93.6 | ✗ |
+| siyuan | 43.1 | 9.09 | 8.85 | 10.1 | 79.2 |
+| tiddlywiki | 33.1 | 8.22 | ≠ | 9.80 | ✗ |
+| **geomean** | **47.4** | **8.73** | **9.01** (14) | **10.4** | **76.3** (8) |
 
 ## Wall time without a JIT, seconds (lower is better)
 
 | | cloison | V8 `--jitless` | JSC no JIT | SpiderMonkey no JIT | QuickJS | ARK |
 |---|---:|---:|---:|---:|---:|---:|
-| excalidraw | 63.0 | 59.0 | 64.9 | 150 | ✗ | ≠ |
-| pdfjs | 118 | 141 | 142 | 320 | 197 | ✗ |
-| typescript | 83.5 | 75.7 | 96.7 | 201 | ✗ | 91.8 |
-| jsnes | 152 | 262 | 250 | 665 | 326 | 276 |
-| sass | 61.2 | 58.0 | 74.2 | 175 | 140 | 69.6 |
-| sheetjs | 69.1 | 54.4 | 94.0 | 132 | 105 | 533 |
-| echarts | 101 | 206 | 185 | 435 | ✗ | 157 |
-| mathjax | 14.4 | 14.6 | 13.8 | 47.7 | 15.1 | 11.5 |
-| snap | 57.4 | 43.9 | 66.4 | 146 | 89.3 | ✗ |
-| cyberchef | 44.1 | 57.3 | 80.2 | 96.0 | 79.2 | ✗ |
-| beepbox | 30.5 | 38.7 | 43.7 | 91.1 | 54.6 | 61.9 |
-| pcjs | 40.8 | 48.7 | 52.2 | 155 | 68.4 | 73.3 |
-| univer | 558 | 442 | 663 | 1,473 | ✗ | ✗ |
-| siyuan | 41.7 | 43.4 | 66.8 | 110 | 84.5 | 61.6 |
-| tiddlywiki | 31.7 | 16.9 | ≠ | 44.3 | ✗ | ✗ |
-| **geomean** | **64.4** | **66.9** | **89.6** (14) | **175** | **89.2** (10) | **92.1** (9) |
+| excalidraw | 59.8 | 59.0 | 64.9 | 150 | ✗ | ≠ |
+| pdfjs | 113 | 141 | 142 | 320 | 197 | ✗ |
+| typescript | 83.3 | 75.7 | 96.7 | 201 | ✗ | 91.8 |
+| jsnes | 145 | 262 | 250 | 665 | 326 | 276 |
+| sass | 60.7 | 58.0 | 74.2 | 175 | 140 | 69.6 |
+| sheetjs | 65.3 | 54.4 | 94.0 | 132 | 105 | 533 |
+| echarts | 98.2 | 206 | 185 | 435 | ✗ | 157 |
+| mathjax | 13.3 | 14.6 | 13.8 | 47.7 | 15.1 | 11.5 |
+| snap | 51.6 | 43.9 | 66.4 | 146 | 89.3 | ✗ |
+| cyberchef | 35.5 | 57.3 | 80.2 | 96.0 | 79.2 | ✗ |
+| beepbox | 30.3 | 38.7 | 43.7 | 91.1 | 54.6 | 61.9 |
+| pcjs | 39.7 | 48.7 | 52.2 | 155 | 68.4 | 73.3 |
+| univer | 543 | 442 | 663 | 1,473 | ✗ | ✗ |
+| siyuan | 41.4 | 43.4 | 66.8 | 110 | 84.5 | 61.6 |
+| tiddlywiki | 30.3 | 16.9 | ≠ | 44.3 | ✗ | ✗ |
+| **geomean** | **61.2** | **66.9** | **89.6** (14) | **175** | **89.2** (10) | **92.1** (9) |
 
 KetteVM runs none of the apps yet (it doesn't parse regular expressions).
 
@@ -103,9 +105,16 @@ iteration in functions with more variables than registers too (Snap!),
 `Intl.Segmenter` is there (Univer). Over the 15 apps the geomeans are
 64 s interpreted and 51 s with the JIT.
 
+On 2026-11-15 they are 61 s and 47 s: the builtins' common paths (key
+lists and JSON, strings, arrays' results, typed arrays' bulk copies),
+regular expression searches that skip where no match can start
+(CyberChef 24 s → 17 s with the JIT, 44 s → 36 s without) and bound
+functions as native objects. Interpreted, cloison is 1.09× V8's Ignition
+(1.04× before).
+
 ## Open issues
 
-- **Univer** is the slowest against the JIT engines (444 s, V8 76 s): its
+- **Univer** is the slowest against the JIT engines (427 s, V8 76 s): its
   hot paths are in functions with exception handlers, which compiled code
   doesn't call directly, and in object spread and iterator instructions
   without stencils.

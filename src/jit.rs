@@ -1181,7 +1181,7 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
         let fo = crate::object::as_object(f);
         unsafe {
             if std::ptr::eq(fo.shape(), vm.function_shape) {
-                let p = *Object::slot(fo, vm.function_shape.live().location(0));
+                let p = fo.slot_value(vm.function_shape.live().location(0));
                 // The new entry first, the first one moved to second.
                 let cache = &*cache;
                 cache[1].set(cache[0].get());

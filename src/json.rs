@@ -4,7 +4,7 @@
 //! [`install`].
 
 use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
-use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, Object, RAW_JSON, as_object, object_value};
+use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, RAW_JSON, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -399,11 +399,11 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
             }
             // (The data property that is still at the name's slot.)
             let own = match k {
-                PKey::Name(a) => unsafe {
+                PKey::Name(a) => {
                     let s = o.shape().live();
                     (s.keys().get(slot as usize) == Some(&a) && s.attrs()[slot as usize] & ACCESSOR == 0)
-                        .then(|| *Object::slot(o, s.location(slot)))
-                },
+                        .then(|| o.slot_value(s.location(slot)))
+                }
                 _ => None,
             };
             let pv = match own {

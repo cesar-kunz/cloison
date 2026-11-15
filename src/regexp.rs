@@ -49,6 +49,13 @@ pub struct Regex {
     /// fail up to the next line terminator, which `.*` could have
     /// crossed to (a match at `q` there would be one at `p`).
     dot_star: bool,
+    /// The unit of the greedy run without bound that it begins with, if
+    /// it does (see [`Regex::lead`]): a failed attempt at `p` means all
+    /// fail to the end of the run from `p`.
+    lead: Option<Insn>,
+    /// What its first units can be, if a match has two or more (see
+    /// [`Window`]).
+    window: Option<Box<Window>>,
     /// `prog` as native code, compiled at the `native_after()`th exec
     /// (`None` inside: it has instructions that don't compile).
     native: std::cell::OnceCell<Option<Native>>,
@@ -80,6 +87,40 @@ enum Starts {
     /// At a code unit in `ascii` (bit `c` for `c` < 128), or at any one
     /// past ASCII if `other`; `few` if those are at most four units.
     Units { ascii: u128, other: bool, few: Option<([u16; 4], usize)> },
+}
+
+/// What the first units of a match can be: each of the first `len`, as
+/// `Starts::Units` has the first (`len` is at most the shortest match's
+/// length). `exec` tries only where they all can, and looks at the last
+/// first: a unit that none of them can be is one no match crosses. (An
+/// address `(?:\d{1,3}\.){3}\d{1,3}` over a log: a place in seven.)
+struct Window {
+    sets: [(u128, bool); WINDOW],
+    len: usize,
+}
+
+/// The most units a [`Window`] looks at.
+const WINDOW: usize = 8;
+
+impl Window {
+    /// How far from `at` the next place is where a match can begin as far
+    /// as the window tells (0: at `at`), if there is room for one.
+    #[inline]
+    fn skip(&self, s: &[u16], at: usize) -> Option<usize> {
+        let w = s.get(at..at + self.len)?;
+        let has = |k: usize, c: u16| {
+            let (ascii, other) = self.sets[k];
+            if c < 128 { ascii >> c & 1 != 0 } else { other }
+        };
+        for k in (0..self.len).rev() {
+            let c = w[k];
+            if !has(k, c) {
+                // The nearest place that has `c` this far in.
+                return Some((1..=k).find(|j| has(k - j, c)).unwrap_or(k + 1));
+            }
+        }
+        Some(0)
+    }
 }
 
 /// The code units a node's non-empty matches can begin with (as in
@@ -547,6 +588,8 @@ impl Regex {
             run: Default::default(),
             literal: None,
             dot_star: false,
+            lead: None,
+            window: None,
             native: Default::default(),
             execs: Default::default(),
             mark: Default::default(),
@@ -571,7 +614,113 @@ impl Regex {
             Node::Seq(ns) => ns.first().is_some_and(dot_star),
             n => dot_star(n),
         };
+        re.lead = re.lead();
+        re.window = re.window();
         Ok(re)
+    }
+
+    fn window(&self) -> Option<Box<Window>> {
+        if !matches!(self.starts, Starts::Units { .. }) {
+            return None;
+        }
+        let mut sets = [(0, false); WINDOW];
+        let ends = self.offsets(&self.node, 1, &mut sets);
+        let len = (ends.trailing_zeros() as usize).min(WINDOW);
+        (len >= 2).then(|| Box::new(Window { sets, len }))
+    }
+
+    /// The offsets from a match's start where `n` can end, having begun
+    /// at one of the offsets `from` (bit `k`: offset `k`; bit `WINDOW`:
+    /// that or more), `sets` taking the units it can have at each.
+    fn offsets(&self, n: &Node, from: u16, sets: &mut [(u128, bool); WINDOW]) -> u16 {
+        const ALL: u16 = (1 << (WINDOW + 1)) - 1;
+        let later = |m: u16, k: usize| {
+            let w = (m as u32) << k;
+            (w as u16 & ALL) | if w >> WINDOW != 0 { 1 << WINDOW } else { 0 }
+        };
+        let mut unit = |(ascii, other): (u128, bool), from: u16| {
+            for (k, set) in sets.iter_mut().enumerate() {
+                if from >> k & 1 != 0 {
+                    *set = (set.0 | ascii, set.1 || other);
+                }
+            }
+        };
+        match n {
+            Node::Empty | Node::Start(_) | Node::End(_) | Node::Boundary(..) | Node::Look(..) => from,
+            Node::Char(_) | Node::Any | Node::Class(..) | Node::Alone(..) => {
+                unit(self.first(n).map_or((u128::MAX, true), |(a, o, _)| (a, o)), from);
+                later(from, 1)
+            }
+            Node::Astral(_) => {
+                unit((0, true), from | later(from, 1));
+                later(from, 2)
+            }
+            // Any units, from its first offset on.
+            Node::BackRef(..) => {
+                let all = ALL & !((1 << from.trailing_zeros().min(WINDOW as u32)) - 1);
+                unit((u128::MAX, true), all);
+                all
+            }
+            Node::Group(inner, _) => self.offsets(inner, from, sets),
+            Node::Seq(nodes) => nodes.iter().fold(from, |m, n| self.offsets(n, m, sets)),
+            Node::Alt(alts) => alts.iter().fold(0, |m, n| m | self.offsets(n, from, sets)),
+            // (Iterations past the window's size reach no new offset.)
+            Node::Repeat(inner, min, max, ..) => {
+                let min = (*min).min(WINDOW as u32 + 1);
+                let max = (*max).min(min + WINDOW as u32 + 1);
+                let (mut m, mut ends) = (from, if min == 0 { from } else { 0 });
+                for i in 1..=max {
+                    m = self.offsets(inner, m, sets);
+                    if i >= min {
+                        ends |= m;
+                    }
+                }
+                ends
+            }
+        }
+    }
+
+    /// The unit `c` of the greedy run `c*` (`c+`, `c{n,}`) that the pattern
+    /// begins with, if at a `c` every match does: the pattern's first
+    /// node, or its first alternative's where the others begin with
+    /// other units. An attempt at `p` that fails has then tried what
+    /// follows the run at each place up to where the run from `p` ends,
+    /// and an attempt from a place in between would try some of those
+    /// again, to fail as they did: what follows the run matches the same
+    /// wherever the attempt began, with no backreference to say where.
+    /// (`[\w.]+@…` over a long word otherwise takes time by the square of
+    /// its length.)
+    fn lead(&self) -> Option<Insn> {
+        fn leads(re: &Regex, n: &Node) -> Option<(u128, bool)> {
+            match n {
+                Node::Repeat(inner, _, u32::MAX, true, _)
+                    if matches!(**inner, Node::Char(_) | Node::Any | Node::Class(..)) =>
+                {
+                    re.first(inner).map(|(a, o, _)| (a, o))
+                }
+                Node::Group(inner, _) => leads(re, inner),
+                Node::Seq(ns) => leads(re, ns.first()?),
+                Node::Alt(alts) => {
+                    let (a, o) = leads(re, alts.first()?)?;
+                    for alt in &alts[1..] {
+                        let (a2, o2, empty) = re.first(alt)?;
+                        if empty || a & a2 != 0 || o && o2 {
+                            return None;
+                        }
+                    }
+                    Some((a, o))
+                }
+                _ => None,
+            }
+        }
+        let code = &self.prog.code;
+        if self.sticky || code.iter().any(|i| matches!(i, Insn::BackRef(..) | Insn::BackRefBack(..))) {
+            return None;
+        }
+        leads(self, &self.node)?;
+        // The run's instruction: after the groups' and alternatives'.
+        let at = code.iter().position(|i| !matches!(i, Insn::Mark(_) | Insn::Split(_)))?;
+        matches!(code[at], Insn::Run { max: u32::MAX, .. }).then(|| code[at + 1])
     }
 
     /// The longest run of characters in the top-level sequence that match
@@ -734,13 +883,22 @@ impl Regex {
                         at += s[at..].iter().position(|&c| is_line_terminator(c))? + 1;
                     }
                 }
-                Starts::Units { few: Some((u, n)), .. } => {
-                    at = find_any(s, &u[..n], at)?;
-                }
-                Starts::Units { ascii, other, .. } => {
-                    let can = |c: u16| if c < 128 { ascii >> c & 1 != 0 } else { other };
-                    at += s[at..].iter().position(|&c| can(c))?;
-                }
+                Starts::Units { few, ascii, other } => loop {
+                    match few {
+                        Some((u, n)) => at = find_any(s, &u[..n], at)?,
+                        // (The window has the first unit too.)
+                        None if self.window.is_some() => {}
+                        None => {
+                            let can = |c: u16| if c < 128 { ascii >> c & 1 != 0 } else { other };
+                            at += s[at..].iter().position(|&c| can(c))?;
+                        }
+                    }
+                    match self.window.as_ref().map(|w| w.skip(s, at)) {
+                        None | Some(Some(0)) => break,
+                        Some(Some(n)) => at += n,
+                        Some(None) => return None,
+                    }
+                },
             }
             // (`u`: a match begins at a code point, never between a pair's
             // halves, where `lastIndex` advances past both.)
@@ -755,6 +913,10 @@ impl Regex {
             }
             if attempt(at) {
                 return Some(at);
+            }
+            if let Some(unit) = self.lead {
+                at += s[at..].iter().take_while(|&&c| self.prog.unit_matches(unit, c)).count().max(1);
+                continue;
             }
             if self.dot_star {
                 at += s[at..].iter().position(|&c| is_line_terminator(c))? + 1;
@@ -2382,6 +2544,13 @@ enum Insn {
         after: u32,
     },
     LookEnd,
+    /// A lookahead (or a lookbehind, `behind`) of the single-unit
+    /// instruction that follows: the unit here (before here) matches it,
+    /// or doesn't (`negative`); on after that instruction, where it was.
+    Peek {
+        negative: bool,
+        behind: bool,
+    },
     /// A lookbehind: its body (ending in `BehindEnd`) matched backwards
     /// from here, right to left (see `Program::backward`); on at `after`.
     Behind {
@@ -2588,6 +2757,7 @@ impl Native {
                 Insn::BackRef(..)
                 | Insn::Look { .. }
                 | Insn::LookEnd
+                | Insn::Peek { .. }
                 | Insn::Behind { .. }
                 | Insn::BehindEnd
                 | Insn::Back
@@ -2728,6 +2898,7 @@ impl Native {
                 Insn::BackRef(..)
                 | Insn::Look { .. }
                 | Insn::LookEnd
+                | Insn::Peek { .. }
                 | Insn::Behind { .. }
                 | Insn::BehindEnd
                 | Insn::Back
@@ -2847,7 +3018,10 @@ impl Program {
     fn unit(&mut self, re: &Regex, n: &Node) -> Option<Insn> {
         let ic = re.fold;
         Some(match n {
-            Node::Char(c) if ic != Case::Exact => Insn::CharFold { c: *c, canon: ic.canon(*c) },
+            // (Folding case, ASCII but letters match only themselves.)
+            Node::Char(c) if ic != Case::Exact && (*c >= 128 || (*c as u8).is_ascii_alphabetic()) => {
+                Insn::CharFold { c: *c, canon: ic.canon(*c) }
+            }
             Node::Char(c) => Insn::Char(*c),
             Node::Any => Insn::Any,
             Node::Class(r, neg) | Node::Alone(r, neg) => {
@@ -2899,6 +3073,14 @@ impl Program {
                 } else {
                     Insn::Save { g: *g as u32, r }
                 });
+            }
+            // A lookaround of one unit (that doesn't look past itself):
+            // a test of the unit there.
+            Node::Look(inner, positive, behind)
+                if matches!(**inner, Node::Char(_) | Node::Any | Node::Class(..))
+                    && let Some(i) = self.unit(re, inner) =>
+            {
+                self.code.extend([Insn::Peek { negative: !positive, behind: *behind }, i]);
             }
             // A lookahead's body forwards, a lookbehind's backwards, wherever
             // they are.
@@ -3226,6 +3408,12 @@ impl Program {
                         stack.push(Bt::LazyRun { pc: pc as u32, max: max as u32, pos, n: min });
                     }
                     ok
+                }
+                Insn::Peek { negative, behind } => {
+                    let unit = self.code[pc + 1];
+                    let at = if behind { pos.wrapping_sub(1) } else { pos };
+                    pc += 2;
+                    (at < s.len() && self.unit_matches(unit, s[at])) != negative
                 }
                 Insn::Look { negative, after } | Insn::Behind { negative, after } => {
                     stack.push(Bt::Look(Box::new((pos, after, negative, caps.clone()))));
@@ -3662,6 +3850,83 @@ mod tests {
         assert!(native > 5000, "{native} compiled");
     }
 
+    /// `exec` skips the places the pattern's leading run and its first
+    /// units rule out, and tests a lookaround of one unit in place: the
+    /// matches are the reference's, which tries everywhere.
+    #[test]
+    fn skipped_places_have_no_match() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        fn piece(rand: &mut dyn FnMut(usize) -> usize, depth: u32) -> String {
+            let atoms = ["a", "b", "@", "\\.", "[ab]", "[^a]", "[a-c1]", "\\d", "\\w", ".", "é", "[b-é]"];
+            let atom = atoms[rand(atoms.len())];
+            match rand(if depth == 0 { 6 } else { 14 }) {
+                0 | 1 => atom.to_string(),
+                2 => format!("{atom}{}", ["*", "+", "{2,}", "{1,2}", "+?", "?"][rand(6)]),
+                3 => format!("(?{}{atom})", ["=", "!", "<=", "<!"][rand(4)]),
+                4 => ["^", "$", "\\b", "\\B"][rand(4)].to_string(),
+                5 => format!("{atom}{atom}"),
+                6 | 7 => format!("(?:{}|{})", piece(rand, depth - 1), piece(rand, depth - 1)),
+                8 => format!("({}){}", piece(rand, depth - 1), ["", "*", "+", "{2,3}", "?"][rand(5)]),
+                9 => format!("(?{}{})", ["=", "!"][rand(2)], piece(rand, depth - 1)),
+                // (No group in one behind: the reference loses a repeated
+                // one's capture there.)
+                12 => format!("(?{}{}{})", ["<=", "<!"][rand(2)], piece(rand, 0), piece(rand, 0)),
+                10 => format!("\\{}", 1 + rand(2)),
+                _ => format!("{}{}", piece(rand, depth - 1), piece(rand, depth - 1)),
+            }
+        }
+        let (mut tried, mut matched, mut leads, mut windows, mut peeks) = (0, 0, 0, 0, 0);
+        for k in 0..20_000 {
+            // Often a run first, as `lead` wants.
+            let head = ["", "[ab]+", "\\w*", "a{2,}", "(?:[ab]+|@)", "(b+|1)"][rand(6)];
+            let p = format!("{head}{}{}", piece(&mut rand, 2), piece(&mut rand, 2));
+            let f = ["", "i", "m", "u", "iu", "s"][rand(6)];
+            let Ok(re) = Regex::new(&p, f) else { continue };
+            leads += re.lead.is_some() as usize;
+            windows += re.window.is_some() as usize;
+            peeks += re.prog.code.iter().any(|i| matches!(i, Insn::Peek { .. })) as usize;
+            if k % 2 == 0 {
+                let _ = re.native.set(Native::compile(&re));
+            }
+            for _ in 0..4 {
+                let len = if rand(3) == 0 { rand(40) } else { rand(12) };
+                let s: Vec<u16> =
+                    (0..len).map(|_| [97, 98, 97, 98, 99, 49, 64, 46, 32, 10, 0xE9, 0xC9][rand(12)]).collect();
+                for start in [0, rand(len + 1)] {
+                    let want = re.exec_reference(&s, start);
+                    matched += want.is_some() as usize;
+                    tried += 1;
+                    assert_eq!(re.exec(&s, start), want, "/{p}/{f} on {:?} from {start}", String::from_utf16_lossy(&s));
+                }
+            }
+        }
+        assert!(matched > tried / 8 && matched < tried * 7 / 8, "{matched} of {tried}");
+        assert!(leads > 1000 && windows > 3000 && peeks > 1000, "{leads} leads, {windows} windows, {peeks} peeks");
+        // What they are, on patterns as written.
+        let re = |p: &str, f: &str| Regex::new(p, f).unwrap();
+        assert!(re("[\\w.]+@x", "").lead.is_some());
+        assert!(re("(?:[a-z]+(?:\\.[a-z]+)*|\"q\")@", "i").lead.is_some());
+        assert!(re("(?:[a-z]+|a)@", "").lead.is_none());
+        assert!(re("(?:[a-z]+|\\b)@", "").lead.is_none());
+        assert!(re("([a-z]+)@\\1", "").lead.is_none());
+        assert!(re("[a-z]+?@", "").lead.is_none());
+        assert!(re("[a-z]{1,9}@", "").lead.is_none());
+        assert_eq!(re("(?:\\d{1,3}\\.){3}\\d", "").window.as_ref().map(|w| w.len), Some(7));
+        assert_eq!(re("ab?c|x\\d\\dy", "").window.as_ref().map(|w| w.len), Some(2));
+        assert!(re("a?", "").window.is_none());
+        let w = re("(?:\\d{1,3}\\.){3}\\d", "").window.unwrap();
+        let u: Vec<u16> = "ab cdefgh1.2.3.4".encode_utf16().collect();
+        assert_eq!(w.skip(&u, 0), Some(7));
+        assert_eq!(w.skip(&u, 9), Some(0));
+        assert_eq!(w.skip(&u, 10), None);
+    }
+
     /// Native code leaves an attempt to the interpreter when its stack
     /// fills, or when a unit past ASCII needs case folding.
     #[test]
@@ -3735,7 +4000,7 @@ mod tests {
                 }
             }
         }
-        assert!(matched > tried / 5 && matched < tried * 4 / 5, "{matched} of {tried}");
+        assert!(matched > tried / 8 && matched < tried * 7 / 8, "{matched} of {tried}");
     }
 
     /// `find` (eight positions at a time) finds what a scan of every

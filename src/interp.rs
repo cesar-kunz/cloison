@@ -4071,6 +4071,10 @@ pub(crate) fn to_number(v: Value) -> f64 {
     // (A Date too: through its `@@toPrimitive` and `valueOf`, which code
     // may have replaced.)
     match string_units(v) {
+        // (A few digits: an integer, exactly.)
+        Some(u) if (1..=15).contains(&u.len()) && u.iter().all(|c| (0x30..0x3A).contains(c)) => {
+            u.iter().fold(0u64, |n, &c| n * 10 + (c - 0x30) as u64) as f64
+        }
         Some(u) => string_to_number(&String::from_utf16_lossy(u)),
         None => to_number(to_primitive(v)),
     }

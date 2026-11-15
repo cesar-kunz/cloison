@@ -358,14 +358,14 @@ pub fn object_header(shape: &Shape) -> [u64; crate::layout::HEADER_WORDS] {
 }
 
 impl Object {
-    /// The number of in-object slots `this` was allocated with.
-    ///
-    /// # Safety
-    /// `this` must be an object.
+    /// The number of in-object slots `this` was allocated with. (`this`
+    /// trusted live, see `raw`.)
     #[inline(always)]
-    pub unsafe fn inline_cap(this: *const Object) -> usize {
-        unsafe {
-            if this.class() == Class::TypedArray { 0 } else { this.kind() as usize | ((*this).cap_hi as usize) << 8 }
+    pub(crate) fn inline_cap(this: *const Object) -> usize {
+        if this.class() == Class::TypedArray {
+            0
+        } else {
+            this.kind() as usize | (unsafe { (*this).cap_hi } as usize) << 8
         }
     }
 
@@ -1030,22 +1030,18 @@ impl Drop for ShapeBox {
     }
 }
 
-/// Keep shape `s` live for good: compiled code gives it to objects.
-///
-/// # Safety
-/// `s` must be a live shape.
+/// Keep shape `s` live for good: compiled code gives it to objects. (`s`
+/// trusted live, see `raw`.)
 #[inline]
-pub unsafe fn pin_shape(s: *const Shape) {
+pub(crate) fn pin_shape(s: *const Shape) {
     s.live().pinned.set(true)
 }
 
 /// Shape `s` found live by a full marking under way (if any). The marker
-/// reads its mark for every object of it: written only if older.
-///
-/// # Safety
-/// `s` must be a live shape.
+/// reads its mark for every object of it: written only if older. (`s`
+/// trusted live, see `raw`.)
 #[inline]
-pub unsafe fn mark_shape(s: *const Shape) {
+pub(crate) fn mark_shape(s: *const Shape) {
     use std::sync::atomic::Ordering::Relaxed;
     let epoch = crate::gc::code_epoch();
     if s.live().mark.load(Relaxed) < epoch {
@@ -1055,15 +1051,25 @@ pub unsafe fn mark_shape(s: *const Shape) {
 
 /// Give object `o` shape `s`, which a full marking under way then finds
 /// live: `o` may have been traced with its old shape (the collector's
-/// barrier for shapes, which are Rust structures).
+/// barrier for shapes, which are Rust structures). (`o` and `s` trusted
+/// live, see `raw`.) Panics if `s` is of another class than `o`.
+#[inline]
+pub(crate) fn set_shape(o: *mut Object, s: *const Shape) {
+    // (Where the slots are depends on the class: `layout::slots_offset`.)
+    assert_eq!(s.live().class, o.class(), "a shape of another class");
+    unsafe { set_shape_unchecked(o, s) }
+}
+
+/// [`set_shape`] without its test of the class, for the interpreter's
+/// cached transitions (the test cost 1% instructions on Octane's
+/// RayTrace and Splay without the JIT).
 ///
 /// # Safety
-/// `o` must be an object and `s` a live shape.
+/// `s` must be a shape of `o`'s class.
 #[inline]
-pub unsafe fn set_shape(o: *mut Object, s: *const Shape) {
+pub(crate) unsafe fn set_shape_unchecked(o: *mut Object, s: *const Shape) {
+    debug_assert_eq!(s.live().class, o.class(), "a shape of another class");
     unsafe {
-        // (Where the slots are depends on the class: `layout::slots_offset`.)
-        debug_assert_eq!((*s).class, (*o).class);
         // (Atomic: the marker thread reads an old object's header while
         // the mutator gives it a shape; `Vm::add_shape`'s fence orders a
         // new shape's fields before this store.)

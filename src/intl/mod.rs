@@ -93,7 +93,7 @@ fn create(vm: &mut Vm, proto: Value, kind: Kind, slots: &[Value]) -> Value {
     let full = vm.root_shape(crate::object::Class::Intl, proto, slots.len() as u32 + 1);
     let bare = vm.root_shape(crate::object::Class::Intl, proto, 0);
     let o = vm.heap.alloc_object(full.live());
-    unsafe { crate::object::set_shape(o, bare) };
+    crate::object::set_shape(o, bare);
     crate::promise::set_slot(o, 0, Value::from_i32(kind as i32));
     for (i, &v) in slots.iter().enumerate() {
         crate::promise::set_slot(o, i + 1, v);

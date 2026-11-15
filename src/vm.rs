@@ -194,10 +194,8 @@ pub use crate::layout::NO_ELEMENTS;
 /// a typed array's or a buffer's: `BYTES_LOC`), and for the JIT a typed
 /// array's element kind plus one in `epoch` (`u32::MAX` once two kinds or
 /// anything else came). A cache holding a shape keeps it.
-///
-/// # Safety
-/// `ic` must be a live cache slot and `o` a live object.
-pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
+/// (`ic`, a cache slot of a live code's, and `o` trusted live, see `raw`.)
+pub(crate) fn note_bytes(ic: *mut Ic, o: *mut Object) {
     unsafe {
         // (A BigInt kind's as anything else's: its loads allocate.)
         let kind = if o.class() == Class::TypedArray && crate::object::TypedKind::from_u8(o.kind()).compiled() {
@@ -348,10 +346,8 @@ unsafe fn install(ic: *mut Ic, e: Ic) -> bool {
 /// Record in named-access cache `ic` that a receiver of shape `shape` found
 /// an accessor in prototype `holder` (see [`ACCESSOR_LOC`]), unless the
 /// cache holds shapes.
-///
-/// # Safety
-/// `ic` must be a live cache slot.
-unsafe fn note_accessor(ic: *mut Ic, shape: *const Shape, holder: *mut Object, epoch: u32) {
+/// (`ic`, a cache slot of a live code's, trusted live, see `raw`.)
+fn note_accessor(ic: *mut Ic, shape: *const Shape, holder: *mut Object, epoch: u32) {
     unsafe {
         let ours = |w: &Ic| w.loc == ACCESSOR_LOC && w.epoch == epoch && w.holder == holder;
         if (*shape).dictionary || !(*ic).shape.is_null() || ours(&*ic) && (*ic).new_shape.is_null() {
@@ -2523,7 +2519,7 @@ impl Vm {
         if let Some(&s) = self.roots.get(&key) {
             // (Live in a full marking under way: it may go to a cache, not
             // an object, as `CreateObject`'s.)
-            unsafe { crate::object::mark_shape(s) };
+            crate::object::mark_shape(s);
             return s;
         }
         if proto.is_cell() {
@@ -2688,50 +2684,48 @@ impl Vm {
     /// inline cache can treat a property added to it as an ordinary
     /// transition (which would skip the epoch bump).
     pub(crate) fn make_prototype(&mut self, o: *mut Object) {
-        unsafe {
-            if o.flags() & PROTOTYPE != 0 {
-                return;
-            }
-            // (V8 makes a prototype fast again: `ReoptimizeIfPrototype`.)
-            self.leave_dictionary(o);
-            o.set_flags(o.flags() | PROTOTYPE);
-            // (A proxy's traps may take any new element's store, and give
-            // any symbol's method.)
-            if self.proxies_exist && crate::proxy::is_proxy(self, o) {
-                self.protect_indices();
-                self.to_primitive_defined = true;
-                self.has_instance_defined = true;
-            } else {
-                self.protect_prototype_indices(o);
-            }
-            let s = o.shape().live();
-            // The object leaves `s` (for a copy of its own).
-            self.shape_left_stable(s);
-            self.unique_left(s);
-            let u = Shape {
-                class: s.class,
-                proto: s.proto,
-                capacity: Cell::new(s.capacity.get()),
-                slots: s.slots.clone(),
-                elems: s.elems,
-                elems_code: s.elems_code,
-                family: std::ptr::null(),
-                push: Cell::new(std::ptr::null_mut()),
-                unique: true,
-                fixed: false,
-                transitions: Default::default(),
-                elem_transitions: Default::default(),
-                relied: Cell::new(false),
-                left: Cell::new(false),
-                lineage_relied: Cell::new(false),
-                parent: Self::lineage_parent(s),
-                mark: Default::default(),
-                traced: Cell::new(0),
-                pinned: Cell::new(false),
-                dictionary: false,
-            };
-            crate::object::set_shape(o, self.add_shape(u));
+        if o.flags() & PROTOTYPE != 0 {
+            return;
         }
+        // (V8 makes a prototype fast again: `ReoptimizeIfPrototype`.)
+        self.leave_dictionary(o);
+        o.set_flags(o.flags() | PROTOTYPE);
+        // (A proxy's traps may take any new element's store, and give
+        // any symbol's method.)
+        if self.proxies_exist && crate::proxy::is_proxy(self, o) {
+            self.protect_indices();
+            self.to_primitive_defined = true;
+            self.has_instance_defined = true;
+        } else {
+            self.protect_prototype_indices(o);
+        }
+        let s = o.shape().live();
+        // The object leaves `s` (for a copy of its own).
+        self.shape_left_stable(s);
+        self.unique_left(s);
+        let u = Shape {
+            class: s.class,
+            proto: s.proto,
+            capacity: Cell::new(s.capacity.get()),
+            slots: s.slots.clone(),
+            elems: s.elems,
+            elems_code: s.elems_code,
+            family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
+            unique: true,
+            fixed: false,
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
+            relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: Self::lineage_parent(s),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
+            dictionary: false,
+        };
+        crate::object::set_shape(o, self.add_shape(u));
     }
 
     /// The parent of a shape made from `s`: `s`, or if it is unique (an
@@ -2844,20 +2838,18 @@ impl Vm {
     /// Add the property that shape `new`, a transition from `o`'s, adds,
     /// with `value`: its slot.
     pub(crate) fn add_property_shaped(&mut self, o: *mut Object, new: *const Shape, value: Value) -> u32 {
-        unsafe {
-            let ns = new.live();
-            let slot = ns.keys().len() as u32 - 1;
-            if slot >= ns.capacity.get() {
-                self.reserve_props(o, slot - ns.capacity.get());
-            }
-            crate::object::set_shape(o, new);
-            self.store_field(o, slot, value);
-            if o.flags() & PROTOTYPE != 0 {
-                self.proto_epoch = self.proto_epoch.wrapping_add(1);
-                self.bump_code_epoch();
-            }
-            slot
+        let ns = new.live();
+        let slot = ns.keys().len() as u32 - 1;
+        if slot >= ns.capacity.get() {
+            self.reserve_props(o, slot - ns.capacity.get());
         }
+        crate::object::set_shape(o, new);
+        self.store_field(o, slot, value);
+        if o.flags() & PROTOTYPE != 0 {
+            self.proto_epoch = self.proto_epoch.wrapping_add(1);
+            self.bump_code_epoch();
+        }
+        slot
     }
 
     /// Whether an inline cache may cache stores to slot `slot` of `o`'s
@@ -4257,52 +4249,50 @@ impl Vm {
     /// if none is given, and changes its attributes: `o` gets a shape of
     /// its own (no shared transition leads to it).
     pub(crate) fn define_property(&mut self, o: *mut Object, name: Atom, value: Option<Value>, attrs: u8) {
-        unsafe {
-            let s = o.shape().live();
-            let Some(slot) = s.lookup(name) else {
-                self.add_property_with(o, name, value.unwrap_or(Value::UNDEFINED), attrs);
-                return;
+        let s = o.shape().live();
+        let Some(slot) = s.lookup(name) else {
+            self.add_property_with(o, name, value.unwrap_or(Value::UNDEFINED), attrs);
+            return;
+        };
+        if s.attrs()[slot as usize] != attrs {
+            // (A dictionary shape's slots are copied: none buried.)
+            if s.dictionary && s.slots.holes() != 0 {
+                self.dict_compact(o);
+                return self.define_property(o, name, value, attrs);
+            }
+            self.shape_left(s);
+            let mut slot_attrs = s.attrs().to_vec();
+            slot_attrs[slot as usize] = attrs;
+            let u = Shape {
+                class: s.class,
+                proto: s.proto,
+                capacity: Cell::new(s.capacity.get()),
+                slots: Slots::new(s.keys(), &slot_attrs, s.fields()),
+                elems: s.elems,
+                elems_code: s.elems_code,
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: true,
+                fixed: false,
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
+                relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: std::ptr::null(),
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
+                dictionary: false,
             };
-            if s.attrs()[slot as usize] != attrs {
-                // (A dictionary shape's slots are copied: none buried.)
-                if s.dictionary && s.slots.holes() != 0 {
-                    self.dict_compact(o);
-                    return self.define_property(o, name, value, attrs);
-                }
-                self.shape_left(s);
-                let mut slot_attrs = s.attrs().to_vec();
-                slot_attrs[slot as usize] = attrs;
-                let u = Shape {
-                    class: s.class,
-                    proto: s.proto,
-                    capacity: Cell::new(s.capacity.get()),
-                    slots: Slots::new(s.keys(), &slot_attrs, s.fields()),
-                    elems: s.elems,
-                    elems_code: s.elems_code,
-                    family: std::ptr::null(),
-                    push: Cell::new(std::ptr::null_mut()),
-                    unique: true,
-                    fixed: false,
-                    transitions: Default::default(),
-                    elem_transitions: Default::default(),
-                    relied: Cell::new(false),
-                    left: Cell::new(false),
-                    lineage_relied: Cell::new(false),
-                    parent: std::ptr::null(),
-                    mark: Default::default(),
-                    traced: Cell::new(0),
-                    pinned: Cell::new(false),
-                    dictionary: false,
-                };
-                crate::object::set_shape(o, self.add_shape(u));
-                self.bump_code_epoch();
-                if o.flags() & PROTOTYPE != 0 {
-                    self.proto_epoch = self.proto_epoch.wrapping_add(1);
-                }
+            crate::object::set_shape(o, self.add_shape(u));
+            self.bump_code_epoch();
+            if o.flags() & PROTOTYPE != 0 {
+                self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
-            if let Some(v) = value {
-                self.store_field(o, slot, v);
-            }
+        }
+        if let Some(v) = value {
+            self.store_field(o, slot, v);
         }
     }
 
@@ -5102,7 +5092,7 @@ impl Vm {
             matches!(c, Class::String | Class::TypedArray) || c.no_elements()
         } {
             let (ic, _) = code.ic(ic);
-            unsafe { note_bytes(ic, as_object(obj)) };
+            note_bytes(ic, as_object(obj));
         } else if obj.is_cell()
             // (Not a mapped `arguments` object's: its elements' values are
             // the parameters', see `mapped_get`.)
@@ -6053,7 +6043,7 @@ impl Vm {
     /// capacity they were created with), at a fixed offset.
     #[inline(always)]
     pub(crate) fn upvalues(f: *const Object) -> *mut *mut Upvalue {
-        debug_assert_eq!(unsafe { Object::inline_cap(f) }, FUNCTION_CAPACITY as usize);
+        debug_assert_eq!(Object::inline_cap(f), FUNCTION_CAPACITY as usize);
         unsafe { f.cast::<u8>().add(UPVALUES_OFF).cast_mut().cast() }
     }
 
@@ -6310,7 +6300,7 @@ impl Vm {
             }
             object_value(r)
         } else if o.shape() == self.mapped_arguments_shape {
-            unsafe { crate::object::set_shape(o, self.arguments_shape) };
+            crate::object::set_shape(o, self.arguments_shape);
             return;
         } else {
             Value::FALSE
@@ -6574,7 +6564,7 @@ impl Vm {
     pub(crate) fn construct_this(&mut self, f: *mut Object) -> Value {
         let s = self.ctor_root(f);
         // (Given to an object a full marking under way may not trace.)
-        unsafe { crate::object::mark_shape(s) };
+        crate::object::mark_shape(s);
         object_value(self.heap.alloc_object(s.live()))
     }
 
@@ -7035,40 +7025,38 @@ impl Vm {
             crate::layout::store_word(Object::slot(l, ns.location(slot)), Value::HOLE);
         }
         let g = self.global;
-        unsafe {
-            let s = g.shape().live();
-            let Some(slot) = s.lookup(name) else {
-                return;
-            };
-            self.field_made_mutable(s.field_cell(slot));
-            self.shape_left(s);
-            let u = Shape {
-                class: s.class,
-                proto: s.proto,
-                capacity: Cell::new(s.capacity.get()),
-                slots: Slots::new(s.keys(), s.attrs(), s.fields()),
-                elems: s.elems,
-                elems_code: s.elems_code,
-                family: std::ptr::null(),
-                push: Cell::new(std::ptr::null_mut()),
-                unique: true,
-                fixed: false,
-                transitions: Default::default(),
-                elem_transitions: Default::default(),
-                relied: Cell::new(false),
-                left: Cell::new(false),
-                lineage_relied: Cell::new(false),
-                parent: std::ptr::null(),
-                mark: Default::default(),
-                traced: Cell::new(0),
-                pinned: Cell::new(false),
-                dictionary: false,
-            };
-            crate::object::set_shape(g, self.add_shape(u));
-            self.bump_code_epoch();
-            if g.flags() & PROTOTYPE != 0 {
-                self.proto_epoch = self.proto_epoch.wrapping_add(1);
-            }
+        let s = g.shape().live();
+        let Some(slot) = s.lookup(name) else {
+            return;
+        };
+        self.field_made_mutable(s.field_cell(slot));
+        self.shape_left(s);
+        let u = Shape {
+            class: s.class,
+            proto: s.proto,
+            capacity: Cell::new(s.capacity.get()),
+            slots: Slots::new(s.keys(), s.attrs(), s.fields()),
+            elems: s.elems,
+            elems_code: s.elems_code,
+            family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
+            unique: true,
+            fixed: false,
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
+            relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: std::ptr::null(),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
+            dictionary: false,
+        };
+        crate::object::set_shape(g, self.add_shape(u));
+        self.bump_code_epoch();
+        if g.flags() & PROTOTYPE != 0 {
+            self.proto_epoch = self.proto_epoch.wrapping_add(1);
         }
     }
 

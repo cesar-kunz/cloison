@@ -121,7 +121,7 @@ pub(crate) trait ObjectPtr: Copy {
         let o = self.object_ptr();
         if loc >= 0 {
             let start = crate::layout::slots_offset(self.class());
-            let end = start + 8 * unsafe { Object::inline_cap(o) };
+            let end = start + 8 * Object::inline_cap(o);
             assert!((start..end).contains(&(loc as usize)) && loc % 8 == 0, "slot {loc} not in the object");
             unsafe { *o.cast::<u8>().add(loc as usize).cast::<Value>() }
         } else {

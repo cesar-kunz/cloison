@@ -140,48 +140,46 @@ impl Vm {
     /// if `drop_code`.
     fn unique_shape_with(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, no_elements: bool, drop_code: bool) {
         self.leave_dictionary(o);
-        unsafe {
-            let s = o.shape().live();
-            let same_attrs = attrs.as_ref().is_none_or(|a| a == s.attrs());
-            // (With no store's fast path for good: elements typed `Any`, so
-            // no store generalizes them, which would give the shape an
-            // `elems_code` of a type again, as `elements_transition` does.)
-            if s.unique && same_attrs && (!no_elements || s.elems_code == NO_ELEMENTS && s.elems == FieldType::Any) {
-                return;
-            }
-            self.shape_left(s);
-            let u = Shape {
-                class: s.class,
-                proto: s.proto,
-                capacity: Cell::new(s.capacity.get()),
-                slots: match attrs {
-                    Some(a) if a != s.attrs() => Slots::new(s.keys(), &a, s.fields()),
-                    _ => s.slots.clone(),
-                },
-                elems: if no_elements { FieldType::Any } else { s.elems },
-                elems_code: if no_elements { NO_ELEMENTS } else { s.elems_code },
-                family: std::ptr::null(),
-                push: Cell::new(std::ptr::null_mut()),
-                unique: true,
-                fixed: false,
-                transitions: Default::default(),
-                elem_transitions: Default::default(),
-                relied: Cell::new(false),
-                left: Cell::new(false),
-                lineage_relied: Cell::new(false),
-                parent: std::ptr::null(),
-                mark: Default::default(),
-                traced: Cell::new(0),
-                pinned: Cell::new(false),
-                dictionary: false,
-            };
-            crate::object::set_shape(o, self.add_shape(u));
-            if drop_code {
-                self.bump_code_epoch();
-            }
-            if o.flags() & crate::object::PROTOTYPE != 0 {
-                self.proto_epoch = self.proto_epoch.wrapping_add(1);
-            }
+        let s = o.shape().live();
+        let same_attrs = attrs.as_ref().is_none_or(|a| a == s.attrs());
+        // (With no store's fast path for good: elements typed `Any`, so
+        // no store generalizes them, which would give the shape an
+        // `elems_code` of a type again, as `elements_transition` does.)
+        if s.unique && same_attrs && (!no_elements || s.elems_code == NO_ELEMENTS && s.elems == FieldType::Any) {
+            return;
+        }
+        self.shape_left(s);
+        let u = Shape {
+            class: s.class,
+            proto: s.proto,
+            capacity: Cell::new(s.capacity.get()),
+            slots: match attrs {
+                Some(a) if a != s.attrs() => Slots::new(s.keys(), &a, s.fields()),
+                _ => s.slots.clone(),
+            },
+            elems: if no_elements { FieldType::Any } else { s.elems },
+            elems_code: if no_elements { NO_ELEMENTS } else { s.elems_code },
+            family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
+            unique: true,
+            fixed: false,
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
+            relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: std::ptr::null(),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
+            dictionary: false,
+        };
+        crate::object::set_shape(o, self.add_shape(u));
+        if drop_code {
+            self.bump_code_epoch();
+        }
+        if o.flags() & crate::object::PROTOTYPE != 0 {
+            self.proto_epoch = self.proto_epoch.wrapping_add(1);
         }
     }
 
@@ -194,51 +192,49 @@ impl Vm {
     /// Compiled code relying on the old shape is dropped.
     fn fix_shape(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, level: u8) {
         self.leave_dictionary(o);
-        unsafe {
-            let s = o.shape().live();
-            if s.unique {
-                return self.unique_shape(o, attrs, true);
-            }
-            if s.fixed && attrs.as_ref().is_none_or(|a| a == s.attrs()) {
-                return;
-            }
-            self.shape_left(s);
-            let found = self.find_transition(s, FIXED_KEY, level);
-            let t = match found {
-                Some(t) => t,
-                None => {
-                    let t = self.add_shape(Shape {
-                        class: s.class,
-                        proto: s.proto,
-                        capacity: Cell::new(s.capacity.get()),
-                        slots: match attrs {
-                            Some(a) if a != s.attrs() => Slots::new(s.keys(), &a, s.fields()),
-                            _ => s.slots.clone(),
-                        },
-                        elems: FieldType::Any,
-                        elems_code: NO_ELEMENTS,
-                        family: std::ptr::null(),
-                        push: Cell::new(std::ptr::null_mut()),
-                        unique: false,
-                        fixed: true,
-                        transitions: Default::default(),
-                        elem_transitions: Default::default(),
-                        relied: Cell::new(false),
-                        left: Cell::new(false),
-                        lineage_relied: Cell::new(false),
-                        parent: std::ptr::null(),
-                        mark: Default::default(),
-                        traced: Cell::new(0),
-                        pinned: Cell::new(false),
-                        dictionary: false,
-                    });
-                    self.add_transition(s, FIXED_KEY, level, t);
-                    t
-                }
-            };
-            crate::object::set_shape(o, t);
-            self.bump_code_epoch();
+        let s = o.shape().live();
+        if s.unique {
+            return self.unique_shape(o, attrs, true);
         }
+        if s.fixed && attrs.as_ref().is_none_or(|a| a == s.attrs()) {
+            return;
+        }
+        self.shape_left(s);
+        let found = self.find_transition(s, FIXED_KEY, level);
+        let t = match found {
+            Some(t) => t,
+            None => {
+                let t = self.add_shape(Shape {
+                    class: s.class,
+                    proto: s.proto,
+                    capacity: Cell::new(s.capacity.get()),
+                    slots: match attrs {
+                        Some(a) if a != s.attrs() => Slots::new(s.keys(), &a, s.fields()),
+                        _ => s.slots.clone(),
+                    },
+                    elems: FieldType::Any,
+                    elems_code: NO_ELEMENTS,
+                    family: std::ptr::null(),
+                    push: Cell::new(std::ptr::null_mut()),
+                    unique: false,
+                    fixed: true,
+                    transitions: Default::default(),
+                    elem_transitions: Default::default(),
+                    relied: Cell::new(false),
+                    left: Cell::new(false),
+                    lineage_relied: Cell::new(false),
+                    parent: std::ptr::null(),
+                    mark: Default::default(),
+                    traced: Cell::new(0),
+                    pinned: Cell::new(false),
+                    dictionary: false,
+                });
+                self.add_transition(s, FIXED_KEY, level, t);
+                t
+            }
+        };
+        crate::object::set_shape(o, t);
+        self.bump_code_epoch();
     }
 
     /// A shape as `s` (shared), but no element store's fast path fits it
@@ -290,52 +286,50 @@ impl Vm {
     /// type if it has no properties, else a unique shape of that type.
     pub(crate) fn dense_elements(&mut self, o: *mut Object) {
         self.leave_dictionary(o);
-        unsafe {
-            let mut elems = FieldType::None;
-            for k in 0..o.elems_len() as usize {
-                let v = o.elem(k);
-                if v != Value::EMPTY {
-                    elems = elems.join(FieldType::of(v));
-                }
+        let mut elems = FieldType::None;
+        for k in 0..o.elems_len() as usize {
+            let v = o.elem(k);
+            if v != Value::EMPTY {
+                elems = elems.join(FieldType::of(v));
             }
-            let s = o.shape().live();
-            let root = self.array_shape.live();
-            if s.keys().is_empty() && s.proto == root.proto && s.capacity.get() == root.capacity.get() {
-                let t = if elems == FieldType::None {
-                    self.array_shape
-                } else {
-                    self.elements_transition(self.array_shape, elems)
-                };
-                crate::object::set_shape(o, t);
-                return;
-            }
-            self.shape_left(s);
-            let u = Shape {
-                class: s.class,
-                proto: s.proto,
-                capacity: Cell::new(s.capacity.get()),
-                slots: s.slots.clone(),
-                elems,
-                elems_code: elems.encode(),
-                family: std::ptr::null(),
-                push: Cell::new(std::ptr::null_mut()),
-                unique: true,
-                fixed: false,
-                transitions: Default::default(),
-                elem_transitions: Default::default(),
-                relied: Cell::new(false),
-                left: Cell::new(false),
-                lineage_relied: Cell::new(false),
-                parent: std::ptr::null(),
-                mark: Default::default(),
-                traced: Cell::new(0),
-                pinned: Cell::new(false),
-                dictionary: false,
+        }
+        let s = o.shape().live();
+        let root = self.array_shape.live();
+        if s.keys().is_empty() && s.proto == root.proto && s.capacity.get() == root.capacity.get() {
+            let t = if elems == FieldType::None {
+                self.array_shape
+            } else {
+                self.elements_transition(self.array_shape, elems)
             };
-            crate::object::set_shape(o, self.add_shape(u));
-            if o.flags() & crate::object::PROTOTYPE != 0 {
-                self.proto_epoch = self.proto_epoch.wrapping_add(1);
-            }
+            crate::object::set_shape(o, t);
+            return;
+        }
+        self.shape_left(s);
+        let u = Shape {
+            class: s.class,
+            proto: s.proto,
+            capacity: Cell::new(s.capacity.get()),
+            slots: s.slots.clone(),
+            elems,
+            elems_code: elems.encode(),
+            family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
+            unique: true,
+            fixed: false,
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
+            relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: std::ptr::null(),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
+            dictionary: false,
+        };
+        crate::object::set_shape(o, self.add_shape(u));
+        if o.flags() & crate::object::PROTOTYPE != 0 {
+            self.proto_epoch = self.proto_epoch.wrapping_add(1);
         }
     }
 

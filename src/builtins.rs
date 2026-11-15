@@ -1267,97 +1267,161 @@ fn run_source_code(vm: &mut Vm, src: &crate::js::lex::Source) -> Result<Value> {
     crate::interp::run_script_at(vm, code)
 }
 
+/// The in-object slots of a bound function's own `length` and `name`,
+/// before its hidden ones: the target, `this`, and the bound arguments.
+const BOUND_OWN: usize = 2;
+
 /// `f.bind(that, …args)`: a function calling `f` with `this` `that` and
-/// `args` before its own. Made by a JS helper (natives carry no data of
-/// their own), evaluated on first use.
+/// `args` before its own (BoundFunctionCreate). A native closure (see
+/// `promise::native_closure`) of [`bound_call`], with `f`, `that` and
+/// `args` in hidden slots after those of its `length` and `name`, which
+/// are properties from the start.
 fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !this.is_cell() || !matches!(unsafe { (*as_object(this)).class }, Class::Function | Class::Native) {
         return Err(Error::type_error("Bind must be called on a function"));
     }
-    if vm.bind_helper.is_undefined() {
-        // (Its calls through natives, not `apply` or `push`, which code may
-        // have replaced.)
-        let make = run_source(
-            vm,
-            "(function (call, construct) { return function (f, that, args, ctor) { \
-               if (ctor) return function B(...rest) { \
-                 return new.target ? construct(f, args, rest, new.target === B ? f : new.target) \
-                   : call(f, that, args, rest); }; \
-               return ({ bound(...rest) { return call(f, that, args, rest); } }).bound; }; })",
-        )?;
-        vm.bind_helper = vm.handle_scope(|vm| {
-            vm.handles.push(make);
-            let call = vm.native_function("call", bound_call, 4, crate::jit::Ty::Any, false);
-            vm.handles.push(object_value(call));
-            let construct = vm.native_function("construct", bound_construct, 4, crate::jit::Ty::Any, false);
-            vm.handles.push(object_value(construct));
-            crate::interp::call_function(vm, make, Value::UNDEFINED, &[object_value(call), object_value(construct)])
-        })?;
-    }
-    let rest = vm.new_array();
-    crate::vm::array_push(vm, rest, a.get(1..).unwrap_or(&[]))?;
-    let helper = vm.bind_helper;
-    // (A constructor only if `this` is one.)
-    let ctor = Value::from_bool(crate::intrinsics::is_constructor(this));
-    let bound = crate::interp::call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), rest, ctor])?;
-    // (No `prototype` of its own.)
-    let a_prototype = vm.a_prototype;
-    vm.force_delete_named(as_object(bound), a_prototype);
-    let a_target = vm.a_bound_target;
-    vm.add_property_with(as_object(bound), a_target, this, DONT_ENUM | READ_ONLY | DONT_DELETE);
-    // Its `length` (what the target's leaves) and `name` ("bound …").
-    let a_length = vm.a_length;
-    let len = if vm.own_property(as_object(this), crate::vm::Key::Name(a_length)).is_some() {
-        let l = vm.get(this, a_length)?;
-        match l.as_number() {
-            Some(n) if n == f64::INFINITY => n,
-            Some(n) if n.is_finite() => (n.trunc() - a.len().saturating_sub(1) as f64).max(0.0),
-            Some(n) if n == f64::NEG_INFINITY => 0.0,
-            _ => 0.0,
-        }
+    let target = as_object(this);
+    let args = a.get(1..).unwrap_or(&[]);
+    let proto = if vm.proxies_exist {
+        crate::proxy::get_prototype_of(vm, target)?
     } else {
-        0.0
+        unsafe { (*(*target).shape).proto }
     };
-    let d = crate::props::Desc::data(Value::number(len), false, false, true);
-    vm.define_own_property(as_object(bound), crate::vm::Key::Name(a_length), &d)?;
-    let a_name = vm.a_name;
-    let name = vm.get(this, a_name)?;
-    let mut units: Vec<u16> = "bound ".encode_utf16().collect();
-    // (Past the longest string: thrown before a long name is read.)
-    push_string(&mut units, name)?;
-    let name = vm.new_string(&units);
-    let d = crate::props::Desc::data(name, false, false, true);
-    vm.define_own_property(as_object(bound), crate::vm::Key::Name(a_name), &d)?;
-    Ok(bound)
-}
-
-/// A bound function's call: `[f, that, bound args, args]`.
-fn bound_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    // (The call takes the list onto the VM stack first: see
-    // `interp::with_args_on_stack`.)
-    bound_args(a[2], a[3], |all| crate::interp::call_function(vm, a[0], a[1], all))
-}
-
-/// The arguments of a bound function's call, to `f`: those bound then
-/// the call's, both arrays of the bind helper's that no code sees (the
-/// first `function_bind`'s, the other a rest parameter's), without holes.
-fn bound_args<R>(bound: Value, rest: Value, f: impl FnOnce(&[Value]) -> R) -> R {
-    let (b, r) = unsafe { (Object::elems(as_object(bound)), Object::elems(as_object(rest))) };
-    let n = b.len() + r.len();
-    let mut few = [Value::UNDEFINED; 16];
-    if n <= few.len() {
-        few[..b.len()].copy_from_slice(b);
-        few[b.len()..n].copy_from_slice(r);
-        return f(&few[..n]);
+    // Its `length` (what the target's leaves) and `name` ("bound …"): the
+    // target's code's, where it has neither as a property of its own
+    // making (nor deleted them); as read otherwise.
+    let (a_length, a_name) = (vm.a_length, vm.a_name);
+    let plain = unsafe {
+        let s = &*(*target).shape;
+        (*target).flags & (crate::object::FN_LENGTH_DELETED | crate::object::FN_NAME_DELETED) == 0
+            && s.lookup(a_length).is_none()
+            && s.lookup(a_name).is_none()
+            && !(vm.proxies_exist && crate::proxy::is_proxy(vm, target))
+    };
+    let mut units: Vec<u16> = Vec::with_capacity(32);
+    units.extend(b"bound ".iter().map(|&c| c as u16));
+    let len = if plain {
+        let code = unsafe { &*(*target).code };
+        if code.name.is_ascii() {
+            if !code.name.starts_with('<') {
+                units.extend(code.name.bytes().map(u16::from));
+            }
+        } else {
+            units.extend(crate::js::lex::to_units(&code.name));
+        }
+        (code.length as f64 - args.len() as f64).max(0.0)
+    } else {
+        let len = if vm.own_property(target, crate::vm::Key::Name(a_length)).is_some() {
+            let l = vm.get(this, a_length)?;
+            match l.as_number() {
+                Some(n) if n == f64::INFINITY => n,
+                Some(n) if n.is_finite() => (n.trunc() - args.len() as f64).max(0.0),
+                _ => 0.0,
+            }
+        } else {
+            0.0
+        };
+        let name = vm.get(this, a_name)?;
+        // (Past the longest string: thrown before a long name is read.)
+        push_string(&mut units, name)?;
+        len
+    };
+    // (A constructor only if `this` is one.)
+    let ctor = crate::intrinsics::is_constructor(this);
+    if vm.bound_fns[ctor as usize].is_null() {
+        vm.bound_fns[ctor as usize] = vm.native_function("", bound_call, 0, crate::jit::Ty::Any, ctor);
     }
-    f(&[b, r].concat())
+    vm.handle_scope(|vm| {
+        let name = vm.new_string(&units);
+        vm.handles.push(name);
+        let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + args.len()) as u32);
+        let own = vm.root_shape(Class::Native, proto, BOUND_OWN as u32);
+        let o = vm.heap.alloc_object(unsafe { &*full });
+        unsafe {
+            crate::object::set_shape(o, own);
+            (*o).code = (*vm.bound_fns[ctor as usize]).code;
+            // (`this` and `a` are where a collection updates them: read
+            // after the allocations.)
+            crate::promise::set_slot(o, BOUND_OWN, this);
+            crate::promise::set_slot(o, BOUND_OWN + 1, arg(a, 0));
+            for (i, &v) in a.get(1..).unwrap_or(&[]).iter().enumerate() {
+                crate::promise::set_slot(o, BOUND_OWN + 2 + i, v);
+            }
+        }
+        vm.handles.push(object_value(o));
+        let name = vm.handles[vm.handles.len() - 2];
+        vm.add_property_with(o, a_length, Value::number(len), DONT_ENUM | READ_ONLY);
+        let o = as_object(vm.handles[vm.handles.len() - 1]);
+        vm.add_property_with(o, a_name, name, DONT_ENUM | READ_ONLY);
+        Ok(vm.handles[vm.handles.len() - 1])
+    })
 }
 
-/// A bound function's construction: `[f, bound args, args, new.target]`.
-fn bound_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    // (The call takes the list onto the VM stack first: see
+/// Whether `o` is a bound function (of any realm).
+pub(crate) fn is_bound(o: *mut Object) -> bool {
+    unsafe {
+        (*o).class == Class::Native
+            && (*(*o).code).native.is_some_and(|f| std::ptr::fn_addr_eq(f, bound_call as NativeFn))
+    }
+}
+
+/// For a call of `f`: if `f` is a bound function with no arguments bound
+/// and its target a bytecode function (in the one realm), the target and
+/// the bound `this`, which are what the call calls.
+pub(crate) unsafe fn unwrap_bound(vm: *const Vm, f: Value) -> Option<(*mut Object, Value)> {
+    unsafe {
+        if !f.is_cell() || !is_bound(as_object(f)) || Object::inline_cap(as_object(f)) != BOUND_OWN + 2 {
+            return None;
+        }
+        let o = as_object(f);
+        let target = crate::promise::slot(o, BOUND_OWN);
+        ((*as_object(target)).class == Class::Function && (*vm).realms.is_empty())
+            .then(|| (as_object(target), crate::promise::slot(o, BOUND_OWN + 1)))
+    }
+}
+
+/// Bound function `o`'s target.
+pub(crate) fn bound_target(o: *mut Object) -> Value {
+    crate::promise::slot(o, BOUND_OWN)
+}
+
+/// A bound function's call or construction ([[Call]] and [[Construct]] of
+/// a bound function exotic object): its target's, with the bound
+/// arguments before `args`, and `new.target` the target where it is the
+/// bound function.
+fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    let o = vm.callee;
+    let constructing = vm.constructing;
+    let (target, this) = (crate::promise::slot(o, BOUND_OWN), crate::promise::slot(o, BOUND_OWN + 1));
+    let bound = unsafe { Object::inline_cap(o) } - BOUND_OWN - 2;
+    let nt = if !constructing {
+        Value::EMPTY
+    } else if vm.native_new_target.0 == object_value(o) {
+        std::mem::replace(&mut vm.native_new_target, (Value::EMPTY, Value::EMPTY)).1
+    } else {
+        target
+    };
+    let run = |vm: &mut Vm, all: &[Value]| {
+        if constructing {
+            crate::intrinsics::construct_with(vm, target, all, nt)
+        } else {
+            crate::interp::call_function(vm, target, this, all)
+        }
+    };
+    if bound == 0 {
+        return run(vm, args);
+    }
+    // (Copied to the VM stack before any safepoint: see
     // `interp::with_args_on_stack`.)
-    bound_args(a[1], a[2], |all| crate::intrinsics::construct_with(vm, a[0], all, a[3]))
+    let slots = (0..bound).map(|i| crate::promise::slot(o, BOUND_OWN + 2 + i));
+    let n = bound + args.len();
+    let mut few = [Value::UNDEFINED; 8];
+    if n <= few.len() {
+        few.iter_mut().zip(slots.chain(args.iter().copied())).for_each(|(at, v)| *at = v);
+        return run(vm, &few[..n]);
+    }
+    let all: Vec<Value> = slots.chain(args.iter().copied()).collect();
+    run(vm, &all)
 }
 
 /// `Function.prototype.toString`: a function's source text, or (a native,
@@ -1368,11 +1432,7 @@ pub(crate) fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Resul
     }
     let o = as_object(this);
     let code = unsafe { &*(*o).code };
-    // (A bound function is the bind helper's closure.)
-    let bound = vm.bind_helper.is_cell() && {
-        let h = unsafe { &*(*as_object(vm.bind_helper)).code };
-        h.closures.iter().any(|&c| std::ptr::eq(c, code))
-    };
+    let bound = is_bound(o);
     if unsafe { (*o).class } == Class::Function
         && !bound
         && let Some(u) = code.text_units()

@@ -19,6 +19,7 @@ use crate::interp::{call_function, to_boolean, to_int32, to_number};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
+use crate::raw::ObjectPtr;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, array_push, is_string, string_units};
 
@@ -266,13 +267,10 @@ pub(crate) fn hashed_by_address(k: Value) -> bool {
 /// The keys of collection `o` that are hashed by their address (for
 /// `CLOISON_GC_FRAG`: they could not move).
 pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
-    if !matches!(
-        unsafe { (*o).class },
-        Class::Map | Class::Set | Class::WeakMap | Class::WeakSet | Class::FinalizationRegistry
-    ) {
+    if !matches!(o.class(), Class::Map | Class::Set | Class::WeakMap | Class::WeakSet | Class::FinalizationRegistry) {
         return;
     }
-    let e = Value::from_bits(unsafe { (*o).code } as u64);
+    let e = Value::from_bits(o.code() as u64);
     if !e.is_cell() {
         return;
     }
@@ -287,7 +285,7 @@ pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
 
 /// The entries array of collection (or iterator) `o`.
 fn entries(o: *mut Object) -> *mut Object {
-    unsafe { as_object(Value::from_bits((*o).code as u64)) }
+    as_object(Value::from_bits(o.code() as u64))
 }
 
 /// Set `o`'s entries array to `e`.
@@ -299,19 +297,19 @@ fn hold_entries(o: *mut Object, e: Value) {
 
 /// Element `i` of entries array `e` (within its length).
 fn slot(e: *mut Object, i: usize) -> Value {
-    unsafe { *(*e).elems.add(i) }
+    e.elem(i)
 }
 
 /// Set element `i` of `e` (an array of any values) to `v`.
 fn put(e: *mut Object, i: usize, v: Value) {
     unsafe {
-        let at = (*e).elems.add(i);
+        let at = e.elems().add(i);
         crate::heap::store(e.cast(), at, v);
     }
 }
 
 fn len(e: *mut Object) -> usize {
-    unsafe { (*e).elems_len as usize }
+    e.elems_len() as usize
 }
 
 /// An int32 element of a header or an index.
@@ -321,7 +319,7 @@ fn int(e: *mut Object, i: usize) -> i32 {
 
 /// A collection's entry width: 2 for the maps, 1 for the sets.
 fn stride(o: *mut Object) -> usize {
-    if matches!(unsafe { (*o).class }, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 }
+    if matches!(o.class(), Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 }
 }
 
 /// The entries array `e` was compacted into, or itself: an iterator's
@@ -448,7 +446,7 @@ fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
 fn remove(o: *mut Object, i: usize) {
     let e = entries(o);
     for j in 0..stride(o) {
-        unsafe { crate::layout::store_word((*e).elems.add(i + j), Value::EMPTY) };
+        e.set_elem(i + j, Value::EMPTY);
     }
     put(e, COUNT, Value::from_i32(int(e, COUNT) - 1));
 }
@@ -506,11 +504,11 @@ pub(crate) fn weak_set_each(o: *mut Object, mut f: impl FnMut(Value)) {
 /// `heap::WEAK_VALUES`).
 fn weaken(o: *mut Object) {
     unsafe {
-        if !matches!((*o).class, Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
+        if !matches!(o.class(), Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
             return;
         }
         let e = entries(o);
-        let elems = (*e).elems;
+        let elems = e.elems();
         if elems.is_null() {
             return;
         }
@@ -598,10 +596,10 @@ fn new_iterator(vm: &mut Vm, o: *mut Object, mode: IterMode) -> Value {
     let s = stride(o);
     let proto = vm.collection_prototypes[if s == 2 { Proto::MapIterator } else { Proto::SetIterator } as usize];
     let it = vm.new_object_with(Class::CollectionIterator, object_value(proto), 0);
-    hold_entries(it, Value::from_bits(unsafe { (*o).code } as u64));
+    hold_entries(it, Value::from_bits(o.code() as u64));
     unsafe {
         *Object::aux(it) = mode as u32 | (s as u32) << 2;
-        (*it).elems_len = BASE as u32;
+        it.set_elems_len(BASE as u32);
     }
     object_value(it)
 }
@@ -650,7 +648,7 @@ fn map_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn clear(vm: &mut Vm, o: *mut Object) -> Result<()> {
     let e = entries(o);
     for i in BASE..len(e) {
-        unsafe { crate::layout::store_word((*e).elems.add(i), Value::EMPTY) };
+        e.set_elem(i, Value::EMPTY);
     }
     move_entries(vm, o)
 }
@@ -780,11 +778,11 @@ pub(crate) fn default_iterator(vm: &mut Vm, o: *mut Object) -> Value {
 /// [`iterator_next`]'s value, without its result object: `None` once
 /// exhausted (for good).
 pub(crate) fn step(vm: &mut Vm, it: *mut Object) -> Result<Option<Value>> {
-    if unsafe { (*it).code }.is_null() {
+    if it.code().is_null() {
         return Ok(None);
     }
     let (mode, s) = unsafe { (*Object::aux(it) & 3, (*Object::aux(it) >> 2) as usize) };
-    let mut i = unsafe { (*it).elems_len } as usize;
+    let mut i = it.elems_len() as usize;
     let e = current(entries(it), &mut i, s);
     hold_entries(it, object_value(e));
     while i < len(e) {
@@ -1037,7 +1035,7 @@ fn view_bytes(o: *mut Object, i: usize, size: usize) -> Result<*mut u8> {
     if i + size > len {
         return Err(Error::range_error("Offset is outside the bounds of the DataView"));
     }
-    Ok(unsafe { (*o).elems.cast::<u8>().add(i) })
+    Ok(unsafe { o.elems().cast::<u8>().add(i) })
 }
 
 /// `view.getInt8(byteOffset)`, …, `view.getFloat64(byteOffset,

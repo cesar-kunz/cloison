@@ -25,6 +25,7 @@ use crate::interp::{call_function, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{is_callable, is_object};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push};
 
@@ -330,19 +331,19 @@ fn type_error(vm: &mut Vm, message: &str) -> Value {
 }
 
 fn len(e: *mut Object) -> usize {
-    unsafe { (*e).elems_len as usize }
+    e.elems_len() as usize
 }
 
 /// Element `i` of array `e` (within its length).
 fn elem(e: *mut Object, i: usize) -> Value {
-    unsafe { *(*e).elems.add(i) }
+    e.elem(i)
 }
 
 /// Set element `i` of array `e` (within its length) to `v`.
 fn put(e: *mut Object, i: usize, v: Value) {
     unsafe {
-        let at = (*e).elems.add(i);
-        crate::heap::store((*e).elems.cast::<u8>().sub(8), at, v);
+        let at = e.elems().add(i);
+        crate::heap::store(e.elems().cast::<u8>().sub(8), at, v);
     }
 }
 
@@ -373,10 +374,10 @@ pub(crate) fn native_closure(vm: &mut Vm, template: *mut Object, data: &[Value])
     let fp = object_value(vm.function_prototype);
     let full = vm.root_shape(Class::Native, fp, data.len() as u32);
     let bare = vm.root_shape(Class::Native, fp, 0);
-    let o = vm.heap.alloc_object(unsafe { &*full });
+    let o = vm.heap.alloc_object(full.live());
     unsafe {
         crate::object::set_shape(o, bare);
-        (*o).code = (*template).code;
+        (*o).code = template.code();
         for (i, &v) in data.iter().enumerate() {
             set_slot(o, i, v);
         }
@@ -429,7 +430,7 @@ pub(crate) fn state(p: Value) -> (i32, Value) {
 
 /// Promise `p`'s state's cells (see [`STATE`]).
 fn cells(p: *mut Object) -> *mut Value {
-    unsafe { (*p).code as *mut Value }
+    p.code() as *mut Value
 }
 
 fn cell(e: *mut Value, i: usize) -> Value {
@@ -1153,7 +1154,7 @@ fn element_done(vm: &mut Vm, me: *mut Object, v: Value) -> Result<Value> {
     let remaining = elem(s, 0).as_i32_unchecked() - 1;
     put(s, 0, Value::from_i32(remaining));
     if remaining == 0 {
-        let any = unsafe { (*me).code } == unsafe { (*root(vm, Root::AnyElement)).code };
+        let any = me.code() == unsafe { (*root(vm, Root::AnyElement)).code };
         let result = if unsafe { Object::inline_cap(me) } > KEYS {
             keyed_result(vm, slot(me, KEYS), values)?
         } else if any {

@@ -41,6 +41,7 @@
 //! Every object has the external bit set: the internal heap of
 //! `docs/object-model.md` is not there. The heap is `crate::heap`.
 
+use crate::raw::{Live, ObjectPtr};
 use std::cell::{Cell, RefCell};
 
 use crate::value::Value;
@@ -310,7 +311,7 @@ pub const ERROR: u8 = 128;
 /// Whether `o` is an error object ([[ErrorData]]): a plain object with
 /// flag `ERROR` (the bit is other flags in other classes).
 pub(crate) fn is_error(o: *mut Object) -> bool {
-    unsafe { (*o).class == Class::Plain && (*o).flags & ERROR != 0 }
+    o.class() == Class::Plain && o.flags() & ERROR != 0
 }
 
 #[repr(C)]
@@ -364,7 +365,7 @@ impl Object {
     #[inline(always)]
     pub unsafe fn inline_cap(this: *const Object) -> usize {
         unsafe {
-            if (*this).class == Class::TypedArray { 0 } else { (*this).kind as usize | ((*this).cap_hi as usize) << 8 }
+            if this.class() == Class::TypedArray { 0 } else { this.kind() as usize | ((*this).cap_hi as usize) << 8 }
         }
     }
 
@@ -402,10 +403,10 @@ impl Object {
     #[inline(always)]
     pub unsafe fn elems<'a>(this: *const Object) -> &'a [Value] {
         unsafe {
-            if (*this).elems.is_null() {
+            if this.elems().is_null() {
                 &[]
             } else {
-                std::slice::from_raw_parts((*this).elems, (*this).elems_len as usize)
+                std::slice::from_raw_parts(this.elems(), this.elems_len() as usize)
             }
         }
     }
@@ -420,7 +421,7 @@ impl Object {
     #[inline(always)]
     pub unsafe fn aux(this: *mut Object) -> *mut u32 {
         unsafe {
-            debug_assert_eq!(crate::layout::extra_words((*this).class), 2);
+            debug_assert_eq!(crate::layout::extra_words(this.class()), 2);
             this.cast::<u8>().add(HEADER_BYTES + 8).cast()
         }
     }
@@ -470,10 +471,8 @@ impl Object {
     /// `code` is its right half).
     #[inline(always)]
     pub unsafe fn string_atom(this: *const Object) -> u32 {
-        unsafe {
-            debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
-            ((*this).code as usize >> 32) as u32 & !ATOM_TAG
-        }
+        debug_assert!(this.class() == Class::String && !this.elems().is_null());
+        (this.code() as usize >> 32) as u32 & !ATOM_TAG
     }
 
     /// Set [`Object::string_atom`] to `a` (below [`ATOM_TAG`]): `code` as a
@@ -489,9 +488,9 @@ impl Object {
     pub unsafe fn set_string_atom(this: *mut Object, a: u32) {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         unsafe {
-            debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
+            debug_assert!(this.class() == Class::String && !this.elems().is_null());
             debug_assert!(a < ATOM_TAG);
-            let words = (*this).code as usize as u32 as u64;
+            let words = this.code() as usize as u32 as u64;
             let code = words | ((a | ATOM_TAG) as u64) << 32;
             debug_assert!(!Value::from_bits(code).is_cell());
             (*(&raw const (*this).code as *const AtomicU64)).store(code, Relaxed);
@@ -504,7 +503,7 @@ impl Object {
     /// `this` must be a live object and `loc` a location in its shape.
     #[inline(always)]
     pub unsafe fn slot(this: *mut Object, loc: i32) -> *mut Value {
-        unsafe { if loc >= 0 { this.cast::<u8>().add(loc as usize).cast() } else { (*this).props.add(!loc as usize) } }
+        unsafe { if loc >= 0 { this.cast::<u8>().add(loc as usize).cast() } else { this.props().add(!loc as usize) } }
     }
 
     /// In-object slot `i`.
@@ -513,7 +512,7 @@ impl Object {
     /// `this` must be a live object with more than `i` inline slots.
     #[inline(always)]
     pub unsafe fn inline(this: *mut Object, i: usize) -> *mut Value {
-        unsafe { this.cast::<u8>().add(crate::layout::slots_offset((*this).class)).cast::<Value>().add(i) }
+        unsafe { this.cast::<u8>().add(crate::layout::slots_offset(this.class())).cast::<Value>().add(i) }
     }
 }
 
@@ -661,7 +660,7 @@ impl FieldType {
             // (Not a dictionary shape, changed in place: V8's field types
             // are maps only of stable maps.)
             let s = Obj::of(v).shape();
-            if unsafe { (*s).dictionary } { FieldType::Any } else { FieldType::Obj(s) }
+            if s.live().dictionary { FieldType::Any } else { FieldType::Obj(s) }
         } else {
             FieldType::Any
         }
@@ -1037,7 +1036,7 @@ impl Drop for ShapeBox {
 /// `s` must be a live shape.
 #[inline]
 pub unsafe fn pin_shape(s: *const Shape) {
-    unsafe { (*s).pinned.set(true) }
+    s.live().pinned.set(true)
 }
 
 /// Shape `s` found live by a full marking under way (if any). The marker
@@ -1049,10 +1048,8 @@ pub unsafe fn pin_shape(s: *const Shape) {
 pub unsafe fn mark_shape(s: *const Shape) {
     use std::sync::atomic::Ordering::Relaxed;
     let epoch = crate::gc::code_epoch();
-    unsafe {
-        if (*s).mark.load(Relaxed) < epoch {
-            (*s).mark.store(epoch, Relaxed);
-        }
+    if s.live().mark.load(Relaxed) < epoch {
+        s.live().mark.store(epoch, Relaxed);
     }
 }
 
@@ -1416,7 +1413,7 @@ impl Shape {
 /// A value's key for [`PushCache`]: 1 for an int32, 2 for another
 /// number, an object's shape, else 0 (its type is `Any`). Values of one key
 /// have one [`FieldType`].
-pub fn push_key(v: Value) -> u64 {
+pub(crate) fn push_key(v: Value) -> u64 {
     if v.is_int32() {
         crate::layout::FIELD_INT
     } else if v.is_number() {
@@ -1440,7 +1437,7 @@ impl Shape {
     #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn dictionary_slots<'a>(s: *const Shape) -> &'a mut Slots {
         unsafe {
-            debug_assert!((*s).dictionary);
+            debug_assert!(s.live().dictionary);
             &mut (*s.cast_mut()).slots
         }
     }
@@ -1646,7 +1643,7 @@ mod tests {
         unsafe {
             *Object::slot(o, s.location(1)) = Value::from_i32(5);
             assert_eq!(*Object::inline(o, 1), Value::from_i32(5));
-            assert_eq!((*o).flags & EXTERNAL, EXTERNAL);
+            assert_eq!(o.flags() & EXTERNAL, EXTERNAL);
         }
     }
 

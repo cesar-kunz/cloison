@@ -14,6 +14,7 @@
 
 use crate::interp::{native_stack_low, write_frame_header};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, Object, as_object, object_value};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
 
@@ -70,7 +71,7 @@ fn cap(st: *mut Value) -> usize {
 
 /// Where the state's registers start: its cells past, for `code`'s.
 fn regs_at(st: *mut Value, code: *const Code) -> *mut Value {
-    unsafe { st.add(cap(st) - (*code).nregs as usize) }
+    unsafe { st.add(cap(st) - code.live().nregs as usize) }
 }
 
 /// The function of state `st`'s generator (its `FUNCTION` cell).
@@ -104,7 +105,7 @@ fn qget(vm: &mut Vm, q: Value, k: i32) -> Value {
 /// Drop the registers kept in state `st` (of `code`'s frame): done.
 fn clear_regs(st: *mut Value, code: *const Code) {
     let r = regs_at(st, code);
-    for i in 0..unsafe { (*code).nregs } as usize {
+    for i in 0..code.live().nregs as usize {
         unsafe { crate::layout::store_word(r.add(i), Value::UNDEFINED) };
     }
 }
@@ -115,12 +116,12 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
     let a_prototype = vm.a_prototype;
     let p = vm.get(object_value(f), a_prototype)?;
     // (An async generator function's: kind 6, see `vm::Code::kind`.)
-    let is_async = unsafe { (*(*f).code).kind } == 6;
+    let is_async = f.code().live().kind == 6;
     let root =
         if is_async { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
     let proto = if crate::props::is_object(p) { p } else { object_value(vm.symbol_roots[root as usize]) };
-    let code = unsafe { (*f).code };
-    let n = cells_for(unsafe { (*code).kind }) + unsafe { (*code).nregs } as usize;
+    let code = f.code();
+    let n = cells_for(code.live().kind) + code.live().nregs as usize;
     let queue = if is_async { vm.new_array() } else { Value::UNDEFINED };
     let g = vm.new_object_with(Class::Generator, proto, 0);
     let st = vm.heap.alloc_values(n);
@@ -150,7 +151,7 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
 /// `regs` must be a frame of `code`.
 pub(crate) unsafe fn suspend(vm: &mut Vm, g: Value, regs: *mut Value, code: *const Code, pc: usize, started: bool) {
     let Some(st) = state_of(g) else { return };
-    let n = unsafe { (*code).nregs } as usize;
+    let n = code.live().nregs as usize;
     let to = regs_at(st, code);
     for i in 0..n {
         unsafe {
@@ -225,9 +226,9 @@ unsafe fn run(vm: &mut Vm, f: *mut Object, saved: *mut Value, pc: usize, v: Valu
             return Err(Error::unsupported("resuming a generator from here (compiled code)"));
         }
         vm.safepoint(top);
-        let code = (*f).code;
+        let code = f.code();
         let new = top.add(crate::interp::HEADER);
-        let n = (*code).nregs as usize;
+        let n = code.live().nregs as usize;
         if new.add(n) > vm.stack_end || native_stack_low(vm) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
@@ -239,8 +240,8 @@ unsafe fn run(vm: &mut Vm, f: *mut Object, saved: *mut Value, pc: usize, v: Valu
         }
         let saved_top = vm.native_top;
         vm.native_top = std::ptr::null_mut();
-        let start = crate::interp::Resume { regs: new, pc: (*code).bytecode.as_ptr().add(pc), acc: v };
-        let out = crate::interp::run_in_realm(vm, &*code, new, start);
+        let start = crate::interp::Resume { regs: new, pc: code.live().bytecode.as_ptr().add(pc), acc: v };
+        let out = crate::interp::run_in_realm(vm, code.live(), new, start);
         vm.native_top = saved_top;
         if out == Value::EMPTY {
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("a generator's run")));

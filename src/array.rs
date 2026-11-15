@@ -4,9 +4,10 @@
 //! [`install`] (`push` is `vm::array_push`, which compiled code calls).
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number, to_string_units};
-use crate::layout::{store_word, swap_words};
+use crate::layout::swap_words;
 use crate::object::{Class, EXTERNAL, Obj, Object, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{
     Error, Key, NativeFn, Result, Vm, array_push, check_string_len, is_string, push_string, string_len, string_units,
@@ -89,7 +90,7 @@ fn relative(v: Value, len: f64, default: f64) -> f64 {
 /// chain (holes are then absent), `Array.prototype` then
 /// `Object.prototype`.
 fn dense(vm: &Vm, o: *mut Object) -> bool {
-    unsafe { (*o).class == Class::Array && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0 && plain_protos(vm, o) }
+    o.class() == Class::Array && o.flags() & !(EXTERNAL | PROTOTYPE) == 0 && plain_protos(vm, o)
 }
 
 /// Whether `o` is an `arguments` object as it was made, but for its
@@ -98,33 +99,29 @@ fn dense(vm: &Vm, o: *mut Object) -> bool {
 /// indexed on `Object.prototype`: its elements read directly, as `dense`'s
 /// (`slice.call(arguments)`, `forEach.call(arguments, …)`).
 fn plain_arguments(vm: &Vm, o: *mut Object) -> bool {
-    unsafe {
-        (*o).shape == vm.arguments_shape
-            && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0
-            && (*(*vm.object_prototype).shape).proto.is_null()
-            && (*vm.object_prototype).elems_len == 0
-            && (*vm.object_prototype).flags & crate::object::SPARSE == 0
-    }
+    o.shape() == vm.arguments_shape
+        && o.flags() & !(EXTERNAL | PROTOTYPE) == 0
+        && vm.object_prototype.shape().live().proto.is_null()
+        && vm.object_prototype.elems_len() == 0
+        && vm.object_prototype.flags() & crate::object::SPARSE == 0
 }
 
 /// Whether `o`'s prototypes are `Array.prototype` then `Object.prototype`
 /// with nothing indexed (`dense`'s condition on them).
 fn plain_protos(vm: &Vm, o: *mut Object) -> bool {
-    unsafe {
-        (*(*o).shape).proto == object_value(vm.array_prototype)
-            && (*(*vm.array_prototype).shape).proto == object_value(vm.object_prototype)
-            && (*(*vm.object_prototype).shape).proto.is_null()
-            && (*vm.array_prototype).elems_len == 0
-            && (*vm.object_prototype).elems_len == 0
-            && (*vm.array_prototype).flags & (crate::object::SPARSE | crate::far::FAR) == 0
-            && (*vm.object_prototype).flags & crate::object::SPARSE == 0
-    }
+    o.shape().live().proto == object_value(vm.array_prototype)
+        && vm.array_prototype.shape().live().proto == object_value(vm.object_prototype)
+        && vm.object_prototype.shape().live().proto.is_null()
+        && vm.array_prototype.elems_len() == 0
+        && vm.object_prototype.elems_len() == 0
+        && vm.array_prototype.flags() & (crate::object::SPARSE | crate::far::FAR) == 0
+        && vm.object_prototype.flags() & crate::object::SPARSE == 0
 }
 
 /// Whether `o` is a far array whose missing indices nothing sees: none of
 /// its own a named property (`SPARSE`), and its prototypes `plain_protos`.
 fn skips(vm: &Vm, o: *mut Object) -> bool {
-    crate::far::is_far(o) && unsafe { (*o).flags } & crate::object::SPARSE == 0 && plain_protos(vm, o)
+    crate::far::is_far(o) && o.flags() & crate::object::SPARSE == 0 && plain_protos(vm, o)
 }
 
 /// Where a loop over `o`'s present elements, at `k` and below `len`, goes
@@ -132,7 +129,7 @@ fn skips(vm: &Vm, o: *mut Object) -> bool {
 /// far key or `len`; else `k`.
 fn skip(vm: &mut Vm, o: Value, k: f64, len: f64) -> f64 {
     let obj = as_object(o);
-    if k >= u32::MAX as f64 || !skips(vm, obj) || k < unsafe { (*obj).elems_len } as f64 {
+    if k >= u32::MAX as f64 || !skips(vm, obj) || k < obj.elems_len() as f64 {
         return k;
     }
     crate::far::next_key(vm, obj, k as u32).map_or(len, |i| (i as f64).min(len))
@@ -142,7 +139,7 @@ fn skip(vm: &mut Vm, o: Value, k: f64, len: f64) -> f64 {
 /// `k` or before, else the end of its dense prefix (-1 for none).
 fn skip_back(vm: &mut Vm, o: Value, k: f64) -> f64 {
     let obj = as_object(o);
-    let n = unsafe { (*obj).elems_len } as f64;
+    let n = obj.elems_len() as f64;
     if k >= u32::MAX as f64 || !skips(vm, obj) || k < n {
         return k;
     }
@@ -163,14 +160,12 @@ fn key(i: f64) -> Key {
 fn element(vm: &mut Vm, o: Value, i: f64) -> Result<(bool, Value)> {
     let obj = as_object(o);
     if (dense(vm, obj) || plain_arguments(vm, obj)) && i < u32::MAX as f64 {
-        unsafe {
-            let i = i as u32;
-            if i < (*obj).elems_len {
-                let v = *(*obj).elems.add(i as usize);
-                return Ok(if v == Value::EMPTY { (false, Value::UNDEFINED) } else { (true, v) });
-            }
-            return Ok((false, Value::UNDEFINED));
+        let i = i as u32;
+        if i < obj.elems_len() {
+            let v = obj.elem(i as usize);
+            return Ok(if v == Value::EMPTY { (false, Value::UNDEFINED) } else { (true, v) });
         }
+        return Ok((false, Value::UNDEFINED));
     }
     let k = key(i);
     if !vm.has_key(o, k)? {
@@ -279,11 +274,11 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
     unsafe {
         let o = Obj::of(original);
         let ap = vm.array_prototype;
-        let s = &*o.shape();
+        let s = o.shape().live();
         if o.class() != Class::Array || s.proto != object_value(ap) || s.lookup(vm.a_constructor).is_some() {
             return false;
         }
-        let ps = &*(*ap).shape;
+        let ps = ap.shape().live();
         let Some(k) = ps.lookup(vm.a_constructor) else { return false };
         if ps.attrs()[k as usize] & crate::object::ACCESSOR != 0
             || *Object::slot(ap, ps.location(k)) != object_value(vm.array_fn)
@@ -291,17 +286,17 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
             return false;
         }
         let a = vm.array_fn;
-        let cs = &*(*a).shape;
+        let cs = a.shape().live();
         let Some(k) = cs.lookup(vm.a_sym_species) else { return false };
         if cs.attrs()[k as usize] & crate::object::ACCESSOR == 0 {
             return false;
         }
         let pair = as_object(*Object::slot(a, cs.location(k)));
-        let g = *(*pair).elems;
+        let g = pair.elem(0);
         g.is_cell() && {
             let g = as_object(g);
-            (*g).class == Class::Native
-                && (*(*g).code).native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
+            g.class() == Class::Native
+                && g.code().live().native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
         }
     }
 }
@@ -391,14 +386,14 @@ fn create(vm: &mut Vm, o: Value, i: f64, v: Value) -> Result<()> {
     // An ordinary array's element within its length (a hole `map`'s
     // result has for each) or the next one: stored.
     let obj = as_object(o);
-    unsafe {
-        if (*obj).class == Class::Array && (*obj).flags & !(EXTERNAL | PROTOTYPE) == 0 {
-            let len = (*obj).elems_len as f64;
+    {
+        if obj.class() == Class::Array && obj.flags() & !(EXTERNAL | PROTOTYPE) == 0 {
+            let len = obj.elems_len() as f64;
             if i <= len && i < (1 << 24) as f64 {
                 let i = i as usize;
                 if i as f64 == len {
                     vm.reserve_elems(obj, i + 1);
-                    (*obj).elems_len = i as u32 + 1;
+                    obj.set_elems_len(i as u32 + 1);
                 }
                 vm.store_element(obj, i, v);
                 return Ok(());
@@ -566,28 +561,28 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let obj = as_object(item);
         // (Only where `out`'s elements end at `n`: an item before may have
         // been copied element by element, its holes only counted.)
-        if unsafe { (*obj).class } == Class::Array
+        if obj.class() == Class::Array
             && dense(vm, obj)
             && dense(vm, as_object(out))
             && Obj::of(out).elems_len() as f64 == n
         {
             unsafe {
-                let m = (*obj).elems_len as usize;
+                let m = obj.elems_len() as usize;
                 let oo = as_object(out);
-                let at = (*oo).elems_len as usize;
+                let at = oo.elems_len() as usize;
                 vm.reserve_elems(oo, at + m);
                 // (As `slice`: the result takes the item's elements' type
                 // at once.)
-                let want = (*(*oo).shape).elems.join((*(*obj).shape).elems);
-                if want != (*(*oo).shape).elems {
-                    crate::object::set_shape(oo, vm.elements_transition((*oo).shape, want));
+                let want = oo.shape().live().elems.join(obj.shape().live().elems);
+                if want != oo.shape().live().elems {
+                    crate::object::set_shape(oo, vm.elements_transition(oo.shape(), want));
                 }
                 if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
-                    vm.heap.move_values((*obj).elems, (*oo).elems.add(at), m);
+                    vm.heap.move_values(obj.elems(), oo.elems().add(at), m);
                 } else {
-                    vm.store_elements(oo, at, (*obj).elems, m);
+                    vm.store_elements(oo, at, obj.elems(), m);
                 }
-                (*oo).elems_len = (at + m) as u32;
+                oo.set_elems_len((at + m) as u32);
             }
             n += len;
             continue;
@@ -616,16 +611,14 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if this.is_cell() && dense(vm, as_object(this)) {
         let o = as_object(this);
-        unsafe {
-            let len = (*o).elems_len as usize;
-            if len == 0 {
-                return Ok(Value::UNDEFINED);
-            }
-            let v = *(*o).elems.add(len - 1);
-            crate::layout::store_word((*o).elems.add(len - 1), Value::EMPTY);
-            (*o).elems_len = (len - 1) as u32;
-            return Ok(if v == Value::EMPTY { Value::UNDEFINED } else { v });
+        let len = o.elems_len() as usize;
+        if len == 0 {
+            return Ok(Value::UNDEFINED);
         }
+        let v = o.elem(len - 1);
+        o.set_elem(len - 1, Value::EMPTY);
+        o.set_elems_len((len - 1) as u32);
+        return Ok(if v == Value::EMPTY { Value::UNDEFINED } else { v });
     }
     let (o, len) = this_object(vm, this)?;
     if len == 0.0 {
@@ -644,10 +637,10 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
     if dense(vm, as_object(o)) {
         let obj = as_object(o);
         unsafe {
-            let n = (*obj).elems_len as usize;
+            let n = obj.elems_len() as usize;
             // (Word by word while a marking runs, not a slice's `reverse`:
             // the marker may be reading the slots, see `Heap::move_values`.)
-            let e = (*obj).elems;
+            let e = obj.elems();
             if vm.heap.gc.marking {
                 for i in 0..n / 2 {
                     swap_words(e.add(i), e.add(n - 1 - i));
@@ -658,8 +651,8 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
             }
             // (Every slot may now hold what was elsewhere: barriered.)
             for i in 0..n {
-                let v = *(*obj).elems.add(i);
-                crate::heap::barrier((*obj).elems.cast::<u8>().sub(8), (*obj).elems.add(i), v);
+                let v = obj.elem(i);
+                crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
             }
         }
         return Ok(o);
@@ -699,14 +692,14 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if dense(vm, as_object(o)) {
         let obj = as_object(o);
         unsafe {
-            let n = (*obj).elems_len as usize;
-            let first = *(*obj).elems;
-            vm.heap.move_values((*obj).elems.add(1), (*obj).elems, n - 1);
-            store_word((*obj).elems.add(n - 1), Value::EMPTY);
-            (*obj).elems_len = (n - 1) as u32;
+            let n = obj.elems_len() as usize;
+            let first = obj.elem(0);
+            vm.heap.move_values(obj.elems().add(1), obj.elems(), n - 1);
+            obj.set_elem(n - 1, Value::EMPTY);
+            obj.set_elems_len((n - 1) as u32);
             for i in 0..n - 1 {
-                let v = *(*obj).elems.add(i);
-                crate::heap::barrier((*obj).elems.cast::<u8>().sub(8), (*obj).elems.add(i), v);
+                let v = obj.elem(i);
+                crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
             }
             return Ok(if first == Value::EMPTY { Value::UNDEFINED } else { first });
         }
@@ -738,18 +731,18 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if dense(vm, as_object(o)) {
             let obj = as_object(o);
             unsafe {
-                let m = (*obj).elems_len as usize;
+                let m = obj.elems_len() as usize;
                 vm.reserve_elems(obj, m + a.len());
-                vm.heap.move_values((*obj).elems, (*obj).elems.add(a.len()), m);
+                vm.heap.move_values(obj.elems(), obj.elems().add(a.len()), m);
                 for (i, &v) in a.iter().enumerate() {
-                    store_word((*obj).elems.add(i), Value::EMPTY);
+                    obj.set_elem(i, Value::EMPTY);
                     vm.store_element(obj, i, v);
                 }
-                (*obj).elems_len = (m + a.len()) as u32;
+                obj.set_elems_len((m + a.len()) as u32);
                 // (Moved elements keep the shape's elements type.)
                 for i in a.len()..m + a.len() {
-                    let v = *(*obj).elems.add(i);
-                    crate::heap::barrier((*obj).elems.cast::<u8>().sub(8), (*obj).elems.add(i), v);
+                    let v = obj.elem(i);
+                    crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
                 }
             }
             return Ok(Value::number(len + n));
@@ -798,17 +791,17 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             // all the values fit: copied, not checked and stored one by one
             // (PdfJS's `decrypt`, `decryptedString.slice(n)`, spent more there
             // than in its loop).
-            let want = (*(*oo).shape).elems.join((*(*obj).shape).elems);
-            if want != (*(*oo).shape).elems {
-                crate::object::set_shape(oo, vm.elements_transition((*oo).shape, want));
+            let want = oo.shape().live().elems.join(obj.shape().live().elems);
+            if want != oo.shape().live().elems {
+                crate::object::set_shape(oo, vm.elements_transition(oo.shape(), want));
             }
             // (Numbers alone, no cells: nothing for the barrier to note.)
             if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
-                vm.heap.move_values((*obj).elems.add(k), (*oo).elems, count);
+                vm.heap.move_values(obj.elems().add(k), oo.elems(), count);
             } else {
-                vm.store_elements(oo, 0, (*obj).elems.add(k), count);
+                vm.store_elements(oo, 0, obj.elems().add(k), count);
             }
-            (*oo).elems_len = count as u32;
+            oo.set_elems_len(count as u32);
         }
         return Ok(out);
     }
@@ -862,29 +855,29 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let ro = as_object(removed);
         unsafe {
             let (start, del) = (start as usize, del as usize);
-            let m = (*obj).elems_len as usize;
+            let m = obj.elems_len() as usize;
             vm.reserve_elems(ro, del);
             for i in 0..del {
-                let v = *(*obj).elems.add(start + i);
+                let v = obj.elem(start + i);
                 if v == Value::EMPTY {
-                    store_word((*ro).elems.add(i), Value::EMPTY);
+                    ro.set_elem(i, Value::EMPTY);
                 } else {
                     vm.store_element(ro, i, v);
                 }
             }
-            (*ro).elems_len = del as u32;
+            ro.set_elems_len(del as u32);
             let new_len = m - del + items.len();
             vm.reserve_elems(obj, new_len);
-            vm.heap.move_values((*obj).elems.add(start + del), (*obj).elems.add(start + items.len()), m - start - del);
+            vm.heap.move_values(obj.elems().add(start + del), obj.elems().add(start + items.len()), m - start - del);
             for (i, &v) in items.iter().enumerate() {
-                store_word((*obj).elems.add(start + i), Value::EMPTY);
+                obj.set_elem(start + i, Value::EMPTY);
                 vm.store_element(obj, start + i, v);
             }
-            vm.heap.fill_values((*obj).elems.add(new_len), m.saturating_sub(new_len), Value::EMPTY);
-            (*obj).elems_len = new_len as u32;
+            vm.heap.fill_values(obj.elems().add(new_len), m.saturating_sub(new_len), Value::EMPTY);
+            obj.set_elems_len(new_len as u32);
             for i in start + items.len()..new_len {
-                let v = *(*obj).elems.add(i);
-                crate::heap::barrier((*obj).elems.cast::<u8>().sub(8), (*obj).elems.add(i), v);
+                let v = obj.elem(i);
+                crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
             }
         }
         return Ok(removed);
@@ -1057,15 +1050,13 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
     let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
     if dense(vm, as_object(o)) {
         let obj = as_object(o);
-        unsafe {
-            // (Not past the length it had: `fromIndex`'s conversion may have
-            // pushed more.)
-            let m = ((*obj).elems_len as usize).min(len as usize);
-            for i in k as usize..m {
-                let e = *(*obj).elems.add(i);
-                if e != Value::EMPTY && strict_equals(e, x) {
-                    return Ok(Value::from_i32(i as i32));
-                }
+        // (Not past the length it had: `fromIndex`'s conversion may have
+        // pushed more.)
+        let m = (obj.elems_len() as usize).min(len as usize);
+        for i in k as usize..m {
+            let e = obj.elem(i);
+            if e != Value::EMPTY && strict_equals(e, x) {
+                return Ok(Value::from_i32(i as i32));
             }
         }
         return Ok(Value::from_i32(-1));
@@ -1308,11 +1299,11 @@ fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // see a store), written in place: the first takes the elements to a
     // type the value fits, the rest are it again.
     let obj = as_object(o);
-    if dense(vm, obj) && k < end && end <= unsafe { (*obj).elems_len } as f64 {
+    if dense(vm, obj) && k < end && end <= obj.elems_len() as f64 {
         let (from, to) = (k as usize, end as usize);
         vm.store_element(obj, from, v);
         unsafe {
-            let e = (*obj).elems;
+            let e = obj.elems();
             if !v.is_cell() {
                 // (No reference: nothing for the barrier.)
                 (from + 1..to).for_each(|i| crate::layout::store_word(e.add(i), v));

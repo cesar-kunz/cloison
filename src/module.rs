@@ -37,6 +37,7 @@ use crate::js::ast::{IMPORT_PARAMS, ImportName, ModuleInfo, Phase};
 use crate::object::{Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, same_value};
+use crate::raw::ObjectPtr;
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, is_string, string_units};
 
@@ -242,7 +243,7 @@ fn template(vm: &mut Vm, t: Template) -> *mut Object {
         for ((f, n), name) in fs.into_iter().zip(names) {
             let o = vm.native_function(name, f, n, any, false);
             // (Every realm's: they run in their caller's.)
-            unsafe { (*(*o).code.cast_mut()).realm = crate::realm::NONE };
+            unsafe { (*o.code().cast_mut()).realm = crate::realm::NONE };
             vm.modules.templates.push(o);
         }
     }

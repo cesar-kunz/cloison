@@ -61,6 +61,7 @@ use crate::bytecode::Op;
 use crate::interp::{self, Frame, Run};
 use crate::layout::InstanceOfEntry;
 use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, page_size};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::{NumberTag, Value};
 
 /// At a full collection, free the versions call sites were bound to before
@@ -290,7 +291,7 @@ pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::
                 return None;
             }
             Some(*index.entry(code).or_insert_with(|| {
-                let held = unsafe { (*code).jit.try_borrow_mut().is_err() };
+                let held = code.live().jit.try_borrow_mut().is_err();
                 by.push(KeptBy {
                     code,
                     addrs: Vec::new(),
@@ -404,7 +405,7 @@ pub(crate) fn retire_functions(
     vm.jit_caches.retired = others;
     versions.extend(theirs);
     for &code in gone {
-        if let Ok(mut j) = unsafe { (*code).jit.try_borrow_mut() }
+        if let Ok(mut j) = code.live().jit.try_borrow_mut()
             && let Some(j) = j.as_mut()
         {
             j.retire(&mut versions, &mut snaps);
@@ -451,7 +452,7 @@ pub(crate) fn age_functions(vm: &mut crate::vm::Vm, kept: &[KeptBy]) -> HashSet<
         return gone;
     }
     for k in kept {
-        let Ok(mut j) = (unsafe { (*k.code).jit.try_borrow_mut() }) else { continue };
+        let Ok(mut j) = k.code.live().jit.try_borrow_mut() else { continue };
         let Some(f) = j.as_mut() else { continue };
         let patience = f.patience.max(unbind_at);
         if f.used.replace(false) || !k.running.is_empty() {
@@ -906,8 +907,8 @@ extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
     if let Some(i) = typed_index(a, b) {
         unsafe {
             let o = crate::object::as_object(a);
-            let kind = crate::object::TypedKind::from_u8((*o).kind);
-            return kind.load((*o).elems.cast(), i).to_bits();
+            let kind = crate::object::TypedKind::from_u8(o.kind());
+            return kind.load(o.elems().cast(), i).to_bits();
         }
     }
     let vm = unsafe { &mut *crate::interp::current_vm() };
@@ -922,22 +923,20 @@ fn typed_index(o: Value, key: Value) -> Option<usize> {
     if !o.is_cell() {
         return None;
     }
-    unsafe {
-        let p = as_object(o);
-        if (*p).class != Class::TypedArray || TypedKind::from_u8((*p).kind).is_big() {
+    let p = as_object(o);
+    if p.class() != Class::TypedArray || TypedKind::from_u8(p.kind()).is_big() {
+        return None;
+    }
+    let i = if key.is_int32() {
+        usize::try_from(key.as_i32_unchecked()).ok()?
+    } else {
+        let d = key.as_number()?;
+        if !(d >= 0.0 && d < u32::MAX as f64 && d.trunc() == d) {
             return None;
         }
-        let i = if key.is_int32() {
-            usize::try_from(key.as_i32_unchecked()).ok()?
-        } else {
-            let d = key.as_number()?;
-            if !(d >= 0.0 && d < u32::MAX as f64 && d.trunc() == d) {
-                return None;
-            }
-            d as usize
-        };
-        (i < crate::typed::ta_length(p).unwrap_or(0)).then_some(i)
-    }
+        d as usize
+    };
+    (i < crate::typed::ta_length(p).unwrap_or(0)).then_some(i)
 }
 
 /// `f`, a runtime call that may run a native (`String.prototype.trim` as
@@ -968,7 +967,7 @@ fn reading(vm: &mut crate::vm::Vm, f: impl FnOnce(&mut crate::vm::Vm) -> u64) ->
 extern "C" fn cloison_rt_create_closure(callee: Value, current: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let callee = callee.to_bits() as *const crate::vm::Code;
-    if unsafe { (*callee).upvalues.iter().any(|&(local, _)| local) } {
+    if callee.live().upvalues.iter().any(|&(local, _)| local) {
         return 0;
     }
     let current = current.to_bits() as *const Object;
@@ -1087,8 +1086,8 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
         unsafe {
             let p = crate::object::as_object(o);
             if !crate::typed::is_immutable_view(p) {
-                let kind = crate::object::TypedKind::from_u8((*p).kind);
-                kind.store_value((*p).elems.cast(), i, v);
+                let kind = crate::object::TypedKind::from_u8(p.kind());
+                kind.store_value(p.elems().cast(), i, v);
                 return 1;
             }
         }
@@ -1181,8 +1180,8 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
     if !cache.is_null() && v.is_cell() {
         let fo = crate::object::as_object(f);
         unsafe {
-            if std::ptr::eq((*fo).shape, vm.function_shape) {
-                let p = *Object::slot(fo, (*vm.function_shape).location(0));
+            if std::ptr::eq(fo.shape(), vm.function_shape) {
+                let p = *Object::slot(fo, vm.function_shape.live().location(0));
                 // The new entry first, the first one moved to second.
                 let cache = &*cache;
                 cache[1].set(cache[0].get());
@@ -3185,7 +3184,7 @@ fn exact_transition(s: u64, name: Atom) -> Option<Prop> {
         }
         p = ps.proto;
     }
-    let ns = unsafe { &*new };
+    let ns = new.live();
     let slot = ns.lookup(name)?;
     let (oop, off) = split_location(ns.location(slot));
     (off <= MAX_SLOT_OFF).then(|| Prop::Transition {
@@ -3249,9 +3248,9 @@ impl Feedback {
         }
         if insn.op == Op::GetKeyed {
             if keyed_log() {
-                eprintln!("keyed pc{} shape {:p} elems {:?}", insn.pc, ic.shape, unsafe { (*ic.shape).elems });
+                eprintln!("keyed pc{} shape {:p} elems {:?}", insn.pc, ic.shape, ic.shape.live().elems);
             }
-            return Prop::Keyed { shape: ic.shape as u64, elems: unsafe { (*ic.shape).elems } };
+            return Prop::Keyed { shape: ic.shape as u64, elems: ic.shape.live().elems };
         }
         if !matches!(insn.op, Op::GetNamed | Op::SetNamed) {
             return self.way(insn, ic, epoch);
@@ -3325,18 +3324,16 @@ impl Feedback {
         }
         let name = self.name(insn);
         let field = |s: *const Shape| {
-            let s = unsafe { &*s };
+            let s = s.live();
             s.lookup(name).map_or(FieldType::Any, |k| s.field_type_relied(k))
         };
         // For loads, `holder` is a prototype; for stores, the field's type.
         let holder = ic.holder;
         match insn.op {
             Op::GetNamed if !holder.is_null() && ic.epoch != epoch => Prop::None,
-            Op::GetNamed if !holder.is_null() => Prop::Proto {
-                shape,
-                addr: unsafe { Object::slot(holder, ic.loc) } as u64,
-                ft: field(unsafe { (*holder).shape }),
-            },
+            Op::GetNamed if !holder.is_null() => {
+                Prop::Proto { shape, addr: unsafe { Object::slot(holder, ic.loc) } as u64, ft: field(holder.shape()) }
+            }
             // (A setter or a read-only property may be on the prototype
             // chain since: see `Ic`.)
             Op::SetNamed if !ic.new_shape.is_null() && ic.epoch != epoch => Prop::None,
@@ -3353,7 +3350,7 @@ impl Feedback {
                 // (Or the global scope's block-scoped binding: see
                 // `Vm::get_global_lexical`.)
                 global: match unsafe { (*self.vm).global_lexicals } {
-                    l if unsafe { (*l).shape } == ic.shape => l,
+                    l if l.shape() == ic.shape => l,
                     _ => self.global,
                 } as u64,
                 off,
@@ -4190,10 +4187,10 @@ fn typed_lengths_standard() -> bool {
     let name = vm.a_length;
     let sp = vm.typed_array_prototype;
     unsafe {
-        if sp.is_null() || (*sp).flags & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, sp) {
+        if sp.is_null() || sp.flags() & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, sp) {
             return false;
         }
-        let ss = &*(*sp).shape;
+        let ss = sp.shape().live();
         let Some(k) = ss.lookup(name) else { return false };
         if ss.attrs()[k as usize] & ACCESSOR == 0 {
             return false;
@@ -4203,10 +4200,10 @@ fn typed_lengths_standard() -> bool {
             return false;
         }
         for &p in &vm.typed_prototypes {
-            if (*p).flags & PROTOTYPE == 0 {
+            if p.flags() & PROTOTYPE == 0 {
                 continue;
             }
-            let s = &*(*p).shape;
+            let s = p.shape().live();
             if s.dictionary
                 || s.lookup(name).is_some()
                 || s.proto != crate::object::object_value(sp)
@@ -4246,10 +4243,10 @@ fn typed_length_known(t: Ty) -> bool {
         }
         let o = as_object(p);
         unsafe {
-            if (*o).flags & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, o) || vm.virtual_own(o, name).is_some() {
+            if o.flags() & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, o) || vm.virtual_own(o, name).is_some() {
                 return false;
             }
-            let ps = &*(*o).shape;
+            let ps = o.shape().live();
             if let Some(k) = ps.lookup(name) {
                 if ps.attrs()[k as usize] & ACCESSOR == 0 {
                     return false;
@@ -4811,7 +4808,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
             let shape = unsafe { (*vm).array_shape };
             debug_assert_eq!(
-                &crate::object::object_header(unsafe { &*shape })[1..],
+                &crate::object::object_header(shape.live())[1..],
                 &[1 << 8 | crate::object::Class::Array as u64, 0, 0],
                 "the header `create_array` writes"
             );
@@ -4844,11 +4841,11 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let shape = unsafe { (*fb.ic(insn.ic as usize)).shape };
             // (A zombie's, no object may have: the interpreter makes it
             // again, see `Vm::create_object`.)
-            if shape.is_null() || unsafe { (*shape).is_zombie() } {
+            if shape.is_null() || shape.live().is_zombie() {
                 return Sel::new("bail", "", out);
             }
             debug_assert_eq!(
-                &crate::object::object_header(unsafe { &*shape })[1..],
+                &crate::object::object_header(shape.live())[1..],
                 &[1 << 8 | (insn.imm as u64) << 16, 0, 0],
                 "the header `create_object` writes"
             );
@@ -4981,7 +4978,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 // strings' concatenation: `concat_short` in the stencils.
                 // Compiled with no VM, as tests do, there are no strings.)
                 let vm = unsafe { &mut *vm };
-                debug_assert_eq!(unsafe { (*vm.string_shape).capacity.get() }, 0);
+                debug_assert_eq!(vm.string_shape.live().capacity.get(), 0);
                 return Sel {
                     ops: Some((0, vm.string_shape as u64, vm.heap.bump() as u64)),
                     ..Sel::new("add", case, out)
@@ -5451,7 +5448,7 @@ fn variable_assigned_uncached(vm: *mut crate::vm::Vm, code: *const crate::vm::Co
     while let Some((n, these)) = stack.pop() {
         debug_assert!(unsafe { (*vm).code_set.contains(&(n as usize)) }, "a freed nested function");
         if !these.is_empty() {
-            if unsafe { (*n).lazy.is_some() } {
+            if n.live().lazy.is_some() {
                 // (Not compiled yet: compiled here, not installed.)
                 match lazy_writes(vm, n) {
                     Some(w) if !these.iter().any(|m| w.contains(m)) => continue,
@@ -5495,7 +5492,7 @@ fn lazy_writes(vm: *mut crate::vm::Vm, code: *const crate::vm::Code) -> Option<R
         return w.clone();
     }
     let w = (|| {
-        let module = crate::js::compile_lazy(unsafe { (*code).lazy.as_ref()? }).ok()?;
+        let module = crate::js::compile_lazy(code.live().lazy.as_ref()?).ok()?;
         let (f0, nested) = module.functions.split_first()?;
         let sta = |f: &crate::asm::FunctionDef| -> Vec<usize> {
             decode(&f.code, true).iter().filter(|i| i.op == Op::StaUpvalue).map(|i| i.imm as usize).collect()
@@ -5527,7 +5524,7 @@ fn smi_registers(
     if let Some(v) = unsafe { (*vm).jit_caches.smis.get(&code) } {
         return v.clone();
     }
-    let c = unsafe { &*code };
+    let c = code.live();
     let n = c.nregs as usize;
     // Per register: no (None), the value so far (Some(Some(v))), unknown.
     let mut val: Vec<Option<Option<i32>>> = vec![Some(None); n];
@@ -5582,13 +5579,13 @@ fn smi_registers(
 /// be the frame's function's), and it isn't `new`'s (whose `this` comes
 /// from the closure's `prototype`).
 fn inline_by_code(fo: *mut Object, i: &Insn) -> bool {
-    i.op != Op::Construct && unsafe { (*(*fo).code).closures_made.get() > 1 && (&(*(*fo).code).closures).is_empty() }
+    i.op != Op::Construct && unsafe { fo.code().live().closures_made.get() > 1 && (&(*fo.code()).closures).is_empty() }
 }
 
 /// Whether a direct call (not `new`'s) to `fo` binds to its code, for any
 /// closure of it (see `CallSite::by_code`).
 fn binds_by_code(fo: *mut Object) -> bool {
-    unsafe { !(&(*(*fo).code).upvalues).is_empty() || (*(*fo).code).closures_made.get() > 1 }
+    unsafe { !(&(*fo.code()).upvalues).is_empty() || fo.code().live().closures_made.get() > 1 }
 }
 
 /// Whether a case of a polymorphic call `i`, for `fo`, which implies the
@@ -5706,7 +5703,7 @@ fn typed_detached(case: &str, checked: bool) -> &'static str {
 /// reached from `b` by adding properties or generalizing its elements has.
 /// An object of shape `s` passes for one of `b` (`Ty::Ext(b)`).
 unsafe fn extends(s: *const Shape, b: *const Shape) -> bool {
-    let (s, b) = unsafe { (&*s, &*b) };
+    let (s, b) = (s.live(), b.live());
     s.class == b.class && s.proto == b.proto && s.capacity.get() == b.capacity.get() && s.slots.starts_with(&b.slots)
 }
 
@@ -9027,7 +9024,7 @@ impl JitCode {
             // Callees compiled for this round's direct calls predict calls
             // back to this function (mutual recursion) from it.
             if !root.is_null() {
-                unsafe { (*root).ret_hint.set(own) };
+                root.live().ret_hint.set(own);
             }
             let predict = |ins: &[Option<TypeState>], own: Ty| -> Vec<Ty> {
                 (0..n)
@@ -9082,7 +9079,7 @@ impl JitCode {
                 }
                 let own = Ty::of_result(returned(insns, &ins, false));
                 if !root.is_null() {
-                    unsafe { (*root).ret_hint.set(own) };
+                    root.live().ret_hint.set(own);
                 }
                 prev = std::mem::replace(&mut want, predict(&ins, own));
                 round += 1;
@@ -10217,7 +10214,7 @@ impl JitCode {
         JIT_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
         let ret = returned(insns, &ins, false);
         if !root.is_null() {
-            unsafe { (*root).ret_hint.set(Ty::of_result(ret)) };
+            root.live().ret_hint.set(Ty::of_result(ret));
         }
         let code = JitCode {
             mem,
@@ -10263,7 +10260,7 @@ impl JitCode {
     fn log(&self, function: *const crate::vm::Code, pc: usize) {
         if std::env::var_os("CLOISON_JIT_LOG").is_some() {
             let names: Vec<&str> = self.stencils().collect();
-            let f = unsafe { &*function };
+            let f = function.live();
             let name = if f.line == 0 { f.name.clone() } else { format!("{}:{}:{}", f.name, f.line, f.col) };
             eprintln!(
                 "jit {} @{pc} ({} hot, {} out-of-line, {} exits, {} bytes): {}",
@@ -10644,7 +10641,7 @@ impl Caches {
             return l.clone();
         }
         let first = self.pc_live(code).get(0).unwrap_or([0; 4]);
-        let nregs = unsafe { (*code).nregs } as usize;
+        let nregs = code.live().nregs as usize;
         let l: Rc<Vec<bool>> = Rc::new((0..nregs).map(|r| rs_has(&first, r)).collect());
         self.entry_live.insert(code, l.clone());
         l
@@ -10786,7 +10783,7 @@ impl VmState {
 /// tens of times what its inlined body does). Calls to functions that loop
 /// gain little from being inlined: warm code calls their code directly.
 unsafe fn inlining_pays(code: *const crate::vm::Code) -> bool {
-    let c = unsafe { &*code };
+    let c = code.live();
     let ics: *const crate::vm::Ic = c.ics().as_ptr().cast();
     decode(&c.bytecode, true).iter().any(|i| {
         // (Not a `PushLiteral`'s call, which has no cache: `Insn::native`.)
@@ -10794,10 +10791,10 @@ unsafe fn inlining_pays(code: *const crate::vm::Code) -> bool {
             return false;
         }
         let fo = unsafe { (*ics.add(i.ic as usize * crate::vm::IC_WAYS)).holder };
-        if fo.is_null() || unsafe { (*fo).class } != crate::object::Class::Function {
+        if fo.is_null() || fo.class() != crate::object::Class::Function {
             return false;
         }
-        let callee = decode(unsafe { &(*(*fo).code).bytecode }, true);
+        let callee = decode(unsafe { &(*fo.code()).bytecode }, true);
         let loops = callee.iter().enumerate().any(|(k, j)| j.jumps() && j.target <= k);
         callee.len() <= MAX_INLINE_INSNS && !loops
     })
@@ -10919,7 +10916,7 @@ impl ArgsRegs {
 /// Where the registers of frames inlined into `f` start: past its own
 /// (and their `extra`) and a header.
 fn frame_end(f: &InlineFrame) -> usize {
-    f.base + unsafe { (*f.code).nregs } as usize + f.extra as usize + interp::HEADER
+    f.base + f.code.live().nregs as usize + f.extra as usize + interp::HEADER
 }
 
 /// A call compiled code makes (`call` and `call_direct` stencils): `op`'s
@@ -11116,7 +11113,7 @@ fn cooling(coolings: &mut u32, out_of_compiles: bool) -> u32 {
 /// How many times `callee` has been compiled (0 if it is being compiled
 /// now: its state is borrowed).
 fn callee_compiles(callee: *const crate::vm::Code) -> u32 {
-    unsafe { (*callee).jit.try_borrow() }.ok().and_then(|f| f.as_ref().map(|f| f.stats.compiles)).unwrap_or(0)
+    callee.live().jit.try_borrow().ok().and_then(|f| f.as_ref().map(|f| f.stats.compiles)).unwrap_or(0)
 }
 
 /// Exits of a direct callee before its call site stops calling directly.
@@ -11222,7 +11219,7 @@ impl CallSite {
             self.dispatch = Some(d);
         }
         let fo = crate::object::as_object(fv);
-        let callee = unsafe { (*fo).code };
+        let callee = fo.code();
         // Its frame set up for the callee bound: not for one reading
         // another register at entry (a parameter past the arguments, a
         // local read as `undefined`), which its compiled code would read
@@ -11233,12 +11230,12 @@ impl CallSite {
         // (A stub isn't compiled yet: its registers aren't known. Nor
         // `undefined` in a local an argument past its parameters lands
         // in, nor the other `this` of a callee of other strictness.)
-        if unsafe { (*callee).lazy.is_some() } {
+        if callee.live().lazy.is_some() {
             return self;
         }
         let live = unsafe { (*self.vm).jit_caches.entry_live(callee) };
-        let nparams = unsafe { (*callee).nparams } as usize;
-        let strict = |c: *const crate::vm::Code| unsafe { (*c).strict };
+        let nparams = callee.live().nparams as usize;
+        let strict = |c: *const crate::vm::Code| c.live().strict;
         if live.iter().enumerate().any(|(r, &l)| l && (!rs_has(&self.sets, r) || (r > nparams && r <= self.argc)))
             || (self.op == Op::CallUndefined && live.first() == Some(&true) && strict(callee) != strict(self.callee))
         {
@@ -11271,7 +11268,7 @@ impl CallSite {
                 closure: key,
                 callee,
                 cached: callee,
-                nparams: unsafe { (*callee).nparams },
+                nparams: callee.live().nparams,
                 claim,
                 pending: true,
                 ..fork
@@ -11328,7 +11325,7 @@ impl CallSite {
 /// # Safety
 /// `caller` and `callee` must be live functions' code.
 pub(crate) unsafe fn unbind_calls(caller: *const crate::vm::Code, callee: *const crate::vm::Code) {
-    let c = unsafe { &*caller };
+    let c = caller.live();
     let Ok(slot) = c.jit.try_borrow() else {
         c.field_deps.set(c.field_deps.get().wrapping_add(1));
         return;
@@ -11375,7 +11372,7 @@ unsafe fn runtime_result(cached: *const crate::vm::Code, op: Op) -> Ty {
     if cached.is_null() {
         return Ty::Any;
     }
-    let code = unsafe { &*cached };
+    let code = cached.live();
     if op == Op::Construct {
         let shape = code.ctor_result.get();
         if shape.is_null() || shape == crate::vm::MANY_SHAPES { Ty::Any } else { Ty::Obj(shape as u64) }
@@ -11402,10 +11399,10 @@ enum Version {
 unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Version {
     let site = unsafe { &*site };
     let (callee, vm) = (site.callee, site.vm);
-    let Ok(mut slot) = (unsafe { (*callee).jit.try_borrow_mut() }) else {
+    let Ok(mut slot) = callee.live().jit.try_borrow_mut() else {
         return Version::Busy;
     };
-    if site.wait_hot && unsafe { (*callee).calls_left.get() } > 0 {
+    if site.wait_hot && callee.live().calls_left.get() > 0 {
         return Version::Busy;
     }
     let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, vm)));
@@ -11928,7 +11925,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             fbs: Vec::new(),
             sites: Vec::new(),
             caches: Vec::new(),
-            nregs: unsafe { (*root).nregs } as usize,
+            nregs: root.live().nregs as usize,
             direct_base: usize::MAX,
             aliases: Vec::new(),
             restores: Vec::new(),
@@ -11979,7 +11976,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
                 i.op == Op::Star
                     && !i.bail
                     && !target[k + 1]
-                    && (f.base..f.base + unsafe { (*f.code).nregs } as usize).contains(&(i.reg as usize))
+                    && (f.base..f.base + f.code.live().nregs as usize).contains(&(i.reg as usize))
             })
             .count()
             .min(room)
@@ -12071,7 +12068,7 @@ fn split_temps(
         target[i.target.min(n)] = true;
     }
     let frame_regs: Vec<FrameRegs> =
-        (out.frames.iter()).map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent)).collect();
+        (out.frames.iter()).map(|f| (f.base, f.code.live().nregs as usize, f.parent)).collect();
     let captured: Vec<Vec<bool>> = out.frames.iter().map(|f| captured_regs(f.code)).collect();
     // Per frame, its bytecode's offsets in order and the registers live
     // into each.
@@ -12400,7 +12397,7 @@ fn scalar_replace(out: &mut Lowered, pc_live: &HashMap<*const crate::vm::Code, R
     for a in allocs {
         let l = live.get_or_insert_with(|| {
             let frames: Vec<FrameRegs> =
-                out.frames.iter().map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent)).collect();
+                out.frames.iter().map(|f| (f.base, f.code.live().nregs as usize, f.parent)).collect();
             // An object replaced already is a use of the registers of
             // its fields where an exit allocates it: one of them may hold
             // the object this allocation makes. And what a handler may
@@ -12596,7 +12593,7 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
                 if get(&st, r) != YES {
                     return None;
                 }
-                let shape = unsafe { &*st.shape };
+                let shape = st.shape.live();
                 let slot = shape.lookup(fb.name(&insn))? as usize;
                 if shape.attrs()[slot] & crate::object::ACCESSOR != 0 {
                     return None;
@@ -12611,7 +12608,7 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
                 if get(&st, r) != YES || st.acc != NO {
                     return None;
                 }
-                let shape = unsafe { &*st.shape };
+                let shape = st.shape.live();
                 let name = fb.name(&insn);
                 let slot = match shape.lookup(name) {
                     Some(k) if shape.attrs()[k as usize] & crate::object::ACCESSOR != 0 => {
@@ -12626,10 +12623,10 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
                             return None;
                         }
                         next.shape = new_shape as *const Shape;
-                        unsafe { (*next.shape).lookup(name)? as usize }
+                        next.shape.live().lookup(name)? as usize
                     }
                 };
-                if unsafe { (*next.shape).location(slot as u32) } < 0 {
+                if (next.shape.live().location(slot as u32)) < 0 {
                     return None;
                 }
                 slots = slots.max(slot + 1);
@@ -12716,7 +12713,7 @@ fn apply_replacement(out: &mut Lowered, a: usize, plan: Replacement) {
     for (i, shape, regs) in plan.live {
         // (An exit allocates the object with it.)
         unsafe { crate::object::pin_shape(shape) };
-        let fields = (0..unsafe { (*shape).keys().len() }).map(h).collect();
+        let fields = (0..shape.live().keys().len()).map(h).collect();
         // Before the objects replaced earlier: one may hold this one in a
         // field (a slot register this allocation writes). (Not the other
         // way: an object stored into one replaced later escapes there.)
@@ -12738,7 +12735,7 @@ fn reuse_global_loads(out: &mut Lowered) {
             target[i.target] = true;
         }
     }
-    let global_shape = out.fbs.first().map_or(0, |f| unsafe { (*f.global).shape } as u64);
+    let global_shape = out.fbs.first().map_or(0, |f| f.global.shape() as u64);
     let may_store_global = |p: &Prop| match *p {
         Prop::Own { shape, .. } | Prop::Oop { shape, .. } | Prop::Transition { shape, .. } => shape == global_shape,
         Prop::Poly { n, at } => poly_cases(&out.polys, n, at).iter().any(|c| c.is_family() || c.shape == global_shape),
@@ -13035,7 +13032,7 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     }
     let word = |at: u64| unsafe { *(at as *const u64) };
     let object = |v: u64| Value::from_bits(v).is_cell().then_some(v as *mut Object);
-    let proto = |o: *mut Object| unsafe { (*o).flags & PROTOTYPE != 0 };
+    let proto = |o: *mut Object| o.flags() & PROTOTYPE != 0;
     // Fields the code may store to. A keyed store's stencils write an
     // array's elements, or go through the runtime for a typed array (which
     // may add it a named property); only `set_keyed_rt` writes any object's.
@@ -13046,9 +13043,9 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     let set: Vec<Atom> =
         (out.insns.iter()).filter(|i| i.op == Op::SetNamed).map(|i| out.fbs[i.ic_frame()].name(i)).collect();
     // The cell of `o`'s field `name`, if constant and not stored to.
-    let constant = |o: *mut Object, name: Atom| unsafe {
-        let s = &*(*o).shape;
-        let typed = (*o).class == crate::object::Class::TypedArray;
+    let constant = |o: *mut Object, name: Atom| {
+        let s = o.shape().live();
+        let typed = o.class() == crate::object::Class::TypedArray;
         (s.lookup(name).map(|slot| s.field_cell(slot)))
             .filter(|c| c.is_constant() && !keyed && !(typed && keyed_typed) && !set.contains(&name))
     };
@@ -14068,7 +14065,7 @@ fn thread_constant_jumps(insns: &mut [Insn]) {
 
 impl Lowering<'_> {
     fn feedback(&self, code: *const crate::vm::Code) -> Feedback {
-        let code = unsafe { &*code };
+        let code = code.live();
         Feedback {
             ics: code.ics().as_ptr().cast(),
             names: code.ic_names.as_ptr(),
@@ -14309,7 +14306,7 @@ impl Lowering<'_> {
                             && unsafe { Obj::of(v).code() == (*vm).function_apply }
                     });
                     let (a, n) = f.args;
-                    let w = base + unsafe { (*f.code).nregs } as usize;
+                    let w = base + f.code.live().nregs as usize;
                     match g {
                         Some(g)
                             if is_apply
@@ -14431,9 +14428,9 @@ impl Lowering<'_> {
                             // (Any closure of its code, where its site
                             // binds to that: see `cached_callees`.)
                             // (The low bits are the guard's flags.)
-                            debug_assert!(fo as u64 & 3 == 0 && unsafe { (*fo).code } as u64 & 3 == 0);
+                            debug_assert!(fo as u64 & 3 == 0 && fo.code() as u64 & 3 == 0);
                             g.guard = match binds_by_code(fo) {
-                                true => unsafe { (*fo).code as u64 | CALL_CODE_GUARD },
+                                true => fo.code() as u64 | CALL_CODE_GUARD,
                                 false => fo as u64,
                             };
                             g.next_case = true;
@@ -14504,8 +14501,8 @@ impl Lowering<'_> {
                 Op::TestIn if i.delete != 0 => {
                     let root = self.state.root;
                     let prop = Prop::Delete {
-                        epoch: unsafe { (*root).field_deps.get() },
-                        addr: unsafe { (*root).field_deps.as_ptr() } as u64,
+                        epoch: root.live().field_deps.get(),
+                        addr: root.live().field_deps.as_ptr() as u64,
                     };
                     self.push(i, prop);
                 }
@@ -14603,10 +14600,10 @@ impl Lowering<'_> {
                     if let Some((fo, shapes, addr, inline)) = self.accessor(frame, &i, depth, acc_out[k]) =>
                 {
                     let set = i.op == Op::SetNamed;
-                    let w = (base + unsafe { (*f.code).nregs } as usize) as u8;
+                    let w = (base + f.code.live().nregs as usize) as u8;
                     if set && !inline {
                         self.push(synth(Op::Star, w + 2, frame, i.pc), Prop::None);
-                    } else if set && unsafe { (*(*fo).code).nparams } > 0 {
+                    } else if set && fo.code().live().nparams > 0 {
                         let param = (frame_end(&f) + 1) as u8;
                         self.push(synth(Op::Star, param, frame, i.pc), Prop::None);
                     }
@@ -14760,16 +14757,16 @@ impl Lowering<'_> {
     fn ctor_site(&mut self, fo: *mut Object) -> (Box<CtorSite>, *const Shape) {
         unsafe {
             let vm = &mut *self.state.vm;
-            let callee = (*fo).code;
+            let callee = fo.code();
             let shape = vm.ctor_root(fo);
             // (The site allocates `this` with it.)
             crate::object::pin_shape(shape);
             let proto_at = Object::inline(fo, 0).cast::<u64>();
             vm.heap.keep(fo as usize);
             vm.heap.keep(*proto_at as usize);
-            let cap_at = match vm.ctor_proto(&*callee, (*shape).proto) {
+            let cap_at = match vm.ctor_proto(callee.live(), shape.live().proto) {
                 Some(e) => (*e).cap.as_ptr(),
-                None => (*callee).ctor_capacity.as_ptr(),
+                None => callee.live().ctor_capacity.as_ptr(),
             };
             let site = Box::new(CtorSite {
                 heap: vm.heap.bump(),
@@ -14777,11 +14774,11 @@ impl Lowering<'_> {
                 proto: *proto_at,
                 cap_at,
                 cap: *cap_at as u64,
-                slots: (*shape).capacity.get() as u64,
+                slots: shape.live().capacity.get() as u64,
                 // Set when the frame is placed.
                 this_off: 0,
                 done_shape: 0,
-                header: crate::object::object_header(&*shape),
+                header: crate::object::object_header(shape.live()),
             });
             (site, shape)
         }
@@ -14814,8 +14811,8 @@ impl Lowering<'_> {
             direct,
             proven,
             // (The compiled function's own epoch: see `Code::field_deps`.)
-            epoch: unsafe { (*self.state.root).field_deps.get() },
-            epoch_addr: unsafe { (*self.state.root).field_deps.as_ptr() } as u64,
+            epoch: self.state.root.live().field_deps.get(),
+            epoch_addr: self.state.root.live().field_deps.as_ptr() as u64,
         };
         let callee = site.callee;
         self.out.sites.push(Box::new(std::cell::UnsafeCell::new(site)));
@@ -14837,15 +14834,14 @@ impl Lowering<'_> {
             if w.holder.is_null() {
                 break;
             }
-            if unsafe { (*w.holder).class } != Class::Function || w.loc == crate::vm::VIA_CALL {
+            if w.holder.class() != Class::Function || w.loc == crate::vm::VIA_CALL {
                 return Vec::new();
             }
             // (One case for the closures of a code its site binds to: the
             // TypeScript checker's functions, closures made anew for each
             // program, had a case each here, whose guard kept its program,
             // and were compiled again once that went.)
-            let same =
-                |&fo: &*mut Object| fo == w.holder || unsafe { (*fo).code == (*w.holder).code } && binds_by_code(fo);
+            let same = |&fo: &*mut Object| fo == w.holder || (fo.code() == w.holder.code()) && binds_by_code(fo);
             if !fos.iter().any(same) {
                 fos.push(w.holder);
             }
@@ -14858,27 +14854,27 @@ impl Lowering<'_> {
         if fo.is_null() {
             return false;
         }
-        let class = unsafe { (*fo).class };
+        let class = fo.class();
         if matches!(class, Class::Function | Class::Native) {
-            site.cached = unsafe { (*fo).code };
+            site.cached = fo.code();
         }
         if class != Class::Function {
             return false;
         }
-        let callee = unsafe { (*fo).code };
+        let callee = fo.code();
         // Not compiled: its exception handlers need interpreted frames.
         // Nor a `that` of `f.call(that, …)` to convert: the runtime does.
         // Nor a function passing its arguments on, which reads them from
         // its frame's header (see `Insn::forward`).
-        if unsafe { (*callee).interpreted } || self.nullable_this(i, fo) || self.frame_args(callee) {
+        if callee.live().interpreted || self.nullable_this(i, fo) || self.frame_args(callee) {
             return false;
         }
         // Its only closure, which its lowerings for direct calls (with no
         // frame of its own to find it in) fold constant upvalues of (see
         // `VmState::root_func`). (Past the checks above: a function that
         // must run interpreted gets no JIT state.)
-        if unsafe { (*callee).closures_made.get() } == 1
-            && let Ok(mut slot) = unsafe { (*callee).jit.try_borrow_mut() }
+        if callee.live().closures_made.get() == 1
+            && let Ok(mut slot) = callee.live().jit.try_borrow_mut()
             && let Some(v) =
                 slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, self.state.vm))).vm.as_mut()
             && v.root_func.is_null()
@@ -14903,12 +14899,11 @@ impl Lowering<'_> {
         // One whose countdown is running binds once it has run out
         // (`wait_hot`): EarleyBoyer's `loop2` called `deriv_trees` through
         // the runtime 12 million times, lowered before it was hot.
-        let left = unsafe { (*callee).calls_left.get() };
+        let left = callee.live().calls_left.get();
         let cold_capturing = self.captures(callee) && left > 0;
         if (self.state.tier == Tier::Warm || cold_capturing) && !site.self_call {
-            let compiled = unsafe { (*callee).jit.try_borrow() }
-                .ok()
-                .is_some_and(|f| f.as_ref().is_some_and(|f| !f.versions.is_empty()));
+            let compiled =
+                callee.live().jit.try_borrow().ok().is_some_and(|f| f.as_ref().is_some_and(|f| !f.versions.is_empty()));
             if !compiled && (self.state.tier == Tier::Warm || left == i32::MAX) {
                 return false;
             }
@@ -14928,7 +14923,7 @@ impl Lowering<'_> {
         } else {
             unsafe { (*self.state.vm).heap.keep(fo as usize) };
         }
-        site.nparams = unsafe { (*callee).nparams };
+        site.nparams = callee.live().nparams;
         site.callee = callee;
         true
     }
@@ -14943,7 +14938,7 @@ impl Lowering<'_> {
         use crate::object::Class;
         let root = self.state.root;
         if next.is_none_or(|n| n.op != Op::Return || n.bail)
-            || i.imm as u32 > unsafe { (*root).nparams }
+            || i.imm as u32 > root.live().nparams
             || (i.op == Op::Call && i.reg2 as i32 <= i.imm)
             || (i.op == Op::Call && i.nullable_this)
             || self.state.callee_exits.get(&(root as usize, i.pc)).is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
@@ -14955,7 +14950,7 @@ impl Lowering<'_> {
         // code has other cells, and the frame's header would keep this
         // one's.)
         let ok = !fo.is_null()
-            && unsafe { (*fo).class == Class::Function && (*fo).code == root && (&(*root).upvalues).is_empty() };
+            && unsafe { fo.class() == Class::Function && fo.code() == root && (&(*root).upvalues).is_empty() };
         ok.then_some(fo)
     }
 
@@ -15000,7 +14995,7 @@ impl Lowering<'_> {
         if i.op == Op::Call {
             mov(self, Some(w), 0);
         } else if live[0] {
-            self.global_this(0, pc, unsafe { (*root).strict });
+            self.global_this(0, pc, root.live().strict);
             self.push(synth(Op::Star, 0, 0, pc), Prop::None);
         }
         for (r, &l) in live.iter().enumerate().skip(1 + argc) {
@@ -15039,9 +15034,9 @@ impl Lowering<'_> {
     fn boxes_this(&mut self, i: &Insn, fo: *mut Object) -> bool {
         i.op == Op::Call
             && !fo.is_null()
-            && unsafe { (*fo).class } == crate::object::Class::Function
-            && !unsafe { (*(*fo).code).strict }
-            && self.entry_live(unsafe { (*fo).code })[0]
+            && fo.class() == crate::object::Class::Function
+            && !fo.code().live().strict
+            && self.entry_live(fo.code())[0]
     }
 
     /// Whether call `i`'s receiver is an object: its sloppy frame's `this`
@@ -15107,8 +15102,8 @@ impl Lowering<'_> {
         i.op == Op::Call
             && i.nullable_this
             && !fo.is_null()
-            && unsafe { (*fo).class } == crate::object::Class::Function
-            && self.entry_live(unsafe { (*fo).code })[0]
+            && fo.class() == crate::object::Class::Function
+            && self.entry_live(fo.code())[0]
     }
 
     /// Load `this` of a call without a receiver into `acc`: the global
@@ -15160,10 +15155,10 @@ impl Lowering<'_> {
     /// constructors): no inlining level (see [`Lowering::inline_case`]),
     /// inlined at any depth; its method within the limit (or a small leaf).
     fn trampoline(&mut self, fo: *mut Object) -> bool {
-        if fo.is_null() || unsafe { (*fo).class } != crate::object::Class::Function {
+        if fo.is_null() || fo.class() != crate::object::Class::Function {
             return false;
         }
-        let code = unsafe { (*fo).code };
+        let code = fo.code();
         self.forwards(code) && self.forwards_this_method(code)
     }
 
@@ -15185,7 +15180,7 @@ impl Lowering<'_> {
         if creates.next().is_some() || insns.iter().any(|j| j.bail) {
             return None;
         }
-        let nparams = unsafe { (*code).nparams } as usize;
+        let nparams = code.live().nparams as usize;
         let mut target = vec![false; n + 1];
         for j in insns.iter().filter(|j| j.jumps()) {
             target[j.target] = true;
@@ -15255,7 +15250,7 @@ impl Lowering<'_> {
             }
             let ok = match j.op {
                 Op::CreateArguments => true,
-                Op::GetNamed => unsafe { (*code).ic(j.imm as u32).1 == length },
+                Op::GetNamed => code.live().ic(j.imm as u32).1 == length,
                 Op::GetKeyed => true,
                 Op::Ldar => copy(k),
                 Op::Star => k > 0 && copy(k - 1) && regs.contains(&insns[k - 1].reg),
@@ -15305,10 +15300,10 @@ impl Lowering<'_> {
     /// The instructions `fo` and the small leaves it calls inline into, if
     /// it is a small leaf `levels` levels deep (see [`Lowering::small_leaf`]).
     fn small_tree(&mut self, fo: *mut Object, levels: u32) -> Option<usize> {
-        if fo.is_null() || unsafe { (*fo).class } != crate::object::Class::Function {
+        if fo.is_null() || fo.class() != crate::object::Class::Function {
             return None;
         }
-        let code = unsafe { (*fo).code };
+        let code = fo.code();
         let d = self.decoded(code);
         if d.0.len() > MAX_LEAF_INSNS {
             return None;
@@ -15362,7 +15357,7 @@ impl Lowering<'_> {
         // `this.output()` in DeltaBlue: counting them left a call in
         // `chainTest`'s hottest loop, 87M direct calls a run).
         let calls = |cx: &mut Self, fo: *mut Object| {
-            let code = unsafe { (*fo).code };
+            let code = fo.code();
             let fb = cx.feedback(code);
             let d = cx.decoded(code);
             d.0.iter().filter(|j| j.is_call() && j.native == 0).any(|j| {
@@ -15386,7 +15381,7 @@ impl Lowering<'_> {
                 break;
             }
             // (Another closure of the code inlined for any of them.)
-            if unsafe { (*fo).code == (*first).code } && inline_by_code(first, i) {
+            if (fo.code() == first.code()) && inline_by_code(first, i) {
                 continue;
             }
             if !self.inlinable(frame, fo) || self.nullable_this(i, fo) || self.out.frames.len() + fos.len() >= 255 {
@@ -15400,11 +15395,8 @@ impl Lowering<'_> {
         // Without a receiver, `this` is the global object for sloppy
         // callees and `undefined` for strict ones: not both (`arg_moves`).
         if i.op == Op::CallUndefined {
-            let strict: Vec<bool> = (fos.iter())
-                .map(|&fo| unsafe { (*fo).code })
-                .filter(|&c| self.entry_live(c)[0])
-                .map(|c| unsafe { (*c).strict })
-                .collect();
+            let strict: Vec<bool> =
+                (fos.iter()).map(|&fo| fo.code()).filter(|&c| self.entry_live(c)[0]).map(|c| c.live().strict).collect();
             if strict.iter().any(|&x| x != strict[0]) {
                 return Vec::new();
             }
@@ -15417,10 +15409,10 @@ impl Lowering<'_> {
     fn inlinable(&mut self, frame: usize, fo: *mut Object) -> bool {
         use crate::object::Class;
         let f = self.out.frames[frame];
-        if fo.is_null() || unsafe { (*fo).class } != Class::Function {
+        if fo.is_null() || fo.class() != Class::Function {
             return false;
         }
-        let callee = unsafe { (*fo).code };
+        let callee = fo.code();
         // Exceptions unwind only through interpreted frames. A function
         // passing its arguments on reads them from its frame's header; one
         // whose registers closures capture keeps them in its own frame.
@@ -15428,7 +15420,7 @@ impl Lowering<'_> {
         // an ordinary one with the call's arguments, if it calls a method
         // of `this`, which its frame resolves: see `emit_frame`. Box2D's
         // `b2Vec2.b2Vec2.apply(this, arguments)`, not, left there: +6%.)
-        if unsafe { (*callee).interpreted }
+        if callee.live().interpreted
             || self.captures(callee)
             || self.forwards(callee) && !self.forwards_this_method(callee)
         {
@@ -15470,7 +15462,7 @@ impl Lowering<'_> {
             g = self.out.frames[g].parent;
         }
         let base = frame_end(&f);
-        let nregs = unsafe { (*callee).nregs } as usize;
+        let nregs = callee.live().nregs as usize;
         base + nregs <= 256 && self.decoded(callee).0.len() <= MAX_INLINE_INSNS
     }
 
@@ -15493,7 +15485,7 @@ impl Lowering<'_> {
         // (`usize::MAX`: `this` of a call without a receiver).
         let mut store = |cx: &mut Self, src: Option<usize>, j: usize| {
             match src {
-                Some(usize::MAX) => cx.global_this(frame, pc, unsafe { (*callee).strict }),
+                Some(usize::MAX) => cx.global_this(frame, pc, callee.live().strict),
                 Some(r) => {
                     cx.push(synth(Op::Ldar, r as u8, frame, pc), Prop::None);
                 }
@@ -15593,7 +15585,7 @@ impl Lowering<'_> {
     /// and that returns nothing (`this` is the result).
     fn inline_ctor(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
         let fo = self.inline_target(frame, i, depth)?;
-        let code = unsafe { &*(*fo).code };
+        let code = fo.code().live();
         // Not a derived class's: its `this` is `super(…)`'s, and a return
         // without that call throws (test262's `super-must-be-called`, once
         // `assert.throws`, which has a `try`, ran compiled).
@@ -15603,12 +15595,12 @@ impl Lowering<'_> {
         let seen = code.ctor_result.get();
         let fits = !seen.is_null()
             && seen != crate::vm::MANY_SHAPES
-            && unsafe { (*seen).keys().len() } as u32 <= code.ctor_capacity.get();
+            && seen.live().keys().len() as u32 <= code.ctor_capacity.get();
         // A constructor passing its arguments on (Prototype's
         // `Class.create`, `this.initialize.apply(this, arguments)`) is one
         // code for every class: the shapes its objects end with say
         // nothing of this one's, whose `this` gets its own root shape.
-        let forwards = unsafe { self.forwards((*fo).code) };
+        let forwards = self.forwards(fo.code());
         if !forwards && (!code.ctor_settled.get() || !fits) {
             return None;
         }
@@ -15646,7 +15638,7 @@ impl Lowering<'_> {
         site.this_shape = shape as u64;
         site.closure = fo as u64;
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
-        site.callee = unsafe { (*fo).code };
+        site.callee = fo.code();
         let site = Box::new(std::cell::UnsafeCell::new(site));
         let alloc = site.get() as u64;
         self.out.sites.push(site);
@@ -15667,13 +15659,13 @@ impl Lowering<'_> {
         let f = self.out.frames[frame];
         let func = if !f.func.is_null() {
             f.func
-        } else if frame == 0 && unsafe { (*f.code).closures_made.get() } == 1 {
-            unsafe { (*f.code).upvalues_folded.set(true) };
+        } else if frame == 0 && f.code.live().closures_made.get() == 1 {
+            f.code.live().upvalues_folded.set(true);
             self.state.root_func
         } else {
             return None;
         };
-        if func.is_null() || unsafe { (*func).code } != f.code || k >= unsafe { (&(*f.code).upvalues).len() } {
+        if func.is_null() || func.code() != f.code || k >= unsafe { (&(*f.code).upvalues).len() } {
             return None;
         }
         let v = unsafe {
@@ -15841,8 +15833,8 @@ impl Lowering<'_> {
                 fused = Some(g.pc);
             }
         }
-        let nparams = fos.iter().map(|&fo| unsafe { (*(*fo).code).nparams } as usize).max();
-        let codes: Vec<_> = fos.iter().map(|&fo| unsafe { (*fo).code }).collect();
+        let nparams = fos.iter().map(|&fo| fo.code().live().nparams as usize).max();
+        let codes: Vec<_> = fos.iter().map(|&fo| fo.code()).collect();
         let aliases = self.arg_moves(frame, i, nparams.unwrap_or(0), &codes);
         if let Some(pc) = fused {
             let mut cell = synth(Op::Nop, i.reg2, frame, pc);
@@ -15971,7 +15963,7 @@ impl Lowering<'_> {
             Some(l) => l.clone(),
             None => {
                 let insns = &d.0;
-                let nregs = unsafe { (*code).nregs } as usize;
+                let nregs = code.live().nregs as usize;
                 let extra: Option<Vec<RegSet>> =
                     pc_live.is_some().then(|| insns.iter().map(|i| caught(i.pc).unwrap_or([0; 4])).collect());
                 let l = Rc::new(RegSets::pack(&reg_live_in_reads(
@@ -16028,7 +16020,7 @@ impl Lowering<'_> {
         }
         unsafe {
             let h = ic.holder;
-            let s = &*(*h).shape;
+            let s = h.shape().live();
             let slot = s.lookup(fb.name(i))?;
             if s.attrs()[slot as usize] & ACCESSOR == 0 {
                 return None;
@@ -16041,7 +16033,7 @@ impl Lowering<'_> {
             let fo = as_object(fv);
             self.call_in_loop = self.in_loop(f.code, i.pc);
             let inline = !(depth >= MAX_INLINE_DEPTH && !self.small_leaf(fo)
-                || self.forwards((*fo).code)
+                || self.forwards(fo.code())
                 || !self.inlinable(frame, fo));
             if !inline && (f.extra as usize) < ACCESSOR_EXTRA {
                 return None;
@@ -16053,7 +16045,7 @@ impl Lowering<'_> {
                 .collect();
             // A sloppy accessor's `this` of a primitive's cell is boxed: by
             // the runtime.
-            if !(*(*fo).code).strict && self.entry_live((*fo).code)[0] && shapes.iter().any(|&s| primitive_cell(s)) {
+            if !fo.code().live().strict && self.entry_live(fo.code())[0] && shapes.iter().any(|&s| primitive_cell(s)) {
                 return None;
             }
             rely_on_slot(at as u64);
@@ -16084,7 +16076,7 @@ impl Lowering<'_> {
         }
         unsafe {
             let h = ic.holder;
-            let s = &*(*h).shape;
+            let s = h.shape().live();
             let slot = s.lookup(fb.name(i))?;
             if s.attrs()[slot as usize] & ACCESSOR == 0 {
                 return None;
@@ -16124,10 +16116,10 @@ impl Lowering<'_> {
         unsafe {
             let shape = (*self.state.vm).ctor_root(fo);
             let name = self.out.fbs[frame].name(i);
-            if (*shape).lookup(name).is_some() {
+            if shape.live().lookup(name).is_some() {
                 return None;
             }
-            let mut p = (*shape).proto;
+            let mut p = shape.live().proto;
             while p.is_cell() {
                 let o = crate::object::as_object(p);
                 // (A slotless `length` or `name` nearer: see
@@ -16135,7 +16127,7 @@ impl Lowering<'_> {
                 if (*self.state.vm).virtual_own(o, name).is_some() {
                     return None;
                 }
-                let s = &*(*o).shape;
+                let s = o.shape().live();
                 if let Some(slot) = s.lookup(name) {
                     if s.attrs()[slot as usize] & crate::object::ACCESSOR != 0 {
                         return None;
@@ -16294,7 +16286,7 @@ impl Lowering<'_> {
         // the global object, or `undefined` to strict callees (all that
         // read it are, or none: see `inline_targets`).
         if i.op == Op::CallUndefined && callees.iter().any(|&c| self.entry_live(c)[0]) {
-            let strict = callees.iter().any(|&c| unsafe { (*c).strict } && self.entry_live(c)[0]);
+            let strict = callees.iter().any(|&c| c.live().strict && self.entry_live(c)[0]);
             self.global_this(frame, i.pc, strict);
             self.push(synth(Op::Star, base as u8, frame, i.pc), Prop::None);
         } else if i.op != Op::Construct {
@@ -16314,7 +16306,7 @@ impl Lowering<'_> {
     /// parameter that it never writes nor passes in a call window (which
     /// must stay contiguous).
     fn read_only(&mut self, code: *const crate::vm::Code, r: usize) -> bool {
-        if r > unsafe { (*code).nparams } as usize {
+        if r > code.live().nparams as usize {
             return false;
         }
         let d = self.decoded(code);
@@ -16347,8 +16339,8 @@ impl Lowering<'_> {
         alloc: u64,
     ) -> (usize, Vec<usize>) {
         let f = self.out.frames[frame];
-        let callee = unsafe { (*fo).code };
-        let c = unsafe { &*callee };
+        let callee = fo.code();
+        let c = callee.live();
         let base = frame_end(&f);
         let id = self.out.frames.len();
         if !self.small_leaf(fo) {
@@ -16461,10 +16453,10 @@ impl Lowering<'_> {
 /// of a nested function that is a register of `code`'s: see
 /// `Code::upvalues`), by register.
 fn captured_regs(code: *const crate::vm::Code) -> Vec<bool> {
-    let code = unsafe { &*code };
+    let code = code.live();
     let mut out = vec![false; code.nregs as usize];
     for &c in &code.closures {
-        for &(local, r) in unsafe { (*c).upvalues.iter() } {
+        for &(local, r) in c.live().upvalues.iter() {
             if local && (r as usize) < out.len() {
                 out[r as usize] = true;
             }
@@ -16534,7 +16526,7 @@ impl JitFunction {
         (vm.props, vm.polys, vm.fbs) = (Props::default(), Vec::new(), Vec::new());
         vm.dirty = true;
         vm.cool = COOL_ENTRIES;
-        (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
+        (vm.settle_mark, vm.settles) = (vm.root.live().ic_misses.get(), 0);
         vm.bail_exits.retain(|pc, _| vm.no_entry.contains(pc));
         self.note_spent();
     }
@@ -16582,7 +16574,7 @@ impl JitFunction {
         // `Vm::bump_code_epoch`.)
         unsafe { (*vm).jitted.push(code) };
         let root_insns = unsafe { (*vm).jit_caches.decoded(code) }.0.clone();
-        let nregs = unsafe { (*code).nregs } as usize;
+        let nregs = code.live().nregs as usize;
         let root_len = root_insns.len();
         let mut f = JitFunction::new_from(unsafe { &(*code).bytecode }, root_insns, nregs);
         f.tiering = None;
@@ -16760,8 +16752,7 @@ impl JitFunction {
             vm.props = Props::pack(&low.props);
             vm.polys = low.polys;
             vm.fbs = low.fbs;
-            let frame_regs =
-                low.frames.iter().map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent)).collect();
+            let frame_regs = low.frames.iter().map(|f| (f.base, f.code.live().nregs as usize, f.parent)).collect();
             // (A stable sort: the first instruction of each place first.)
             let mut exit_at: Vec<u32> =
                 (0..insns.len() as u32).filter(|&k| insns[k as usize].hoisted.get().is_none()).collect();
@@ -17165,7 +17156,7 @@ impl JitFunction {
             }
         } else if insn.guard != 0 || insn.native != 0 {
             vm.cool = cooling(&mut vm.coolings, out_of_compiles);
-            (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
+            (vm.settle_mark, vm.settles) = (vm.root.live().ic_misses.get(), 0);
             *vm.callee_exits.entry(origin).or_insert(0) += 1;
         } else if insn.is_property() && matches!(vm.props.get(k), Some(Prop::Runtime)) {
             // Given up already (through the runtime, which left where only
@@ -17174,7 +17165,7 @@ impl JitFunction {
             vm.dirty = was_dirty;
         } else if insn.is_property() {
             vm.cool = cooling(&mut vm.coolings, out_of_compiles);
-            (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
+            (vm.settle_mark, vm.settles) = (vm.root.live().ic_misses.get(), 0);
             // A miss of an access whose cases filled its cache, past half
             // the function's compilations: given up at once, not after
             // more exits each costing one (TypeScript's `ast.nodeType`
@@ -17265,7 +17256,7 @@ impl JitFunction {
         // loads from fields give, so its own calls to itself fit (see
         // `fits_entry` in `JitCode::compile`).
         let params = match &self.vm {
-            Some(vm) if entry == 0 => (unsafe { (*vm.root).nparams }) as usize + 1,
+            Some(vm) if entry == 0 => (vm.root.live().nparams) as usize + 1,
             _ => 0,
         };
         TypeState {
@@ -17724,7 +17715,7 @@ unsafe fn materialize(
                 vm,
                 regs.add(fr.base),
                 fr.code,
-                (*parent.code).bytecode.as_ptr().add(fr.ret_pc),
+                parent.code.live().bytecode.as_ptr().add(fr.ret_pc),
                 regs.add(parent.base),
                 if fr.construct { interp::CONSTRUCT } else { 0 },
             );
@@ -17802,7 +17793,11 @@ unsafe fn materialize(
         }
     }
     let fr = frames[frame];
-    interp::Resume { regs: unsafe { regs.add(fr.base) }, pc: unsafe { (*fr.code).bytecode.as_ptr().add(exit_pc) }, acc }
+    interp::Resume {
+        regs: unsafe { regs.add(fr.base) },
+        pc: unsafe { fr.code.live().bytecode.as_ptr().add(exit_pc) },
+        acc,
+    }
 }
 
 /// `call_direct` stencils, once their checks passed: call the compiled
@@ -18085,7 +18080,7 @@ extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
         vm.safepoint(regs.to_bits() as *mut Value);
         let this = vm.construct_this((*s).closure as *mut Object);
         let o = crate::object::as_object(this);
-        if (*s).this_shape != 0 && (*o).shape as u64 != (*s).this_shape {
+        if (*s).this_shape != 0 && o.shape() as u64 != (*s).this_shape {
             (*s).entry = 0;
             return cloison_rt_call(regs, site);
         }
@@ -18111,7 +18106,7 @@ extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
         let m = &*(mat.to_bits() as *const Mat);
         let regs = regs.to_bits() as *mut Value;
         let vm = &mut *crate::interp::current_vm();
-        let o = vm.heap.alloc_object(&*m.shape);
+        let o = vm.heap.alloc_object(m.shape.live());
         for (k, &r) in m.fields.iter().enumerate() {
             vm.store_field(o, k as u32, *regs.add(r as usize));
         }
@@ -18181,12 +18176,12 @@ extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
     unsafe {
         let s = &mut *(site.to_bits() as *mut CallSite);
         let o = crate::object::as_object(this);
-        let code = &*s.callee;
+        let code = s.callee.live();
         crate::vm::Vm::construct_done(code, o);
-        let shape = (*o).shape;
+        let shape = o.shape();
         let seen = code.ctor_result.get();
         if code.ctor_settled.get()
-            && (*shape).keys().len() as u32
+            && shape.live().keys().len() as u32
                 <= crate::vm::Vm::shared_proto(code, o).map_or(code.ctor_capacity.get(), |e| e.cap.get())
             && (seen == shape || seen == crate::vm::MANY_SHAPES)
         {
@@ -18261,7 +18256,7 @@ unsafe fn direct_exit(
                 .expect("the code a direct call's exit left"),
         };
         let (frame, exit_pc) = {
-            let mut slot = (*site.callee).jit.borrow_mut();
+            let mut slot = site.callee.live().jit.borrow_mut();
             slot.as_mut().unwrap().vm_finish(code, 0, record as usize)
         };
         // Not a `new` frame, even for `new`: `cloison_rt_construct` makes the
@@ -18284,7 +18279,7 @@ extern "C" fn cloison_rt_call(regs: Value, site: Value) -> Value {
         if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) && !site.callee.is_null() {
             let key = format!(
                 "rt_call {} entry={} pending={} exits={} claim={} bound={}",
-                (*site.callee).name,
+                site.callee.live().name,
                 site.entry != 0,
                 site.pending,
                 site.exits,

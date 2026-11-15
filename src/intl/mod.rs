@@ -13,6 +13,7 @@ mod collator;
 mod icu;
 mod segmenter;
 
+use crate::raw::Live;
 use std::collections::HashMap;
 
 use crate::object::{DONT_ENUM, Object, object_value};
@@ -91,7 +92,7 @@ enum Kind {
 fn create(vm: &mut Vm, proto: Value, kind: Kind, slots: &[Value]) -> Value {
     let full = vm.root_shape(crate::object::Class::Intl, proto, slots.len() as u32 + 1);
     let bare = vm.root_shape(crate::object::Class::Intl, proto, 0);
-    let o = vm.heap.alloc_object(unsafe { &*full });
+    let o = vm.heap.alloc_object(full.live());
     unsafe { crate::object::set_shape(o, bare) };
     crate::promise::set_slot(o, 0, Value::from_i32(kind as i32));
     for (i, &v) in slots.iter().enumerate() {

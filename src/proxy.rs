@@ -20,6 +20,7 @@ use crate::interp::{call_function, to_boolean};
 use crate::jit::HashSet;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object, same_value};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, Key, Result, Vm};
 
@@ -33,7 +34,7 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.native_function("", trampoline, 0, any, true),
         vm.native_function("", revoke, 0, any, false),
     ]
-    .map(|f| unsafe { (*f).code });
+    .map(|f| f.code());
     // (A proxy's call runs in its caller's realm: see `realm`.)
     for c in vm.proxy_codes {
         unsafe { (*c.cast_mut()).realm = crate::realm::NONE };
@@ -42,12 +43,10 @@ pub(crate) fn install(vm: &mut Vm) {
 
 /// Whether `o` is a proxy.
 pub(crate) fn is_proxy(vm: &Vm, o: *mut Object) -> bool {
-    unsafe {
-        match (*o).class {
-            Class::Proxy => true,
-            Class::Native => (*o).code == vm.proxy_codes[0] || (*o).code == vm.proxy_codes[1],
-            _ => false,
-        }
+    match o.class() {
+        Class::Proxy => true,
+        Class::Native => o.code() == vm.proxy_codes[0] || o.code() == vm.proxy_codes[1],
+        _ => false,
     }
 }
 
@@ -61,7 +60,7 @@ pub(crate) fn chain_has_proxy(vm: &Vm, mut o: *mut Object) -> bool {
         if is_proxy(vm, o) {
             return true;
         }
-        let p = unsafe { (*(*o).shape).proto };
+        let p = o.shape().live().proto;
         if !p.is_cell() {
             return false;
         }
@@ -155,7 +154,7 @@ pub(crate) fn create(vm: &mut Vm, target: Value, handler: Value) -> Result<Value
     let class = if callable { Class::Native } else { Class::Proxy };
     let full = vm.root_shape(class, Value::NULL, 2);
     let bare = vm.root_shape(class, Value::NULL, 0);
-    let o = vm.heap.alloc_object(unsafe { &*full });
+    let o = vm.heap.alloc_object(full.live());
     unsafe {
         crate::object::set_shape(o, bare);
         if callable {
@@ -185,7 +184,7 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let p = create(vm, arg(a, 0), arg(a, 1))?;
     let full = vm.root_shape(Class::Native, object_value(vm.function_prototype), 1);
     let bare = vm.root_shape(Class::Native, object_value(vm.function_prototype), 0);
-    let r = vm.heap.alloc_object(unsafe { &*full });
+    let r = vm.heap.alloc_object(full.live());
     unsafe {
         crate::object::set_shape(r, bare);
         (*r).code = vm.proxy_codes[2];
@@ -322,7 +321,7 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
             }
             return Ok(d.value.unwrap_or(Value::UNDEFINED));
         }
-        let p = unsafe { (*(*cur).shape).proto };
+        let p = cur.shape().live().proto;
         if !p.is_cell() {
             return Ok(Value::UNDEFINED);
         }
@@ -340,7 +339,7 @@ pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: V
         if let Some(d) = vm.own_property(cur, key) {
             break Some(d);
         }
-        let p = unsafe { (*(*cur).shape).proto };
+        let p = cur.shape().live().proto;
         if !p.is_cell() {
             break None;
         }
@@ -379,7 +378,7 @@ pub(crate) fn generic_has(vm: &mut Vm, o: Value, key: Key) -> Result<bool> {
         if vm.own_property(cur, key).is_some() {
             return Ok(true);
         }
-        let p = unsafe { (*(*cur).shape).proto };
+        let p = cur.shape().live().proto;
         if !p.is_cell() {
             return Ok(false);
         }
@@ -627,7 +626,7 @@ pub(crate) fn enumerable_own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key
 /// `o.[[GetPrototypeOf]]()`.
 pub(crate) fn get_prototype_of(vm: &mut Vm, o: *mut Object) -> Result<Value> {
     if !is_proxy(vm, o) {
-        return Ok(unsafe { (*(*o).shape).proto });
+        return Ok(o.shape().live().proto);
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "getPrototypeOf")? else {
@@ -745,7 +744,7 @@ pub(crate) fn is_array(vm: &Vm, v: Value) -> Result<bool> {
         return Ok(false);
     }
     let o = final_target(vm, as_object(v))?;
-    Ok(unsafe { (*o).class } == Class::Array)
+    Ok(o.class() == Class::Array)
 }
 
 /// Proxy `o`'s target (a TypeError once revoked).

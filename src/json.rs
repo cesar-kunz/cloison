@@ -6,6 +6,7 @@
 use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
 use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, Object, RAW_JSON, as_object, object_value};
 use crate::props::{is_callable, is_object};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, string_len, string_units, wrapped};
 
@@ -310,9 +311,9 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
         while i < len {
             lead(st, out, any);
             // (An array's element there, not a hole: no code runs.)
-            let own = unsafe {
-                ((*o).class == Class::Array && i < (*o).elems_len as f64)
-                    .then(|| *(*o).elems.add(i as usize))
+            let own = {
+                (o.class() == Class::Array && i < o.elems_len() as f64)
+                    .then(|| o.elem(i as usize))
                     .filter(|&e| e != Value::EMPTY)
             };
             let e = match own {
@@ -340,7 +341,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
                 ks
             }
             None if vm.plain_named(o) => {
-                let s = unsafe { &*(*o).shape };
+                let s = o.shape().live();
                 let slots = vm.listed_slots(o, false, false).unwrap_or_default();
                 slots
                     .into_iter()
@@ -399,7 +400,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
             // (The data property that is still at the name's slot.)
             let own = match k {
                 PKey::Name(a) => unsafe {
-                    let s = &*(*o).shape;
+                    let s = o.shape().live();
                     (s.keys().get(slot as usize) == Some(&a) && s.attrs()[slot as usize] & ACCESSOR == 0)
                         .then(|| *Object::slot(o, s.location(slot)))
                 },
@@ -730,15 +731,15 @@ impl<'a> Parser<'a> {
                         // (A name the object has, stored in its slot, a
                         // new one added: no string of it, no descriptor.)
                         match property_key(vm, &k) {
-                            Key::Name(a) => unsafe {
+                            Key::Name(a) => {
                                 let ob = as_object(o);
-                                match (*(*ob).shape).lookup(a) {
+                                match ob.shape().live().lookup(a) {
                                     Some(slot) => vm.store_field(ob, slot, v),
                                     None => {
                                         vm.add_property_keyed(ob, a, v);
                                     }
                                 }
-                            },
+                            }
                             key => vm.create_data_property(o, key, v)?,
                         }
                         if self.track {
@@ -763,12 +764,10 @@ impl<'a> Parser<'a> {
                     loop {
                         let v = self.value(vm)?;
                         // (Pushed: traced from here on.)
-                        unsafe {
-                            vm.reserve_elems(ao, n + 1);
-                            vm.store_element(ao, n, v);
-                            n += 1;
-                            (*ao).elems_len = n as u32;
-                        }
+                        vm.reserve_elems(ao, n + 1);
+                        vm.store_element(ao, n, v);
+                        n += 1;
+                        ao.set_elems_len(n as u32);
                         if self.eat(b']') {
                             break;
                         }

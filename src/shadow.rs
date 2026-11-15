@@ -8,6 +8,7 @@ use crate::interp::call_function;
 use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, is_callable, is_object};
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, is_string, string_units};
 
@@ -123,7 +124,7 @@ fn thrown_message(vm: &mut Vm, e: &Error) -> String {
         _ => None,
     };
     let (a_name, a_message) = (vm.a_name, vm.intern_name("message"));
-    let proto = unsafe { (*(*o).shape).proto };
+    let proto = o.shape().live().proto;
     let name = data(vm, o, a_name)
         .or_else(|| is_object(proto).then(|| data(vm, as_object(proto), a_name)).flatten())
         .unwrap_or_else(|| "Error".into());

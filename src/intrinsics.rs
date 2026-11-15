@@ -10,6 +10,7 @@ use crate::js::ast::{
 };
 use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::props::Desc;
+use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, Key, Result, Vm};
 use std::ops::ControlFlow;
@@ -220,12 +221,10 @@ pub(crate) fn is_constructor(f: Value) -> bool {
         return false;
     }
     let o = as_object(f);
-    unsafe {
-        match (*o).class {
-            Class::Function => (*(*o).code).constructor(),
-            Class::Native => (*(*o).code).constructs,
-            _ => false,
-        }
+    match o.class() {
+        Class::Function => o.code().live().constructor(),
+        Class::Native => o.code().live().constructs,
+        _ => false,
     }
 }
 
@@ -246,7 +245,7 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
 fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result<Value> {
     if f.is_cell() && Obj::of(f).class() == Class::Function {
         let o = as_object(f);
-        let code = unsafe { &*(*o).code };
+        let code = o.code().live();
         if !code.constructor() {
             return Err(Error::type_error(format!("{} is not a constructor", crate::vm::shown(f))));
         }
@@ -301,7 +300,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         // (A view's buffer checked again after: the spec reads the
         // prototype first, and its getter may have detached or shrunk it.)
         let o = as_object(r);
-        let class = unsafe { (*o).class };
+        let class = o.class();
         // (A subclass's `RegExp` has no legacy features: see
         // `builtins::note_legacy`.)
         if class == Class::RegExp {

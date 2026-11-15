@@ -28,6 +28,7 @@
 //! read the length (`get_length_*`, `array_pop_`), and a far array's shape
 //! takes no store's fast path (`slow_elements`), so it never appends.
 
+use crate::raw::ObjectPtr;
 use std::sync::OnceLock;
 
 use crate::object::{Class, FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, SEALED, as_object};
@@ -164,7 +165,7 @@ fn parse_bytes(s: &str) -> Option<usize> {
 /// bound, and `a[1024]`, `a[3072]`, `a[7168]`, … would double the elements
 /// each time).
 pub(crate) fn goes_far(vm: &Vm, o: *mut Object, n: usize, adding: usize) -> bool {
-    let (len, cap) = unsafe { ((*o).elems_len as usize, Object::elems_cap(o) as usize) };
+    let (len, cap) = unsafe { (o.elems_len() as usize, Object::elems_cap(o) as usize) };
     let d = &vm.density;
     let store = adding > 0;
     if d.goes_far(len + adding, n, store) {
@@ -173,25 +174,25 @@ pub(crate) fn goes_far(vm: &Vm, o: *mut Object, n: usize, adding: usize) -> bool
     if n <= cap || n.saturating_mul(8) <= if store { d.waste } else { d.prealloc.max(d.waste) } {
         return false;
     }
-    let present = (0..len).filter(|&k| unsafe { *(*o).elems.add(k) } != Value::EMPTY).count();
+    let present = (0..len).filter(|&k| o.elem(k) != Value::EMPTY).count();
     d.goes_far(present + adding, n, store)
 }
 
 /// Whether `o` is a far array (the bit is another flag in other classes).
 #[inline]
 pub(crate) fn is_far(o: *mut Object) -> bool {
-    unsafe { (*o).flags & FAR != 0 && (*o).class == Class::Array }
+    o.flags() & FAR != 0 && o.class() == Class::Array
 }
 
 /// Array `o`'s `length`: its far store's, else its elements' count.
 #[inline]
 pub(crate) fn array_length(o: *mut Object) -> u32 {
-    if is_far(o) { length(o) } else { unsafe { (*o).elems_len } }
+    if is_far(o) { length(o) } else { o.elems_len() }
 }
 
 /// Where far array `o`'s store is: its elements' last slot.
 pub(crate) fn store_slot(o: *mut Object) -> *mut Value {
-    unsafe { (*o).elems.add(crate::layout::values_cap((*o).elems) as usize - 1) }
+    unsafe { o.elems().add(crate::layout::values_cap(o.elems()) as usize - 1) }
 }
 
 fn store(o: *mut Object) -> *mut Object {
@@ -199,12 +200,12 @@ fn store(o: *mut Object) -> *mut Object {
 }
 
 fn slot(e: *mut Object, i: usize) -> Value {
-    unsafe { *(*e).elems.add(i) }
+    e.elem(i)
 }
 
 fn put(e: *mut Object, i: usize, v: Value) {
     unsafe {
-        let at = (*e).elems.add(i);
+        let at = e.elems().add(i);
         crate::heap::store(e.cast(), at, v);
     }
 }
@@ -406,12 +407,10 @@ fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> *mut Object {
     let e = as_object(vm.new_array());
     let n = BASE + 2 * buckets;
     vm.reserve_elems(e, n);
-    unsafe {
-        for k in 0..n {
-            crate::layout::store_word((*e).elems.add(k), Value::EMPTY);
-        }
-        (*e).elems_len = n as u32;
+    for k in 0..n {
+        e.set_elem(k, Value::EMPTY);
     }
+    e.set_elems_len(n as u32);
     put(e, LENGTH, Value::number(len as f64));
     set_int(e, COUNT, 0);
     set_int(e, USED, 0);
@@ -426,7 +425,7 @@ fn hold(o: *mut Object, e: *mut Object) {
     let v = crate::object::object_value(e);
     unsafe {
         let at = store_slot(o);
-        crate::heap::store((*o).elems.cast::<u8>().sub(8), at, v);
+        crate::heap::store(o.elems().cast::<u8>().sub(8), at, v);
     }
 }
 
@@ -456,12 +455,12 @@ fn rehash(vm: &mut Vm, o: *mut Object, buckets: usize) {
 /// its elements up to the first hole stay its dense prefix, the ones after
 /// move to the store (and the elements shrink, if that frees half).
 pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
-    debug_assert!(unsafe { (*o).class == Class::Array } && !is_far(o));
-    let n = unsafe { (*o).elems_len } as usize;
-    let first_hole = (0..n).find(|&k| unsafe { *(*o).elems.add(k) } == Value::EMPTY).unwrap_or(n);
+    debug_assert!((o.class() == Class::Array) && !is_far(o));
+    let n = o.elems_len() as usize;
+    let first_hole = (0..n).find(|&k| o.elem(k) == Value::EMPTY).unwrap_or(n);
     let rest: Vec<(u32, Value)> = (first_hole..n)
         .filter_map(|k| {
-            let v = unsafe { *(*o).elems.add(k) };
+            let v = o.elem(k);
             (v != Value::EMPTY).then_some((k as u32, v))
         })
         .collect();
@@ -472,9 +471,9 @@ pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
     hold(o, e);
     vm.far_elements(o);
     unsafe {
-        (*o).flags |= FAR;
-        vm.heap.fill_values((*o).elems.add(first_hole), n.saturating_sub(first_hole), Value::EMPTY);
-        (*o).elems_len = first_hole as u32;
+        o.set_flags(o.flags() | FAR);
+        vm.heap.fill_values(o.elems().add(first_hole), n.saturating_sub(first_hole), Value::EMPTY);
+        o.set_elems_len(first_hole as u32);
         if first_hole * 2 < Object::elems_cap(o) as usize {
             vm.shrink_elems(o);
         }
@@ -489,55 +488,49 @@ pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
 /// to hold it. An element next to the prefix extends it, taking the far
 /// keys after it along.
 pub(crate) fn set(vm: &mut Vm, o: *mut Object, i: u32, v: Value) {
-    unsafe {
-        let n = (*o).elems_len;
-        if i == n && (i as usize) < MAX_ELEMENTS {
-            remove(o, i);
-            vm.reserve_elems(o, i as usize + 1);
-            vm.store_element(o, i as usize, v);
-            (*o).elems_len = i + 1;
-            pull(vm, o);
-        } else {
-            insert(vm, o, i, v);
-        }
-        if i >= length(o) {
-            set_length(o, i + 1);
-        }
+    let n = o.elems_len();
+    if i == n && (i as usize) < MAX_ELEMENTS {
+        remove(o, i);
+        vm.reserve_elems(o, i as usize + 1);
+        vm.store_element(o, i as usize, v);
+        o.set_elems_len(i + 1);
+        pull(vm, o);
+    } else {
+        insert(vm, o, i, v);
+    }
+    if i >= length(o) {
+        set_length(o, i + 1);
     }
     maybe_dense(vm, o);
 }
 
 /// Move the far keys that follow far array `o`'s dense prefix into it.
 fn pull(vm: &mut Vm, o: *mut Object) {
-    unsafe {
-        if count(o) == 0 {
+    if count(o) == 0 {
+        return;
+    }
+    loop {
+        let n = o.elems_len();
+        if n as usize >= MAX_ELEMENTS {
             return;
         }
-        loop {
-            let n = (*o).elems_len;
-            if n as usize >= MAX_ELEMENTS {
-                return;
-            }
-            let Some(v) = get(o, n) else { return };
-            remove(o, n);
-            vm.reserve_elems(o, n as usize + 1);
-            vm.store_element(o, n as usize, v);
-            (*o).elems_len = n + 1;
-        }
+        let Some(v) = get(o, n) else { return };
+        remove(o, n);
+        vm.reserve_elems(o, n as usize + 1);
+        vm.store_element(o, n as usize, v);
+        o.set_elems_len(n + 1);
     }
 }
 
 /// Far array `o` cut to length `n` (its elements at `n` and past it gone:
 /// the caller checked they may be).
 pub(crate) fn truncate(o: *mut Object, n: u32) {
-    unsafe {
-        let len = (*o).elems_len;
-        if n < len {
-            for k in n..len {
-                crate::layout::store_word((*o).elems.add(k as usize), Value::EMPTY);
-            }
-            (*o).elems_len = n;
+    let len = o.elems_len();
+    if n < len {
+        for k in n..len {
+            o.set_elem(k as usize, Value::EMPTY);
         }
+        o.set_elems_len(n);
     }
     for k in keys(o) {
         if k >= n {
@@ -552,24 +545,24 @@ pub(crate) fn truncate(o: *mut Object, n: u32) {
 /// fast paths again.
 pub(crate) fn maybe_dense(vm: &mut Vm, o: *mut Object) {
     let len = length(o) as usize;
-    let present = unsafe { (*o).elems_len } as usize + count(o);
+    let present = o.elems_len() as usize + count(o);
     if !vm.density.goes_dense(present, len) {
         return;
     }
     // (One that isn't extensible has the slow shape it would have anyway.)
-    let flags = unsafe { (*o).flags };
+    let flags = o.flags();
     let all = entries(o);
     unsafe {
-        let n = (*o).elems_len as usize;
+        let n = o.elems_len() as usize;
         vm.reserve_elems(o, len);
-        vm.heap.fill_values((*o).elems.add(n), len.saturating_sub(n), Value::EMPTY);
-        (*o).elems_len = len as u32;
+        vm.heap.fill_values(o.elems().add(n), len.saturating_sub(n), Value::EMPTY);
+        o.set_elems_len(len as u32);
         for (i, v) in all {
             vm.store_element(o, i as usize, v);
         }
         // The store's slot one of the elements' room again.
         crate::layout::store_word(store_slot(o), Value::UNDEFINED);
-        (*o).flags &= !FAR;
+        o.set_flags(o.flags() & !FAR);
     }
     if flags & (NOT_EXTENSIBLE | SEALED | FROZEN | LENGTH_READ_ONLY) == 0 {
         vm.dense_elements(o);

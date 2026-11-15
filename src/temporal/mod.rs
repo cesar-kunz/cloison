@@ -21,6 +21,7 @@ mod plain;
 pub(crate) mod tz;
 mod zoned;
 
+use crate::raw::ObjectPtr;
 use std::collections::HashMap;
 
 use crate::builtins::is_class;
@@ -112,7 +113,7 @@ pub(crate) fn slots(v: Value) -> Option<Slots> {
     if !is_class(v, Class::Temporal) {
         return None;
     }
-    Some(unsafe { (*as_object(v)).elems.cast::<Slots>().read_unaligned() })
+    Some(unsafe { as_object(v).elems().cast::<Slots>().read_unaligned() })
 }
 
 /// A new object of `slots`'s class (its intrinsic prototype).

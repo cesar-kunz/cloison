@@ -1852,7 +1852,7 @@ mod tests {
         {
             let mut vm = Vm::new();
             let v = vm.run(&crate::js::compile(src).unwrap()).unwrap();
-            let flagged = unsafe { (*as_object(v)).flags } & RUNTIME_LENGTH != 0;
+            let flagged = crate::object::Obj::of(v).flags() & RUNTIME_LENGTH != 0;
             assert_eq!((flagged, vm.checked_length_views), (long, long), "{src}");
         }
     }

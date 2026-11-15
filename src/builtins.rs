@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
-use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, as_object, object_value};
+use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, Object, READ_ONLY, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{
     Error, NativeFn, Result, Vm, check_string_len, is_string, number_to_string, push_string, string_len, string_units,
@@ -879,7 +879,7 @@ fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let (s, p, kept) = vm.split_cache[slot];
         seen = s == subject && p == sep;
         // (Another realm's arrays are of its own prototype.)
-        if seen && kept != Value::EMPTY && unsafe { (*(*as_object(kept)).shape).proto == (*vm.array_shape).proto } {
+        if seen && kept != Value::EMPTY && unsafe { (*Obj::of(kept).shape()).proto == (*vm.array_shape).proto } {
             return Ok(array_copy(vm, kept));
         }
     }
@@ -887,7 +887,7 @@ fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if let Some((subject, sep, slot)) = key {
         // The pieces are kept at the second split only: most strings
         // (one built for the occasion) are split once.
-        let keep = seen && unsafe { (*as_object(arr)).elems_len as usize } <= crate::vm::SPLIT_CACHE_PIECES;
+        let keep = seen && (Obj::of(arr).elems_len() as usize) <= crate::vm::SPLIT_CACHE_PIECES;
         // (A copy: the caller may change its array.)
         let kept = if keep { array_copy(vm, arr) } else { Value::EMPTY };
         vm.split_cache[slot] = (subject, sep, kept);
@@ -1037,7 +1037,7 @@ fn plain_list(list: Value, holes: bool) -> Option<Vec<Value>> {
     if list.is_undefined() || list.is_null() {
         return Some(Vec::new());
     }
-    if !list.is_cell() || unsafe { (*as_object(list)).class } != Class::Array {
+    if !list.is_cell() || Obj::of(list).class() != Class::Array {
         return None;
     }
     let o = as_object(list);
@@ -1281,7 +1281,7 @@ const BOUND_INLINE: usize = 1024;
 /// `args` in hidden slots after those of its `length` and `name`, which
 /// are properties from the start.
 fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if !this.is_cell() || !matches!(unsafe { (*as_object(this)).class }, Class::Function | Class::Native) {
+    if !this.is_cell() || !matches!(Obj::of(this).class(), Class::Function | Class::Native) {
         return Err(Error::type_error("Bind must be called on a function"));
     }
     let target = as_object(this);
@@ -1388,7 +1388,7 @@ pub(crate) unsafe fn unwrap_bound(vm: *const Vm, f: Value) -> Option<(*mut Objec
         }
         let o = as_object(f);
         let target = crate::promise::slot(o, BOUND_OWN);
-        ((*as_object(target)).class == Class::Function && (*vm).realms.is_empty())
+        (Obj::of(target).class() == Class::Function && (*vm).realms.is_empty())
             .then(|| (as_object(target), crate::promise::slot(o, BOUND_OWN + 1)))
     }
 }
@@ -1475,7 +1475,7 @@ pub(crate) fn arguments_object(vm: &mut Vm, values: &[Value]) -> Value {
 /// function's calls with a direct `eval` (eval.js).
 pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
     let o = arguments_object_of(vm, values, callee);
-    let s = unsafe { (*as_object(o)).shape };
+    let s = Obj::of(o).shape();
     if s == vm.arguments_shape {
         if vm.mapped_arguments_shape.is_null() {
             vm.mapped_arguments_shape = vm.no_elements_copy(s);
@@ -2330,7 +2330,7 @@ pub(crate) fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) -> *m
 }
 
 pub(crate) fn is_class(v: Value, c: Class) -> bool {
-    v.is_cell() && unsafe { (*as_object(v)).class } == c
+    v.is_cell() && Obj::of(v).class() == c
 }
 
 // ---- JSON ----
@@ -2605,7 +2605,7 @@ fn realm_of(vm: &mut Vm, o: *mut Object) -> u32 {
 
 /// `v`'s compiled regular expression, if it is a `RegExp`.
 fn regexp_of<'a>(v: Value) -> Option<&'a crate::regexp::Regex> {
-    is_class(v, Class::RegExp).then(|| unsafe { &*((*as_object(v)).code as *const crate::regexp::Regex) })
+    is_class(v, Class::RegExp).then(|| unsafe { &*(Obj::of(v).code() as *const crate::regexp::Regex) })
 }
 
 /// `RegExp.prototype.compile(pattern, flags)` (Annex B): `this` made
@@ -2614,7 +2614,7 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !is_class(this, Class::RegExp) {
         return Err(Error::type_error("RegExp.prototype.compile called on an incompatible receiver"));
     }
-    if unsafe { (*as_object(this)).flags } & crate::object::LEGACY_DISABLED != 0 {
+    if Obj::of(this).flags() & crate::object::LEGACY_DISABLED != 0 {
         return Err(Error::type_error("RegExp.prototype.compile called on a subclass's RegExp"));
     }
     if !vm.realms.is_empty() && realm_of(vm, as_object(this)) != vm.realm {
@@ -2804,7 +2804,7 @@ fn plain_last_index(vm: &Vm, this: Value) -> Option<*mut Object> {
 /// `caps`: UpdateLegacyRegExpStaticProperties, or, of a subclass's,
 /// InvalidateLegacyRegExpStaticProperties.
 fn note_legacy(vm: &mut Vm, rx: Value, input: Value, caps: &[Option<(usize, usize)>]) {
-    if rx.is_cell() && unsafe { (*as_object(rx)).flags } & crate::object::LEGACY_DISABLED != 0 {
+    if rx.is_cell() && Obj::of(rx).flags() & crate::object::LEGACY_DISABLED != 0 {
         vm.legacy_valid = false;
         return;
     }
@@ -3400,8 +3400,7 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
-    let func =
-        replacement.is_cell() && matches!(unsafe { (*as_object(replacement)).class }, Class::Function | Class::Native);
+    let func = replacement.is_cell() && matches!(Obj::of(replacement).class(), Class::Function | Class::Native);
     let template = if func { std::borrow::Cow::Borrowed(&[][..]) } else { units(replacement) };
     // The matches: each one's groups.
     let mut flat: crate::regexp::Captures = Vec::new();
@@ -3888,7 +3887,7 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     }
     unsafe {
         let rp = vm.regexp_prototype;
-        if (*as_object(rx)).shape == vm.regexp_shapes.1 && (*rp).shape == vm.regexp_proto_shape {
+        if Obj::of(rx).shape() == vm.regexp_shapes.1 && (*rp).shape == vm.regexp_proto_shape {
             let at = |i: usize| *Object::slot(rp, vm.regexp_slots[i]);
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
             // (An accessor's slot holds its getter-setter pair.)
@@ -4316,7 +4315,7 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
     unsafe {
         let (rp, rc) = (vm.regexp_prototype, vm.regexp_constructor);
         let (ps, cs) = vm.regexp_species_shapes;
-        if (*as_object(r)).shape == vm.regexp_shapes.1 && (*rp).shape == ps && (*rc).shape == cs {
+        if Obj::of(r).shape() == vm.regexp_shapes.1 && (*rp).shape == ps && (*rc).shape == cs {
             let [pl, cl] = vm.regexp_species_slots;
             // (An accessor's slot holds its getter-setter pair.)
             return *Object::slot(rp, pl) == object_value(rc)

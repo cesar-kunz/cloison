@@ -5,7 +5,7 @@
 //! it returns the same way (and turns what is thrown into a `TypeError`).
 
 use crate::interp::call_function;
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, is_callable, is_object};
 use crate::value::Value;
@@ -69,7 +69,7 @@ fn shadow_realm_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// ValidateShadowRealmObject: the realm of ShadowRealm `v`.
 fn realm_of(vm: &mut Vm, v: Value, what: &str) -> Result<u32> {
     if is_object(v)
-        && unsafe { (*as_object(v)).class } == Class::Plain
+        && Obj::of(v).class() == Class::Plain
         && let k = hidden_key(vm)
         && let Some(d) = vm.own_property(as_object(v), k)
         && let Some(r) = d.value.and_then(|r| r.as_number())

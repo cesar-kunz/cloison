@@ -8,7 +8,7 @@ use crate::js::ast::{
     EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_LIVE_THIS,
     EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS,
 };
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::props::Desc;
 use crate::value::Value;
 use crate::vm::{Error, Key, Result, Vm};
@@ -198,7 +198,7 @@ fn spread(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// The elements of array `arr` (made by the front end: dense, its own).
 fn elements(vm: &mut Vm, arr: Value) -> Result<Vec<Value>> {
-    let n = unsafe { (*as_object(arr)).elems_len };
+    let n = Obj::of(arr).elems_len();
     (0..n).map(|i| vm.get_keyed(arr, Value::from_i32(i as i32))).collect()
 }
 
@@ -244,7 +244,7 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
 
 /// [`construct_with`], `args` on the VM stack (or no cell moving).
 fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result<Value> {
-    if f.is_cell() && unsafe { (*as_object(f)).class } == Class::Function {
+    if f.is_cell() && Obj::of(f).class() == Class::Function {
         let o = as_object(f);
         let code = unsafe { &*(*o).code };
         if !code.constructor() {
@@ -292,7 +292,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
             vm.set_prototype_of(as_object(r), proto);
         } else if !vm.realms.is_empty() {
             // (The builtin's prototype of `nt`'s realm.)
-            let own = unsafe { (*(*as_object(r)).shape).proto };
+            let own = unsafe { (*Obj::of(r).shape()).proto };
             let p = crate::realm::default_proto(vm, nt, own)?;
             if p != own {
                 vm.set_prototype_of(as_object(r), p);
@@ -598,7 +598,7 @@ pub(crate) fn get_from(vm: &mut Vm, start: Value, key: Key, receiver: Value) -> 
             }
             return Ok(d.value.unwrap_or(Value::UNDEFINED));
         }
-        o = unsafe { (*(*as_object(o)).shape).proto };
+        o = unsafe { (*Obj::of(o).shape()).proto };
     }
     if o.is_cell() {
         // (A string's prototype chain.)
@@ -612,7 +612,7 @@ fn super_base(home: Value) -> Result<Value> {
     if !crate::props::is_object(home) {
         return Err(Error::type_error("'super' keyword unexpected here"));
     }
-    Ok(unsafe { (*(*as_object(home)).shape).proto })
+    Ok(unsafe { (*Obj::of(home).shape()).proto })
 }
 
 /// `super[key]`: `[home, key, this]`.
@@ -673,7 +673,7 @@ pub(crate) fn ordinary_set(vm: &mut Vm, start: Value, key: Key, v: Value, receiv
             }
             break;
         }
-        o = unsafe { (*(*as_object(o)).shape).proto };
+        o = unsafe { (*Obj::of(o).shape()).proto };
     }
     if !crate::props::is_object(receiver) {
         return Ok(false);
@@ -698,7 +698,7 @@ fn super_call(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !crate::props::is_object(f) {
         return Err(Error::type_error("'super' keyword unexpected here"));
     }
-    let parent = unsafe { (*(*as_object(f)).shape).proto };
+    let parent = unsafe { (*Obj::of(f).shape()).proto };
     if !is_constructor(parent) {
         return Err(Error::type_error(format!(
             "Super constructor {} of anonymous class is not a constructor",
@@ -1338,7 +1338,7 @@ fn scope_delete(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         if vm.own_property(as_object(o), key).is_some() {
             return Ok(Value::from_bool(vm.delete_property(o, a[0])?));
         }
-        o = unsafe { (*(*as_object(o)).shape).proto };
+        o = unsafe { (*Obj::of(o).shape()).proto };
     }
     Ok(Value::TRUE)
 }

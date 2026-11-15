@@ -660,7 +660,7 @@ impl FieldType {
         } else if v.is_cell() {
             // (Not a dictionary shape, changed in place: V8's field types
             // are maps only of stable maps.)
-            let s = unsafe { (*as_object(v)).shape };
+            let s = Obj::of(v).shape();
             if unsafe { (*s).dictionary } { FieldType::Any } else { FieldType::Obj(s) }
         } else {
             FieldType::Any
@@ -696,7 +696,7 @@ pub fn field_fits(want: u64, v: Value) -> bool {
     match want {
         crate::layout::FIELD_INT => v.is_int32(),
         crate::layout::FIELD_NUM => v.is_number(),
-        s => v.is_cell() && unsafe { (*as_object(v)).shape } as u64 == s,
+        s => v.is_cell() && Obj::of(v).shape() as u64 == s,
     }
 }
 
@@ -1421,8 +1421,8 @@ pub fn push_key(v: Value) -> u64 {
         crate::layout::FIELD_INT
     } else if v.is_number() {
         crate::layout::FIELD_NUM
-    } else if v.is_cell() && unsafe { !(*(*as_object(v)).shape).dictionary } {
-        unsafe { (*as_object(v)).shape as u64 }
+    } else if v.is_cell() && unsafe { !(*Obj::of(v).shape()).dictionary } {
+        Obj::of(v).shape() as u64
     } else {
         crate::layout::FIELD_ANY
     }
@@ -1525,6 +1525,74 @@ impl Shape {
 #[inline(always)]
 pub fn as_object(v: Value) -> *mut Object {
     v.to_bits() as *mut Object
+}
+
+/// A cell, as a handle whose header fields read without `unsafe`.
+///
+/// The trust is where one is made: [`Obj::of`] takes a cell value, which
+/// the crate alone makes (`Value::from_bits` is crate-internal, #71) and
+/// which, held by Rust code, the native stack's conservative scan keeps
+/// alive and in place.
+/// The accessors read through the pointer, never through an `&Object`, so
+/// they don't assert the absence of writes elsewhere (the marker thread
+/// reads the header concurrently, the code writes through `*mut Object`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub(crate) struct Obj(std::ptr::NonNull<Object>);
+
+impl Obj {
+    /// `v` as a cell, if it is one.
+    #[inline(always)]
+    pub(crate) fn cell(v: Value) -> Option<Obj> {
+        // (Not 0: `is_cell` excludes it.)
+        v.is_cell().then(|| Obj(unsafe { std::ptr::NonNull::new_unchecked(as_object(v)) }))
+    }
+
+    /// The cell `v` is. Panics if `v` isn't one (where a test of
+    /// `is_cell` came first, the check folds away).
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn of(v: Value) -> Obj {
+        Obj::cell(v).expect("a cell")
+    }
+
+    #[inline(always)]
+    pub(crate) fn ptr(self) -> *mut Object {
+        self.0.as_ptr()
+    }
+
+    #[inline(always)]
+    pub(crate) fn class(self) -> Class {
+        unsafe { (*self.ptr()).class }
+    }
+
+    #[inline(always)]
+    pub(crate) fn flags(self) -> u8 {
+        unsafe { (*self.ptr()).flags }
+    }
+
+    /// A typed array's element type (see [`Object::kind`]).
+    #[inline(always)]
+    pub(crate) fn kind(self) -> u8 {
+        unsafe { (*self.ptr()).kind }
+    }
+
+    #[inline(always)]
+    pub(crate) fn elems_len(self) -> u32 {
+        unsafe { (*self.ptr()).elems_len }
+    }
+
+    /// The word past the header (see [`Object::code`]): only for the
+    /// classes with it.
+    #[inline(always)]
+    pub(crate) fn code(self) -> *const Code {
+        unsafe { (*self.ptr()).code }
+    }
+
+    #[inline(always)]
+    pub(crate) fn shape(self) -> *const Shape {
+        unsafe { (*self.ptr()).shape }
+    }
 }
 
 /// The object `o` as a value. Crate-internal: a cell value is trusted to

@@ -4,7 +4,7 @@
 //! [`install`].
 
 use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
-use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Object, RAW_JSON, as_object, object_value};
+use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, Object, RAW_JSON, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, string_len, string_units, wrapped};
@@ -620,7 +620,7 @@ fn is_raw_json(v: Value) -> bool {
     // (A mapped `arguments` object's `MAPPED` is the bit too: it is never
     // frozen.)
     let both = RAW_JSON | crate::object::FROZEN;
-    is_object(v) && unsafe { (*as_object(v)).class == Class::Plain && (*as_object(v)).flags & both == both }
+    is_object(v) && (Obj::of(v).class() == Class::Plain && Obj::of(v).flags() & both == both)
 }
 
 /// `JSON.rawJSON(text)`: a frozen null-prototype object whose `rawJSON`

@@ -16,7 +16,7 @@
 
 use crate::builtins::{getter, link_constructor};
 use crate::interp::{call_function, to_string_units};
-use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
+use crate::object::{Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm};
@@ -151,7 +151,7 @@ fn put(o: Value, i: usize, v: Value) {
 }
 
 fn len(o: Value) -> usize {
-    unsafe { (*as_object(o)).elems_len as usize }
+    Obj::of(o).elems_len() as usize
 }
 
 const ASYNC_SLOT: usize = 0;
@@ -387,8 +387,8 @@ fn stack_ctor<const ASYNC: bool>(vm: &mut Vm, _: Value, _: &[Value]) -> Result<V
 
 /// `this`'s state, a stack of the kind (`async_`), else a TypeError.
 fn state_of(this: Value, async_: bool, what: &str) -> Result<Value> {
-    if this.is_cell() && unsafe { (*as_object(this)).class } == Class::DisposableStack {
-        let state = Value::from_bits(unsafe { (*as_object(this)).code } as u64);
+    if this.is_cell() && Obj::of(this).class() == Class::DisposableStack {
+        let state = Value::from_bits(Obj::of(this).code() as u64);
         if elem(state, ASYNC_SLOT) == Value::from_bool(async_) {
             return Ok(state);
         }
@@ -437,7 +437,7 @@ fn stack_defer<const ASYNC: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Resu
 fn stack_move<const ASYNC: bool>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let state = live_state(this, ASYNC, "move")?;
     let out = new_stack(vm, ASYNC)?;
-    let to = Value::from_bits(unsafe { (*as_object(out)).code } as u64);
+    let to = Value::from_bits(Obj::of(out).code() as u64);
     put(to, RESOURCES, elem(state, RESOURCES));
     let empty = vm.new_array();
     put(state, RESOURCES, empty);

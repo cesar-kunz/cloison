@@ -17,6 +17,7 @@
 use std::cell::Cell;
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number};
+use crate::object::Obj;
 use crate::object::{
     ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FN_LENGTH_DELETED, FN_NAME_DELETED, FROZEN, FieldType,
     LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, READ_ONLY, SEALED, SPARSE, Shape, Slots, as_object, object_value,
@@ -111,12 +112,12 @@ pub(crate) fn same_value(a: Value, b: Value) -> bool {
 
 /// Whether `v` is callable.
 pub(crate) fn is_callable(v: Value) -> bool {
-    v.is_cell() && matches!(unsafe { (*as_object(v)).class }, Class::Function | Class::Native)
+    v.is_cell() && matches!(Obj::of(v).class(), Class::Function | Class::Native)
 }
 
 /// Whether `v` is an object (not a primitive: strings are cells too).
 pub(crate) fn is_object(v: Value) -> bool {
-    v.is_cell() && !matches!(unsafe { (*as_object(v)).class }, Class::String | Class::Symbol | Class::BigInt)
+    v.is_cell() && !matches!(Obj::of(v).class(), Class::String | Class::Symbol | Class::BigInt)
 }
 
 /// The canonical array index `name` is, if any.
@@ -1222,7 +1223,7 @@ impl Vm {
                 if as_object(p) == o {
                     return false;
                 }
-                p = (*(*as_object(p)).shape).proto;
+                p = (*Obj::of(p).shape()).proto;
             }
             if proto.is_cell() {
                 self.make_prototype(as_object(proto));
@@ -1392,7 +1393,7 @@ impl Vm {
         // up the chain takes.)
         if let Key::Name(name) = key
             && is_object(o)
-            && unsafe { (*as_object(o)).class } == Class::Plain
+            && Obj::of(o).class() == Class::Plain
             && self.realms_empty()
             && name != self.a_length
             && name != self.a_name
@@ -2084,12 +2085,12 @@ fn object_is_prototype_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
         return Ok(Value::FALSE);
     }
     let o = vm.to_object(this)?;
-    let mut p = unsafe { (*(*as_object(v)).shape).proto };
+    let mut p = unsafe { (*Obj::of(v).shape()).proto };
     while p.is_cell() {
         if as_object(p) == o {
             return Ok(Value::TRUE);
         }
-        p = unsafe { (*(*as_object(p)).shape).proto };
+        p = unsafe { (*Obj::of(p).shape()).proto };
     }
     Ok(Value::FALSE)
 }

@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell, UnsafeCell};
 // FxHash: interning the builtins' names at startup was mostly SipHash.
 use crate::jit::{HashMap, HashSet};
+use crate::object::Obj;
 use std::fmt;
 
 use crate::asm::Module;
@@ -4119,7 +4120,7 @@ impl Vm {
         // `jit::MAX_SETTLE`.)
         let room_only = obj.is_cell()
             && unsafe {
-                (*ic).shape == (*as_object(obj)).shape
+                (*ic).shape == Obj::of(obj).shape()
                     && !(*ic).new_shape.is_null()
                     && (*ic).loc < 0
                     && (*ic).epoch == self.proto_epoch
@@ -4481,7 +4482,7 @@ impl Vm {
         } else if v.is_bool() {
             2
         } else if v.is_cell() {
-            match unsafe { (*as_object(v)).class } {
+            match Obj::of(v).class() {
                 Class::String => 3,
                 Class::Function | Class::Native => 4,
                 Class::Symbol => 6,
@@ -4584,9 +4585,9 @@ impl Vm {
         }
         self.check_own(v, "Vm::instance_of");
         self.check_own(f, "Vm::instance_of");
-        let function = f.is_cell() && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
+        let function = f.is_cell() && matches!(Obj::of(f).class(), Class::Function | Class::Native);
         if !function
-            || unsafe { (*as_object(f)).shape } != self.function_shape
+            || Obj::of(f).shape() != self.function_shape
                 && (self.has_instance_defined || self.proxies_exist && crate::proxy::is_proxy(self, as_object(f)))
         {
             return self.instance_of_generic(v, f);
@@ -4621,7 +4622,7 @@ impl Vm {
     /// `instanceof`).
     #[inline(always)]
     pub(crate) fn ordinary_has_instance(&mut self, v: Value, f: Value) -> Result<bool> {
-        let callable = f.is_cell() && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
+        let callable = f.is_cell() && matches!(Obj::of(f).class(), Class::Function | Class::Native);
         if !callable {
             return Ok(false);
         }
@@ -5129,12 +5130,10 @@ impl Vm {
         code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         // A string's elements are code units, not values, and a typed
         // array's or buffer's bytes: recorded as such (`note_bytes`).
-        if obj.is_cell()
-            && unsafe {
-                let c = (*as_object(obj)).class;
-                matches!(c, Class::String | Class::TypedArray) || c.no_elements()
-            }
-        {
+        if obj.is_cell() && {
+            let c = Obj::of(obj).class();
+            matches!(c, Class::String | Class::TypedArray) || c.no_elements()
+        } {
             let (ic, _) = code.ic(ic);
             unsafe { note_bytes(ic, as_object(obj)) };
         } else if obj.is_cell()
@@ -5144,7 +5143,7 @@ impl Vm {
         {
             let (ic, _) = code.ic(ic);
             unsafe {
-                install(ic, Ic { shape: (*as_object(obj)).shape, ..Ic::EMPTY });
+                install(ic, Ic { shape: Obj::of(obj).shape(), ..Ic::EMPTY });
             }
         }
         self.get_keyed(obj, key)
@@ -5317,7 +5316,7 @@ impl Vm {
         };
         if let Some(pair) = self.accessor(holder, name) {
             let g = unsafe { *(*as_object(pair)).elems };
-            if g.is_cell() && unsafe { (*as_object(g)).class } != Class::Native {
+            if g.is_cell() && Obj::of(g).class() != Class::Native {
                 return None;
             }
         }
@@ -7892,7 +7891,7 @@ impl Vm {
     /// Words of in-object storage in `o` (for tests).
     pub fn inline_capacity(&self, o: Value) -> u32 {
         self.check_own(o, "Vm::inline_capacity");
-        unsafe { (*(*as_object(o)).shape).capacity.get() }
+        unsafe { (*Obj::of(o).shape()).capacity.get() }
     }
 }
 
@@ -8493,8 +8492,8 @@ pub(crate) fn wrapped(v: Value) -> Option<Value> {
     if !v.is_cell() {
         return None;
     }
-    let o = as_object(v);
-    unsafe { ((*o).class == Class::Wrapper).then(|| Value::from_bits((*o).code as u64)) }
+    let o = Obj::of(v);
+    (o.class() == Class::Wrapper).then(|| Value::from_bits(o.code() as u64))
 }
 
 /// A mapped `arguments` object (see `Vm::mapped_args`).
@@ -8587,7 +8586,7 @@ fn array_push_method(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> 
 /// Push onto array `this` (as array literals do: elements defined, not
 /// stored through prototypes).
 pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
-    if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
+    if !this.is_cell() || Obj::of(this).class() != Class::Array {
         return array_push_generic(vm, this, args);
     }
     let o = as_object(this);
@@ -8783,8 +8782,8 @@ pub(crate) fn string_len(v: Value) -> Option<usize> {
     if !v.is_cell() {
         return None;
     }
-    let o = as_object(v);
-    unsafe { ((*o).class == Class::String).then(|| (*o).elems_len as usize) }
+    let o = Obj::of(v);
+    (o.class() == Class::String).then(|| o.elems_len() as usize)
 }
 
 /// The most code units a string has: past it, what makes one throws a

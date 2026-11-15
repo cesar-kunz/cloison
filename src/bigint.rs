@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Error, Result, Vm};
 
@@ -508,7 +508,7 @@ impl Big {
 /// Whether `v` is a BigInt.
 #[inline]
 pub(crate) fn is_bigint(v: Value) -> bool {
-    v.is_cell() && unsafe { (*as_object(v)).class } == Class::BigInt
+    v.is_cell() && Obj::of(v).class() == Class::BigInt
 }
 
 /// BigInt `v`'s value.

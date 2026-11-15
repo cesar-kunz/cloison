@@ -5,7 +5,7 @@
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number, to_string_units};
 use crate::layout::{store_word, swap_words};
-use crate::object::{Class, EXTERNAL, Object, PROTOTYPE, as_object, object_value};
+use crate::object::{Class, EXTERNAL, Obj, Object, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
 use crate::vm::{
@@ -202,11 +202,9 @@ fn set_length(vm: &mut Vm, o: Value, n: f64) -> Result<()> {
 fn this_object(vm: &mut Vm, this: Value) -> Result<(Value, f64)> {
     // (An ordinary array's length is its elements' count.)
     if this.is_cell() {
-        let o = as_object(this);
-        unsafe {
-            if (*o).class == Class::Array && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0 {
-                return Ok((this, (*o).elems_len as f64));
-            }
+        let o = Obj::of(this);
+        if o.class() == Class::Array && o.flags() & !(EXTERNAL | PROTOTYPE) == 0 {
+            return Ok((this, o.elems_len() as f64));
         }
     }
     let o = object_value(vm.to_object(this)?);
@@ -279,10 +277,10 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
         return false;
     }
     unsafe {
-        let o = as_object(original);
+        let o = Obj::of(original);
         let ap = vm.array_prototype;
-        let s = &*(*o).shape;
-        if (*o).class != Class::Array || s.proto != object_value(ap) || s.lookup(vm.a_constructor).is_some() {
+        let s = &*o.shape();
+        if o.class() != Class::Array || s.proto != object_value(ap) || s.lookup(vm.a_constructor).is_some() {
             return false;
         }
         let ps = &*(*ap).shape;
@@ -415,7 +413,7 @@ fn array_is_array(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if vm.proxies_exist {
         return crate::proxy::is_array(vm, v).map(Value::from_bool);
     }
-    Ok(Value::from_bool(v.is_cell() && unsafe { (*as_object(v)).class } == Class::Array))
+    Ok(Value::from_bool(v.is_cell() && Obj::of(v).class() == Class::Array))
 }
 
 /// `Array.prototype.join(sep)`: elements' strings (holes, `undefined` and
@@ -571,7 +569,7 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if unsafe { (*obj).class } == Class::Array
             && dense(vm, obj)
             && dense(vm, as_object(out))
-            && unsafe { (*as_object(out)).elems_len } as f64 == n
+            && Obj::of(out).elems_len() as f64 == n
         {
             unsafe {
                 let m = (*obj).elems_len as usize;
@@ -789,7 +787,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if out != o
         && (dense(vm, as_object(o)) || plain_arguments(vm, as_object(o)))
         && dense(vm, as_object(out))
-        && unsafe { (*as_object(o)).elems_len } as f64 == len
+        && Obj::of(o).elems_len() as f64 == len
     {
         let obj = as_object(o);
         let oo = as_object(out);
@@ -856,7 +854,7 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // `length` set would then truncate it before the shift.)
     if removed != o
         && dense(vm, as_object(o))
-        && unsafe { (*as_object(o)).elems_len } as f64 == len
+        && Obj::of(o).elems_len() as f64 == len
         && is_object(removed)
         && dense(vm, as_object(removed))
     {

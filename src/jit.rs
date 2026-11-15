@@ -60,7 +60,7 @@
 use crate::bytecode::Op;
 use crate::interp::{self, Frame, Run};
 use crate::layout::InstanceOfEntry;
-use crate::object::{Atom, Class, FieldType, Object, Shape, page_size};
+use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, page_size};
 use crate::value::{NumberTag, Value};
 
 /// At a full collection, free the versions call sites were bound to before
@@ -1067,7 +1067,7 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
     // tables left at each `this.table[key] = data` once given up on, 391
     // times a run in `find`). If that changed what compiled code relies
     // on (an epoch moved), leave: the interpreter stores again, the same.
-    if o.is_cell() && key.is_cell() && unsafe { (*crate::object::as_object(key)).class } == Class::String {
+    if o.is_cell() && key.is_cell() && Obj::of(key).class() == Class::String {
         let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
         vm.store_failed = false;
         return u64::from(
@@ -1093,33 +1093,31 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
             }
         }
     }
-    unsafe {
-        let p = crate::object::as_object(o);
-        match (*p).class {
-            // A value whose conversion may call code (an object's
-            // `valueOf`, which a runtime call skips, see
-            // `interp::to_primitive_hint`) or throws (a BigInt for a
-            // number's element): the interpreter stores it, before
-            // anything is stored here.
-            Class::TypedArray
-                if v.is_cell()
-                    && !crate::vm::is_string(v)
-                    && !(crate::bigint::is_bigint(v) && crate::object::TypedKind::from_u8((*p).kind).is_big()) =>
-            {
+    let p = Obj::of(o);
+    match p.class() {
+        // A value whose conversion may call code (an object's
+        // `valueOf`, which a runtime call skips, see
+        // `interp::to_primitive_hint`) or throws (a BigInt for a
+        // number's element): the interpreter stores it, before
+        // anything is stored here.
+        Class::TypedArray
+            if v.is_cell()
+                && !crate::vm::is_string(v)
+                && !(crate::bigint::is_bigint(v) && crate::object::TypedKind::from_u8(p.kind()).is_big()) =>
+        {
+            return 0;
+        }
+        Class::TypedArray => {}
+        // (Far past a plain object's elements: a named property, a
+        // transition. An array's far elements are no property: see
+        // `far`.)
+        Class::Plain => {
+            if key.as_i32_unchecked() as usize > p.elems_len() as usize * 2 + 1024 {
                 return 0;
             }
-            Class::TypedArray => {}
-            // (Far past a plain object's elements: a named property, a
-            // transition. An array's far elements are no property: see
-            // `far`.)
-            Class::Plain => {
-                if key.as_i32_unchecked() as usize > (*p).elems_len as usize * 2 + 1024 {
-                    return 0;
-                }
-            }
-            Class::Array => {}
-            _ => return 0,
         }
+        Class::Array => {}
+        _ => return 0,
     }
     // (It may grow the elements: a collection asked for is made first, as
     // compiled code growing an array by index may reach no other
@@ -1156,7 +1154,7 @@ extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
     let name = crate::object::Atom(a[1].to_bits() as u32);
     let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
     vm.store_failed = false;
-    let old = if a[0].is_cell() { unsafe { (*crate::object::as_object(a[0])).shape } } else { std::ptr::null() };
+    let old = if a[0].is_cell() { Obj::of(a[0]).shape() } else { std::ptr::null() };
     let ok = vm.set_named_rt(a[0], name, a[2]).is_some()
         && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
         && !vm.store_failed;
@@ -1189,7 +1187,7 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
                 let cache = &*cache;
                 cache[1].set(cache[0].get());
                 cache[0].set(InstanceOfEntry {
-                    shape: (*crate::object::as_object(v)).shape as u64,
+                    shape: Obj::of(v).shape() as u64,
                     proto: p.to_bits(),
                     result: r.to_bits(),
                 });
@@ -3175,7 +3173,7 @@ fn exact_transition(s: u64, name: Atom) -> Option<Prop> {
     let new = vm.find_transition(shape, name, 0)?;
     let mut p = shape.proto;
     while p.is_cell() {
-        let ps = unsafe { &*(*crate::object::as_object(p)).shape };
+        let ps = unsafe { &*Obj::of(p).shape() };
         if ps.class != Class::Plain {
             return None;
         }
@@ -14308,7 +14306,7 @@ impl Lowering<'_> {
                     let g = self.loaded_value(frame, i.reg2);
                     let is_apply = apply.is_some_and(|v| {
                         crate::builtins::is_class(v, crate::object::Class::Native)
-                            && unsafe { (*crate::object::as_object(v)).code == (*vm).function_apply }
+                            && unsafe { Obj::of(v).code() == (*vm).function_apply }
                     });
                     let (a, n) = f.args;
                     let w = base + unsafe { (*f.code).nregs } as usize;
@@ -14317,8 +14315,7 @@ impl Lowering<'_> {
                             if is_apply
                                 && w + 1 + (n as usize) <= 256
                                 && g.is_cell()
-                                && unsafe { (*crate::object::as_object(g)).class }
-                                    == crate::object::Class::Function =>
+                                && Obj::of(g).class() == crate::object::Class::Function =>
                         {
                             let w = w as u8;
                             self.mov(frame, i.pc, Some(i.reg2 + 1), w);
@@ -16038,7 +16035,7 @@ impl Lowering<'_> {
             }
             let at = Object::slot(h, s.location(slot));
             let fv = *(*as_object(*at)).elems.add(usize::from(set));
-            if !fv.is_cell() || (*as_object(fv)).class != Class::Function {
+            if !fv.is_cell() || Obj::of(fv).class() != Class::Function {
                 return None;
             }
             let fo = as_object(fv);
@@ -17781,7 +17778,7 @@ unsafe fn materialize(
         let Some(array) = regs_of()
             .filter(|&r| rs_has(&live, r))
             .map(|r| unsafe { *at.add(r) })
-            .find(|v| v.is_cell() && unsafe { (*crate::object::as_object(*v)).class } == crate::object::Class::Array)
+            .find(|v| v.is_cell() && Obj::of(*v).class() == crate::object::Class::Array)
         else {
             continue;
         };
@@ -18305,12 +18302,12 @@ extern "C" fn cloison_rt_call(regs: Value, site: Value) -> Value {
             && matches!(site.op, Op::Call | Op::CallUndefined)
             && !site.self_call
             && fv.is_cell()
-            && (*crate::object::as_object(fv)).class == crate::object::Class::Function
+            && Obj::of(fv).class() == crate::object::Class::Function
             && site.closure
-                != if site.by_code { (*crate::object::as_object(fv)).code as u64 } else { fv.to_bits() }
+                != if site.by_code { Obj::of(fv).code() as u64 } else { fv.to_bits() }
             // (A site bound to a closure writes that one to the callee's
             // frame header, if any: a callee with upvalues reads it.)
-            && (site.by_code || (&(*(*crate::object::as_object(fv)).code).upvalues).is_empty())
+            && (site.by_code || (&(*Obj::of(fv).code()).upvalues).is_empty())
         {
             site.misses += 1;
             if site.misses >= DISPATCH_AFTER { site.dispatched(fv) } else { site }

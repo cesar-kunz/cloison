@@ -3275,7 +3275,7 @@ impl Vm {
         let mut top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
         for a in (sp..self.heap.gc.stack_base).step_by(8) {
             let w = unsafe { *(a as *const usize) };
-            if (stack..stack_end).contains(&w) {
+            if points_into_vm_stack(w, stack, stack_end) {
                 top = top.max(w);
             }
         }
@@ -3308,7 +3308,7 @@ impl Vm {
             let base = self.heap.gc.stack_base;
             for a in (sp..base).step_by(8) {
                 let w = *(a as *const usize);
-                if (stack..stack_end).contains(&w) {
+                if points_into_vm_stack(w, stack, stack_end) {
                     top = top.max(w);
                 } else {
                     self.mark_interior(m, w);
@@ -4580,7 +4580,7 @@ impl Vm {
             let mut top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
             for a in (sp..self.heap.gc.stack_base).step_by(8) {
                 let w = *(a as *const usize);
-                if (stack..stack_end).contains(&w) {
+                if points_into_vm_stack(w, stack, stack_end) {
                     top = top.max(w);
                 } else if let Some(p) = self.heap.cell_containing(w) {
                     f(Root::Pinned(p));
@@ -5281,6 +5281,16 @@ impl Heap {
             }
         }
     }
+}
+
+/// Whether native stack word `w` may point into the VM stack
+/// (`stack..stack_end`): to a register, so at a `Value`'s alignment. (An
+/// integer whose high half is the stack's falls in the range now and then,
+/// where the stack lies just below a 4 GiB boundary: `0x…ffffffff`, two
+/// `u32`s. Taken for a frame's, it had a collection read the stale frames
+/// up to it, and keep what they held.)
+fn points_into_vm_stack(w: usize, stack: usize, stack_end: usize) -> bool {
+    w.is_multiple_of(std::mem::align_of::<Value>()) && (stack..stack_end).contains(&w)
 }
 
 #[cfg(test)]

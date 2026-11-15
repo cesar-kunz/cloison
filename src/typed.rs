@@ -994,7 +994,7 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, n: Option
 /// in `Vm::handles`: the caller's in a handle scope).
 fn iterate_with(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
     // (An array or a typed array the builtins iterate: its elements.)
-    if let Some(values) = crate::symbol::dense_values(vm, v) {
+    if let Some(values) = crate::symbol::dense_values(vm, v, m) {
         vm.handles.extend_from_slice(&values);
         return Ok(values);
     }

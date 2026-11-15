@@ -981,14 +981,15 @@ fn iterates_as_typed(vm: &mut Vm, v: Value) -> bool {
     protector(vm) & ITER_TYPED != 0
 }
 
-/// The values iterating `v` gives, when it is an array with no holes or
-/// a typed array in bounds that the builtins iterate: nothing of the
-/// iteration is observable then.
-pub(crate) fn dense_values(vm: &mut Vm, v: Value) -> Option<Vec<Value>> {
-    if iterates_as_typed(vm, v) {
+/// The values iterating `v` with its `@@iterator` method `m` gives, when
+/// it is an array with no holes or a typed array in bounds that the
+/// builtins iterate, `m` theirs: nothing of the iteration is observable
+/// then. (`m` read before: a getter of it may have changed `v`.)
+pub(crate) fn dense_values(vm: &mut Vm, v: Value, m: Value) -> Option<Vec<Value>> {
+    if is_native(vm, m, crate::typed::typed_values) && iterates_as_typed(vm, v) {
         return crate::typed::elements(vm, as_object(v));
     }
-    if !iterates_as_array(vm, v) {
+    if !is_native(vm, m, array_values) || !iterates_as_array(vm, v) {
         return None;
     }
     let s = as_object(v);

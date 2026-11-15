@@ -7,7 +7,7 @@
 // buffers, iteration replaced and restored.
 // The lines' count and a hash of them (`all`), as V8 and SpiderMonkey give
 // them (JavaScriptCore but for three of its own).
-// expect: 691:160622312
+// expect: 693:-2085273064
 var out = [];
 function show(v) {
   if (typeof v === 'bigint') return v + 'n';
@@ -107,6 +107,11 @@ t('TA iterator', function () { TA[Symbol.iterator] = gen; try { return [Array.fr
 t('restored 2', function () { return [Array.from(u), [...u], Uint16Array.from(u)]; });
 t('TA iterator deleted', function () { delete TA[Symbol.iterator]; try { return [Array.from(u), Uint16Array.from(u)]; } finally { Object.defineProperty(TA, Symbol.iterator, { value: orig, writable: true, configurable: true }); } });
 t('TA iterator deleted spread', function () { delete TA[Symbol.iterator]; try { return [...u]; } finally { Object.defineProperty(TA, Symbol.iterator, { value: orig, writable: true, configurable: true }); } });
+// The method read, then gone: the one read is the one called.
+function selfDeleting(v) { Object.defineProperty(v, Symbol.iterator, { configurable: true, get: function () { delete v[Symbol.iterator]; return function* () { yield 9; }; } }); return v; }
+t('getter deletes itself', function () { return [new Uint8Array(selfDeleting([1, 2])), Uint8Array.from(selfDeleting([1, 2])), new Uint8Array(selfDeleting(new Uint8Array([1, 2]))), Uint8Array.from(selfDeleting(new Int8Array([1, 2])))]; });
+function arm(P, o) { Object.defineProperty(P, Symbol.iterator, { configurable: true, get: function () { Object.defineProperty(P, Symbol.iterator, { value: o, writable: true, configurable: true }); return function* () { yield 9; }; } }); }
+t('getter restores the builtin', function () { var r = []; arm(Array.prototype, Array.prototype[Symbol.iterator]); r.push(new Uint8Array([1, 2])); arm(Array.prototype, Array.prototype[Symbol.iterator]); r.push(Uint8Array.from([1, 2])); arm(TA, orig); r.push(Uint8Array.from(new Int8Array([1, 2]))); return r; });
 var AIP = Object.getPrototypeOf([][Symbol.iterator]()), next = AIP.next;
 t('next changed', function () { var n = 0; AIP.next = function () { return n++ < 2 ? { value: 40 + n, done: false } : { done: true }; }; try { return [Array.from(u)]; } finally { AIP.next = next; } });
 t('next changed ctor', function () { var n = 0; AIP.next = function () { return n++ < 2 ? { value: 40 + n, done: false } : { done: true }; }; try { return [new Uint8Array([5, 6, 7])]; } finally { AIP.next = next; } });

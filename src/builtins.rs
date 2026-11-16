@@ -2554,7 +2554,11 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
     // The shape with both found once: then only their stores.
     let root = o.shape();
     if vm.regexp_shapes.0 == root {
-        crate::object::set_shape(o, vm.regexp_shapes.1);
+        // SAFETY: the cached shape is a RegExp's with these two slots, and
+        // `o` was made with room for three in the object. (Not
+        // `set_shape`: its checks cost 0.5% instructions on Octane's
+        // RegExp, which makes one of these per literal evaluated.)
+        unsafe { crate::object::set_shape_unchecked(o, vm.regexp_shapes.1) };
         for (slot, (_, v)) in props.into_iter().enumerate() {
             vm.store_field(o, slot as u32, v);
         }
@@ -2749,7 +2753,7 @@ fn regexp_match_into<'a>(
     let plain = plain_last_index(vm, this);
     // (`lastIndex` read and converted even when not used.)
     let li = match plain {
-        Some(o) => o.slot_value(o.shape().live().location(0)),
+        Some(o) => o.field(0),
         None => vm.get(this, a_last)?,
     };
     // (Read and converted with no user code run: a data property holding
@@ -3910,7 +3914,7 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     // Whether slot `slot` of `h` holds `regexp_fns[i]` (a getter's from 6
     // on).
     let builtin = |vm: &Vm, h: *mut Object, slot: u32, i: usize| unsafe {
-        let v = h.slot_value(h.shape().live().location(slot));
+        let v = h.field(slot);
         let v = match (vm.is_accessor(h, slot), i >= 6) {
             (true, true) => *as_object(v).elems(),
             (false, false) => v,

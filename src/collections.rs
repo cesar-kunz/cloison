@@ -446,7 +446,7 @@ fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
 fn remove(o: *mut Object, i: usize) {
     let e = entries(o);
     for j in 0..stride(o) {
-        e.set_elem(i + j, Value::EMPTY);
+        e.clear_elem(i + j);
     }
     put(e, COUNT, Value::from_i32(int(e, COUNT) - 1));
 }
@@ -648,7 +648,7 @@ fn map_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn clear(vm: &mut Vm, o: *mut Object) -> Result<()> {
     let e = entries(o);
     for i in BASE..len(e) {
-        e.set_elem(i, Value::EMPTY);
+        e.clear_elem(i);
     }
     move_entries(vm, o)
 }

@@ -5,7 +5,7 @@
 3 src/bigint.rs
 4 src/bin/cloison.rs
 2 src/bin/dispatch_bench.rs
-17 src/builtins.rs
+18 src/builtins.rs
 11 src/collections.rs
 7 src/date.rs
 5 src/dispose.rs
@@ -37,4 +37,4 @@
 2 src/temporal/mod.rs
 39 src/typed.rs
 1 src/value.rs
-135 src/vm.rs
+137 src/vm.rs

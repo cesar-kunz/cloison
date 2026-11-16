@@ -937,7 +937,7 @@ impl Vm {
                         self.grow_elements(o, i as usize + 1)?;
                     }
                     if i < o.elems_len() && Self::has_element(o, i) {
-                        o.set_elem(i as usize, Value::EMPTY);
+                        o.clear_elem(i as usize);
                     }
                     if crate::far::is_far(o) {
                         crate::far::remove(o, i);
@@ -1137,7 +1137,7 @@ impl Vm {
                     if o.flags() & SEALED != 0 {
                         return false;
                     }
-                    o.set_elem(i as usize, Value::EMPTY);
+                    o.clear_elem(i as usize);
                     return true;
                 }
                 if crate::far::is_far(o) && crate::far::has(o, i) {
@@ -1902,7 +1902,7 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
     {
         return Ok(vm.array_of_with(slots.len(), |vm, i| {
             let k = slots[i];
-            let value = |o: *mut Object| o.slot_value(o.shape().live().location(k));
+            let value = |o: *mut Object| o.field(k);
             if !entries {
                 return value(o);
             }

@@ -614,7 +614,7 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
             return Ok(Value::UNDEFINED);
         }
         let v = o.elem(len - 1);
-        o.set_elem(len - 1, Value::EMPTY);
+        o.clear_elem(len - 1);
         o.set_elems_len((len - 1) as u32);
         return Ok(if v == Value::EMPTY { Value::UNDEFINED } else { v });
     }
@@ -693,7 +693,7 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             let n = obj.elems_len() as usize;
             let first = obj.elem(0);
             vm.heap.move_values(obj.elems().add(1), obj.elems(), n - 1);
-            obj.set_elem(n - 1, Value::EMPTY);
+            obj.clear_elem(n - 1);
             obj.set_elems_len((n - 1) as u32);
             for i in 0..n - 1 {
                 let v = obj.elem(i);
@@ -733,7 +733,7 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 vm.reserve_elems(obj, m + a.len());
                 vm.heap.move_values(obj.elems(), obj.elems().add(a.len()), m);
                 for (i, &v) in a.iter().enumerate() {
-                    obj.set_elem(i, Value::EMPTY);
+                    obj.clear_elem(i);
                     vm.store_element(obj, i, v);
                 }
                 obj.set_elems_len((m + a.len()) as u32);
@@ -851,14 +851,15 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     {
         let obj = as_object(o);
         let ro = as_object(removed);
+        // (Raw in the loops: a dense array, its length checked above.)
         unsafe {
             let (start, del) = (start as usize, del as usize);
             let m = obj.elems_len() as usize;
             vm.reserve_elems(ro, del);
             for i in 0..del {
-                let v = obj.elem(start + i);
+                let v = *obj.elems().add(start + i);
                 if v == Value::EMPTY {
-                    ro.set_elem(i, Value::EMPTY);
+                    crate::layout::store_word(ro.elems().add(i), Value::EMPTY);
                 } else {
                     vm.store_element(ro, i, v);
                 }
@@ -868,13 +869,13 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             vm.reserve_elems(obj, new_len);
             vm.heap.move_values(obj.elems().add(start + del), obj.elems().add(start + items.len()), m - start - del);
             for (i, &v) in items.iter().enumerate() {
-                obj.set_elem(start + i, Value::EMPTY);
+                crate::layout::store_word(obj.elems().add(start + i), Value::EMPTY);
                 vm.store_element(obj, start + i, v);
             }
             vm.heap.fill_values(obj.elems().add(new_len), m.saturating_sub(new_len), Value::EMPTY);
             obj.set_elems_len(new_len as u32);
             for i in start + items.len()..new_len {
-                let v = obj.elem(i);
+                let v = *obj.elems().add(i);
                 crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
             }
         }

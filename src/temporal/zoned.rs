@@ -6,6 +6,7 @@ use super::fields::{self, Field, Required};
 use super::iso::{self, DateTime, RoundingMode, Unit};
 use super::plain::{self, date_getter, time_getter};
 use super::*;
+use crate::object::Obj;
 
 /// ToBigInt of `v`, as an exact time in range (a RangeError if not).
 fn to_epoch_ns(vm: &mut Vm, v: Value) -> Result<i128> {
@@ -689,7 +690,7 @@ pub(crate) fn install_now(vm: &mut Vm, temporal: *mut Object) {
             ("zonedDateTimeISO", now_zoned, 0),
         ],
     );
-    crate::symbol::to_string_tag(vm, now, "Temporal.Now");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(now) }, "Temporal.Now");
     let dp = vm.date_prototype;
     vm.define_natives(dp, &[("toTemporalInstant", to_temporal_instant as NativeFn, 0)]);
 }

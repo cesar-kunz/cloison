@@ -16,7 +16,7 @@ mod segmenter;
 use crate::raw::Live;
 use std::collections::HashMap;
 
-use crate::object::{DONT_ENUM, Object, object_value};
+use crate::object::{DONT_ENUM, Obj, Object, object_value};
 use crate::props::is_object;
 use crate::temporal::to_rust_string;
 use crate::value::Value;
@@ -66,7 +66,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let intl = vm.new_object(op);
     let a = vm.intern_name("Intl");
     vm.add_property_with(g, a, object_value(intl), DONT_ENUM);
-    crate::symbol::to_string_tag(vm, intl, "Intl");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(intl) }, "Intl");
     vm.intl_roots = vec![std::ptr::null_mut(); 5];
     collator::install(vm, intl);
     segmenter::install(vm, intl);
@@ -92,13 +92,13 @@ enum Kind {
 fn create(vm: &mut Vm, proto: Value, kind: Kind, slots: &[Value]) -> Value {
     let full = vm.root_shape(crate::object::Class::Intl, proto, slots.len() as u32 + 1);
     let bare = vm.root_shape(crate::object::Class::Intl, proto, 0);
-    let o = vm.heap.alloc_object(full.live());
-    crate::object::set_shape(o, bare);
+    let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(full.live())) };
+    crate::object::set_shape(o.ptr(), bare);
     crate::promise::set_slot(o, 0, Value::from_i32(kind as i32));
     for (i, &v) in slots.iter().enumerate() {
         crate::promise::set_slot(o, i + 1, v);
     }
-    object_value(o)
+    object_value(o.ptr())
 }
 
 /// `v` as the `Intl` object of kind `kind` it is (RequireInternalSlot),
@@ -114,7 +114,7 @@ fn require(v: Value, kind: Kind, method: &str) -> Result<*mut Object> {
 
 /// Internal slot `i` of `Intl` object `o`.
 fn slot(o: *mut Object, i: usize) -> Value {
-    crate::promise::slot(o, i)
+    crate::promise::slot(unsafe { Obj::from_ptr(o) }, i)
 }
 
 // ---- Locales ----

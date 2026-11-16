@@ -171,9 +171,9 @@ pub(crate) fn new_with_resolvers(vm: &mut Vm) -> (Value, Value, Value) {
 /// for the reactions' results, which nothing reads; with it, a pending
 /// `async` call kept two promises).
 pub(crate) fn await_then(vm: &mut Vm, v: Value, on_fulfilled: Value, on_rejected: Value) -> Result<()> {
-    let c = object_value(root(vm, Root::Constructor));
+    let c = object_value(root(vm, Root::Constructor).ptr());
     let p = promise_resolve_with(vm, c, v)?;
-    perform_then(vm, as_object(p), on_fulfilled, on_rejected, &Cap::NONE)
+    perform_then(vm, Obj::of(p), on_fulfilled, on_rejected, &Cap::NONE)
 }
 
 /// `await v` of coroutine `g` (an async function's or async generator's):
@@ -183,20 +183,20 @@ pub(crate) fn await_then(vm: &mut Vm, v: Value, on_fulfilled: Value, on_rejected
 /// tells a coroutine from a handler (no handler is a generator object: it
 /// isn't callable).
 pub(crate) fn await_coroutine(vm: &mut Vm, v: Value, g: Value) -> Result<()> {
-    let c = object_value(root(vm, Root::Constructor));
+    let c = object_value(root(vm, Root::Constructor).ptr());
     let p = promise_resolve_with(vm, c, v)?;
-    perform_reaction(vm, as_object(p), g, g, &Cap::NONE)
+    perform_reaction(vm, Obj::of(p), g, g, &Cap::NONE)
 }
 
 /// Resolve `p`, %Promise%'s, with `v`, as its resolve function would (an
 /// async function's promise, which has none: nothing else can resolve it).
 pub(crate) fn resolve_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
-    resolve_promise(vm, as_object(p), v)
+    resolve_promise(vm, Obj::of(p), v)
 }
 
 /// Reject `p`, %Promise%'s, with `v` (see [`resolve_own`]).
 pub(crate) fn reject_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
-    settle(vm, as_object(p), REJECTED, v)
+    settle(vm, Obj::of(p), REJECTED, v)
 }
 
 /// AsyncFromSyncIterator's promise of a step's value `v`:
@@ -206,7 +206,7 @@ pub(crate) fn reject_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
 /// first (unless undefined: the iterator done, or a `return()`'s value).
 /// (AsyncFromSyncIteratorContinuation, `closeOnRejection`.)
 pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, record: Value, close: Value) -> Result<Value> {
-    let c = object_value(root(vm, Root::Constructor));
+    let c = object_value(root(vm, Root::Constructor).ptr());
     let wrapper = match promise_resolve_with(vm, c, v) {
         Ok(w) => w,
         Err(e) => {
@@ -224,7 +224,7 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, record: Value, close: Value
     // (Its `onFulfilled`'s iterator result: the record for `resolve`, see
     // `cap_resolve`.)
     let cap = Cap { promise: new_promise(vm), resolve: record, reject: Value::UNDEFINED };
-    perform_then(vm, as_object(wrapper), Value::UNDEFINED, on_rejected, &cap)?;
+    perform_then(vm, Obj::of(wrapper), Value::UNDEFINED, on_rejected, &cap)?;
     Ok(cap.promise)
 }
 
@@ -240,7 +240,7 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, record: Value, close: Value
 /// marked for the consumers to read what `p` gives as an iterator result
 /// (`symbol::set_sync_result`): a `then` getter may have changed it, or
 /// keep it.
-pub(crate) fn resolve_iter_result(vm: &mut Vm, p: *mut Object, v: Value, record: Value) -> Result<()> {
+pub(crate) fn resolve_iter_result(vm: &mut Vm, p: Obj, v: Value, record: Value) -> Result<()> {
     let a_then = vm.a_then;
     if vm.lookup(vm.object_prototype, a_then).is_none() {
         return settle(vm, p, FULFILLED, v);
@@ -257,14 +257,14 @@ pub(crate) fn resolve_iter_result(vm: &mut Vm, p: *mut Object, v: Value, record:
     if !is_callable(then) {
         return settle(vm, p, FULFILLED, r);
     }
-    enqueue(vm, [Value::from_i32(THENABLE), object_value(p), r, then, Value::UNDEFINED, Value::UNDEFINED])
+    enqueue(vm, [Value::from_i32(THENABLE), object_value(p.ptr()), r, then, Value::UNDEFINED, Value::UNDEFINED])
 }
 
 /// A promise resolved as [`resolve_iter_result`] of `v` and sync record
 /// `record` resolves it.
 pub(crate) fn iter_result_promise(vm: &mut Vm, v: Value, record: Value) -> Result<Value> {
     let p = new_promise(vm);
-    resolve_iter_result(vm, as_object(p), v, record)?;
+    resolve_iter_result(vm, Obj::of(p), v, record)?;
     Ok(p)
 }
 
@@ -272,14 +272,14 @@ pub(crate) fn iter_result_promise(vm: &mut Vm, v: Value, record: Value) -> Resul
 pub(crate) fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
     let reason = thrown(vm, e)?;
     let p = new_promise(vm);
-    settle(vm, as_object(p), REJECTED, reason)?;
+    settle(vm, Obj::of(p), REJECTED, reason)?;
     Ok(p)
 }
 
 /// [`async_from_sync`]'s rejection handler: the iterator in slot 0
 /// closed (its own errors lost), the reason thrown on.
 fn close_on_rejection(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let _ = crate::symbol::close(vm, slot(vm.callee, 0));
+    let _ = crate::symbol::close(vm, slot(unsafe { Obj::from_ptr(vm.callee) }, 0));
     Err(Error::thrown(arg(a, 0)))
 }
 
@@ -294,13 +294,13 @@ fn string(vm: &mut Vm, s: &str) -> Value {
     vm.new_string(&u)
 }
 
-fn root(vm: &Vm, r: Root) -> *mut Object {
-    vm.promise_roots[r as usize]
+fn root(vm: &Vm, r: Root) -> Obj {
+    unsafe { Obj::from_ptr(vm.promise_roots[r as usize]) }
 }
 
 /// Whether `v` is `Promise` itself.
 fn is_intrinsic(vm: &Vm, v: Value) -> bool {
-    v.is_cell() && as_object(v) == root(vm, Root::Constructor)
+    v.is_cell() && as_object(v) == root(vm, Root::Constructor).ptr()
 }
 
 fn is_constructor(v: Value) -> bool {
@@ -330,17 +330,17 @@ fn type_error(vm: &mut Vm, message: &str) -> Value {
     make_error(vm, 1, Some(&m))
 }
 
-fn len(e: *mut Object) -> usize {
+fn len(e: Obj) -> usize {
     e.elems_len() as usize
 }
 
 /// Element `i` of array `e` (within its length).
-fn elem(e: *mut Object, i: usize) -> Value {
+fn elem(e: Obj, i: usize) -> Value {
     e.elem(i)
 }
 
 /// Set element `i` of array `e` (within its length) to `v`.
-fn put(e: *mut Object, i: usize, v: Value) {
+fn put(e: Obj, i: usize, v: Value) {
     unsafe {
         let at = e.elems().add(i);
         crate::heap::store(e.elems().cast::<u8>().sub(8), at, v);
@@ -348,11 +348,11 @@ fn put(e: *mut Object, i: usize, v: Value) {
 }
 
 /// Drop array `e`'s elements from `n` on.
-fn truncate(e: *mut Object, n: usize) {
+fn truncate(e: Obj, n: usize) {
     for i in n..len(e) {
         put(e, i, Value::UNDEFINED);
     }
-    unsafe { (*e).elems_len = n as u32 };
+    unsafe { (*e.ptr()).elems_len = n as u32 };
 }
 
 // ---- Closures ----
@@ -370,7 +370,7 @@ fn closure(vm: &mut Vm, template: Root, data: &[Value]) -> Value {
 
 /// A closure of native function `template`'s code (see [`closure`]),
 /// which reads `data` with [`slot`].
-pub(crate) fn native_closure(vm: &mut Vm, template: *mut Object, data: &[Value]) -> Value {
+pub(crate) fn native_closure(vm: &mut Vm, template: Obj, data: &[Value]) -> Value {
     let fp = object_value(vm.function_prototype);
     let full = vm.root_shape(Class::Native, fp, data.len() as u32);
     let bare = vm.root_shape(Class::Native, fp, 0);
@@ -379,7 +379,7 @@ pub(crate) fn native_closure(vm: &mut Vm, template: *mut Object, data: &[Value])
         crate::object::set_shape(o, bare);
         (*o).code = template.code();
         for (i, &v) in data.iter().enumerate() {
-            set_slot(o, i, v);
+            set_slot(Obj::from_ptr(o), i, v);
         }
     }
     object_value(o)
@@ -394,17 +394,18 @@ pub(crate) fn binding_accessor(vm: &mut Vm, setter: bool, data: &[Value]) -> Val
 
 /// Whether `v` is a direct `eval`'s binding's getter.
 pub(crate) fn is_binding_get(vm: &Vm, v: Value) -> bool {
-    crate::builtins::is_class(v, Class::Native) && unsafe { Obj::of(v).code() == (*root(vm, Root::BindingGet)).code }
+    crate::builtins::is_class(v, Class::Native)
+        && unsafe { Obj::of(v).code() == (*root(vm, Root::BindingGet).ptr()).code }
 }
 
-pub(crate) fn slot(o: *mut Object, i: usize) -> Value {
-    unsafe { *Object::inline(o, i) }
+pub(crate) fn slot(o: Obj, i: usize) -> Value {
+    unsafe { *Object::inline(o.ptr(), i) }
 }
 
-pub(crate) fn set_slot(o: *mut Object, i: usize, v: Value) {
+pub(crate) fn set_slot(o: Obj, i: usize, v: Value) {
     unsafe {
-        let at = Object::inline(o, i);
-        crate::heap::store(o.cast(), at, v);
+        let at = Object::inline(o.ptr(), i);
+        crate::heap::store(o.ptr().cast(), at, v);
     }
 }
 
@@ -412,7 +413,7 @@ pub(crate) fn set_slot(o: *mut Object, i: usize, v: Value) {
 
 /// A new pending promise (of `Promise.prototype`).
 pub(crate) fn new_promise(vm: &mut Vm) -> Value {
-    let proto = object_value(root(vm, Root::Prototype));
+    let proto = object_value(root(vm, Root::Prototype).ptr());
     let o = vm.new_object_with(Class::Promise, proto, 0);
     let st = vm.heap.alloc_values(3);
     unsafe {
@@ -424,12 +425,12 @@ pub(crate) fn new_promise(vm: &mut Vm) -> Value {
 
 /// Promise `p`'s state (pending 0, fulfilled 1, rejected 2) and result.
 pub(crate) fn state(p: Value) -> (i32, Value) {
-    let e = cells(as_object(p));
+    let e = cells(Obj::of(p));
     (cell(e, STATE).as_i32_unchecked(), cell(e, RESULT))
 }
 
 /// Promise `p`'s state's cells (see [`STATE`]).
-fn cells(p: *mut Object) -> *mut Value {
+fn cells(p: Obj) -> *mut Value {
     p.code() as *mut Value
 }
 
@@ -443,9 +444,9 @@ fn put_cell(e: *mut Value, i: usize, v: Value) {
     }
 }
 
-fn this_promise(this: Value, what: &str) -> Result<*mut Object> {
+fn this_promise(this: Value, what: &str) -> Result<Obj> {
     if is_class(this, Class::Promise) {
-        Ok(as_object(this))
+        Ok(Obj::of(this))
     } else {
         Err(Error::type_error(format!("{what} called on incompatible receiver {}", crate::vm::shown(this))))
     }
@@ -453,7 +454,7 @@ fn this_promise(this: Value, what: &str) -> Result<*mut Object> {
 
 /// FulfillPromise or RejectPromise: pending `p` settles with `value`, and
 /// its reactions' jobs queue (the ones of the new state's kind run).
-fn settle(vm: &mut Vm, p: *mut Object, state: i32, value: Value) -> Result<()> {
+fn settle(vm: &mut Vm, p: Obj, state: i32, value: Value) -> Result<()> {
     let e = cells(p);
     if cell(e, STATE).as_i32_unchecked() != PENDING {
         return Ok(());
@@ -465,7 +466,7 @@ fn settle(vm: &mut Vm, p: *mut Object, state: i32, value: Value) -> Result<()> {
         return Ok(());
     }
     put_cell(e, REACTIONS, Value::UNDEFINED);
-    let r = as_object(list);
+    let r = Obj::of(list);
     let mut i = 0;
     while i + REACTION <= len(r) {
         let (promise, resolve, reject) = (elem(r, i), elem(r, i + 1), elem(r, i + 2));
@@ -479,8 +480,8 @@ fn settle(vm: &mut Vm, p: *mut Object, state: i32, value: Value) -> Result<()> {
 /// The resolve function's work (§27.2.1.3.2 from step 7): `p` fulfills
 /// with `resolution` unless that is a thenable, which a job will follow
 /// (or `p` itself, a TypeError).
-fn resolve_promise(vm: &mut Vm, p: *mut Object, resolution: Value) -> Result<()> {
-    if resolution.is_cell() && as_object(resolution) == p {
+fn resolve_promise(vm: &mut Vm, p: Obj, resolution: Value) -> Result<()> {
+    if resolution.is_cell() && as_object(resolution) == p.ptr() {
         let e = type_error(vm, "Chaining cycle detected for promise #<Promise>");
         return settle(vm, p, REJECTED, e);
     }
@@ -498,7 +499,10 @@ fn resolve_promise(vm: &mut Vm, p: *mut Object, resolution: Value) -> Result<()>
     if !is_callable(then) {
         return settle(vm, p, FULFILLED, resolution);
     }
-    enqueue(vm, [Value::from_i32(THENABLE), object_value(p), resolution, then, Value::UNDEFINED, Value::UNDEFINED])
+    enqueue(
+        vm,
+        [Value::from_i32(THENABLE), object_value(p.ptr()), resolution, then, Value::UNDEFINED, Value::UNDEFINED],
+    )
 }
 
 /// CreateResolvingFunctions: a resolve and a reject function for
@@ -507,25 +511,25 @@ fn resolve_promise(vm: &mut Vm, p: *mut Object, resolution: Value) -> Result<()>
 fn resolving_functions(vm: &mut Vm, promise: Value) -> (Value, Value) {
     let resolve = closure(vm, Root::ResolveFn, &[promise, Value::UNDEFINED, Value::FALSE]);
     let reject = closure(vm, Root::RejectFn, &[promise, resolve, Value::FALSE]);
-    set_slot(as_object(resolve), 1, reject);
+    set_slot(Obj::of(resolve), 1, reject);
     (resolve, reject)
 }
 
 /// The resolving function now called, if neither of its pair was called
 /// before (both are marked called).
-fn take_pair(vm: &mut Vm) -> Option<*mut Object> {
-    let me = vm.callee;
+fn take_pair(vm: &mut Vm) -> Option<Obj> {
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     if slot(me, 2) == Value::TRUE {
         return None;
     }
     set_slot(me, 2, Value::TRUE);
-    set_slot(as_object(slot(me, 1)), 2, Value::TRUE);
+    set_slot(Obj::of(slot(me, 1)), 2, Value::TRUE);
     Some(me)
 }
 
 fn resolve_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if let Some(me) = take_pair(vm) {
-        let p = as_object(slot(me, 0));
+        let p = Obj::of(slot(me, 0));
         resolve_promise(vm, p, arg(a, 0))?;
     }
     Ok(Value::UNDEFINED)
@@ -533,7 +537,7 @@ fn resolve_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn reject_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if let Some(me) = take_pair(vm) {
-        let p = as_object(slot(me, 0));
+        let p = Obj::of(slot(me, 0));
         settle(vm, p, REJECTED, arg(a, 0))?;
     }
     Ok(Value::UNDEFINED)
@@ -571,7 +575,7 @@ fn new_capability(vm: &mut Vm, c: Value) -> Result<Cap> {
     }
     let executor = closure(vm, Root::Executor, &[Value::UNDEFINED, Value::UNDEFINED]);
     let promise = construct(vm, c, executor)?;
-    let eo = as_object(executor);
+    let eo = Obj::of(executor);
     let (resolve, reject) = (slot(eo, 0), slot(eo, 1));
     if !is_callable(resolve) {
         return Err(Error::type_error("Promise resolve function is not callable"));
@@ -600,7 +604,7 @@ fn construct(vm: &mut Vm, c: Value, executor: Value) -> Result<Value> {
 /// The capability's executor: keeps the resolve and reject functions it
 /// is called with (slots 0 and 1), once.
 fn executor_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let me = vm.callee;
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     if !slot(me, 0).is_undefined() {
         return Err(Error::type_error("Promise executor has already been invoked with non-undefined arguments"));
     }
@@ -628,14 +632,14 @@ fn cap_resolve(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
         return Ok(());
     }
     if cap.resolve.is_undefined() {
-        return resolve_promise(vm, as_object(cap.promise), v);
+        return resolve_promise(vm, Obj::of(cap.promise), v);
     }
     if !is_callable(cap.resolve) {
         debug_assert!(
             is_class(cap.resolve, Class::Plain),
             "a capability's resolve neither a function nor a sync record"
         );
-        return resolve_iter_result(vm, as_object(cap.promise), v, cap.resolve);
+        return resolve_iter_result(vm, Obj::of(cap.promise), v, cap.resolve);
     }
     call_function(vm, cap.resolve, Value::UNDEFINED, &[v]).map(drop)
 }
@@ -646,7 +650,7 @@ fn cap_reject(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
         return Ok(());
     }
     if cap.reject.is_undefined() {
-        return settle(vm, as_object(cap.promise), REJECTED, v);
+        return settle(vm, Obj::of(cap.promise), REJECTED, v);
     }
     call_function(vm, cap.reject, Value::UNDEFINED, &[v]).map(drop)
 }
@@ -654,7 +658,7 @@ fn cap_reject(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
 // ---- Jobs ----
 
 fn enqueue(vm: &mut Vm, job: [Value; JOB]) -> Result<()> {
-    let jobs = object_value(root(vm, Root::Jobs));
+    let jobs = object_value(root(vm, Root::Jobs).ptr());
     array_push(vm, jobs, &job)?;
     Ok(())
 }
@@ -753,7 +757,7 @@ fn promise_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn species_constructor(vm: &mut Vm, o: Value) -> Result<Value> {
     let a_constructor = vm.intern_name("constructor");
     let c = vm.get(o, a_constructor)?;
-    let intrinsic = object_value(root(vm, Root::Constructor));
+    let intrinsic = object_value(root(vm, Root::Constructor).ptr());
     if c.is_undefined() {
         return Ok(intrinsic);
     }
@@ -774,7 +778,7 @@ fn species_constructor(vm: &mut Vm, o: Value) -> Result<Value> {
 
 /// PerformPromiseThen: a reaction with the handlers (undefined if not
 /// callable) and `cap`, or its job at once if `p` is settled.
-fn perform_then(vm: &mut Vm, p: *mut Object, on_fulfilled: Value, on_rejected: Value, cap: &Cap) -> Result<()> {
+fn perform_then(vm: &mut Vm, p: Obj, on_fulfilled: Value, on_rejected: Value, cap: &Cap) -> Result<()> {
     let on_fulfilled = if is_callable(on_fulfilled) { on_fulfilled } else { Value::UNDEFINED };
     let on_rejected = if is_callable(on_rejected) { on_rejected } else { Value::UNDEFINED };
     perform_reaction(vm, p, on_fulfilled, on_rejected, cap)
@@ -782,7 +786,7 @@ fn perform_then(vm: &mut Vm, p: *mut Object, on_fulfilled: Value, on_rejected: V
 
 /// [`perform_then`] of handlers already checked (or a coroutine: see
 /// [`await_coroutine`]).
-fn perform_reaction(vm: &mut Vm, p: *mut Object, on_fulfilled: Value, on_rejected: Value, cap: &Cap) -> Result<()> {
+fn perform_reaction(vm: &mut Vm, p: Obj, on_fulfilled: Value, on_rejected: Value, cap: &Cap) -> Result<()> {
     let e = cells(p);
     match cell(e, STATE).as_i32_unchecked() {
         PENDING => {
@@ -842,7 +846,7 @@ fn promise_finally(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `finally`'s fulfillment handler: `onFinally()`, then the value again
 /// once a promise for the result settles. Slots: `onFinally`, `C`.
 fn then_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let me = vm.callee;
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
     let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
     let p = promise_resolve_with(vm, c, result)?;
@@ -855,7 +859,7 @@ fn then_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `finally`'s rejection handler: as [`then_finally`], the reason thrown
 /// again.
 fn catch_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let me = vm.callee;
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
     let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
     let p = promise_resolve_with(vm, c, result)?;
@@ -866,11 +870,11 @@ fn catch_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn value_thunk(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Ok(slot(vm.callee, 0))
+    Ok(slot(unsafe { Obj::from_ptr(vm.callee) }, 0))
 }
 
 fn thrower(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Err(Error::thrown(slot(vm.callee, 0)))
+    Err(Error::thrown(slot(unsafe { Obj::from_ptr(vm.callee) }, 0)))
 }
 
 // ---- The statics ----
@@ -995,7 +999,7 @@ fn perform_combine(vm: &mut Vm, c: Value, cap: &Cap, iterable: Value, kind: Comb
                 let mut data = data;
                 data[6] = f;
                 let r = closure(vm, Root::SettledReject, &data);
-                set_slot(as_object(f), 6, r);
+                set_slot(Obj::of(f), 6, r);
                 (f, r)
             }
             Combinator::Any => {
@@ -1005,7 +1009,7 @@ fn perform_combine(vm: &mut Vm, c: Value, cap: &Cap, iterable: Value, kind: Comb
             }
         };
         if kind != Combinator::Race {
-            let s = as_object(state);
+            let s = Obj::of(state);
             put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
         }
         let then = vm.get(next_promise, a_then)?;
@@ -1014,7 +1018,7 @@ fn perform_combine(vm: &mut Vm, c: Value, cap: &Cap, iterable: Value, kind: Comb
         Ok(())
     })?;
     if kind != Combinator::Race {
-        let s = as_object(state);
+        let s = Obj::of(state);
         let remaining = elem(s, 0).as_i32_unchecked() - 1;
         put(s, 0, Value::from_i32(remaining));
         if remaining == 0 {
@@ -1091,18 +1095,18 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
             let mut data = data;
             data[PARTNER] = f;
             let r = closure(vm, Root::SettledReject, &data);
-            set_slot(as_object(f), PARTNER, r);
+            set_slot(Obj::of(f), PARTNER, r);
             (f, r)
         } else {
             (closure(vm, Root::AllElement, &data), cap.reject)
         };
-        let s = as_object(state);
+        let s = Obj::of(state);
         put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
         let then = vm.get(next_promise, a_then)?;
         call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
         index += 1;
     }
-    let s = as_object(state);
+    let s = Obj::of(state);
     let remaining = elem(s, 0).as_i32_unchecked() - 1;
     put(s, 0, Value::from_i32(remaining));
     if remaining == 0 {
@@ -1117,9 +1121,9 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
 fn keyed_result(vm: &mut Vm, keys: Value, values: Value) -> Result<Value> {
     let o = object_value(vm.new_object(Value::NULL));
     let (k, v) = (as_object(keys), as_object(values));
-    for i in 0..len(k) {
-        let key = crate::intrinsics::to_property_key(vm, elem(k, i))?;
-        vm.create_data_property(o, key, elem(v, i))?;
+    for i in 0..len(unsafe { Obj::from_ptr(k) }) {
+        let key = crate::intrinsics::to_property_key(vm, elem(unsafe { Obj::from_ptr(k) }, i))?;
+        vm.create_data_property(o, key, elem(unsafe { Obj::from_ptr(v) }, i))?;
     }
     Ok(o)
 }
@@ -1147,15 +1151,15 @@ const KEYS: usize = 7;
 /// Store `v` as the element function `me`'s value, and settle the
 /// capability if it was the last: with the values, or (`any`) an
 /// `AggregateError` of them.
-fn element_done(vm: &mut Vm, me: *mut Object, v: Value) -> Result<Value> {
+fn element_done(vm: &mut Vm, me: Obj, v: Value) -> Result<Value> {
     let values = slot(me, VALUES);
     vm.set_keyed(values, slot(me, INDEX), v)?;
-    let s = as_object(slot(me, REMAINING));
+    let s = Obj::of(slot(me, REMAINING));
     let remaining = elem(s, 0).as_i32_unchecked() - 1;
     put(s, 0, Value::from_i32(remaining));
     if remaining == 0 {
-        let any = me.code() == unsafe { (*root(vm, Root::AnyElement)).code };
-        let result = if Object::inline_cap(me) > KEYS {
+        let any = me.code() == unsafe { (*root(vm, Root::AnyElement).ptr()).code };
+        let result = if Object::inline_cap(me.ptr().cast_const()) > KEYS {
             keyed_result(vm, slot(me, KEYS), values)?
         } else if any {
             aggregate_error(vm, values)
@@ -1169,14 +1173,14 @@ fn element_done(vm: &mut Vm, me: *mut Object, v: Value) -> Result<Value> {
 
 /// The element function now called, if not called before (it is marked,
 /// and its partner if it has one).
-fn take_element(vm: &mut Vm) -> Option<*mut Object> {
-    let me = vm.callee;
+fn take_element(vm: &mut Vm) -> Option<Obj> {
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     if slot(me, CALLED) == Value::TRUE {
         return None;
     }
     set_slot(me, CALLED, Value::TRUE);
-    if Object::inline_cap(me) > PARTNER && slot(me, PARTNER).is_cell() {
-        set_slot(as_object(slot(me, PARTNER)), CALLED, Value::TRUE);
+    if Object::inline_cap(me.ptr().cast_const()) > PARTNER && slot(me, PARTNER).is_cell() {
+        set_slot(Obj::of(slot(me, PARTNER)), CALLED, Value::TRUE);
     }
     Some(me)
 }
@@ -1232,7 +1236,7 @@ fn any_element(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// A new `AggregateError` of `errors` (an array), with `message` if given.
 fn new_aggregate_error(vm: &mut Vm, errors: Value, message: Option<&[u16]>) -> Value {
-    let proto = object_value(root(vm, Root::AggregateErrorPrototype));
+    let proto = object_value(root(vm, Root::AggregateErrorPrototype).ptr());
     let o = vm.new_object(proto);
     unsafe { (*o).flags |= crate::object::ERROR };
     if let Some(m) = message {

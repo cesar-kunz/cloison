@@ -8,7 +8,7 @@
 //! much they read and wrote.
 
 use crate::interp::to_boolean;
-use crate::object::{Class, Object, TypedKind, as_object, object_value};
+use crate::object::{Class, Obj, Object, TypedKind, as_object, object_value};
 use crate::props::is_object;
 use crate::raw::ObjectPtr;
 use crate::value::Value;
@@ -38,7 +38,7 @@ fn arg(a: &[Value], i: usize) -> Value {
 
 /// ValidateUint8Array: `v` a `Uint8Array` (in bounds or not).
 fn uint8_array(v: Value) -> Result<*mut Object> {
-    if crate::builtins::is_class(v, Class::TypedArray) && crate::typed::kind_of(as_object(v)) == TypedKind::U8 {
+    if crate::builtins::is_class(v, Class::TypedArray) && crate::typed::kind_of(Obj::of(v)) == TypedKind::U8 {
         Ok(as_object(v))
     } else {
         Err(Error::type_error("this is not a Uint8Array"))
@@ -48,7 +48,7 @@ fn uint8_array(v: Value) -> Result<*mut Object> {
 /// A `Uint8Array`'s length, if in bounds, of its record made seq-cst (as
 /// the methods and GetUint8ArrayBytes make it).
 fn length_of(vm: &mut Vm, o: *mut Object) -> Result<usize> {
-    crate::typed::ta_length_seq_cst(vm, o)
+    crate::typed::ta_length_seq_cst(vm, unsafe { Obj::from_ptr(o) })
         .ok_or_else(|| Error::type_error("Cannot perform this operation on a detached or out of bounds typed array"))
 }
 
@@ -285,7 +285,7 @@ fn written(vm: &mut Vm, o: *mut Object, d: Decoded) -> Result<Value> {
 
 fn set_from_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = uint8_array(this)?;
-    crate::typed::writable_view(o)?;
+    crate::typed::writable_view(unsafe { Obj::from_ptr(o) })?;
     let s = string_arg(arg(a, 0))?;
     let opts = options(arg(a, 1))?;
     let url = url_alphabet(vm, opts)?;
@@ -297,7 +297,7 @@ fn set_from_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn set_from_hex(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = uint8_array(this)?;
-    crate::typed::writable_view(o)?;
+    crate::typed::writable_view(unsafe { Obj::from_ptr(o) })?;
     let s = string_arg(arg(a, 0))?;
     let max = length_of(vm, o)?;
     let d = decode_hex(s, max);

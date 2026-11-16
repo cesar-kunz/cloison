@@ -121,15 +121,15 @@ fn plain_protos(vm: &Vm, o: *mut Object) -> bool {
 /// Whether `o` is a far array whose missing indices nothing sees: none of
 /// its own a named property (`SPARSE`), and its prototypes `plain_protos`.
 fn skips(vm: &Vm, o: *mut Object) -> bool {
-    crate::far::is_far(o) && o.flags() & crate::object::SPARSE == 0 && plain_protos(vm, o)
+    crate::far::is_far(unsafe { Obj::from_ptr(o) }) && o.flags() & crate::object::SPARSE == 0 && plain_protos(vm, o)
 }
 
 /// Where a loop over `o`'s present elements, at `k` and below `len`, goes
 /// on: past a far array's missing indices (where `skips`), to its next
 /// far key or `len`; else `k`.
 fn skip(vm: &mut Vm, o: Value, k: f64, len: f64) -> f64 {
-    let obj = as_object(o);
-    if k >= u32::MAX as f64 || !skips(vm, obj) || k < obj.elems_len() as f64 {
+    let obj = Obj::of(o);
+    if k >= u32::MAX as f64 || !skips(vm, obj.ptr()) || k < obj.elems_len() as f64 {
         return k;
     }
     crate::far::next_key(vm, obj, k as u32).map_or(len, |i| (i as f64).min(len))
@@ -138,9 +138,9 @@ fn skip(vm: &mut Vm, o: Value, k: f64, len: f64) -> f64 {
 /// `skip` for a loop going down from `k`: a far array's last far key at
 /// `k` or before, else the end of its dense prefix (-1 for none).
 fn skip_back(vm: &mut Vm, o: Value, k: f64) -> f64 {
-    let obj = as_object(o);
+    let obj = Obj::of(o);
     let n = obj.elems_len() as f64;
-    if k >= u32::MAX as f64 || !skips(vm, obj) || k < n {
+    if k >= u32::MAX as f64 || !skips(vm, obj.ptr()) || k < n {
         return k;
     }
     crate::far::prev_key(vm, obj, k as u32).map_or(n - 1.0, |i| i as f64)
@@ -223,7 +223,7 @@ fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
     }
     let a = vm.new_array();
     if n > 0.0 {
-        vm.set_array_length(as_object(a), Value::number(n))?;
+        vm.set_array_length(Obj::of(a), Value::number(n))?;
     }
     Ok(a)
 }

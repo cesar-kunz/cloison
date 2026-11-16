@@ -286,7 +286,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
         let Stringify { indent, gap, .. } = st;
         indent.extend_from_slice(gap);
     }
-    let o = as_object(v);
+    let o = Obj::of(v);
     let array = crate::proxy::is_array(vm, v)?;
     // The units `out` gets after a part: the closing bracket, with a gap
     // after a newline and the indentation. `out` with them is checked
@@ -331,18 +331,18 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
         // (With its slot in the shape, of a plain object's name.)
         let keys: Vec<(PKey, u32)> = match &st.keys {
             Some(k) => k.iter().map(|&k| (PKey::Str(k), u32::MAX)).collect(),
-            None if vm.proxies_exist && crate::proxy::is_proxy(vm, o) => {
+            None if vm.proxies_exist && crate::proxy::is_proxy(vm, o.ptr()) => {
                 let mut ks = Vec::new();
-                for key in crate::proxy::enumerable_own_keys(vm, o)? {
+                for key in crate::proxy::enumerable_own_keys(vm, o.ptr())? {
                     let s = vm.key_string(key);
                     vm.handles.push(s);
                     ks.push((PKey::Str(s), u32::MAX));
                 }
                 ks
             }
-            None if vm.plain_named(o) => {
+            None if vm.plain_named(o.ptr()) => {
                 let s = o.shape().live();
-                let slots = vm.listed_slots(o, false, false).unwrap_or_default();
+                let slots = vm.listed_slots(o.ptr(), false, false).unwrap_or_default();
                 slots
                     .into_iter()
                     .map(|k| {
@@ -585,13 +585,13 @@ fn internalize(
         vm.create_data_property(context, Key::Name(a_source), source)?;
     }
     if is_object(v) {
-        let o = as_object(v);
+        let o = Obj::of(v);
         let array = crate::proxy::is_array(vm, v)?;
         let keys: Vec<Key> = if array {
             let len = vm.length_of(v)?;
             (0..len as u32).map(Key::Index).collect()
-        } else if crate::proxy::is_proxy(vm, o) {
-            crate::proxy::enumerable_own_keys(vm, o)?
+        } else if crate::proxy::is_proxy(vm, o.ptr()) {
+            crate::proxy::enumerable_own_keys(vm, o.ptr())?
         } else {
             vm.own_keys(o).into_iter().filter(|&(_, e)| e).map(|(k, _)| k).collect()
         };
@@ -606,10 +606,10 @@ fn internalize(
             // (A proxy's traps, and what they throw; a property that can't
             // be deleted or defined stays.)
             if nv.is_undefined() {
-                crate::proxy::delete(vm, o, k)?;
+                crate::proxy::delete(vm, o.ptr(), k)?;
             } else {
                 let d = crate::props::Desc::data(nv, true, true, true);
-                crate::proxy::define_property(vm, o, k, &d)?;
+                crate::proxy::define_property(vm, o.ptr(), k, &d)?;
             }
         }
     }

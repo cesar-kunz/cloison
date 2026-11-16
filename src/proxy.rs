@@ -18,7 +18,7 @@
 
 use crate::interp::{call_function, to_boolean};
 use crate::jit::HashSet;
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object, same_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -541,8 +541,8 @@ fn from_partial_descriptor(vm: &mut Vm, d: &Desc) -> Value {
 /// `o.[[OwnPropertyKeys]]()`: indices, names, then symbols.
 pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
     if !is_proxy(vm, o) {
-        let mut keys: Vec<Key> = vm.own_keys(o).into_iter().map(|(k, _)| k).collect();
-        for s in crate::symbol::own_symbol_keys(vm, o) {
+        let mut keys: Vec<Key> = vm.own_keys(unsafe { Obj::from_ptr(o) }).into_iter().map(|(k, _)| k).collect();
+        for s in crate::symbol::own_symbol_keys(vm, unsafe { Obj::from_ptr(o) }) {
             keys.push(Key::Name(crate::symbol::symbol_atom(vm, s)));
         }
         return Ok(keys);

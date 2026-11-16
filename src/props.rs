@@ -365,25 +365,25 @@ impl Vm {
         if let Key::Index(i) = key
             && let Some(v) = self.mapped_get(o, i)
         {
-            let mut d = self.own_property_inner(o, key)?;
+            let mut d = self.own_property_inner(unsafe { Obj::from_ptr(o) }, key)?;
             d.value = Some(v);
             return Some(d);
         }
-        self.own_property_inner(o, key)
+        self.own_property_inner(unsafe { Obj::from_ptr(o) }, key)
     }
 
     /// Whether element `i` of `o` is a writable data property (or absent).
     pub(crate) fn writable_element(&mut self, o: *mut Object, i: u32) -> bool {
-        self.own_property_inner(o, Key::Index(i)).is_none_or(|d| d.writable != Some(false))
+        self.own_property_inner(unsafe { Obj::from_ptr(o) }, Key::Index(i)).is_none_or(|d| d.writable != Some(false))
     }
 
-    fn own_property_inner(&mut self, o: *mut Object, key: Key) -> Option<Desc> {
+    fn own_property_inner(&mut self, o: Obj, key: Key) -> Option<Desc> {
         unsafe {
             let class = o.class();
             let flags = o.flags();
             match key {
                 Key::Index(i) => {
-                    if let Some(u) = Self::string_of(o) {
+                    if let Some(u) = Self::string_of(o.ptr()) {
                         if (i as usize) < u.len() {
                             let c = self.single_char(u[i as usize]);
                             return Some(Desc::data(c, false, true, false));
@@ -394,52 +394,54 @@ impl Vm {
                     }
                     match class {
                         Class::TypedArray => {
-                            return ((i as usize) < crate::typed::ta_length(o).unwrap_or(0)).then(|| {
-                                let kind = crate::object::TypedKind::from_u8(o.kind());
-                                // (An immutable buffer's: neither writable nor
-                                // configurable.)
-                                let mutable = !crate::typed::is_immutable_view(o);
-                                Desc::data(kind.load(o.elems().cast(), i as usize), mutable, true, mutable)
-                            });
+                            return ((i as usize) < crate::typed::ta_length(Obj::from_ptr(o.ptr())).unwrap_or(0)).then(
+                                || {
+                                    let kind = crate::object::TypedKind::from_u8(o.kind());
+                                    // (An immutable buffer's: neither writable nor
+                                    // configurable.)
+                                    let mutable = !crate::typed::is_immutable_view(Obj::from_ptr(o.ptr()));
+                                    Desc::data(kind.load(o.elems().cast(), i as usize), mutable, true, mutable)
+                                },
+                            );
                         }
                         c if c.no_elements() => return None,
                         _ => {}
                     }
-                    if Self::has_element(o, i) {
+                    if Self::has_element(o.ptr(), i) {
                         let v = o.elem(i as usize);
                         return Some(Desc::data(v, flags & FROZEN == 0, true, flags & SEALED == 0));
                     }
-                    if crate::far::is_far(o)
-                        && let Some(v) = crate::far::get(o, i)
+                    if crate::far::is_far(Obj::from_ptr(o.ptr()))
+                        && let Some(v) = crate::far::get(Obj::from_ptr(o.ptr()), i)
                     {
                         return Some(Desc::data(v, flags & FROZEN == 0, true, flags & SEALED == 0));
                     }
                     if flags & SPARSE != 0 {
                         let a = self.intern_name(&i.to_string());
-                        return self.own_named(o, a);
+                        return self.own_named(o.ptr(), a);
                     }
                     None
                 }
                 Key::Name(a) => {
-                    if self.typed_numeric(o, a) {
+                    if self.typed_numeric(o.ptr(), a) {
                         return None;
                     }
-                    if let Some(d) = self.own_named(o, a) {
+                    if let Some(d) = self.own_named(o.ptr(), a) {
                         return Some(d);
                     }
                     if a == self.a_length {
-                        if let Some(u) = Self::string_of(o) {
+                        if let Some(u) = Self::string_of(o.ptr()) {
                             let n = Value::from_i32(u.len() as i32);
                             return Some(Desc::data(n, false, false, false));
                         }
                         return match class {
                             Class::Array => {
-                                let n = Value::number(crate::far::array_length(o) as f64);
+                                let n = Value::number(crate::far::array_length(Obj::from_ptr(o.ptr())) as f64);
                                 Some(Desc::data(n, flags & LENGTH_READ_ONLY == 0, false, false))
                             }
                             Class::Function | Class::Native if flags & FN_LENGTH_DELETED == 0 => {
                                 let c = flags & (SEALED | FROZEN) == 0;
-                                Some(Desc::data(Self::function_length(o), false, false, c))
+                                Some(Desc::data(Self::function_length(o.ptr()), false, false, c))
                             }
                             _ => None,
                         };
@@ -448,7 +450,7 @@ impl Vm {
                         && matches!(class, Class::Function | Class::Native)
                         && flags & FN_NAME_DELETED == 0
                     {
-                        let n = self.function_name(o);
+                        let n = self.function_name(o.ptr());
                         return Some(Desc::data(n, false, false, flags & (SEALED | FROZEN) == 0));
                     }
                     None
@@ -460,12 +462,12 @@ impl Vm {
     /// `o`'s own property keys: indices in order, then names in insertion
     /// order (the ones without a slot first), each with whether it is
     /// enumerable.
-    pub(crate) fn own_keys(&mut self, o: *mut Object) -> Vec<(Key, bool)> {
+    pub(crate) fn own_keys(&mut self, o: Obj) -> Vec<(Key, bool)> {
         let mut out = Vec::new();
         let class = o.class();
         let s = o.shape().live();
         let mut indices: Vec<u32> = Vec::new();
-        if let Some(u) = Self::string_of(o) {
+        if let Some(u) = Self::string_of(o.ptr()) {
             indices.extend(0..u.len() as u32);
         }
         match class {
@@ -475,7 +477,7 @@ impl Vm {
             c if c.no_elements() => {}
             _ => {
                 for i in 0..o.elems_len() {
-                    if Self::has_element(o, i) {
+                    if Self::has_element(o.ptr(), i) {
                         indices.push(i);
                     }
                 }
@@ -504,7 +506,7 @@ impl Vm {
         // The properties without slots (see `own_property`).
         let flags = o.flags();
         // (Not those a slot redefined: listed with the slots.)
-        let length = Self::string_of(o).is_some() || class == Class::Array;
+        let length = Self::string_of(o.ptr()).is_some() || class == Class::Array;
         if (length || matches!(class, Class::Function | Class::Native) && flags & FN_LENGTH_DELETED == 0)
             && s.lookup(self.a_length).is_none()
         {
@@ -687,7 +689,7 @@ impl Vm {
         // this object is on their prototype chain.
         if freeze
             && o.flags() & crate::object::PROTOTYPE != 0
-            && (o.elems_len() > 0 || o.flags() & SPARSE != 0 || crate::far::is_far(o))
+            && (o.elems_len() > 0 || o.flags() & SPARSE != 0 || crate::far::is_far(unsafe { Obj::from_ptr(o) }))
         {
             self.protect_indices();
         }
@@ -729,7 +731,8 @@ impl Vm {
         // are the sparse shape keys.
         let protected = {
             let flags = o.flags();
-            let dense_or_far = flags & FROZEN != 0 && (o.elems_len() != 0 || crate::far::is_far(o));
+            let dense_or_far =
+                flags & FROZEN != 0 && (o.elems_len() != 0 || crate::far::is_far(unsafe { Obj::from_ptr(o) }));
             // A typed array takes an inherited store of an index outside
             // its length (doing nothing: its [[Set]]); a string object's
             // characters are read-only.
@@ -753,7 +756,7 @@ impl Vm {
         if Self::is_extensible(o) {
             return false;
         }
-        for (key, _) in self.own_keys(o) {
+        for (key, _) in self.own_keys(unsafe { Obj::from_ptr(o) }) {
             let Some(d) = self.own_property(o, key) else { continue };
             if d.configurable == Some(true) || frozen && d.writable == Some(true) {
                 return false;
@@ -803,7 +806,7 @@ impl Vm {
     fn define_own_property_inner(&mut self, o: *mut Object, key: Key, d: &Desc) -> Result<bool> {
         let class = o.class();
         if class == Class::Array && key == Key::Name(self.a_length) {
-            return self.define_array_length(o, d);
+            return self.define_array_length(unsafe { Obj::from_ptr(o) }, d);
         }
         // (A typed array's numeric property that is no index: none to
         // define.)
@@ -831,7 +834,7 @@ impl Vm {
                     d.configurable.unwrap_or(false),
                 )
             };
-            return self.store_own(o, key, full, None);
+            return self.store_own(unsafe { Obj::from_ptr(o) }, key, full, None);
         };
         // Validate against the current property.
         if cur.configurable == Some(false) {
@@ -879,22 +882,25 @@ impl Vm {
                 configurable,
             )
         };
-        self.store_own(o, key, full, Some(cur))
+        self.store_own(unsafe { Obj::from_ptr(o) }, key, full, Some(cur))
     }
 
     /// Store `o`'s own property `key`, now `full` (a complete descriptor),
     /// `cur` being what it was.
-    fn store_own(&mut self, o: *mut Object, key: Key, full: Desc, cur: Option<Desc>) -> Result<bool> {
+    fn store_own(&mut self, o: Obj, key: Key, full: Desc, cur: Option<Desc>) -> Result<bool> {
         unsafe {
             let class = o.class();
             match key {
                 Key::Index(i) => {
-                    if Self::string_of(o).is_some_and(|u| (i as usize) < u.len()) {
+                    if Self::string_of(o.ptr()).is_some_and(|u| (i as usize) < u.len()) {
                         // Validated above: nothing changes.
                         return Ok(true);
                     }
                     // (An array whose `length` is read-only doesn't grow.)
-                    if class == Class::Array && i >= crate::far::array_length(o) && o.flags() & LENGTH_READ_ONLY != 0 {
+                    if class == Class::Array
+                        && i >= crate::far::array_length(Obj::from_ptr(o.ptr()))
+                        && o.flags() & LENGTH_READ_ONLY != 0
+                    {
                         return Ok(false);
                     }
                     match class {
@@ -902,11 +908,11 @@ impl Vm {
                         c if c.no_elements() => return Ok(false),
                         // (An immutable buffer's element: what validating it
                         // against its current one let through changes nothing.)
-                        Class::TypedArray if crate::typed::is_immutable_view(o) => {
-                            return Ok((i as usize) < crate::typed::ta_length(o).unwrap_or(0));
+                        Class::TypedArray if crate::typed::is_immutable_view(Obj::from_ptr(o.ptr())) => {
+                            return Ok((i as usize) < crate::typed::ta_length(Obj::from_ptr(o.ptr())).unwrap_or(0));
                         }
                         Class::TypedArray => {
-                            let valid = (i as usize) < crate::typed::ta_length(o).unwrap_or(0);
+                            let valid = (i as usize) < crate::typed::ta_length(Obj::from_ptr(o.ptr())).unwrap_or(0);
                             if !valid || full.is_accessor() || full.attrs() != 0 {
                                 return Ok(false);
                             }
@@ -922,11 +928,11 @@ impl Vm {
                         let a = self.intern_name(&i.to_string());
                         o.shape().live().lookup(a).is_some()
                     };
-                    let far = class != Class::Array && self.sparse_key(o, i);
+                    let far = class != Class::Array && self.sparse_key(o.ptr(), i);
                     if plain && !far {
                         if named {
                             let a = self.intern_name(&i.to_string());
-                            self.delete_named(o, a);
+                            self.delete_named(o.ptr(), a);
                         }
                         self.set_element(o, i, full.value.unwrap());
                         return Ok(true);
@@ -938,21 +944,21 @@ impl Vm {
                     {
                         self.protect_indices();
                     }
-                    if class == Class::Array && i >= crate::far::array_length(o) {
+                    if class == Class::Array && i >= crate::far::array_length(Obj::from_ptr(o.ptr())) {
                         self.grow_elements(o, i as usize + 1)?;
                     }
-                    if i < o.elems_len() && Self::has_element(o, i) {
+                    if i < o.elems_len() && Self::has_element(o.ptr(), i) {
                         o.clear_elem(i as usize);
                     }
-                    if crate::far::is_far(o) {
-                        crate::far::remove(o, i);
+                    if crate::far::is_far(Obj::from_ptr(o.ptr())) {
+                        crate::far::remove(Obj::from_ptr(o.ptr()), i);
                     }
                     o.set_flags(o.flags() | SPARSE);
                     if !far {
-                        self.slow_elements(o);
+                        self.slow_elements(o.ptr());
                     }
                     let a = self.intern_name(&i.to_string());
-                    self.store_named(o, a, full);
+                    self.store_named(o.ptr(), a, full);
                     Ok(true)
                 }
                 Key::Name(a) => {
@@ -969,7 +975,7 @@ impl Vm {
                                 && full.attrs() == cur.attrs());
                         }
                     }
-                    self.store_named(o, a, full);
+                    self.store_named(o.ptr(), a, full);
                     Ok(true)
                 }
             }
@@ -989,33 +995,34 @@ impl Vm {
 
     /// `o[i] = v` as a plain data element (`o` not a string, typed array
     /// or buffer), the elements grown to hold it.
-    fn set_element(&mut self, o: *mut Object, i: u32, v: Value) {
+    fn set_element(&mut self, o: Obj, i: u32, v: Value) {
         unsafe {
             // (Past an array's dense elements: far if it is, or if they
             // would be too sparse: see `far::Density`.)
             if o.class() == Class::Array
                 && i >= o.elems_len()
-                && (crate::far::is_far(o) || crate::far::goes_far(self, o, i as usize + 1, 1))
+                && (crate::far::is_far(Obj::from_ptr(o.ptr()))
+                    || crate::far::goes_far(self, Obj::from_ptr(o.ptr()), i as usize + 1, 1))
             {
-                if !crate::far::is_far(o) {
-                    crate::far::make_far(self, o, o.elems_len());
+                if !crate::far::is_far(Obj::from_ptr(o.ptr())) {
+                    crate::far::make_far(self, Obj::from_ptr(o.ptr()), o.elems_len());
                 }
-                crate::far::set(self, o, i, v);
+                crate::far::set(self, Obj::from_ptr(o.ptr()), i, v);
                 return;
             }
             if i >= o.elems_len() {
-                self.reserve_elems(o, i as usize + 1);
+                self.reserve_elems(o.ptr(), i as usize + 1);
                 let at = o.elems().add(o.elems_len() as usize);
                 self.heap.fill_values(at, i.saturating_sub(o.elems_len()) as usize, Value::EMPTY);
                 o.set_elems_len(i + 1);
             }
-            self.store_element(o, i as usize, v);
+            self.store_element(o.ptr(), i as usize, v);
         }
     }
 
     /// Grow array `o` to length `n` with holes: its elements, or its far
     /// store's length where it is or goes far (see `far::Density`).
-    fn grow_elements(&mut self, o: *mut Object, n: usize) -> Result<()> {
+    fn grow_elements(&mut self, o: Obj, n: usize) -> Result<()> {
         if crate::far::is_far(o) {
             if n as u32 > crate::far::length(o) {
                 crate::far::set_length(o, n as u32);
@@ -1028,7 +1035,7 @@ impl Vm {
         }
         unsafe {
             let len = o.elems_len() as usize;
-            self.reserve_elems(o, n);
+            self.reserve_elems(o.ptr(), n);
             self.heap.fill_values(o.elems().add(len), n.saturating_sub(len), Value::EMPTY);
             o.set_elems_len(n as u32);
         }
@@ -1036,7 +1043,7 @@ impl Vm {
     }
 
     /// `Object.defineProperty(array, "length", d)` (ArraySetLength).
-    pub(crate) fn define_array_length(&mut self, o: *mut Object, d: &Desc) -> Result<bool> {
+    pub(crate) fn define_array_length(&mut self, o: Obj, d: &Desc) -> Result<bool> {
         unsafe {
             let read_only = o.flags() & LENGTH_READ_ONLY != 0;
             if d.is_accessor() || d.configurable == Some(true) || d.enumerable == Some(true) {
@@ -1053,7 +1060,7 @@ impl Vm {
                     Some(u as u32)
                 }
             };
-            let old_len = crate::far::array_length(o);
+            let old_len = crate::far::array_length(Obj::from_ptr(o.ptr()));
             if read_only {
                 if d.writable == Some(true) {
                     return Ok(false);
@@ -1087,13 +1094,13 @@ impl Vm {
                                     stop = k + 1;
                                     break;
                                 }
-                                self.delete_named(o, a);
+                                self.delete_named(o.ptr(), a);
                             }
                         }
                     }
-                    if crate::far::is_far(o) {
-                        crate::far::truncate(o, stop);
-                        crate::far::maybe_dense(self, o);
+                    if crate::far::is_far(Obj::from_ptr(o.ptr())) {
+                        crate::far::truncate(Obj::from_ptr(o.ptr()), stop);
+                        crate::far::maybe_dense(self, Obj::from_ptr(o.ptr()));
                     } else {
                         let at = o.elems().add(stop as usize);
                         self.heap.fill_values(at, old_len.saturating_sub(stop) as usize, Value::EMPTY);
@@ -1102,7 +1109,7 @@ impl Vm {
                     if stop != n {
                         if d.writable == Some(false) {
                             o.set_flags(o.flags() | LENGTH_READ_ONLY);
-                            self.slow_elements(o);
+                            self.slow_elements(o.ptr());
                         }
                         return Ok(false);
                     }
@@ -1110,7 +1117,7 @@ impl Vm {
             }
             if d.writable == Some(false) {
                 o.set_flags(o.flags() | LENGTH_READ_ONLY);
-                self.slow_elements(o);
+                self.slow_elements(o.ptr());
             }
             Ok(true)
         }
@@ -1118,27 +1125,29 @@ impl Vm {
 
     /// `delete o[key]`: whether it is gone.
     pub(crate) fn delete_own(&mut self, o: *mut Object, key: Key) -> bool {
-        let r = self.delete_own_inner(o, key);
+        let r = self.delete_own_inner(unsafe { Obj::from_ptr(o) }, key);
         if r && let Key::Index(i) = key {
             self.unmap_argument(o, i);
         }
         r
     }
 
-    fn delete_own_inner(&mut self, o: *mut Object, key: Key) -> bool {
+    fn delete_own_inner(&mut self, o: Obj, key: Key) -> bool {
         let class = o.class();
         match key {
             Key::Index(i) => {
-                if Self::string_of(o).is_some_and(|u| (i as usize) < u.len()) {
+                if Self::string_of(o.ptr()).is_some_and(|u| (i as usize) < u.len()) {
                     return false;
                 }
                 match class {
                     Class::String => return i >= o.elems_len(),
-                    Class::TypedArray => return i as usize >= crate::typed::ta_length(o).unwrap_or(0),
+                    Class::TypedArray => {
+                        return i as usize >= crate::typed::ta_length(o).unwrap_or(0);
+                    }
                     c if c.no_elements() => return true,
                     _ => {}
                 }
-                if i < o.elems_len() && Self::has_element(o, i) {
+                if i < o.elems_len() && Self::has_element(o.ptr(), i) {
                     if o.flags() & SEALED != 0 {
                         return false;
                     }
@@ -1154,16 +1163,16 @@ impl Vm {
                 }
                 if o.flags() & SPARSE != 0 {
                     let a = self.intern_name(&i.to_string());
-                    return self.delete_named(o, a);
+                    return self.delete_named(o.ptr(), a);
                 }
                 true
             }
             Key::Name(a) => {
-                if self.typed_numeric(o, a) {
+                if self.typed_numeric(o.ptr(), a) {
                     return true;
                 }
                 if o.shape().live().lookup(a).is_none() {
-                    if o == self.global {
+                    if o == unsafe { Obj::from_ptr(self.global) } {
                         return self.delete_global(a);
                     }
                     if matches!(class, Class::Function | Class::Native) {
@@ -1179,10 +1188,10 @@ impl Vm {
                         }
                         return true;
                     }
-                    let length = a == self.a_length && (Self::string_of(o).is_some() || class == Class::Array);
+                    let length = a == self.a_length && (Self::string_of(o.ptr()).is_some() || class == Class::Array);
                     return !length;
                 }
-                let deleted = self.delete_named(o, a);
+                let deleted = self.delete_named(o.ptr(), a);
                 if deleted && matches!(class, Class::Function | Class::Native) {
                     if a == self.a_length {
                         // SAFETY: a function's own flag: its `length` deleted.
@@ -1407,8 +1416,8 @@ impl Vm {
             }
         }
         if is_object(o) {
-            let obj = as_object(o);
-            let own = self.own_property(obj, key);
+            let obj = Obj::of(o);
+            let own = self.own_property(obj.ptr(), key);
             let blocked = match own {
                 Some(d) if d.is_data() => d.writable == Some(false),
                 Some(d) => d.set.is_some_and(|s| s.is_undefined()),
@@ -1419,9 +1428,9 @@ impl Vm {
                     // is made on the object (one inherited writable or none),
                     // which must be extensible, and an array whose `length`
                     // is read-only doesn't grow.
-                    let inherited = self.inherited_property(obj, key);
+                    let inherited = self.inherited_property(obj.ptr(), key);
                     let made = || {
-                        !Self::is_extensible(obj)
+                        !Self::is_extensible(obj.ptr())
                             || matches!(key, Key::Index(i) if {
                                 obj.class() == Class::Array
                                     && i >= crate::far::array_length(obj)
@@ -1711,7 +1720,7 @@ fn keys_array(vm: &mut Vm, o: *mut Object, all: bool) -> Result<Value> {
             vm.atom_string(a)
         }));
     }
-    let keys = vm.own_keys(o);
+    let keys = vm.own_keys(unsafe { Obj::from_ptr(o) });
     let arr = vm.new_array();
     let mut values = Vec::with_capacity(keys.len());
     vm.handle_scope(|vm| {
@@ -1792,11 +1801,11 @@ fn object_freeze(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Ok(o);
     }
     if is_object(o) {
-        let obj = as_object(o);
+        let obj = Obj::of(o);
         if (obj.class() == Class::TypedArray) && crate::typed::ta_length(obj).unwrap_or(0) > 0 {
             return Err(Error::type_error("Cannot freeze array buffer views with elements"));
         }
-        vm.seal(obj, true);
+        vm.seal(obj.ptr(), true);
     }
     Ok(o)
 }

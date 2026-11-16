@@ -176,16 +176,16 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
     let abp = object_value(vm.array_buffer_prototype);
     let o = vm.new_object_with(Class::ArrayBuffer, abp, 0);
     unsafe {
-        (*o).elems = vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast();
+        (*o.ptr()).elems = vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast();
         o.set_elems_len(n as u32);
         if let Some(max) = max {
             o.set_flags(o.flags() | RESIZABLE);
-            *Object::aux(o) = max as u32;
+            *Object::aux(o.ptr()) = max as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
+            (*o.ptr()).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
         }
     }
-    Ok(unsafe { Obj::from_ptr(o) })
+    Ok(o)
 }
 
 /// A `Uint8Array` of `bytes`, on an immutable buffer (a bytes module's
@@ -299,7 +299,7 @@ pub(crate) fn make_view(
     if class == Class::TypedArray {
         note_proto(vm, k as u8, proto);
     }
-    let o = unsafe { Obj::from_ptr(vm.new_object_with(class, proto, 0)) };
+    let o = vm.new_object_with(class, proto, 0);
     unsafe {
         // (A `DataView`'s `kind` is its inline capacity, as other objects'.)
         if class == Class::TypedArray {
@@ -438,7 +438,7 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let c = vm.typed_constructors[TypedKind::ALL.len()];
     let proto = vm.take_new_target(c, object_value(vm.array_buffer_prototype))?;
     let o = new_buffer_max(vm, n, max)?;
-    vm.set_prototype_of(o.ptr(), proto);
+    vm.set_prototype_of(o, proto);
     Ok(object_value(o.ptr()))
 }
 
@@ -1037,7 +1037,7 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             }
             (Some(iterate_with(vm, source, m)?), Value::UNDEFINED)
         } else {
-            (None, object_value(vm.to_object(source)?))
+            (None, object_value((vm.to_object(source)?).ptr()))
         };
         let n = match &values {
             Some(v) => v.len(),
@@ -1455,7 +1455,7 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             Ok(Value::UNDEFINED)
         });
     }
-    let src = object_value(vm.to_object(src)?);
+    let src = object_value((vm.to_object(src)?).ptr());
     let n = vm.length_of(src)?;
     if offset == f64::INFINITY || n + offset > len as f64 {
         return Err(Error::range_error("offset is out of bounds"));
@@ -1700,8 +1700,8 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    let abp = vm.new_object(op);
-    vm.array_buffer_prototype = abp;
+    let abp = vm.new_plain(op);
+    vm.array_buffer_prototype = abp.ptr();
     let ab = vm.define_native(g, "ArrayBuffer", array_buffer_ctor, 1, any, true);
     link_constructor(vm, ab, abp);
     getter(vm, abp, "byteLength", buffer_byte_length);
@@ -1710,7 +1710,7 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, abp, "detached", buffer_detached);
     getter(vm, abp, "immutable", buffer_immutable);
     vm.define_natives(
-        abp,
+        abp.ptr(),
         &[
             ("slice", buffer_slice as NativeFn, 2),
             ("resize", buffer_resize, 1),
@@ -1720,16 +1720,16 @@ pub(crate) fn install(vm: &mut Vm) {
             ("sliceToImmutable", buffer_slice_immutable, 2),
         ],
     );
-    vm.define_native(ab, "isView", buffer_is_view, 1, any, false);
+    vm.define_native(ab.ptr(), "isView", buffer_is_view, 1, any, false);
 
     // `%TypedArray%` (abstract) and its prototype, the concrete kinds'.
-    let shared = vm.new_object(op);
-    vm.typed_array_prototype = shared;
+    let shared = vm.new_plain(op);
+    vm.typed_array_prototype = shared.ptr();
     let ta = vm.native_function("TypedArray", typed_array_abstract, 0, any, true);
     link_constructor(vm, ta, shared);
-    vm.define_natives(ta, &[("from", typed_from as NativeFn, 1), ("of", typed_of, 0)]);
+    vm.define_natives(ta.ptr(), &[("from", typed_from as NativeFn, 1), ("of", typed_of, 0)]);
     vm.define_natives(
-        shared,
+        shared.ptr(),
         &[
             ("at", typed_at as NativeFn, 1),
             ("copyWithin", typed_copy_within, 2),
@@ -1762,11 +1762,11 @@ pub(crate) fn install(vm: &mut Vm) {
             ("with", typed_with, 2),
         ],
     );
-    vm.define_native(shared, "values", typed_values, 0, any, false);
+    vm.define_native(shared.ptr(), "values", typed_values, 0, any, false);
     // (`toString` is `Array.prototype.toString` itself.)
     let a_to_string = vm.intern_name("toString");
     let to_string = vm.get(object_value(vm.array_prototype), a_to_string).unwrap_or(Value::UNDEFINED);
-    vm.add_property_with(shared, a_to_string, to_string, DONT_ENUM);
+    vm.add_property_with(shared.ptr(), a_to_string, to_string, DONT_ENUM);
     getter(vm, shared, "buffer", typed_buffer);
     getter(vm, shared, "byteLength", typed_byte_length);
     getter(vm, shared, "byteOffset", typed_byte_offset);
@@ -1787,17 +1787,17 @@ pub(crate) fn install(vm: &mut Vm) {
     ];
     let a_bpe = vm.intern_name("BYTES_PER_ELEMENT");
     for (k, kind) in TypedKind::ALL.iter().enumerate() {
-        let proto = vm.new_object(object_value(shared));
-        let c = vm.define_native(g, kind.name(), CTORS[k], 3, any, true);
+        let proto = vm.new_plain(object_value(shared.ptr()));
+        let c = unsafe { Obj::from_ptr((vm.define_native(g, kind.name(), CTORS[k], 3, any, true)).ptr()) };
         link_constructor(vm, c, proto);
-        vm.set_prototype_of(c, object_value(ta));
+        vm.set_prototype_of(c, object_value(ta.ptr()));
         let size = Value::from_i32(kind.size() as i32);
-        vm.add_property_with(c, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
-        vm.add_property_with(proto, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
-        vm.typed_prototypes.push(proto);
-        vm.typed_constructors.push(c);
+        vm.add_property_with(c.ptr(), a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
+        vm.add_property_with(proto.ptr(), a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
+        vm.typed_prototypes.push(proto.ptr());
+        vm.typed_constructors.push(c.ptr());
     }
-    vm.typed_constructors.push(ab);
+    vm.typed_constructors.push(ab.ptr());
     crate::shared::install(vm);
     crate::base64::install(vm);
 }
@@ -1811,10 +1811,11 @@ pub(crate) fn install_symbols(vm: &mut Vm) {
     let values = vm.get(object_value(shared), a_values).unwrap_or(Value::UNDEFINED);
     let a_iter = vm.a_sym_iterator;
     vm.add_property_with(shared, a_iter, values, DONT_ENUM);
-    let holder = vm.new_object(Value::NULL);
-    let tag = vm.define_native(holder, "get [Symbol.toStringTag]", typed_to_string_tag, 0, crate::jit::Ty::Any, false);
+    let holder = vm.new_plain(Value::NULL);
+    let tag =
+        vm.define_native(holder.ptr(), "get [Symbol.toStringTag]", typed_to_string_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
-    vm.define_accessor(shared, a_tag, Some(object_value(tag)), None, DONT_ENUM);
+    vm.define_accessor(shared, a_tag, Some(object_value(tag.ptr())), None, DONT_ENUM);
     let abp = vm.array_buffer_prototype;
     crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(abp) }, "ArrayBuffer");
     crate::shared::install_symbols(vm);

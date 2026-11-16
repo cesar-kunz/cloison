@@ -40,15 +40,15 @@ pub(crate) fn install(vm: &mut Vm) {
     let any = crate::jit::Ty::Any;
     let g = vm.global;
     let op = object_value(vm.object_prototype);
-    let proto = vm.new_object(op);
+    let proto = vm.new_plain(op);
     let c = vm.define_native(g, "ShadowRealm", shadow_realm_ctor, 0, any, true);
-    crate::builtins::link_constructor(vm, c, proto);
-    vm.define_natives(proto, &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
-    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, "ShadowRealm");
+    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
+    vm.define_natives(proto.ptr(), &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
+    crate::symbol::to_string_tag(vm, proto, "ShadowRealm");
     let wrapped = vm.native_function("", wrapped_call, 0, any, false);
     let imported = vm.native_function("", imported, 1, any, false);
     let failed = vm.native_function("", import_failed, 1, any, false);
-    vm.shadow_roots = vec![proto, wrapped, imported, failed];
+    vm.shadow_roots = vec![proto.ptr(), wrapped.ptr(), imported.ptr(), failed.ptr()];
 }
 
 /// `new ShadowRealm()`: a new realm, its global object the host's.
@@ -59,12 +59,12 @@ fn shadow_realm_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let callee = vm.callee;
     let default = object_value(root(vm, Root::Prototype));
     let proto = vm.take_new_target(callee, default)?;
-    let o = vm.new_object(proto);
+    let o = vm.new_plain(proto);
     let r = crate::realm::create(vm);
     let k = hidden_key(vm);
     let d = Desc::data(Value::from_i32(r as i32), false, false, false);
     vm.define_own_property(o, k, &d)?;
-    Ok(object_value(o))
+    Ok(object_value(o.ptr()))
 }
 
 /// ValidateShadowRealmObject: the realm of ShadowRealm `v`.
@@ -72,7 +72,7 @@ fn realm_of(vm: &mut Vm, v: Value, what: &str) -> Result<u32> {
     if is_object(v)
         && Obj::of(v).class() == Class::Plain
         && let k = hidden_key(vm)
-        && let Some(d) = vm.own_property(as_object(v), k)
+        && let Some(d) = vm.own_property(Obj::of(v), k)
         && let Some(r) = d.value.and_then(|r| r.as_number())
     {
         return Ok(r as u32);
@@ -115,20 +115,20 @@ fn thrown_message(vm: &mut Vm, e: &Error) -> String {
     let Some(v) = e.1.filter(|&v| is_object(v)) else {
         return e.0.clone();
     };
-    let o = as_object(v);
-    if !crate::object::is_error(o) {
+    let o = Obj::of(v);
+    if !crate::object::is_error(o.ptr()) {
         return e.0.clone();
     }
-    let data = |vm: &mut Vm, o: *mut Object, name| match vm.own_property(o, Key::Name(name)) {
+    let data = |vm: &mut Vm, o: *mut Object, name| match vm.own_property(unsafe { Obj::from_ptr(o) }, Key::Name(name)) {
         Some(Desc { value: Some(s), .. }) => string_units(s).map(String::from_utf16_lossy),
         _ => None,
     };
     let (a_name, a_message) = (vm.a_name, vm.intern_name("message"));
     let proto = o.shape().live().proto;
-    let name = data(vm, o, a_name)
+    let name = data(vm, o.ptr(), a_name)
         .or_else(|| is_object(proto).then(|| data(vm, as_object(proto), a_name)).flatten())
         .unwrap_or_else(|| "Error".into());
-    match data(vm, o, a_message) {
+    match data(vm, o.ptr(), a_message) {
         Some(m) if !m.is_empty() => format!("{name}: {m}"),
         _ => name,
     }
@@ -176,11 +176,11 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
         }
     }
     let d = Desc::data(Value::number(len), false, false, true);
-    vm.define_own_property(as_object(f), Key::Name(a_length), &d)?;
+    vm.define_own_property(Obj::of(f), Key::Name(a_length), &d)?;
     let name = vm.get(target, a_name)?;
     let name = if is_string(name) { name } else { vm.new_string(&[]) };
     let d = Desc::data(name, false, false, true);
-    vm.define_own_property(as_object(f), Key::Name(a_name), &d)?;
+    vm.define_own_property(Obj::of(f), Key::Name(a_name), &d)?;
     Ok(())
 }
 

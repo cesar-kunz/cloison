@@ -527,11 +527,11 @@ pub(crate) fn new_bigint(vm: &mut Vm, b: Big) -> Value {
     let proto = if vm.bigint_prototype.is_null() { Value::NULL } else { object_value(vm.bigint_prototype) };
     let o = vm.new_object_with(Class::BigInt, proto, 0);
     unsafe {
-        *Object::aux(o) = b.neg as u32;
+        *Object::aux(o.ptr()) = b.neg as u32;
         if !b.mag.is_empty() {
             let p = vm.heap.alloc_bytes(4 * b.mag.len().next_multiple_of(2)).cast::<u32>();
             std::ptr::copy_nonoverlapping(b.mag.as_ptr(), p, b.mag.len());
-            (*o).elems = p.cast();
+            (*o.ptr()).elems = p.cast();
         }
         o.set_elems_len(b.mag.len() as u32);
         // (Its class's root shape takes no element store: see
@@ -539,7 +539,7 @@ pub(crate) fn new_bigint(vm: &mut Vm, b: Big) -> Value {
         // never be freed.)
         o.set_flags(o.flags() | crate::object::NOT_EXTENSIBLE);
     }
-    object_value(o)
+    object_value(o.ptr())
 }
 
 /// A new BigInt of 64 bits `bits` (two's complement if `signed`), for
@@ -789,20 +789,23 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
-    let proto = vm.new_object(op);
-    vm.bigint_prototype = proto;
+    let proto = vm.new_plain(op);
+    vm.bigint_prototype = proto.ptr();
     let c = vm.define_native(g, "BigInt", bigint_fn, 1, any, true);
-    crate::builtins::link_constructor(vm, c, proto);
-    vm.define_natives(c, &[("asIntN", bigint_as_int_n as crate::vm::NativeFn, 2), ("asUintN", bigint_as_uint_n, 2)]);
+    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
     vm.define_natives(
-        proto,
+        c.ptr(),
+        &[("asIntN", bigint_as_int_n as crate::vm::NativeFn, 2), ("asUintN", bigint_as_uint_n, 2)],
+    );
+    vm.define_natives(
+        proto.ptr(),
         &[
             ("toString", bigint_to_string as crate::vm::NativeFn, 0),
             ("toLocaleString", bigint_to_locale_string, 0),
             ("valueOf", bigint_value_of, 0),
         ],
     );
-    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, "BigInt");
+    crate::symbol::to_string_tag(vm, proto, "BigInt");
 }
 
 fn arg(a: &[Value], i: usize) -> Value {

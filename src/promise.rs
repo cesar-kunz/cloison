@@ -89,7 +89,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
-    let proto = vm.new_object(op);
+    let proto = vm.new_plain(op);
     let c = vm.define_native(g, "Promise", promise_ctor, 1, any, true);
     link_constructor(vm, c, proto);
     // (One queue for every realm.)
@@ -100,16 +100,16 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // `AggregateError`, as the error kinds are made in `builtins`.
     let ep = object_value(vm.error_prototypes[0]);
-    let aep = vm.new_object(ep);
+    let aep = vm.new_plain(ep);
     let ac = vm.define_native(g, "AggregateError", aggregate_error_ctor, 2, any, true);
     link_constructor(vm, ac, aep);
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = string(vm, "AggregateError");
-    vm.add_property_with(aep, a_name, name, DONT_ENUM);
+    vm.add_property_with(aep.ptr(), a_name, name, DONT_ENUM);
     let empty = string(vm, "");
-    vm.add_property_with(aep, a_message, empty, DONT_ENUM);
+    vm.add_property_with(aep.ptr(), a_message, empty, DONT_ENUM);
 
-    vm.promise_roots = vec![proto, c, jobs, aep, std::ptr::null_mut()];
+    vm.promise_roots = vec![proto.ptr(), c.ptr(), jobs, aep.ptr(), std::ptr::null_mut()];
     let templates: [(NativeFn, u32); 14] = [
         (resolve_fn, 1),
         (reject_fn, 1),
@@ -128,10 +128,10 @@ pub(crate) fn install(vm: &mut Vm) {
     ];
     for (f, n) in templates {
         let t = vm.native_function("", f, n, any, false);
-        vm.promise_roots.push(t);
+        vm.promise_roots.push(t.ptr());
     }
     vm.define_natives(
-        c,
+        c.ptr(),
         &[
             ("resolve", promise_resolve as NativeFn, 1),
             ("reject", promise_reject, 1),
@@ -146,7 +146,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     vm.define_natives(
-        proto,
+        proto.ptr(),
         &[("then", promise_then as NativeFn, 2), ("catch", promise_catch, 1), ("finally", promise_finally, 1)],
     );
 }
@@ -418,9 +418,9 @@ pub(crate) fn new_promise(vm: &mut Vm) -> Value {
     let st = vm.heap.alloc_values(3);
     unsafe {
         *st.add(STATE) = Value::from_i32(PENDING);
-        crate::heap::store_young(o.cast(), &raw mut (*o).code, st as *const Code);
+        crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).code, st as *const Code);
     }
-    object_value(o)
+    object_value(o.ptr())
 }
 
 /// Promise `p`'s state (pending 0, fulfilled 1, rejected 2) and result.
@@ -917,10 +917,10 @@ fn promise_with_resolvers(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
     let mut cap = new_capability(vm, c)?;
     materialize(vm, &mut cap);
     let op = object_value(vm.object_prototype);
-    let o = vm.new_object(op);
+    let o = vm.new_plain(op);
     let names = [vm.intern_name("promise"), vm.intern_name("resolve"), vm.intern_name("reject")];
-    vm.add_properties(o, &names, &[cap.promise, cap.resolve, cap.reject], 0);
-    Ok(object_value(o))
+    vm.add_properties(o.ptr(), &names, &[cap.promise, cap.resolve, cap.reject], 0);
+    Ok(object_value(o.ptr()))
 }
 
 /// `Promise.try(f, …args)`: a promise for `f(…args)`, rejected if it
@@ -1119,7 +1119,7 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
 /// CreateKeyedPromiseCombinatorResultObject: a null-prototype object of
 /// `values` by `keys` (arrays).
 fn keyed_result(vm: &mut Vm, keys: Value, values: Value) -> Result<Value> {
-    let o = object_value(vm.new_object(Value::NULL));
+    let o = object_value(vm.new_plain(Value::NULL).ptr());
     let (k, v) = (as_object(keys), as_object(values));
     for i in 0..len(unsafe { Obj::from_ptr(k) }) {
         let key = crate::intrinsics::to_property_key(vm, elem(unsafe { Obj::from_ptr(k) }, i))?;
@@ -1217,11 +1217,11 @@ fn settled_reject(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn settled_result(vm: &mut Vm, status: &str, key: &str, v: Value) -> Value {
     let op = object_value(vm.object_prototype);
-    let o = vm.new_object(op);
+    let o = vm.new_plain(op);
     let names = [vm.intern_name("status"), vm.intern_name(key)];
     let status = string(vm, status);
-    vm.add_properties(o, &names, &[status, v], 0);
-    object_value(o)
+    vm.add_properties(o.ptr(), &names, &[status, v], 0);
+    object_value(o.ptr())
 }
 
 /// `any`'s reject element function.
@@ -1237,16 +1237,16 @@ fn any_element(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// A new `AggregateError` of `errors` (an array), with `message` if given.
 fn new_aggregate_error(vm: &mut Vm, errors: Value, message: Option<&[u16]>) -> Value {
     let proto = object_value(root(vm, Root::AggregateErrorPrototype).ptr());
-    let o = vm.new_object(proto);
-    unsafe { (*o).flags |= crate::object::ERROR };
+    let o = vm.new_plain(proto);
+    unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
         let a = vm.intern_name("message");
         let m = vm.new_string(m);
-        vm.add_property_with(o, a, m, DONT_ENUM);
+        vm.add_property_with(o.ptr(), a, m, DONT_ENUM);
     }
     let a = vm.intern_name("errors");
-    vm.add_property_with(o, a, errors, DONT_ENUM);
-    object_value(o)
+    vm.add_property_with(o.ptr(), a, errors, DONT_ENUM);
+    object_value(o.ptr())
 }
 
 /// `any`'s rejection: every promise was rejected.

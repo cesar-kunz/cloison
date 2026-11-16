@@ -52,7 +52,7 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
 
     // `SuppressedError`, an error kind of its own (as `AggregateError`).
     let ep = object_value(vm.error_prototypes[0]);
-    let sep = vm.new_object(ep);
+    let sep = vm.new_plain(ep);
     let sc = vm.define_native(g, "SuppressedError", suppressed_error_ctor, 3, any, true);
     link_constructor(vm, sc, sep);
     // (Its prototype is `Error`, as the other kinds'.)
@@ -61,19 +61,19 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     vm.set_prototype_of(sc, error);
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = str_value(vm, "SuppressedError");
-    vm.add_property_with(sep, a_name, name, DONT_ENUM);
+    vm.add_property_with(sep.ptr(), a_name, name, DONT_ENUM);
     let empty = str_value(vm, "");
-    vm.add_property_with(sep, a_message, empty, DONT_ENUM);
+    vm.add_property_with(sep.ptr(), a_message, empty, DONT_ENUM);
 
     // `DisposableStack` and `AsyncDisposableStack`.
     let a_dispose = vm.intern_name(&format!("{mark}Symbol.dispose"));
     let a_async_dispose = vm.intern_name(&format!("{mark}Symbol.asyncDispose"));
     let a_tag = vm.a_sym_to_string_tag;
-    let dsp = vm.new_object(op);
+    let dsp = vm.new_plain(op);
     let dc = vm.define_native(g, "DisposableStack", stack_ctor::<false>, 0, any, true);
     link_constructor(vm, dc, dsp);
     vm.define_natives(
-        dsp,
+        dsp.ptr(),
         &[
             ("adopt", stack_adopt::<false> as NativeFn, 2),
             ("defer", stack_defer::<false>, 1),
@@ -81,17 +81,17 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
             ("use", stack_use::<false>, 1),
         ],
     );
-    let dispose = vm.define_native(dsp, "dispose", stack_dispose, 0, any, false);
-    vm.add_property_with(dsp, a_dispose, object_value(dispose), DONT_ENUM);
+    let dispose = vm.define_native(dsp.ptr(), "dispose", stack_dispose, 0, any, false);
+    vm.add_property_with(dsp.ptr(), a_dispose, object_value(dispose.ptr()), DONT_ENUM);
     getter(vm, dsp, "disposed", stack_disposed::<false>);
     let tag = str_value(vm, "DisposableStack");
     let _ = vm.define_own_property(dsp, Key::Name(a_tag), &Desc::data(tag, false, false, true));
 
-    let adsp = vm.new_object(op);
+    let adsp = vm.new_plain(op);
     let adc = vm.define_native(g, "AsyncDisposableStack", stack_ctor::<true>, 0, any, true);
     link_constructor(vm, adc, adsp);
     vm.define_natives(
-        adsp,
+        adsp.ptr(),
         &[
             ("adopt", stack_adopt::<true> as NativeFn, 2),
             ("defer", stack_defer::<true>, 1),
@@ -99,8 +99,8 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
             ("use", stack_use::<true>, 1),
         ],
     );
-    let dispose_async = vm.define_native(adsp, "disposeAsync", stack_dispose_async, 0, any, false);
-    vm.add_property_with(adsp, a_async_dispose, object_value(dispose_async), DONT_ENUM);
+    let dispose_async = vm.define_native(adsp.ptr(), "disposeAsync", stack_dispose_async, 0, any, false);
+    vm.add_property_with(adsp.ptr(), a_async_dispose, object_value(dispose_async.ptr()), DONT_ENUM);
     getter(vm, adsp, "disposed", stack_disposed::<true>);
     let tag = str_value(vm, "AsyncDisposableStack");
     let _ = vm.define_own_property(adsp, Key::Name(a_tag), &Desc::data(tag, false, false, true));
@@ -109,12 +109,13 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     // `%AsyncIteratorPrototype%[Symbol.asyncDispose]`.
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
     let f = vm.native_function("[Symbol.dispose]", iterator_dispose, 0, any, false);
-    vm.add_property_with(ip, a_dispose, object_value(f), DONT_ENUM);
+    vm.add_property_with(ip, a_dispose, object_value(f.ptr()), DONT_ENUM);
     let aip = async_iterator_prototype(vm);
     let f = vm.native_function("[Symbol.asyncDispose]", async_iterator_dispose, 0, any, false);
-    vm.add_property_with(aip, a_async_dispose, object_value(f), DONT_ENUM);
+    vm.add_property_with(aip, a_async_dispose, object_value(f.ptr()), DONT_ENUM);
 
-    vm.dispose_roots = vec![object_value(dsp), object_value(adsp), object_value(sep), Value::UNDEFINED];
+    vm.dispose_roots =
+        vec![object_value(dsp.ptr()), object_value(adsp.ptr()), object_value(sep.ptr()), Value::UNDEFINED];
     Ok(())
 }
 
@@ -229,12 +230,12 @@ fn thrown(vm: &mut Vm, e: Error) -> Result<Value> {
 /// message (DisposeResources').
 fn suppressed_error(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
     let proto = root(vm, Root::SuppressedErrorPrototype);
-    let o = vm.new_object(proto);
-    unsafe { (*o).flags |= crate::object::ERROR };
+    let o = vm.new_plain(proto);
+    unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
-    vm.add_property_with(o, a_error, error, DONT_ENUM);
-    vm.add_property_with(o, a_suppressed, suppressed, DONT_ENUM);
-    object_value(o)
+    vm.add_property_with(o.ptr(), a_error, error, DONT_ENUM);
+    vm.add_property_with(o.ptr(), a_suppressed, suppressed, DONT_ENUM);
+    object_value(o.ptr())
 }
 
 /// DisposeResources, synchronously, of capability `state`'s resources
@@ -276,9 +277,10 @@ fn async_helper(vm: &mut Vm) -> Result<Value> {
     let make = crate::builtins::run_source(vm, ASYNC_DISPOSE)?;
     let h = vm.handle_scope(|vm| {
         vm.handles.push(make);
-        let call = object_value(vm.native_function("call", helper_call, 2, crate::jit::Ty::Any, false));
+        let call = object_value(vm.native_function("call", helper_call, 2, crate::jit::Ty::Any, false).ptr());
         vm.handles.push(call);
-        let suppress = object_value(vm.native_function("suppress", helper_suppress, 2, crate::jit::Ty::Any, false));
+        let suppress =
+            object_value(vm.native_function("suppress", helper_suppress, 2, crate::jit::Ty::Any, false).ptr());
         vm.handles.push(suppress);
         call_function(vm, make, Value::UNDEFINED, &[call, suppress])
     })?;
@@ -353,16 +355,16 @@ fn suppressed_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         _ => None,
     };
     let proto = root(vm, Root::SuppressedErrorPrototype);
-    let o = vm.new_object(proto);
-    unsafe { (*o).flags |= crate::object::ERROR };
+    let o = vm.new_plain(proto);
+    unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
         let a_message = vm.intern_name("message");
-        vm.add_property_with(o, a_message, m, DONT_ENUM);
+        vm.add_property_with(o.ptr(), a_message, m, DONT_ENUM);
     }
     let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
-    vm.add_property_with(o, a_error, arg(a, 0), DONT_ENUM);
-    vm.add_property_with(o, a_suppressed, arg(a, 1), DONT_ENUM);
-    Ok(object_value(o))
+    vm.add_property_with(o.ptr(), a_error, arg(a, 0), DONT_ENUM);
+    vm.add_property_with(o.ptr(), a_suppressed, arg(a, 1), DONT_ENUM);
+    Ok(object_value(o.ptr()))
 }
 
 // ---- DisposableStack and AsyncDisposableStack ----
@@ -375,8 +377,8 @@ fn new_stack(vm: &mut Vm, async_: bool) -> Result<Value> {
     let state = new_state(vm, async_)?;
     let proto = root(vm, if async_ { Root::AsyncStackPrototype } else { Root::StackPrototype });
     let o = vm.new_object_with(Class::DisposableStack, proto, 0);
-    unsafe { (*o).code = state.to_bits() as *const crate::vm::Code };
-    Ok(object_value(o))
+    unsafe { (*o.ptr()).code = state.to_bits() as *const crate::vm::Code };
+    Ok(object_value(o.ptr()))
 }
 
 fn stack_ctor<const ASYNC: bool>(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {

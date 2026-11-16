@@ -279,7 +279,7 @@ macro_rules! handlers {
             // compiled code, once its call countdown has run out.
             macro_rules! enter {
                 ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
-                    let callee: *const Code = (*$fo).code;
+                    let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code;
                     let new = push_frame($regs, $fo, callee, $this, $args, $argc, $flags, $pc.add($size));
                     // (Thrown from the call: a `catch` around it catches it.)
                     if new.is_null() {
@@ -959,7 +959,7 @@ handlers! {
         let (args, argc) = frame_args(vm, regs, &mut spread);
         let values = std::slice::from_raw_parts(args, argc);
         let callee: *mut Object = header(regs, FUNC);
-        *reg(pc, 1, regs) = crate::builtins::arguments_object_of(vm, values, callee);
+        *reg(pc, 1, regs) = crate::builtins::arguments_object_of(vm, values, unsafe { Obj::from_ptr(callee).ptr() });
         next!(any, Op::CreateArguments.size(), acc)
     }
 
@@ -1102,7 +1102,7 @@ handlers! {
             configurable: Some(true),
             ..Default::default()
         };
-        let r = vm.define_own_property(o, key, &d).map(|_| acc);
+        let r = vm.define_own_property(unsafe { Obj::from_ptr(o) }, key, &d).map(|_| acc);
         next_or_throw!(Op::DefineAccessor.size(), r)
     }
 
@@ -1242,9 +1242,9 @@ handlers! {
         let callee: *mut Object = header(regs, FUNC);
         let n = argc.min((*frame_code(regs)).nparams as usize);
         let o = if n > 0 {
-            crate::builtins::mapped_arguments_object(vm, values, callee)
+            crate::builtins::mapped_arguments_object(vm, values, unsafe { Obj::from_ptr(callee) })
         } else {
-            crate::builtins::arguments_object_of(vm, values, callee)
+            crate::builtins::arguments_object_of(vm, values, unsafe { Obj::from_ptr(callee).ptr() })
         };
         if n > 0 {
             let escapes = (*frame_code(regs)).arguments_escape;
@@ -2299,7 +2299,7 @@ handlers! {
         // A bound function of a bytecode one, with no arguments bound: its
         // target, entered here with the bound `this`.
         if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
-            enter!(fo, that, w.add(1), argc, 0, Op::Call.size())
+            enter!(fo.ptr(), that, w.add(1), argc, 0, Op::Call.size())
         }
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
         let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
@@ -2311,7 +2311,7 @@ handlers! {
     fn slow_call_undefined_other(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
-            enter!(fo, that, reg(pc, 2, regs), *pc.add(3) as usize, 0, Op::CallUndefined.size())
+            enter!(fo.ptr(), that, reg(pc, 2, regs), *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
         let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
@@ -5584,7 +5584,7 @@ pub(crate) unsafe fn call_from_jit(
         if op != Op::Construct
             && let Some((fo, that)) = crate::builtins::unwrap_bound(vm, fv)
         {
-            (fv, this) = (object_value(fo), that);
+            (fv, this) = (object_value(fo.ptr()), that);
         }
         let bytecode = fv.is_cell() && Obj::of(fv).class() == Class::Function;
         // `f.apply(that, list)`'s arguments (alive until the call returns).

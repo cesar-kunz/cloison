@@ -13,11 +13,11 @@ use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, s
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
-    let json = vm.new_object(op);
+    let json = vm.new_plain(op);
     let a_json = vm.intern_name("JSON");
-    vm.add_property_with(g, a_json, object_value(json), DONT_ENUM);
+    vm.add_property_with(g, a_json, object_value(json.ptr()), DONT_ENUM);
     vm.define_natives(
-        json,
+        json.ptr(),
         &[
             ("stringify", json_stringify as NativeFn, 3),
             ("parse", json_parse, 2),
@@ -119,7 +119,7 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let depth = vm.handles.len();
     let r = vm.handle_scope(|vm| {
         let op = object_value(vm.object_prototype);
-        let wrapper = object_value(vm.new_object(op));
+        let wrapper = object_value(vm.new_plain(op).ptr());
         let empty = vm.new_string(&[]);
         let a_empty = vm.intern_name("");
         vm.create_data_property(wrapper, Key::Name(a_empty), arg(a, 0))?;
@@ -340,9 +340,9 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
                 }
                 ks
             }
-            None if vm.plain_named(o.ptr()) => {
+            None if vm.plain_named(o) => {
                 let s = o.shape().live();
-                let slots = vm.listed_slots(o.ptr(), false, false).unwrap_or_default();
+                let slots = vm.listed_slots(o, false, false).unwrap_or_default();
                 slots
                     .into_iter()
                     .map(|k| {
@@ -515,7 +515,7 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     vm.handle_scope(|vm| {
         let (v, record) = parse_text(vm, &u, true)?;
         let op = object_value(vm.object_prototype);
-        let root = object_value(vm.new_object(op));
+        let root = object_value(vm.new_plain(op).ptr());
         vm.handles.push(root);
         let empty = vm.intern_name("");
         vm.create_data_property(root, Key::Name(empty), v)?;
@@ -577,7 +577,7 @@ fn internalize(
     check_native_stack(vm)?;
     let v = vm.get_keyed(holder, name)?;
     let record = record.filter(|r| crate::props::same_value(r.value, v));
-    let context = object_value(vm.new_object(object_value(vm.object_prototype)));
+    let context = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     if let Some(&Record { kind: RecordKind::Source(start, end), .. }) = record
         && !is_object(v)
     {
@@ -637,13 +637,13 @@ fn json_raw_json(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::new_syntax("JSON.rawJSON: not a primitive's JSON text"));
     }
     parse_text(vm, &u, false)?;
-    let o = vm.new_object(Value::NULL);
+    let o = vm.new_plain(Value::NULL);
     let s = vm.new_string(&u);
     let a_raw = vm.intern_name("rawJSON");
-    vm.create_data_property(object_value(o), Key::Name(a_raw), s)?;
-    unsafe { (*o).flags |= RAW_JSON };
+    vm.create_data_property(object_value(o.ptr()), Key::Name(a_raw), s)?;
+    unsafe { (*o.ptr()).flags |= RAW_JSON };
     vm.seal(o, true);
-    Ok(object_value(o))
+    Ok(object_value(o.ptr()))
 }
 
 fn json_is_raw_json(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -719,7 +719,7 @@ impl<'a> Parser<'a> {
         let (v, container) = match self.peek().map(|c| c as u8 as char) {
             Some('{') if self.peek() < Some(128) => {
                 self.i += 1;
-                let o = object_value(vm.new_object(object_value(vm.object_prototype)));
+                let o = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
                 if !self.eat(b'}') {
                     loop {
                         self.space();

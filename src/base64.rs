@@ -276,7 +276,7 @@ fn written(vm: &mut Vm, o: *mut Object, d: Decoded) -> Result<Value> {
     if let Some(e) = d.error {
         return Err(e);
     }
-    let r = object_value(vm.new_object(object_value(vm.object_prototype)));
+    let r = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     let (a_read, a_written) = (vm.intern_name("read"), vm.intern_name("written"));
     vm.create_data_property(r, Key::Name(a_read), Value::number(d.read as f64))?;
     vm.create_data_property(r, Key::Name(a_written), Value::number(d.bytes.len() as f64))?;

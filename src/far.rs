@@ -28,11 +28,10 @@
 //! read the length (`get_length_*`, `array_pop_`), and a far array's shape
 //! takes no store's fast path (`slow_elements`), so it never appends.
 
-use crate::object::Obj;
 use crate::raw::ObjectPtr;
 use std::sync::OnceLock;
 
-use crate::object::{Class, FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, SEALED};
+use crate::object::{Class, FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, Obj, Object, SEALED};
 use crate::value::Value;
 use crate::vm::{MAX_ELEMENTS, Vm};
 
@@ -471,7 +470,7 @@ pub(crate) fn make_far(vm: &mut Vm, o: Obj, len: u32) {
     // A slot for the store past the elements, whose room shrinks by it.
     vm.reserve_elems(o.ptr(), n + 1);
     hold(o, e);
-    vm.far_elements(o.ptr());
+    vm.far_elements(o);
     unsafe {
         o.set_flags(o.flags() | FAR);
         vm.heap.fill_values(o.elems().add(first_hole), n.saturating_sub(first_hole), Value::EMPTY);
@@ -570,6 +569,6 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: Obj) {
         o.set_flags(o.flags() & !FAR);
     }
     if flags & (NOT_EXTENSIBLE | SEALED | FROZEN | LENGTH_READ_ONLY) == 0 {
-        vm.dense_elements(o.ptr());
+        vm.dense_elements(o);
     }
 }

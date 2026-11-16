@@ -123,9 +123,9 @@ pub(crate) fn create(vm: &mut Vm, slots: Slots) -> Value {
     let bytes = vm.heap.alloc_bytes(size_of::<Slots>());
     unsafe {
         bytes.cast::<Slots>().write_unaligned(slots);
-        (*o).elems = bytes.cast();
+        (*o.ptr()).elems = bytes.cast();
     }
-    object_value(o)
+    object_value(o.ptr())
 }
 
 fn this_slots(this: Value, kind: Kind) -> Result<Slots> {
@@ -240,7 +240,7 @@ pub(crate) fn bigint_of(vm: &mut Vm, ns: i128) -> Value {
 /// GetOptionsObject.
 pub(crate) fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
-        return Ok(object_value(vm.new_object(Value::NULL)));
+        return Ok(object_value(vm.new_plain(Value::NULL).ptr()));
     }
     if is_object(v) {
         return Ok(v);
@@ -788,10 +788,10 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    let temporal = vm.new_object(op);
+    let temporal = vm.new_plain(op);
     let a = vm.intern_name("Temporal");
-    vm.add_property_with(g, a, object_value(temporal), crate::object::DONT_ENUM);
-    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(temporal) }, "Temporal");
+    vm.add_property_with(g, a, object_value(temporal.ptr()), crate::object::DONT_ENUM);
+    crate::symbol::to_string_tag(vm, temporal, "Temporal");
     vm.temporal.protos = vec![std::ptr::null_mut(); 8];
     vm.temporal.ctors = vec![std::ptr::null_mut(); 8];
     let specs = [
@@ -805,18 +805,18 @@ pub(crate) fn install(vm: &mut Vm) {
         duration::spec(),
     ];
     for spec in specs {
-        let proto = vm.new_object(op);
-        let c = vm.define_native(temporal, spec.name, spec.ctor, spec.length, any, true);
-        crate::builtins::link_constructor(vm, c, proto);
-        vm.define_natives(c, spec.statics);
+        let proto = vm.new_plain(op);
+        let c = vm.define_native(temporal.ptr(), spec.name, spec.ctor, spec.length, any, true);
+        crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
+        vm.define_natives(c.ptr(), spec.statics);
         for &(name, f) in spec.getters {
             crate::builtins::getter(vm, proto, name, f);
         }
-        vm.define_natives(proto, spec.methods);
-        vm.define_natives(proto, &[("valueOf", value_of as NativeFn, 0)]);
-        crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, &format!("Temporal.{}", spec.name));
-        vm.temporal.protos[spec.kind as usize] = proto;
-        vm.temporal.ctors[spec.kind as usize] = c;
+        vm.define_natives(proto.ptr(), spec.methods);
+        vm.define_natives(proto.ptr(), &[("valueOf", value_of as NativeFn, 0)]);
+        crate::symbol::to_string_tag(vm, proto, &format!("Temporal.{}", spec.name));
+        vm.temporal.protos[spec.kind as usize] = proto.ptr();
+        vm.temporal.ctors[spec.kind as usize] = c.ptr();
     }
-    zoned::install_now(vm, temporal);
+    zoned::install_now(vm, temporal.ptr());
 }

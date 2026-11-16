@@ -57,15 +57,15 @@ impl Flags {
 
 pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
     let op = object_value(vm.object_prototype);
-    let proto = vm.new_object(op);
+    let proto = vm.new_plain(op);
     let c = vm.define_native(intl, "Collator", collator_ctor, 0, crate::jit::Ty::Any, true);
-    crate::builtins::link_constructor(vm, c, proto);
-    vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
+    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
+    vm.define_natives(c.ptr(), &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
     crate::builtins::getter(vm, proto, "compare", compare_getter);
-    vm.define_natives(proto, &[("resolvedOptions", resolved_options as NativeFn, 0)]);
-    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, "Intl.Collator");
-    vm.intl_roots[Root::CollatorPrototype as usize] = proto;
-    vm.intl_roots[Root::Compare as usize] = vm.native_function("", bound_compare, 2, crate::jit::Ty::Any, false);
+    vm.define_natives(proto.ptr(), &[("resolvedOptions", resolved_options as NativeFn, 0)]);
+    crate::symbol::to_string_tag(vm, proto, "Intl.Collator");
+    vm.intl_roots[Root::CollatorPrototype as usize] = proto.ptr();
+    vm.intl_roots[Root::Compare as usize] = vm.native_function("", bound_compare, 2, crate::jit::Ty::Any, false).ptr();
 }
 
 /// `Intl.Collator(locales, options)`, with `new` or without.
@@ -219,7 +219,7 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_collator(this, "resolvedOptions")?;
     let f = Flags::unpack(slot(o, FLAGS).as_i32_unchecked());
     let op = object_value(vm.object_prototype);
-    let r = vm.new_object(op);
+    let r = vm.new_plain(op);
     let usage = if f.search { "search" } else { "sort" };
     let strings = [
         ("locale", None),
@@ -239,9 +239,9 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             _ => unreachable!(),
         };
         let a = vm.intern_name(name);
-        vm.add_property(r, a, v);
+        vm.add_property(r.ptr(), a, v);
     }
-    Ok(object_value(r))
+    Ok(object_value(r.ptr()))
 }
 
 /// `Intl.Collator.supportedLocalesOf(locales, options)`.

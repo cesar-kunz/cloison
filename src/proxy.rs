@@ -28,7 +28,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let any = crate::jit::Ty::Any;
     let c = vm.define_native(g, "Proxy", proxy_ctor, 2, any, true);
-    vm.define_native(c, "revocable", proxy_revocable, 2, any, false);
+    vm.define_native(c.ptr(), "revocable", proxy_revocable, 2, any, false);
     vm.proxy_codes = [
         vm.native_function("", trampoline, 0, any, false),
         vm.native_function("", trampoline, 0, any, true),
@@ -190,7 +190,7 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         (*r).code = vm.proxy_codes[2];
     }
     set_slot(r, 0, p);
-    let out = object_value(vm.new_object(object_value(vm.object_prototype)));
+    let out = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     let (a_proxy, a_revoke) = (vm.intern_name("proxy"), vm.intern_name("revoke"));
     vm.create_data_property(out, Key::Name(a_proxy), p)?;
     vm.create_data_property(out, Key::Name(a_revoke), object_value(r))?;
@@ -312,7 +312,7 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
         if is_proxy(vm, cur) {
             return get(vm, cur, key, receiver);
         }
-        if let Some(d) = vm.own_property(cur, key) {
+        if let Some(d) = vm.own_property(unsafe { Obj::from_ptr(cur) }, key) {
             if d.is_accessor() {
                 return match d.get.filter(|g| !g.is_undefined()) {
                     Some(g) => call_function(vm, g, receiver, &[]),
@@ -336,7 +336,7 @@ pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: V
         if is_proxy(vm, cur) {
             return set(vm, cur, key, v, receiver);
         }
-        if let Some(d) = vm.own_property(cur, key) {
+        if let Some(d) = vm.own_property(unsafe { Obj::from_ptr(cur) }, key) {
             break Some(d);
         }
         let p = cur.shape().live().proto;
@@ -375,7 +375,7 @@ pub(crate) fn generic_has(vm: &mut Vm, o: Value, key: Key) -> Result<bool> {
         if is_proxy(vm, cur) {
             return has(vm, cur, key);
         }
-        if vm.own_property(cur, key).is_some() {
+        if vm.own_property(unsafe { Obj::from_ptr(cur) }, key).is_some() {
             return Ok(true);
         }
         let p = cur.shape().live().proto;
@@ -389,7 +389,7 @@ pub(crate) fn generic_has(vm: &mut Vm, o: Value, key: Key) -> Result<bool> {
 /// `o.[[Delete]](key)`: whether it's gone.
 pub(crate) fn delete(vm: &mut Vm, o: *mut Object, key: Key) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return Ok(vm.delete_own(o, key));
+        return Ok(vm.delete_own(unsafe { Obj::from_ptr(o) }, key));
     }
     let (t, h) = parts(o)?;
     match trap(vm, h, "deleteProperty")? {
@@ -415,7 +415,7 @@ pub(crate) fn delete(vm: &mut Vm, o: *mut Object, key: Key) -> Result<bool> {
 /// `o.[[GetOwnProperty]](key)`.
 pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<Option<Desc>> {
     if !is_proxy(vm, o) {
-        return Ok(vm.own_property(o, key));
+        return Ok(vm.own_property(unsafe { Obj::from_ptr(o) }, key));
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "getOwnPropertyDescriptor")? else {
@@ -476,7 +476,7 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
 /// `o.[[DefineOwnProperty]](key, d)`: whether it was defined.
 pub(crate) fn define_property(vm: &mut Vm, o: *mut Object, key: Key, d: &Desc) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return vm.define_own_property(o, key, d);
+        return vm.define_own_property(unsafe { Obj::from_ptr(o) }, key, d);
     }
     proxy_define(vm, o, key, d)
 }
@@ -520,7 +520,7 @@ pub(crate) fn proxy_define(vm: &mut Vm, o: *mut Object, key: Key, d: &Desc) -> R
 
 /// A descriptor object of just the fields `d` has.
 fn from_partial_descriptor(vm: &mut Vm, d: &Desc) -> Value {
-    let o = object_value(vm.new_object(object_value(vm.object_prototype)));
+    let o = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     let fields = [
         ("value", d.value),
         ("writable", d.writable.map(Value::from_bool)),
@@ -645,7 +645,7 @@ pub(crate) fn get_prototype_of(vm: &mut Vm, o: *mut Object) -> Result<Value> {
 /// `o.[[SetPrototypeOf]](proto)`: whether it was set.
 pub(crate) fn set_prototype_of(vm: &mut Vm, o: *mut Object, proto: Value) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return Ok(vm.set_prototype_of(o, proto));
+        return Ok(vm.set_prototype_of(unsafe { Obj::from_ptr(o) }, proto));
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "setPrototypeOf")? else {
@@ -663,7 +663,7 @@ pub(crate) fn set_prototype_of(vm: &mut Vm, o: *mut Object, proto: Value) -> Res
 /// `o.[[IsExtensible]]()`.
 pub(crate) fn is_extensible(vm: &mut Vm, o: *mut Object) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return Ok(Vm::is_extensible(o));
+        return Ok(Vm::is_extensible(unsafe { Obj::from_ptr(o) }));
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "isExtensible")? else {
@@ -679,7 +679,7 @@ pub(crate) fn is_extensible(vm: &mut Vm, o: *mut Object) -> Result<bool> {
 /// `o.[[PreventExtensions]]()`: whether it now isn't extensible.
 pub(crate) fn prevent_extensions(vm: &mut Vm, o: *mut Object) -> Result<bool> {
     if !is_proxy(vm, o) {
-        vm.prevent_extensions(o);
+        vm.prevent_extensions(unsafe { Obj::from_ptr(o) });
         return Ok(true);
     }
     let (t, h) = parts(o)?;

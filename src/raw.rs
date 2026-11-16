@@ -192,6 +192,13 @@ pub(crate) trait ObjectPtr: Copy {
     }
 }
 
+impl ObjectPtr for crate::object::Obj {
+    #[inline(always)]
+    fn object_ptr(self) -> *mut Object {
+        self.ptr()
+    }
+}
+
 impl ObjectPtr for *mut Object {
     #[inline(always)]
     fn object_ptr(self) -> *mut Object {

@@ -2843,7 +2843,11 @@ impl Vm {
         if slot >= ns.capacity.get() {
             self.reserve_props(o, slot - ns.capacity.get());
         }
-        crate::object::set_shape(o, new);
+        // SAFETY: `new`, a transition from `o`'s shape, is of `o`'s class,
+        // and the room for its new slot was just made. (Not `set_shape`,
+        // whose checks of both cost 1% instructions on Octane's RegExp:
+        // each exec's result gets its properties here.)
+        unsafe { crate::object::set_shape_unchecked(o, new) };
         self.store_field(o, slot, value);
         if o.flags() & PROTOTYPE != 0 {
             self.proto_epoch = self.proto_epoch.wrapping_add(1);
@@ -3486,10 +3490,10 @@ impl Vm {
         }
         Ok(match self.lookup(o, name) {
             Some((h, slot)) if self.is_accessor(h, slot) => {
-                let pair = h.slot_value(h.shape().live().location(slot));
+                let pair = h.field(slot);
                 return self.call_getter(pair, obj);
             }
-            Some((h, slot)) => h.slot_value(h.shape().live().location(slot)),
+            Some((h, slot)) => h.field(slot),
             None => return Ok(self.virtual_get(o, name)),
         })
     }
@@ -3511,10 +3515,10 @@ impl Vm {
         }
         match found {
             Some((h, slot)) if self.is_accessor(h, slot) => {
-                let pair = h.slot_value(h.shape().live().location(slot));
+                let pair = h.field(slot);
                 self.call_getter(pair, obj)
             }
-            Some((h, slot)) => Ok(h.slot_value(h.shape().live().location(slot))),
+            Some((h, slot)) => Ok(h.field(slot)),
             None => Ok(self.virtual_get(o, name)),
         }
     }
@@ -3732,7 +3736,7 @@ impl Vm {
     /// what `o.name` finds: its getter-setter pair.
     fn accessor(&self, o: *mut Object, name: Atom) -> Option<Value> {
         let (h, slot) = self.lookup(o, name)?;
-        self.is_accessor(h, slot).then(|| h.slot_value(h.shape().live().location(slot)))
+        self.is_accessor(h, slot).then(|| h.field(slot))
     }
 
     /// `this.name` through an accessor `pair`'s getter (`undefined`
@@ -3821,10 +3825,10 @@ impl Vm {
         match found {
             // (A getter's `this` the primitive.)
             Some((h, slot)) if self.is_accessor(h, slot) => {
-                let pair = h.slot_value(h.shape().live().location(slot));
+                let pair = h.field(slot);
                 self.call_getter(pair, receiver)
             }
-            Some((h, slot)) => Ok(h.slot_value(h.shape().live().location(slot))),
+            Some((h, slot)) => Ok(h.field(slot)),
             None => Ok(self.virtual_get(p, name)),
         }
     }
@@ -3864,10 +3868,10 @@ impl Vm {
             return match self.lookup(o, name) {
                 // (A getter's `this` the primitive.)
                 Some((h, slot)) if self.is_accessor(h, slot) => {
-                    let pair = h.slot_value(h.shape().live().location(slot));
+                    let pair = h.field(slot);
                     self.call_getter(pair, obj)
                 }
-                Some((h, slot)) => Ok(h.slot_value(h.shape().live().location(slot))),
+                Some((h, slot)) => Ok(h.field(slot)),
                 None => Ok(Value::UNDEFINED),
             };
         }
@@ -4020,7 +4024,7 @@ impl Vm {
                     self.heap.note(object_value(h));
                     note_accessor(ic, o.shape(), h, self.proto_epoch);
                 }
-                return self.call_getter(h.slot_value(loc), obj);
+                return self.call_getter(h.field(slot), obj);
             }
             self.heap.note(object_value(h));
             let e = Ic {
@@ -4039,7 +4043,7 @@ impl Vm {
                     self.interp_megas[interp_mega_index(sh, name.0)] = InterpMega { shape: sh, name: name.0, loc };
                 }
             }
-            Ok(h.slot_value(loc))
+            Ok(h.field(slot))
         }
     }
 
@@ -4155,7 +4159,7 @@ impl Vm {
                     self.heap.note(object_value(h));
                     note_accessor(ic, old, h, self.proto_epoch);
                 }
-                return self.call_setter(h.slot_value(h.shape().live().location(slot)), obj, value);
+                return self.call_setter(h.field(slot), obj, value);
             }
             if let Some(slot) = old.live().lookup(name) {
                 self.store_field(o, slot, value);
@@ -4315,7 +4319,7 @@ impl Vm {
         unsafe {
             let shape = l.shape();
             let loc = shape.live().location(slot);
-            let v = l.slot_value(loc);
+            let v = l.field(slot);
             if v == Value::HOLE {
                 return Some(Err(Error::reference_error(format!(
                     "Cannot access '{}' before initialization",
@@ -4635,7 +4639,8 @@ impl Vm {
             Class::String => i < o.elems_len(),
             Class::TypedArray => (i as usize) < crate::typed::ta_length(o).unwrap_or(0),
             c if c.no_elements() => false,
-            _ => i < o.elems_len() && o.elem(i as usize) != Value::EMPTY,
+            // SAFETY: values, below the length (as `Vm::get_index_from`'s).
+            _ => i < o.elems_len() && unsafe { *o.elems().add(i as usize) } != Value::EMPTY,
         }
     }
 
@@ -4647,7 +4652,7 @@ impl Vm {
         let Some(slot) = o.shape().live().lookup(a) else {
             return Ok(None);
         };
-        let v = o.slot_value(o.shape().live().location(slot));
+        let v = o.field(slot);
         if self.is_accessor(o, slot) {
             return self.call_getter(v, receiver).map(Some);
         }
@@ -5192,7 +5197,11 @@ impl Vm {
                     _ => {}
                 }
                 if i < o.elems_len() && o.class() != Class::String {
-                    let v = o.elem(i as usize);
+                    // SAFETY: values (not a string's, a typed array's or a
+                    // buffer's bytes, all returned above), below the length.
+                    // (Not `elem`, whose checks cost 1% instructions on
+                    // Octane's DeltaBlue without the JIT.)
+                    let v = *o.elems().add(i as usize);
                     if v != Value::EMPTY {
                         return Ok(v);
                     }
@@ -5368,7 +5377,7 @@ impl Vm {
             if i >= o.elems_len() {
                 self.reserve_elems(o, i as usize + 1);
                 for j in o.elems_len()..i {
-                    o.set_elem(j as usize, Value::EMPTY);
+                    o.clear_elem(j as usize);
                 }
                 o.set_elems_len(i + 1);
             }
@@ -5487,7 +5496,7 @@ impl Vm {
             }
             self.reserve_elems(o, i as usize + 1);
             for j in o.elems_len()..i {
-                o.set_elem(j as usize, Value::EMPTY);
+                o.clear_elem(j as usize);
             }
             o.set_elems_len(i + 1);
         }
@@ -5528,7 +5537,7 @@ impl Vm {
             self.reserve_elems(o, n);
         }
         for i in n.min(len)..n.max(len) {
-            o.set_elem(i, Value::EMPTY);
+            o.clear_elem(i);
         }
         o.set_elems_len(n as u32);
         Ok(())
@@ -6095,7 +6104,7 @@ impl Vm {
     fn released_get(&self, o: *mut Object, i: u32) -> Option<Value> {
         match self.released_binding(o, i)? {
             Binding::Upvalue(u) => Some(unsafe { *(*u).at }),
-            Binding::Scope(env, slot) => Some(env.slot_value(env.shape().live().location(slot))),
+            Binding::Scope(env, slot) => Some(env.field(slot)),
         }
     }
 
@@ -6129,7 +6138,7 @@ impl Vm {
         } else if let Some(r) = self.released_record(o)
             && 1 + i < r.elems_len()
         {
-            r.set_elem(1 + i as usize, Value::EMPTY);
+            r.clear_elem(1 + i as usize);
         }
     }
 
@@ -8061,7 +8070,7 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     for (i, &v) in elems.iter().enumerate() {
         // Holes don't type the elements.
         if v == Value::EMPTY {
-            o.set_elem(i, v);
+            o.clear_elem(i);
         } else {
             vm.store_element(o, i, v);
         }
@@ -8468,7 +8477,7 @@ impl MappedArgs {
     unsafe fn value(&self, i: usize) -> Value {
         unsafe {
             match self.scope_slot(i) {
-                Some((env, slot)) => env.slot_value(env.shape().live().location(slot)),
+                Some((env, slot)) => env.field(slot),
                 None => *self.regs.add(1 + i),
             }
         }

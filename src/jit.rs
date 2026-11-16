@@ -15665,7 +15665,13 @@ impl Lowering<'_> {
         } else {
             return None;
         };
-        if func.is_null() || func.code() != f.code || k >= unsafe { (&(*f.code).upvalues).len() } {
+        // (A script's or an eval's frame may hold another object than a
+        // function there, with no code word.)
+        if func.is_null()
+            || func.class() != Class::Function
+            || func.code() != f.code
+            || k >= unsafe { (&(*f.code).upvalues).len() }
+        {
             return None;
         }
         let v = unsafe {

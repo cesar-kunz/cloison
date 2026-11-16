@@ -1052,11 +1052,23 @@ pub(crate) fn mark_shape(s: *const Shape) {
 /// Give object `o` shape `s`, which a full marking under way then finds
 /// live: `o` may have been traced with its old shape (the collector's
 /// barrier for shapes, which are Rust structures). (`o` and `s` trusted
-/// live, see `raw`.) Panics if `s` is of another class than `o`.
+/// live, see `raw`.) Panics if `s` is of another class than `o`, or has
+/// more slots than `o` has room for (its out-of-line slots are grown
+/// first).
 #[inline]
 pub(crate) fn set_shape(o: *mut Object, s: *const Shape) {
     // (Where the slots are depends on the class: `layout::slots_offset`.)
     assert_eq!(s.live().class, o.class(), "a shape of another class");
+    // Room for its slots: the first `capacity` in the object, the rest
+    // out of line (`Shape::location`), which the caller grows first.
+    if o.class() != Class::String {
+        let (n, cap) = (s.live().slots.len(), s.live().capacity.get() as usize);
+        assert!(
+            n.min(cap) <= Object::inline_cap(o)
+                && n.saturating_sub(cap) <= crate::raw::values_cap(o.props()).unwrap_or(0),
+            "no room for the shape's slots"
+        );
+    }
     unsafe { set_shape_unchecked(o, s) }
 }
 

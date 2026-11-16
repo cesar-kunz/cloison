@@ -408,7 +408,7 @@ fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> *mut Object {
     let n = BASE + 2 * buckets;
     vm.reserve_elems(e, n);
     for k in 0..n {
-        e.set_elem(k, Value::EMPTY);
+        e.clear_elem(k);
     }
     e.set_elems_len(n as u32);
     put(e, LENGTH, Value::number(len as f64));
@@ -528,7 +528,7 @@ pub(crate) fn truncate(o: *mut Object, n: u32) {
     let len = o.elems_len();
     if n < len {
         for k in n..len {
-            o.set_elem(k as usize, Value::EMPTY);
+            o.clear_elem(k as usize);
         }
         o.set_elems_len(n);
     }

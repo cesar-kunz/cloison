@@ -4671,7 +4671,7 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
         }
         vm.safepoint(top);
         let fo = as_object(f);
-        let callee = fo.code();
+        let callee = (*fo).code;
         let new = top.add(HEADER);
         let n = callee.live().nregs as usize;
         // (Past the compiled calls' limit, the callee is interpreted: its
@@ -4915,7 +4915,7 @@ unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: *mut Object) {
     unsafe {
         let old = (*ic).holder;
         if old != f {
-            if !old.is_null() && old.code() != f.code() {
+            if !old.is_null() && old.code_or_null() != f.code_or_null() {
                 keep_callee(ic, old, f);
             }
             (*ic).holder = f;
@@ -4996,7 +4996,7 @@ unsafe fn is_leaf(tag: NumberTag, f: Value) -> bool {
 unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value, argc: usize) -> Option<Value> {
     unsafe {
         let o = as_object(f);
-        let code = o.code();
+        let code = (*o).code;
         let args = std::slice::from_raw_parts(args, argc);
         if args.iter().any(|a| a.is_cell()) {
             return None;
@@ -5630,7 +5630,7 @@ pub(crate) unsafe fn call_from_jit(
             }
         }
         let fo = as_object(fv);
-        let callee = fo.code();
+        let callee = (*fo).code;
         // (A `Call` the JIT made of `f.call(that, …)` passes `that`.)
         let this = if op == Op::Construct {
             // (A derived class's `this` is its base's, from `super()`, as

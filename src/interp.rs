@@ -3437,7 +3437,7 @@ pub(crate) fn create_closure(regs: *mut Value, i: u32) -> Value {
             *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
         }
         let current: *const crate::object::Object = header(regs, FUNC);
-        (*frame_vm(regs)).create_closure_in(code, i, regs, Obj::from_ptr(current.cast_mut()))
+        (*frame_vm(regs)).create_closure_in(code, i, regs, current.cast_mut())
     }
 }
 
@@ -4783,7 +4783,7 @@ pub(crate) unsafe fn create_closure_of(regs: *mut Value, callee: *const Code) ->
         vm.safepoint(regs);
         *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
         let current: *const crate::object::Object = header(regs, FUNC);
-        vm.closure_of(callee, regs, Obj::from_ptr(current.cast_mut()))
+        vm.closure_of(callee, regs, current.cast_mut())
     }
 }
 

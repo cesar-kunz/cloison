@@ -1506,7 +1506,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
             }
             vm.arguments_shape = vm.elements_transition(s, crate::object::FieldType::Any);
         }
-        let o = unsafe { Obj::from_ptr((Obj::from_ptr(vm.heap.alloc_object(vm.arguments_shape.live()))).ptr()) };
+        let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(vm.arguments_shape.live())) };
         let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
         vm.store_field(o, 0, Value::from_i32(values.len() as i32));
         vm.store_field(o, 1, values_fn.map_or(Value::UNDEFINED, |f| object_value(f.ptr())));

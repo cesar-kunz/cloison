@@ -3336,7 +3336,7 @@ impl Vm {
                 return Some((o, c.slot));
             }
             if c.epoch == self.proto_epoch {
-                return (c.slot != u32::MAX).then_some((unsafe { Obj::from_ptr(c.holder) }, c.slot));
+                return (c.slot != u32::MAX).then(|| (unsafe { Obj::from_ptr(c.holder) }, c.slot));
             }
         }
         let found = self.lookup_uncached(o, name);
@@ -3656,7 +3656,7 @@ impl Vm {
     pub(crate) fn known_typed_length(&self, o: Obj) -> Option<Obj> {
         let s = o.shape();
         let e = self.typed_lengths[typed_length_index(s)];
-        (e.shape == s && e.epoch == self.proto_epoch && !s.is_null()).then_some(unsafe { Obj::from_ptr(e.holder) })
+        (e.shape == s && e.epoch == self.proto_epoch && !s.is_null()).then(|| unsafe { Obj::from_ptr(e.holder) })
     }
 
     /// Typed array `o`'s `length` found to be the builtin getter in
@@ -3881,7 +3881,7 @@ impl Vm {
             Class::BigInt => self.bigint_prototype,
             _ => return None,
         };
-        (o.shape().live().proto != object_value(p)).then_some(unsafe { Obj::from_ptr(p) })
+        (o.shape().live().proto != object_value(p)).then(|| unsafe { Obj::from_ptr(p) })
     }
 
     /// `p.[[Get]](name, receiver)`.
@@ -6041,13 +6041,13 @@ impl Vm {
     /// `CreateClosure` in frame `regs` of function `current`: the closure's
     /// upvalues (after its in-object slots: see [`Vm::upvalues`]) are open
     /// ones for `regs`' registers, or `current`'s own.
-    pub(crate) fn create_closure_in(&mut self, code: &Code, i: u32, regs: *mut Value, current: Obj) -> Value {
+    pub(crate) fn create_closure_in(&mut self, code: &Code, i: u32, regs: *mut Value, current: *mut Object) -> Value {
         self.closure_of(code.closures[i as usize], regs, current)
     }
 
     /// A new closure of `callee` in frame `regs` of function `current`
     /// (see [`Vm::create_closure_in`]).
-    pub(crate) fn closure_of(&mut self, callee: *const Code, regs: *mut Value, current: Obj) -> Value {
+    pub(crate) fn closure_of(&mut self, callee: *const Code, regs: *mut Value, current: *mut Object) -> Value {
         unsafe {
             let shape = &*self.closure_shape(callee);
             let ups = &(*callee).upvalues;
@@ -6060,7 +6060,7 @@ impl Vm {
                     *out.add(k) = if local {
                         self.open_upvalue(regs.add(idx as usize))
                     } else {
-                        *Self::upvalues(current).add(idx as usize)
+                        *Self::upvalues(crate::object::Obj::from_ptr(current)).add(idx as usize)
                     };
                 }
                 o

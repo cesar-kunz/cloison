@@ -1787,7 +1787,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let a_bpe = vm.intern_name("BYTES_PER_ELEMENT");
     for (k, kind) in TypedKind::ALL.iter().enumerate() {
         let proto = vm.new_plain(object_value(shared.ptr()));
-        let c = unsafe { Obj::from_ptr((vm.define_native(g, kind.name(), CTORS[k], 3, any, true)).ptr()) };
+        let c = vm.define_native(g, kind.name(), CTORS[k], 3, any, true);
         link_constructor(vm, c, proto);
         vm.set_prototype_of(c, object_value(ta.ptr()));
         let size = Value::from_i32(kind.size() as i32);

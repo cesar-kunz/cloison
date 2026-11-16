@@ -53,7 +53,7 @@ pub(crate) enum Root {
 }
 
 fn root(vm: &Vm, r: Root) -> Obj {
-    unsafe { Obj::from_ptr((vm.symbol_roots[r as usize]).ptr()) }
+    vm.symbol_roots[r as usize]
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -302,7 +302,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
     let sp = vm.new_plain(op);
     vm.symbol_roots = vec![sp];
-    let ctor = unsafe { Obj::from_ptr(vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true).ptr()) };
+    let ctor = vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true);
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
     let d = Desc::data(object_value(sp.ptr()), false, false, false);
     let _ = vm.define_own_property(ctor, Key::Name(a_p), &d);

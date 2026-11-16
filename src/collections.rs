@@ -60,12 +60,12 @@ pub(crate) fn install(vm: &mut Vm) {
         [("Map", map_ctor), ("Set", set_ctor), ("WeakMap", weak_map_ctor), ("WeakSet", weak_set_ctor)];
     for (k, (name, f)) in ctors.into_iter().enumerate() {
         let c = vm.define_native(g, name, f, 0, any, true);
-        link_constructor(vm, c, unsafe { Obj::from_ptr((protos[k]).ptr()) });
+        link_constructor(vm, c, protos[k]);
         if name == "Map" {
             vm.define_native(c, "groupBy", map_group_by, 2, any, false);
         }
     }
-    let mp = unsafe { Obj::from_ptr((protos[Proto::Map as usize]).ptr()) };
+    let mp = protos[Proto::Map as usize];
     vm.define_natives(
         mp,
         &[
@@ -83,7 +83,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     getter(vm, mp, "size", map_size);
-    let sp = unsafe { Obj::from_ptr((protos[Proto::Set as usize]).ptr()) };
+    let sp = protos[Proto::Set as usize];
     vm.define_natives(
         sp,
         &[
@@ -108,7 +108,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(sp, a_keys, object_value(values.ptr()), DONT_ENUM);
     getter(vm, sp, "size", set_size);
     vm.define_natives(
-        unsafe { Obj::from_ptr((protos[Proto::WeakMap as usize]).ptr()) },
+        protos[Proto::WeakMap as usize],
         &[
             ("get", weak_map_get as NativeFn, 1),
             ("set", weak_map_set, 2),
@@ -119,44 +119,23 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     vm.define_natives(
-        unsafe { Obj::from_ptr((protos[Proto::WeakSet as usize]).ptr()) },
+        protos[Proto::WeakSet as usize],
         &[("add", weak_set_add as NativeFn, 1), ("has", weak_set_has, 1), ("delete", weak_set_delete, 1)],
     );
     let wr = vm.define_native(g, "WeakRef", weak_ref_ctor, 1, any, true);
-    link_constructor(vm, wr, unsafe { Obj::from_ptr((protos[Proto::WeakRef as usize]).ptr()) });
-    vm.define_native(
-        unsafe { Obj::from_ptr((protos[Proto::WeakRef as usize]).ptr()) },
-        "deref",
-        weak_ref_deref,
-        0,
-        any,
-        false,
-    );
+    link_constructor(vm, wr, protos[Proto::WeakRef as usize]);
+    vm.define_native(protos[Proto::WeakRef as usize], "deref", weak_ref_deref, 0, any, false);
     let fr = vm.define_native(g, "FinalizationRegistry", finalization_ctor, 1, any, true);
-    let frp = unsafe { Obj::from_ptr((protos[Proto::FinalizationRegistry as usize]).ptr()) };
+    let frp = protos[Proto::FinalizationRegistry as usize];
     link_constructor(vm, fr, frp);
     vm.define_natives(
         frp,
         &[("register", finalization_register as NativeFn, 2), ("unregister", finalization_unregister, 1)],
     );
-    vm.define_native(
-        unsafe { Obj::from_ptr((protos[Proto::MapIterator as usize]).ptr()) },
-        "next",
-        iterator_next,
-        0,
-        any,
-        false,
-    );
-    vm.define_native(
-        unsafe { Obj::from_ptr((protos[Proto::SetIterator as usize]).ptr()) },
-        "next",
-        iterator_next,
-        0,
-        any,
-        false,
-    );
+    vm.define_native(protos[Proto::MapIterator as usize], "next", iterator_next, 0, any, false);
+    vm.define_native(protos[Proto::SetIterator as usize], "next", iterator_next, 0, any, false);
 
-    let dp = unsafe { Obj::from_ptr((protos[Proto::DataView as usize]).ptr()) };
+    let dp = protos[Proto::DataView as usize];
     let c = vm.define_native(g, "DataView", data_view_ctor, 1, any, true);
     link_constructor(vm, c, dp);
     getter(vm, dp, "buffer", view_buffer);

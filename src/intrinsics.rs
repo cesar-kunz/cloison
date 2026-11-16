@@ -181,7 +181,7 @@ pub(crate) fn to_property_key(vm: &mut Vm, v: Value) -> Result<Key> {
 /// `[…, , …]`: the array one longer, with a hole.
 fn hole(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let arr = a[0];
-    let n = crate::far::array_length(as_object(arr));
+    let n = crate::far::array_length(Obj::of(arr));
     let a_length = vm.a_length;
     vm.put_key(arr, Key::Name(a_length), Value::number(n as f64 + 1.0))?;
     Ok(arr)
@@ -299,12 +299,12 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         }
         // (A view's buffer checked again after: the spec reads the
         // prototype first, and its getter may have detached or shrunk it.)
-        let o = as_object(r);
+        let o = Obj::of(r);
         let class = o.class();
         // (A subclass's `RegExp` has no legacy features: see
         // `builtins::note_legacy`.)
         if class == Class::RegExp {
-            unsafe { (*o).flags |= crate::object::LEGACY_DISABLED };
+            unsafe { (*o.ptr()).flags |= crate::object::LEGACY_DISABLED };
         }
         if matches!(class, Class::TypedArray | Class::DataView) {
             if crate::typed::is_detached(crate::typed::buffer_of(o)) {
@@ -1883,7 +1883,7 @@ fn bound_accessors(vm: &mut Vm, o: Value, f: Value, bindings: &[SiteBinding], pl
 /// (An imported binding's: see [`import_of`].)
 fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Option<(Value, Key)>)> {
     let me = vm.callee;
-    let slot = |i| crate::promise::slot(me, i);
+    let slot = |i| crate::promise::slot(unsafe { Obj::from_ptr(me) }, i);
     let (f, b, name, var) = (slot(0), slot(1), slot(2), slot(3));
     let b = b.as_number().unwrap_or(0.0) as i32;
     let u = unsafe { *Vm::upvalues(as_object(f)).add((b >> 4) as usize) };
@@ -1897,7 +1897,7 @@ fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Optio
 /// itself); none if not an imported binding's.
 fn import_of(vm: &mut Vm) -> Result<Option<(Value, Value, Option<Key>)>> {
     let me = vm.callee;
-    let slot = |i| crate::promise::slot(me, i);
+    let slot = |i| crate::promise::slot(unsafe { Obj::from_ptr(me) }, i);
     if slot(1).as_number().unwrap_or(0.0) as i32 >> 4 != EVAL_IMPORT {
         return Ok(None);
     }
@@ -1980,7 +1980,7 @@ pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn binding_kind(vm: &mut Vm, scope: Value, key: Key) -> Option<i32> {
     let d = vm.own_property(as_object(scope), key)?;
     let get = d.get.filter(|&g| crate::promise::is_binding_get(vm, g))?;
-    crate::promise::slot(as_object(get), 1).as_number().map(|b| b as i32 & 15)
+    crate::promise::slot(Obj::of(get), 1).as_number().map(|b| b as i32 & 15)
 }
 
 /// Whether Annex B's `var` of a function declared in a block of a direct
@@ -2098,7 +2098,7 @@ fn flush_scope(vm: &mut Vm, scope: Value, target: Value, bindings: &[Key]) -> Re
     if !crate::props::is_object(target) {
         return Ok(());
     }
-    for (key, _) in vm.own_keys(as_object(scope)) {
+    for (key, _) in vm.own_keys(Obj::of(scope)) {
         if bindings.contains(&key) {
             continue;
         }

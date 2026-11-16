@@ -11,7 +11,7 @@ use super::{
     Kind, Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
-use crate::object::{Object, object_value};
+use crate::object::{Obj, Object, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, string_units};
@@ -63,7 +63,7 @@ pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
     vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
     crate::builtins::getter(vm, proto, "compare", compare_getter);
     vm.define_natives(proto, &[("resolvedOptions", resolved_options as NativeFn, 0)]);
-    crate::symbol::to_string_tag(vm, proto, "Intl.Collator");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, "Intl.Collator");
     vm.intl_roots[Root::CollatorPrototype as usize] = proto;
     vm.intl_roots[Root::Compare as usize] = vm.native_function("", bound_compare, 2, crate::jit::Ty::Any, false);
 }
@@ -199,8 +199,8 @@ fn compare_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         return Ok(f);
     }
     let template = root(vm, Root::Compare);
-    let f = crate::promise::native_closure(vm, template, &[slot(o, HANDLE)]);
-    crate::promise::set_slot(o, BOUND_COMPARE, f);
+    let f = crate::promise::native_closure(vm, unsafe { Obj::from_ptr(template) }, &[slot(o, HANDLE)]);
+    crate::promise::set_slot(unsafe { Obj::from_ptr(o) }, BOUND_COMPARE, f);
     Ok(f)
 }
 

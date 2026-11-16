@@ -52,8 +52,8 @@ pub(crate) enum Root {
     AsyncGeneratorPrototype,
 }
 
-fn root(vm: &Vm, r: Root) -> *mut Object {
-    vm.symbol_roots[r as usize]
+fn root(vm: &Vm, r: Root) -> Obj {
+    unsafe { Obj::from_ptr(vm.symbol_roots[r as usize]) }
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -138,7 +138,7 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
         return object_value(o);
     }
     let atom = name.map(|n| vm.intern_name(&n));
-    let proto = object_value(root(vm, Root::SymbolPrototype));
+    let proto = object_value(root(vm, Root::SymbolPrototype).ptr());
     let o = vm.new_object_with(Class::Symbol, proto, 0);
     unsafe {
         (*o).code = desc.to_bits() as *const crate::vm::Code;
@@ -244,7 +244,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
             })
             .collect()
     } else {
-        own_symbol_keys(vm, o)
+        own_symbol_keys(vm, unsafe { Obj::from_ptr(o) })
     };
     let out = vm.new_array();
     for s in keys {
@@ -254,7 +254,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
 }
 
 /// `o`'s own symbol-keyed properties' symbols, in order.
-pub(crate) fn own_symbol_keys(vm: &mut Vm, o: *mut Object) -> Vec<Value> {
+pub(crate) fn own_symbol_keys(vm: &mut Vm, o: Obj) -> Vec<Value> {
     let keys: Vec<Atom> = o.shape().live().keys().to_vec();
     keys.into_iter()
         .filter(|&a| is_symbol_atom(vm, a) && !is_private_atom(vm, a))
@@ -263,10 +263,10 @@ pub(crate) fn own_symbol_keys(vm: &mut Vm, o: *mut Object) -> Vec<Value> {
 }
 
 /// Define native `f` on `o` under symbol key `a`, named `name`.
-fn define_symbol_native(vm: &mut Vm, o: *mut Object, a: Atom, name: &str, f: NativeFn, n: u32) -> *mut Object {
+fn define_symbol_native(vm: &mut Vm, o: Obj, a: Atom, name: &str, f: NativeFn, n: u32) -> Obj {
     let fo = vm.native_function(name, f, n, crate::jit::Ty::Any, false);
-    vm.add_property_with(o, a, object_value(fo), DONT_ENUM);
-    fo
+    vm.add_property_with(o.ptr(), a, object_value(fo), DONT_ENUM);
+    unsafe { Obj::from_ptr(fo) }
 }
 
 /// `Function.prototype[Symbol.hasInstance](v)`: OrdinaryHasInstance.
@@ -276,7 +276,7 @@ fn function_has_instance(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 }
 
 /// A getter `name` on `o`.
-fn define_getter(vm: &mut Vm, o: *mut Object, key: Key, name: &str, f: NativeFn) {
+fn define_getter(vm: &mut Vm, o: Obj, key: Key, name: &str, f: NativeFn) {
     let g = vm.native_function(&format!("get {name}"), f, 0, crate::jit::Ty::Any, false);
     let d = Desc {
         get: Some(object_value(g)),
@@ -285,28 +285,28 @@ fn define_getter(vm: &mut Vm, o: *mut Object, key: Key, name: &str, f: NativeFn)
         configurable: Some(true),
         ..Default::default()
     };
-    let _ = vm.define_own_property(o, key, &d);
+    let _ = vm.define_own_property(o.ptr(), key, &d);
 }
 
 /// `o[@@toStringTag] = tag`, read-only.
-pub(crate) fn to_string_tag(vm: &mut Vm, o: *mut Object, tag: &str) {
+pub(crate) fn to_string_tag(vm: &mut Vm, o: Obj, tag: &str) {
     let u: Vec<u16> = tag.encode_utf16().collect();
     let s = vm.string_constant(&u);
     let a = vm.a_sym_to_string_tag;
     let d = Desc::data(s, false, false, true);
-    let _ = vm.define_own_property(o, Key::Name(a), &d);
+    let _ = vm.define_own_property(o.ptr(), Key::Name(a), &d);
 }
 
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
-    let sp = vm.new_object(op);
-    vm.symbol_roots = vec![sp];
+    let sp = unsafe { Obj::from_ptr(vm.new_object(op)) };
+    vm.symbol_roots = vec![sp.ptr()];
     let ctor = vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true);
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-    let d = Desc::data(object_value(sp), false, false, false);
+    let d = Desc::data(object_value(sp.ptr()), false, false, false);
     let _ = vm.define_own_property(ctor, Key::Name(a_p), &d);
-    vm.add_property_with(sp, a_c, object_value(ctor), DONT_ENUM);
+    vm.add_property_with(sp.ptr(), a_c, object_value(ctor), DONT_ENUM);
     for &w in WELL_KNOWN {
         let desc_units: Vec<u16> = format!("Symbol.{w}").encode_utf16().collect();
         let desc = vm.string_constant(&desc_units);
@@ -363,13 +363,13 @@ pub(crate) fn install(vm: &mut Vm) {
     let ap = vm.array_prototype;
     let _ = vm.define_own_property(ap, Key::Name(a_unscopables), &d);
     vm.define_natives(ctor, &[("for", symbol_for as NativeFn, 1), ("keyFor", symbol_key_for, 1)]);
-    vm.define_natives(sp, &[("toString", symbol_to_string as NativeFn, 0), ("valueOf", symbol_value_of, 0)]);
+    vm.define_natives(sp.ptr(), &[("toString", symbol_to_string as NativeFn, 0), ("valueOf", symbol_value_of, 0)]);
     let a_description = vm.intern_name("description");
     define_getter(vm, sp, Key::Name(a_description), "description", symbol_description);
     let tp = vm.a_sym_to_primitive;
     let f = vm.native_function("[Symbol.toPrimitive]", symbol_value_of, 1, crate::jit::Ty::Any, false);
     let d = Desc::data(object_value(f), false, false, true);
-    let _ = vm.define_own_property(sp, Key::Name(tp), &d);
+    let _ = vm.define_own_property(sp.ptr(), Key::Name(tp), &d);
     to_string_tag(vm, sp, "Symbol");
     let object_ctor = {
         let a = vm.intern_name("Object");
@@ -389,7 +389,7 @@ pub(crate) fn install(vm: &mut Vm) {
         let a = vm.intern_name(name);
         let c = vm.get(object_value(g), a).unwrap_or(Value::UNDEFINED);
         if is_object(c) {
-            define_getter(vm, as_object(c), Key::Name(a_species), "[Symbol.species]", return_this);
+            define_getter(vm, Obj::of(c), Key::Name(a_species), "[Symbol.species]", return_this);
         }
     }
 
@@ -397,15 +397,15 @@ pub(crate) fn install(vm: &mut Vm) {
     let ip = vm.new_object(op);
     vm.symbol_roots.push(ip);
     let a_iter = vm.a_sym_iterator;
-    define_symbol_native(vm, ip, a_iter, "[Symbol.iterator]", return_this, 0);
+    define_symbol_native(vm, unsafe { Obj::from_ptr(ip) }, a_iter, "[Symbol.iterator]", return_this, 0);
     let aip = vm.new_object(object_value(ip));
     vm.symbol_roots.push(aip);
     vm.define_natives(aip, &[("next", array_iterator_next as NativeFn, 0)]);
-    to_string_tag(vm, aip, "Array Iterator");
+    to_string_tag(vm, unsafe { Obj::from_ptr(aip) }, "Array Iterator");
     let sip = vm.new_object(object_value(ip));
     vm.symbol_roots.push(sip);
     vm.define_natives(sip, &[("next", string_iterator_next as NativeFn, 0)]);
-    to_string_tag(vm, sip, "String Iterator");
+    to_string_tag(vm, unsafe { Obj::from_ptr(sip) }, "String Iterator");
 
     let ap = vm.array_prototype;
     vm.define_natives(ap, &[("keys", array_keys as NativeFn, 0), ("entries", array_entries, 0)]);
@@ -414,42 +414,42 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(ap, a_iter, object_value(values), DONT_ENUM);
     // (`%TypedArray%`'s `@@species`: the kinds' constructors' prototype.)
     if let Some(&c) = vm.typed_constructors.first() {
-        let ta = as_object(c.shape().live().proto);
+        let ta = Obj::of(c.shape().live().proto);
         define_getter(vm, ta, Key::Name(a_species), "[Symbol.species]", return_this);
         crate::typed::install_symbols(vm);
     }
     let strp = vm.string_prototype;
-    define_symbol_native(vm, strp, a_iter, "[Symbol.iterator]", string_iterator, 0);
+    define_symbol_native(vm, unsafe { Obj::from_ptr(strp) }, a_iter, "[Symbol.iterator]", string_iterator, 0);
 
     // Maps' and sets' iterators: `@@iterator`, and `%IteratorPrototype%`.
     use crate::collections::Proto;
     let cp = vm.collection_prototypes.clone();
     for (p, method, tag) in [(Proto::Map, "entries", "Map"), (Proto::Set, "values", "Set")] {
-        let o = cp[p as usize];
+        let o = unsafe { Obj::from_ptr(cp[p as usize]) };
         let a = vm.intern_name(method);
-        let f = vm.get(object_value(o), a).unwrap_or(Value::UNDEFINED);
-        vm.add_property_with(o, a_iter, f, DONT_ENUM);
+        let f = vm.get(object_value(o.ptr()), a).unwrap_or(Value::UNDEFINED);
+        vm.add_property_with(o.ptr(), a_iter, f, DONT_ENUM);
         to_string_tag(vm, o, tag);
     }
     for (p, tag) in [(Proto::MapIterator, "Map Iterator"), (Proto::SetIterator, "Set Iterator")] {
         let o = cp[p as usize];
         vm.set_prototype_of(o, object_value(ip));
-        to_string_tag(vm, o, tag);
+        to_string_tag(vm, unsafe { Obj::from_ptr(o) }, tag);
     }
     crate::promise::install_symbols(vm);
     crate::module::install_symbols(vm);
-    to_string_tag(vm, cp[Proto::WeakMap as usize], "WeakMap");
-    to_string_tag(vm, cp[Proto::WeakSet as usize], "WeakSet");
-    to_string_tag(vm, cp[Proto::WeakRef as usize], "WeakRef");
-    to_string_tag(vm, cp[Proto::FinalizationRegistry as usize], "FinalizationRegistry");
-    to_string_tag(vm, cp[Proto::DataView as usize], "DataView");
+    to_string_tag(vm, unsafe { Obj::from_ptr(cp[Proto::WeakMap as usize]) }, "WeakMap");
+    to_string_tag(vm, unsafe { Obj::from_ptr(cp[Proto::WeakSet as usize]) }, "WeakSet");
+    to_string_tag(vm, unsafe { Obj::from_ptr(cp[Proto::WeakRef as usize]) }, "WeakRef");
+    to_string_tag(vm, unsafe { Obj::from_ptr(cp[Proto::FinalizationRegistry as usize]) }, "FinalizationRegistry");
+    to_string_tag(vm, unsafe { Obj::from_ptr(cp[Proto::DataView as usize]) }, "DataView");
     let math = {
         let a = vm.intern_name("Math");
         vm.get(object_value(g), a)
     }
     .unwrap_or(Value::UNDEFINED);
     if is_object(math) {
-        to_string_tag(vm, as_object(math), "Math");
+        to_string_tag(vm, Obj::of(math), "Math");
     }
     for name in ["JSON", "Reflect"] {
         let o = {
@@ -458,7 +458,7 @@ pub(crate) fn install(vm: &mut Vm) {
         }
         .unwrap_or(Value::UNDEFINED);
         if is_object(o) {
-            to_string_tag(vm, as_object(o), name);
+            to_string_tag(vm, Obj::of(o), name);
         }
     }
 }
@@ -475,7 +475,7 @@ pub(crate) fn return_this(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value>
 /// index, kind]` in `code`.
 fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Value> {
     let state = crate::array::new_array_of(vm, &[target, Value::from_i32(0), Value::from_i32(kind)])?;
-    let p = object_value(root(vm, proto));
+    let p = object_value(root(vm, proto).ptr());
     let it = vm.new_object_with(Class::ArrayIterator, p, 0);
     unsafe { (*it).code = state.to_bits() as *const crate::vm::Code };
     Ok(object_value(it))
@@ -589,7 +589,7 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     }
     let i = vm.get_keyed(state, Value::from_i32(1))?.as_number().unwrap_or(0.0);
     let kind = vm.get_keyed(state, Value::from_i32(2))?.as_number().unwrap_or(1.0) as i32;
-    let o = as_object(target);
+    let o = Obj::of(target);
     let len = if o.class() == Class::TypedArray {
         // (Its record made seq-cst: 23.1.5.1.)
         match crate::typed::ta_length_seq_cst(vm, o) {
@@ -864,7 +864,7 @@ fn protector_again(vm: &mut Vm) -> u8 {
     let sip = root(vm, Root::StringIteratorPrototype);
     let cp = |p: Proto| vm.collection_prototypes[p as usize];
     let (mp, sp, mip, setip) = (cp(Proto::Map), cp(Proto::Set), cp(Proto::MapIterator), cp(Proto::SetIterator));
-    let iterators = [aip, sip, mip, setip];
+    let iterators = [aip.ptr(), sip.ptr(), mip, setip];
     // (Each of the chains, prototypes: a change to any bumps the epoch.
     // A proxy on one may run code for any lookup, which `Vm::lookup`
     // doesn't: then no bits.)
@@ -879,8 +879,8 @@ fn protector_again(vm: &mut Vm) -> u8 {
             o = if p.is_cell() { as_object(p) } else { std::ptr::null_mut() };
         }
     }
-    let rely = |vm: &mut Vm, o: *mut Object, name: Atom| -> Option<Value> {
-        let (h, slot) = vm.lookup(o, name)?;
+    let rely = |vm: &mut Vm, o: Obj, name: Atom| -> Option<Value> {
+        let (h, slot) = vm.lookup(o.ptr(), name)?;
         if vm.is_accessor(h, slot) {
             return None;
         }
@@ -888,20 +888,20 @@ fn protector_again(vm: &mut Vm) -> u8 {
         vm.relied_slots.insert(at as usize);
         Some(unsafe { *at })
     };
-    let values = object_value(root(vm, Root::ArrayValues));
+    let values = object_value(root(vm, Root::ArrayValues).ptr());
     let mut bits = 0;
     // (`is_native`: the current realm's own builtins, factories and
     // `next`s alike.)
     let builtins =
         |vm: &mut Vm, proto: *mut Object, method: Option<NativeFn>, it_proto: *mut Object, next: NativeFn| {
-            let m = rely(vm, proto, vm.a_sym_iterator);
+            let m = rely(vm, unsafe { Obj::from_ptr(proto) }, vm.a_sym_iterator);
             let ok = match method {
                 Some(f) => m.is_some_and(|m| is_native(vm, m, f)),
                 None => m == Some(values),
             };
-            ok && rely(vm, it_proto, vm.a_next).is_some_and(|n| is_native(vm, n, next))
+            ok && rely(vm, unsafe { Obj::from_ptr(it_proto) }, vm.a_next).is_some_and(|n| is_native(vm, n, next))
         };
-    if builtins(vm, vm.array_prototype, None, aip, array_iterator_next) {
+    if builtins(vm, unsafe { Obj::from_ptr(vm.array_prototype).ptr() }, None, aip.ptr(), array_iterator_next) {
         bits |= ITER_ARRAY;
     }
     if builtins(vm, mp, Some(crate::collections::map_entries), mip, crate::collections::iterator_next) {
@@ -910,10 +910,22 @@ fn protector_again(vm: &mut Vm) -> u8 {
     if builtins(vm, sp, Some(crate::collections::set_values), setip, crate::collections::iterator_next) {
         bits |= ITER_SET;
     }
-    if builtins(vm, vm.string_prototype, Some(string_iterator), sip, string_iterator_next) {
+    if builtins(
+        vm,
+        unsafe { Obj::from_ptr(vm.string_prototype).ptr() },
+        Some(string_iterator),
+        sip.ptr(),
+        string_iterator_next,
+    ) {
         bits |= ITER_STRING;
     }
-    if builtins(vm, tap, Some(crate::typed::typed_values), aip, array_iterator_next) {
+    if builtins(
+        vm,
+        unsafe { Obj::from_ptr(tap).ptr() },
+        Some(crate::typed::typed_values),
+        aip.ptr(),
+        array_iterator_next,
+    ) {
         bits |= ITER_TYPED;
     }
     if iterators.iter().all(|&p| vm.lookup(p, vm.a_return).is_none()) {
@@ -977,12 +989,12 @@ fn iterates_as_typed(vm: &mut Vm, v: Value) -> bool {
 /// then. (`m` read before: a getter of it may have changed `v`.)
 pub(crate) fn dense_values(vm: &mut Vm, v: Value, m: Value) -> Option<Vec<Value>> {
     if is_native(vm, m, crate::typed::typed_values) && iterates_as_typed(vm, v) {
-        return crate::typed::elements(vm, as_object(v));
+        return crate::typed::elements(vm, Obj::of(v));
     }
     if !is_native(vm, m, array_values) || !iterates_as_array(vm, v) {
         return None;
     }
-    let s = as_object(v);
+    let s = Obj::of(v);
     unsafe {
         let n = s.elems_len() as usize;
         if crate::far::is_far(s) || vm.length_field(s) as usize != n {
@@ -1019,7 +1031,7 @@ unsafe fn fast_open_other(vm: &mut Vm, slots: *mut Value) -> bool {
         if !v.is_cell() {
             return false;
         }
-        let o = as_object(v);
+        let o = Obj::of(v);
         let (bit, proto) = match o.class() {
             Class::String => {
                 if protector(vm) & ITER_STRING == 0 {
@@ -1076,12 +1088,14 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
         return false;
     }
     let (d, s) = (as_object(dst), as_object(src));
-    if d.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 || crate::far::is_far(d) {
+    if d.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0
+        || crate::far::is_far(unsafe { Obj::from_ptr(d) })
+    {
         return false;
     }
     // (A typed array's, loaded.)
     if iterates_as_typed(vm, src) {
-        let Some(values) = crate::typed::elements(vm, s) else { return false };
+        let Some(values) = crate::typed::elements(vm, unsafe { Obj::from_ptr(s) }) else { return false };
         let (len, n) = (d.elems_len() as usize, values.len());
         if len + n >= 1 << 28 {
             return false;
@@ -1092,11 +1106,11 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
         unsafe { d.set_elems_len((len + n) as u32) };
         return true;
     }
-    if !iterates_as_array(vm, src) || crate::far::is_far(s) {
+    if !iterates_as_array(vm, src) || crate::far::is_far(unsafe { Obj::from_ptr(s) }) {
         return false;
     }
     let n = s.elems_len() as usize;
-    if vm.length_field(s) as usize != n || (0..n).any(|i| s.elem(i) == Value::EMPTY) {
+    if vm.length_field(unsafe { Obj::from_ptr(s) }) as usize != n || (0..n).any(|i| s.elem(i) == Value::EMPTY) {
         return false;
     }
     let len = d.elems_len() as usize;
@@ -1116,7 +1130,7 @@ pub(crate) fn is_open_array(v: Value) -> bool {
 /// Element `i` of array `a` as `%ArrayIteratorPrototype%.next` gives it,
 /// `None` past its length.
 pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Option<Value>> {
-    let o = as_object(a);
+    let o = Obj::of(a);
     if i >= vm.length_field(o) {
         return Ok(None);
     }
@@ -1186,7 +1200,7 @@ unsafe fn iterator_next_other(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
                 });
             }
             Class::CollectionIterator => {
-                return Ok(match crate::collections::step(vm, as_object(s))? {
+                return Ok(match crate::collections::step(vm, Obj::of(s))? {
                     Some(v) => v,
                     None => {
                         *slots = Value::UNDEFINED;

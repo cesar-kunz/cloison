@@ -33,7 +33,7 @@
 
 use crate::heap::{BYTES, COLOR, END, EVAC, GRANULE, Heap, UPVALUE, VALUES, WEAK_VALUES, YOUNG, cell_size};
 use crate::layout::load_word;
-use crate::object::{Class, Object};
+use crate::object::{Class, Obj, Object};
 use crate::value::Value;
 use crate::vm::Vm;
 
@@ -3446,7 +3446,9 @@ impl Vm {
         };
         cells(&mut |p, _| {
             if unsafe { *(p as *const u64) } & 1 == 0 {
-                crate::collections::address_keys(p as *mut crate::object::Object, &mut |k| add(&mut pin, k, HASHED));
+                crate::collections::address_keys(unsafe { Obj::from_ptr(p as *mut crate::object::Object) }, &mut |k| {
+                    add(&mut pin, k, HASHED)
+                });
             }
         });
         // By block: live bytes, pinned bytes (any reason), by reason.
@@ -3815,7 +3817,7 @@ impl Vm {
             for keys in in_parallel(threads, &cols, 16, |cs| {
                 let mut keys = Vec::new();
                 for &o in cs {
-                    crate::collections::address_keys(o as *mut Object, &mut |k| {
+                    crate::collections::address_keys(unsafe { Obj::from_ptr(o as *mut Object) }, &mut |k| {
                         if cand.has(k) {
                             keys.push(k);
                         }

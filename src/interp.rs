@@ -2105,7 +2105,7 @@ handlers! {
             && ((*ic).loc == LENGTH_LOC || (*ic).loc == crate::vm::ACCESSOR_LOC && (*ic).holder == h)
         {
             code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
-            let n = crate::typed::ta_length(o).unwrap_or(0);
+            let n = crate::typed::ta_length(unsafe { Obj::from_ptr(o) }).unwrap_or(0);
             next!(any, Op::GetNamed.size(), Value::from_i32(n as i32))
         }
         let r = with_top(regs, None, |vm| vm.get_named_miss(code, index_at(pc, 2), obj));
@@ -2137,7 +2137,7 @@ handlers! {
             let ic = ic_at(regs, pc, 2);
             if o.class() == Class::TypedArray
                 && i < o.elems_len()
-                && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(o)))
+                && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(unsafe { Obj::from_ptr(o) })))
                 && (*ic).loc == crate::vm::BYTES_LOC
                 && (*ic).epoch == o.kind() as u32 + 1
             {
@@ -2183,7 +2183,7 @@ handlers! {
             if o.class() == Class::TypedArray
                 && i < o.elems_len()
                 && (!(*frame_vm(regs)).views_detached
-                    || !crate::typed::is_detached(crate::typed::buffer_of(o)) && !crate::typed::is_immutable_view(o))
+                    || !crate::typed::is_detached(crate::typed::buffer_of(unsafe { Obj::from_ptr(o) })) && !crate::typed::is_immutable_view(unsafe { Obj::from_ptr(o) }))
                 && !crate::object::TypedKind::from_u8(o.kind()).is_big()
             {
                 crate::vm::note_bytes(ic_at(regs, pc, 3), o);

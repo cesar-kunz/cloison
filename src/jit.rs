@@ -919,11 +919,11 @@ extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
 /// a kind with no BigInts and `key` is a number naming such an index.
 #[inline(always)]
 fn typed_index(o: Value, key: Value) -> Option<usize> {
-    use crate::object::{Class, TypedKind, as_object};
+    use crate::object::{Class, TypedKind};
     if !o.is_cell() {
         return None;
     }
-    let p = as_object(o);
+    let p = Obj::of(o);
     if p.class() != Class::TypedArray || TypedKind::from_u8(p.kind()).is_big() {
         return None;
     }
@@ -1084,7 +1084,7 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
         && let Some(i) = typed_index(o, key)
     {
         unsafe {
-            let p = crate::object::as_object(o);
+            let p = Obj::of(o);
             if !crate::typed::is_immutable_view(p) {
                 let kind = crate::object::TypedKind::from_u8(p.kind());
                 kind.store_value(p.elems().cast(), i, v);

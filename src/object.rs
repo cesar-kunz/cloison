@@ -389,7 +389,10 @@ impl Object {
     /// typed array, a buffer or another class whose `elems` are bytes).
     #[inline(always)]
     pub unsafe fn elems_cap(this: *const Object) -> u32 {
-        unsafe { crate::layout::elems_cap(crate::layout::header(this)) - crate::far::is_far(this.cast_mut()) as u32 }
+        unsafe {
+            crate::layout::elems_cap(crate::layout::header(this))
+                - crate::far::is_far(Obj::from_ptr(this.cast_mut())) as u32
+        }
     }
 
     /// `this`'s elements, the first `elems_len`: none if `elems` is null,
@@ -1577,6 +1580,18 @@ impl Obj {
     #[track_caller]
     pub(crate) fn of(v: Value) -> Obj {
         Obj::cell(v).expect("a cell")
+    }
+
+    /// The cell `o` points to: where code not converted to `Obj` yet hands
+    /// one over.
+    ///
+    /// # Safety
+    /// `o` must point to a live cell (as every `*mut Object` in the crate
+    /// is trusted to, see `raw`), and not be null.
+    #[inline(always)]
+    pub(crate) unsafe fn from_ptr(o: *mut Object) -> Obj {
+        debug_assert!(!o.is_null());
+        Obj(unsafe { std::ptr::NonNull::new_unchecked(o) })
     }
 
     #[inline(always)]

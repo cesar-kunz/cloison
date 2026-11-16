@@ -109,7 +109,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     let hp = vm.new_object(object_value(ip));
     vm.define_natives(hp, &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
-    crate::symbol::to_string_tag(vm, hp, "Iterator Helper");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(hp) }, "Iterator Helper");
     let wp = vm.new_object(object_value(ip));
     vm.define_natives(wp, &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
     vm.iterator_roots = vec![c, hp, wp];

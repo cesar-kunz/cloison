@@ -802,7 +802,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("valueOf", bigint_value_of, 0),
         ],
     );
-    crate::symbol::to_string_tag(vm, proto, "BigInt");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, "BigInt");
 }
 
 fn arg(a: &[Value], i: usize) -> Value {

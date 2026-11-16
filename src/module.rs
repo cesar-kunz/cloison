@@ -34,7 +34,7 @@
 
 use crate::interp::call_function;
 use crate::js::ast::{IMPORT_PARAMS, ImportName, ModuleInfo, Phase};
-use crate::object::{Object, as_object, object_value};
+use crate::object::{Obj, Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, same_value};
 use crate::raw::ObjectPtr;
@@ -252,7 +252,7 @@ fn template(vm: &mut Vm, t: Template) -> *mut Object {
 
 fn closure(vm: &mut Vm, t: Template, data: &[Value]) -> Value {
     let t = template(vm, t);
-    native_closure(vm, t, data)
+    native_closure(vm, unsafe { Obj::from_ptr(t) }, data)
 }
 
 fn rec(vm: &Vm, m: usize) -> &Record {
@@ -587,8 +587,8 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
 /// a deferred namespace's module evaluated now if it wasn't
 /// (GetModuleExportsList).
 fn ns_module(vm: &mut Vm) -> Result<usize> {
-    let m = slot(vm.callee, 0).as_i32_unchecked() as usize;
-    if slot(vm.callee, 1) == Value::TRUE {
+    let m = slot(unsafe { Obj::from_ptr(vm.callee) }, 0).as_i32_unchecked() as usize;
+    if slot(unsafe { Obj::from_ptr(vm.callee) }, 1) == Value::TRUE {
         evaluate_sync(vm, m)?;
     }
     Ok(m)
@@ -602,7 +602,7 @@ fn ns_key(vm: &mut Vm, k: Value) -> Result<Option<Vec<u16>>> {
     }
     let s = if k.is_number() { crate::intrinsics::to_string(vm, k)? } else { k };
     let u = string_units(s).unwrap_or(&[]).to_vec();
-    if slot(vm.callee, 1) == Value::TRUE && u == "then".encode_utf16().collect::<Vec<u16>>() {
+    if slot(unsafe { Obj::from_ptr(vm.callee) }, 1) == Value::TRUE && u == "then".encode_utf16().collect::<Vec<u16>>() {
         return Ok(None);
     }
     Ok(Some(u))
@@ -723,7 +723,7 @@ fn ns_get_own(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// key's, has no property: not one).
 fn ns_own_keys(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let m = ns_module(vm)?;
-    let deferred = slot(vm.callee, 1) == Value::TRUE;
+    let deferred = slot(unsafe { Obj::from_ptr(vm.callee) }, 1) == Value::TRUE;
     let then: Vec<u16> = "then".encode_utf16().collect();
     let names: Vec<Vec<u16>> =
         rec(vm, m).exports.iter().map(|(n, _)| n.clone()).filter(|n| !deferred || *n != then).collect();
@@ -1123,7 +1123,7 @@ fn gather_ancestors(vm: &mut Vm, m: usize, out: &mut Vec<usize>) {
 
 /// AsyncModuleExecutionFulfilled (§16.2.1.5.3.4), module in slot 0.
 fn async_fulfilled(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let m = slot(vm.callee, 0).as_i32_unchecked() as usize;
+    let m = slot(unsafe { Obj::from_ptr(vm.callee) }, 0).as_i32_unchecked() as usize;
     module_fulfilled(vm, m)?;
     Ok(Value::UNDEFINED)
 }
@@ -1172,7 +1172,7 @@ fn module_fulfilled(vm: &mut Vm, m: usize) -> Result<()> {
 
 /// AsyncModuleExecutionRejected (§16.2.1.5.3.5), module in slot 0.
 fn async_rejected(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let m = slot(vm.callee, 0).as_i32_unchecked() as usize;
+    let m = slot(unsafe { Obj::from_ptr(vm.callee) }, 0).as_i32_unchecked() as usize;
     module_rejected(vm, m, arg(a, 0))?;
     Ok(Value::UNDEFINED)
 }
@@ -1302,7 +1302,7 @@ fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Valu
 /// evaluation's promise then resolving `import()`'s with its namespace
 /// (see [`dynamic_import`] for the other phases).
 fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let me = vm.callee;
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     let (spec, ty, referrer, resolve, reject) = (slot(me, 0), slot(me, 1), slot(me, 2), slot(me, 3), slot(me, 4));
     let phase = slot(me, 5).to_number() as i32;
     let r = (|| {
@@ -1349,7 +1349,7 @@ fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// `import()`'s module evaluated (slots: the module, resolve): its
 /// namespace resolves the promise.
 fn import_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let me = vm.callee;
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     let (m, resolve) = (slot(me, 0).as_i32_unchecked() as usize, slot(me, 1));
     match namespace(vm, m) {
         Ok(ns) => call_function(vm, resolve, Value::UNDEFINED, &[ns]),
@@ -1361,7 +1361,7 @@ fn import_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// (slots: the module, resolve, `[how many to go]`): after the last, its
 /// deferred namespace resolves the promise.
 fn defer_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let me = vm.callee;
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     let (m, resolve, count) = (slot(me, 0).as_i32_unchecked() as usize, slot(me, 1), slot(me, 2));
     let left = vm.get_keyed(count, Value::from_i32(0))?.as_i32_unchecked() - 1;
     vm.set_keyed(count, Value::from_i32(0), Value::from_i32(left))?;

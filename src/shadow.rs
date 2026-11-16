@@ -44,7 +44,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let c = vm.define_native(g, "ShadowRealm", shadow_realm_ctor, 0, any, true);
     crate::builtins::link_constructor(vm, c, proto);
     vm.define_natives(proto, &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
-    crate::symbol::to_string_tag(vm, proto, "ShadowRealm");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, "ShadowRealm");
     let wrapped = vm.native_function("", wrapped_call, 0, any, false);
     let imported = vm.native_function("", imported, 1, any, false);
     let failed = vm.native_function("", import_failed, 1, any, false);
@@ -144,7 +144,7 @@ fn wrap(vm: &mut Vm, v: Value) -> Result<Value> {
         return Err(Error::type_error("ShadowRealm values crossing must be primitives or callables"));
     }
     let template = root(vm, Root::Wrapped);
-    let f = native_closure(vm, template, &[v]);
+    let f = native_closure(vm, unsafe { Obj::from_ptr(template) }, &[v]);
     copy_name_and_length(vm, f, v)
         .map_err(|e| Error::type_error(format!("wrapping a function: {}", thrown_message(vm, &e))))?;
     Ok(f)
@@ -188,7 +188,7 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
 /// its realm with the arguments and `this` wrapped for it, the result
 /// wrapped back. Whatever is thrown is a `TypeError`.
 fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let target = slot(vm.callee, 0);
+    let target = slot(unsafe { Obj::from_ptr(vm.callee) }, 0);
     let r = (|| {
         let target_realm = crate::realm::function_realm(vm, target)?;
         vm.handle_scope(|vm| {
@@ -226,8 +226,12 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let loaded = crate::realm::run_in(vm, r, |vm| crate::module::import_now(vm, spec));
     match loaded {
         Ok((m, done)) => {
-            let ok = native_closure(vm, root(vm, Root::Imported), &[Value::from_i32(m as i32), name, resolve, reject]);
-            let bad = native_closure(vm, root(vm, Root::ImportFailed), &[reject]);
+            let ok = native_closure(
+                vm,
+                unsafe { Obj::from_ptr(root(vm, Root::Imported)) },
+                &[Value::from_i32(m as i32), name, resolve, reject],
+            );
+            let bad = native_closure(vm, unsafe { Obj::from_ptr(root(vm, Root::ImportFailed)) }, &[reject]);
             crate::promise::await_then(vm, done, ok, bad)?;
         }
         Err(e) if e.0.starts_with("unsupported") => return Err(e),
@@ -243,7 +247,7 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `importValue`'s module evaluated: its export, wrapped (none: a
 /// `TypeError`).
 fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let me = vm.callee;
+    let me = unsafe { Obj::from_ptr(vm.callee) };
     let (m, name, resolve, reject) = (slot(me, 0), slot(me, 1), slot(me, 2), slot(me, 3));
     let r = (|| {
         let ns = crate::module::namespace(vm, m.as_number().unwrap_or(0.0) as usize)?;
@@ -268,7 +272,7 @@ fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 
 /// `importValue`'s module failed: a `TypeError`.
 fn import_failed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let reject = slot(vm.callee, 0);
+    let reject = slot(unsafe { Obj::from_ptr(vm.callee) }, 0);
     let e = Error::thrown(arg(a, 0));
     let m = thrown_message(vm, &e);
     let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));

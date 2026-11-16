@@ -25,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::builtins::{getter, is_class};
-use crate::object::{Class, Object, TypedKind, as_object, object_value};
+use crate::object::{Class, Obj, Object, TypedKind, as_object, object_value};
 use crate::props::is_object;
 use crate::typed::{
     MAX_BYTES, MAX_RESIZABLE, RESIZABLE, integer, is_resizable, kind_of, refresh_views, relative, species_constructor,
@@ -202,7 +202,7 @@ fn prune(vm: &mut Vm) -> Result<()> {
         return Ok(());
     }
     s.pruned = count;
-    let values = crate::collections::weak_set_values(s.live);
+    let values = crate::collections::weak_set_values(unsafe { Obj::from_ptr(s.live) });
     // Each live buffer keeps one reference to its block (the VM holds one
     // per buffer: several on the same block, broadcast again, each hold
     // one), the dead ones' released.
@@ -231,14 +231,14 @@ fn prune(vm: &mut Vm) -> Result<()> {
     vm.handle_scope(|vm| {
         vm.handles.extend_from_slice(&values);
         let set = crate::collections::new_weak_set(vm)?;
-        vm.shared.live = set;
+        vm.shared.live = set.ptr();
         for &v in &values {
             crate::collections::weak_set_insert(vm, set, v)?;
         }
         if !vm.shared.growing.is_null() {
             let set = crate::collections::new_weak_set(vm)?;
-            vm.shared.growing = set;
-            for v in values.into_iter().filter(|&v| is_resizable(as_object(v))) {
+            vm.shared.growing = set.ptr();
+            for v in values.into_iter().filter(|&v| is_resizable(Obj::of(v))) {
                 crate::collections::weak_set_insert(vm, set, v)?;
             }
         }
@@ -254,10 +254,10 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
     // leaves it to the next pruning, which needs `live`.)
     let made = prune(vm).and_then(|()| {
         if vm.shared.live.is_null() {
-            vm.shared.live = crate::collections::new_weak_set(vm)?;
+            vm.shared.live = (crate::collections::new_weak_set(vm)?).ptr();
         }
         if growable && vm.shared.growing.is_null() {
-            vm.shared.growing = crate::collections::new_weak_set(vm)?;
+            vm.shared.growing = (crate::collections::new_weak_set(vm)?).ptr();
         }
         Ok(())
     });
@@ -283,14 +283,14 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
             o.set_flags(o.flags() | RESIZABLE);
             *Object::aux(o) = (*b).room as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o).code = object_value(views).to_bits() as *const crate::vm::Code;
+            (*o).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
         }
     }
     let live = vm.shared.live;
-    crate::collections::weak_set_insert(vm, live, object_value(o))?;
+    crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(live) }, object_value(o))?;
     if growable {
         let growing = vm.shared.growing;
-        crate::collections::weak_set_insert(vm, growing, object_value(o))?;
+        crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(growing) }, object_value(o))?;
     }
     Ok(object_value(o))
 }
@@ -302,7 +302,7 @@ fn sync_length(o: *mut Object) -> usize {
     let n = unsafe { (*block_of(o)).len.load(SeqCst) };
     if n != o.elems_len() as usize {
         unsafe { (*o).elems_len = n as u32 };
-        refresh_views(o);
+        refresh_views(unsafe { Obj::from_ptr(o) });
     }
     n
 }
@@ -439,7 +439,7 @@ pub(crate) fn catch_up(vm: &mut Vm) {
     // (With no allocation, and a buffer's views refreshed only if its
     // length changed: while a grow is in flight, every catch-up comes
     // here.)
-    crate::collections::weak_set_each(vm.shared.growing, |v| {
+    crate::collections::weak_set_each(unsafe { Obj::from_ptr(vm.shared.growing) }, |v| {
         sync_length(as_object(v));
     });
     if settled {
@@ -501,19 +501,19 @@ fn shared_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 fn shared_growable(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(is_resizable(this_shared(this, "growable")?)))
+    Ok(Value::from_bool(is_resizable(unsafe { Obj::from_ptr(this_shared(this, "growable")?) })))
 }
 
 fn shared_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_shared(this, "maxByteLength")?;
-    let n = if is_resizable(o) { unsafe { (*block_of(o)).room } } else { sync_length(o) };
+    let n = if is_resizable(unsafe { Obj::from_ptr(o) }) { unsafe { (*block_of(o)).room } } else { sync_length(o) };
     Ok(Value::number(n as f64))
 }
 
 /// `buffer.grow(newLength)`: never shorter.
 fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_shared(this, "grow")?;
-    if !is_resizable(o) {
+    if !is_resizable(unsafe { Obj::from_ptr(o) }) {
         return Err(Error::type_error("SharedArrayBuffer.prototype.grow: the buffer is not growable"));
     }
     let n = to_index(vm, arg(a, 0))?;
@@ -606,7 +606,7 @@ fn access(
     if !is_class(ta, Class::TypedArray) {
         return Err(Error::type_error("Atomics: the argument is not a typed array"));
     }
-    let o = as_object(ta);
+    let o = Obj::of(ta);
     let Some(len) = ta_length(o) else {
         return Err(Error::type_error("Atomics: the typed array is detached or out of bounds"));
     };
@@ -626,13 +626,13 @@ fn access(
     if i >= len {
         return Err(Error::range_error("Atomics: index out of range"));
     }
-    Ok((o, k, i))
+    Ok((o.ptr(), k, i))
 }
 
 /// RevalidateAtomicAccess: the conversions may have detached or shrunk
 /// the buffer.
 fn revalidate(o: *mut Object, i: usize) -> Result<()> {
-    match ta_length(o) {
+    match ta_length(unsafe { Obj::from_ptr(o) }) {
         None => Err(Error::type_error("Atomics: the typed array is detached or out of bounds")),
         Some(n) if i >= n => Err(Error::range_error("Atomics: index out of range")),
         _ => Ok(()),
@@ -845,9 +845,9 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
     if !async_ && !can_block(vm) {
         return Err(Error::type_error("Atomics.wait: this agent can't block"));
     }
-    let b = crate::typed::buffer_of(o);
-    let block = block_of(b);
-    let index = i * k.size() + crate::typed::offset_of(o);
+    let b = crate::typed::buffer_of(unsafe { Obj::from_ptr(o) });
+    let block = block_of(b.ptr());
+    let index = i * k.size() + crate::typed::offset_of(unsafe { Obj::from_ptr(o) });
     let deadline = (t.is_finite()).then(|| Instant::now() + Duration::from_secs_f64(t / 1000.0));
     let mut list = waiters();
     let w = apply(o, k, i, Op::Load, 0);
@@ -898,10 +898,10 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
 /// ValidateAtomicAccess.
 fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(*mut Object, TypedKind, usize)> {
     if is_class(ta, Class::TypedArray) {
-        let o = as_object(ta);
+        let o = Obj::of(ta);
         if ta_length(o).is_some()
             && matches!(kind_of(o), TypedKind::I32 | TypedKind::I64)
-            && !is_shared(crate::typed::buffer_of(o))
+            && !is_shared(crate::typed::buffer_of(o).ptr())
         {
             return Err(Error::type_error("Atomics.wait: the typed array's buffer is not shared"));
         }
@@ -934,12 +934,12 @@ fn atomics_notify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), true, false)?;
     let count = arg(a, 2);
     let c = if count.is_undefined() { f64::INFINITY } else { integer(vm, count)?.max(0.0) };
-    let b = crate::typed::buffer_of(o);
-    if !is_shared(b) {
+    let b = crate::typed::buffer_of(unsafe { Obj::from_ptr(o) });
+    if !is_shared(b.ptr()) {
         return Ok(Value::from_i32(0));
     }
-    let block = block_of(b) as usize;
-    let index = i * k.size() + crate::typed::offset_of(o);
+    let block = block_of(b.ptr()) as usize;
+    let index = i * k.size() + crate::typed::offset_of(unsafe { Obj::from_ptr(o) });
     let mut list = waiters();
     let mut n = 0usize;
     list.retain(|w| {
@@ -1080,7 +1080,7 @@ pub(crate) fn install(vm: &mut Vm) {
 /// `[@@toStringTag]`s (see `typed::install_symbols`).
 pub(crate) fn install_symbols(vm: &mut Vm) {
     let sp = vm.shared.prototype;
-    crate::symbol::to_string_tag(vm, sp, "SharedArrayBuffer");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(sp) }, "SharedArrayBuffer");
     let atomics = vm.shared_atomics;
-    crate::symbol::to_string_tag(vm, atomics, "Atomics");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(atomics) }, "Atomics");
 }

@@ -25,7 +25,7 @@ use crate::raw::ObjectPtr;
 use std::collections::HashMap;
 
 use crate::builtins::is_class;
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::props::is_object;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, is_string, string_units};
@@ -791,7 +791,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let temporal = vm.new_object(op);
     let a = vm.intern_name("Temporal");
     vm.add_property_with(g, a, object_value(temporal), crate::object::DONT_ENUM);
-    crate::symbol::to_string_tag(vm, temporal, "Temporal");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(temporal) }, "Temporal");
     vm.temporal.protos = vec![std::ptr::null_mut(); 8];
     vm.temporal.ctors = vec![std::ptr::null_mut(); 8];
     let specs = [
@@ -814,7 +814,7 @@ pub(crate) fn install(vm: &mut Vm) {
         }
         vm.define_natives(proto, spec.methods);
         vm.define_natives(proto, &[("valueOf", value_of as NativeFn, 0)]);
-        crate::symbol::to_string_tag(vm, proto, &format!("Temporal.{}", spec.name));
+        crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, &format!("Temporal.{}", spec.name));
         vm.temporal.protos[spec.kind as usize] = proto;
         vm.temporal.ctors[spec.kind as usize] = c;
     }

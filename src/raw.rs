@@ -49,7 +49,7 @@
 //! compiled (`Vm::load_functions`). No [`Live`] reference to such a shape
 //! or code may be held across those writes.
 
-use crate::object::{Class, Object, Shape};
+use crate::object::{Class, Obj, Object, Shape};
 use crate::value::Value;
 use crate::vm::Code;
 
@@ -232,7 +232,7 @@ pub(crate) trait ObjectPtr: Copy {
     }
 }
 
-impl ObjectPtr for crate::object::Obj {
+impl ObjectPtr for Obj {
     #[inline(always)]
     fn object_ptr(self) -> *mut Object {
         self.ptr()

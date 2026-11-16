@@ -1203,7 +1203,7 @@ fn host_detach_array_buffer(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
     if !is_class(b, Class::ArrayBuffer) {
         return Err(Error::type_error("not an ArrayBuffer"));
     }
-    crate::typed::detach(vm, as_object(b))?;
+    crate::typed::detach(vm, Obj::of(b))?;
     Ok(Value::NULL)
 }
 
@@ -1338,26 +1338,26 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         vm.handles.push(name);
         let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + nslots) as u32);
         let own = vm.root_shape(Class::Native, proto, BOUND_OWN as u32);
-        let o = vm.heap.alloc_object(full.live());
+        let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(full.live())) };
         unsafe {
-            crate::object::set_shape(o, own);
-            (*o).code = (*vm.bound_fns[ctor as usize]).code;
+            crate::object::set_shape(o.ptr(), own);
+            (*o.ptr()).code = (*vm.bound_fns[ctor as usize]).code;
             // (`this` and `a` are where a collection updates them: read
             // after the allocations.)
-            crate::promise::set_slot(o, BOUND_OWN, this);
-            crate::promise::set_slot(o, BOUND_OWN + 1, arg(a, 0));
+            crate::promise::set_slot(Obj::from_ptr(o.ptr()), BOUND_OWN, this);
+            crate::promise::set_slot(Obj::from_ptr(o.ptr()), BOUND_OWN + 1, arg(a, 0));
             if many {
-                crate::promise::set_slot(o, BOUND_OWN + 2, vm.handles[vm.handles.len() - 2]);
-                crate::promise::set_slot(o, BOUND_OWN + 3, Value::EMPTY);
+                crate::promise::set_slot(Obj::from_ptr(o.ptr()), BOUND_OWN + 2, vm.handles[vm.handles.len() - 2]);
+                crate::promise::set_slot(Obj::from_ptr(o.ptr()), BOUND_OWN + 3, Value::EMPTY);
             } else {
                 for (i, &v) in a.get(1..).unwrap_or(&[]).iter().enumerate() {
-                    crate::promise::set_slot(o, BOUND_OWN + 2 + i, v);
+                    crate::promise::set_slot(Obj::from_ptr(o.ptr()), BOUND_OWN + 2 + i, v);
                 }
             }
         }
-        vm.handles.push(object_value(o));
+        vm.handles.push(object_value(o.ptr()));
         let name = vm.handles[vm.handles.len() - 2];
-        vm.add_property_with(o, a_length, Value::number(len), DONT_ENUM | READ_ONLY);
+        vm.add_property_with(o.ptr(), a_length, Value::number(len), DONT_ENUM | READ_ONLY);
         let o = as_object(vm.handles[vm.handles.len() - 1]);
         vm.add_property_with(o, a_name, name, DONT_ENUM | READ_ONLY);
         Ok(vm.handles[vm.handles.len() - 1])
@@ -1378,7 +1378,7 @@ pub(crate) unsafe fn unwrap_bound(vm: *const Vm, f: Value) -> Option<(*mut Objec
         if !f.is_cell() || !is_bound(as_object(f)) || Object::inline_cap(as_object(f)) != BOUND_OWN + 2 {
             return None;
         }
-        let o = as_object(f);
+        let o = Obj::of(f);
         let target = crate::promise::slot(o, BOUND_OWN);
         (Obj::of(target).class() == Class::Function && (*vm).realms.is_empty())
             .then(|| (as_object(target), crate::promise::slot(o, BOUND_OWN + 1)))
@@ -1387,7 +1387,7 @@ pub(crate) unsafe fn unwrap_bound(vm: *const Vm, f: Value) -> Option<(*mut Objec
 
 /// Bound function `o`'s target.
 pub(crate) fn bound_target(o: *mut Object) -> Value {
-    crate::promise::slot(o, BOUND_OWN)
+    crate::promise::slot(unsafe { Obj::from_ptr(o) }, BOUND_OWN)
 }
 
 /// A bound function's call or construction ([[Call]] and [[Construct]] of
@@ -1395,13 +1395,13 @@ pub(crate) fn bound_target(o: *mut Object) -> Value {
 /// arguments before `args`, and `new.target` the target where it is the
 /// bound function.
 fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
-    let o = vm.callee;
+    let o = unsafe { Obj::from_ptr(vm.callee) };
     let constructing = vm.constructing;
     let (target, this) = (crate::promise::slot(o, BOUND_OWN), crate::promise::slot(o, BOUND_OWN + 1));
-    let bound = Object::inline_cap(o) - BOUND_OWN - 2;
+    let bound = Object::inline_cap(o.ptr().cast_const()) - BOUND_OWN - 2;
     let nt = if !constructing {
         Value::EMPTY
-    } else if vm.native_new_target.0 == object_value(o) {
+    } else if vm.native_new_target.0 == object_value(o.ptr()) {
         std::mem::replace(&mut vm.native_new_target, (Value::EMPTY, Value::EMPTY)).1
     } else {
         target

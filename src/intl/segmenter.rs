@@ -11,7 +11,7 @@ use super::{
     Kind, Root, canonicalize_locale_list, coerce_options, create, data_error, options_object, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
-use crate::object::{DONT_ENUM, Object, object_value};
+use crate::object::{DONT_ENUM, Obj, Object, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, string_units};
@@ -46,7 +46,7 @@ pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
     crate::builtins::link_constructor(vm, c, proto);
     vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
     vm.define_natives(proto, &[("resolvedOptions", resolved_options as NativeFn, 0), ("segment", segment, 1)]);
-    crate::symbol::to_string_tag(vm, proto, "Intl.Segmenter");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(proto) }, "Intl.Segmenter");
     vm.intl_roots[Root::SegmenterPrototype as usize] = proto;
 
     let segments = vm.new_object(op);
@@ -59,7 +59,7 @@ pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
     let ip = object_value(vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize]);
     let iterators = vm.new_object(ip);
     vm.define_natives(iterators, &[("next", iterator_next as NativeFn, 0)]);
-    crate::symbol::to_string_tag(vm, iterators, "Segmenter String Iterator");
+    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(iterators) }, "Segmenter String Iterator");
     vm.intl_roots[Root::SegmentIteratorPrototype as usize] = iterators;
 }
 
@@ -121,13 +121,13 @@ fn segment(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `%IntlSegmentsPrototype%.containing(index)`: the segment the code
 /// unit at `index` is in.
 fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let o = require(this, Kind::Segments, "%IntlSegmentsPrototype%.containing")?;
+    let o = unsafe { Obj::from_ptr(require(this, Kind::Segments, "%IntlSegmentsPrototype%.containing")?) };
     let n = crate::interp::to_number(arg(a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
     let n = if n.is_nan() { 0.0 } else { n.trunc() };
-    let units = string_units(slot(o, STRING)).unwrap_or(&[]);
+    let units = string_units(slot(o.ptr(), STRING)).unwrap_or(&[]);
     if n < 0.0 || n >= units.len() as f64 {
         return Ok(Value::UNDEFINED);
     }
@@ -135,9 +135,9 @@ fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // FindBoundary before and after `n`. The segment the last call
     // found, if `n` is in it too (a long one would be scanned to its
     // end at each index).
-    let (last, last_end) = (slot(o, AT).to_number() as usize, slot(o, END).to_number() as usize);
+    let (last, last_end) = (slot(o.ptr(), AT).to_number() as usize, slot(o.ptr(), END).to_number() as usize);
     if last <= n && n < last_end {
-        return segment_data(vm, o, last, last_end, slot(o, WORD_LIKE) == Value::TRUE);
+        return segment_data(vm, o.ptr(), last, last_end, slot(o.ptr(), WORD_LIKE) == Value::TRUE);
     }
     // Else the segments from a boundary known at or before `n`, up to
     // its own: the last segment's end if `n` is shortly after it (asking
@@ -145,8 +145,8 @@ fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // boundaries earlier calls passed, [`STRIDE`] apart or more, so that
     // no call scans from the string's start what another did (asking
     // the indices backwards, or here and there, in a long string).
-    let mut marks = slot(o, MARKS);
-    let count = if marks.is_undefined() { 0 } else { crate::far::array_length(crate::object::as_object(marks)) };
+    let mut marks = slot(o.ptr(), MARKS);
+    let count = if marks.is_undefined() { 0 } else { crate::far::array_length(Obj::of(marks)) };
     let mark = |vm: &mut Vm, i: u32| Ok(vm.get_keyed(marks, Value::number(i as f64))?.to_number() as usize);
     let mut top = if count == 0 { 0 } else { mark(vm, count - 1)? };
     let mut start = if last_end <= n && n - last_end < STRIDE {
@@ -169,7 +169,7 @@ fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if last_end <= n { known.max(last_end) } else { known }
     };
     let mut found = Vec::new();
-    let breaker = breaker(vm, o);
+    let breaker = breaker(vm, o.ptr());
     let (end, word_like) = loop {
         if start >= top + STRIDE {
             found.push(Value::number(start as f64));
@@ -191,7 +191,7 @@ fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     crate::promise::set_slot(o, AT, Value::number(start as f64));
     crate::promise::set_slot(o, END, Value::number(end as f64));
     crate::promise::set_slot(o, WORD_LIKE, Value::from_bool(word_like));
-    segment_data(vm, o, start, end, word_like)
+    segment_data(vm, o.ptr(), start, end, word_like)
 }
 
 /// `%IntlSegmentsPrototype%[Symbol.iterator]()`: a Segment Iterator
@@ -214,7 +214,7 @@ fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     // string's start: no rule of UAX #29 looks back past a boundary.)
     let (length, word_like) = breaker(vm, o).first(&units[start..]);
     let end = start + length;
-    crate::promise::set_slot(o, AT, Value::number(end as f64));
+    crate::promise::set_slot(unsafe { Obj::from_ptr(o) }, AT, Value::number(end as f64));
     let data = segment_data(vm, o, start, end, word_like)?;
     crate::symbol::iter_result(vm, data, false)
 }

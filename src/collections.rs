@@ -17,6 +17,7 @@
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_int32, to_number};
 use crate::jit::Ty;
+use crate::object::Obj;
 use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::raw::ObjectPtr;
@@ -183,9 +184,9 @@ fn arg(a: &[Value], i: usize) -> Value {
 }
 
 /// `this` as an object of class `c`, else a TypeError from `what`.
-fn this_of(this: Value, c: Class, what: &str) -> Result<*mut Object> {
+fn this_of(this: Value, c: Class, what: &str) -> Result<Obj> {
     if is_class(this, c) {
-        Ok(as_object(this))
+        Ok(Obj::of(this))
     } else {
         Err(Error::type_error(format!("{what} called on incompatible receiver")))
     }
@@ -266,7 +267,7 @@ pub(crate) fn hashed_by_address(k: Value) -> bool {
 
 /// The keys of collection `o` that are hashed by their address (for
 /// `CLOISON_GC_FRAG`: they could not move).
-pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
+pub(crate) fn address_keys(o: Obj, f: &mut dyn FnMut(usize)) {
     if !matches!(o.class(), Class::Map | Class::Set | Class::WeakMap | Class::WeakSet | Class::FinalizationRegistry) {
         return;
     }
@@ -274,7 +275,7 @@ pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
     if !e.is_cell() {
         return;
     }
-    let (e, s) = (as_object(e), stride(o));
+    let (e, s) = (Obj::of(e), stride(o));
     for i in (BASE..len(e)).step_by(s) {
         let k = slot(e, i);
         if hashed_by_address(k) {
@@ -284,50 +285,50 @@ pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
 }
 
 /// The entries array of collection (or iterator) `o`.
-fn entries(o: *mut Object) -> *mut Object {
-    as_object(Value::from_bits(o.code() as u64))
+fn entries(o: Obj) -> Obj {
+    Obj::of(Value::from_bits(o.code() as u64))
 }
 
 /// Set `o`'s entries array to `e`.
-fn hold_entries(o: *mut Object, e: Value) {
+fn hold_entries(o: Obj, e: Value) {
     unsafe {
-        crate::heap::store(o.cast(), (&raw mut (*o).code).cast(), e);
+        crate::heap::store(o.ptr().cast(), (&raw mut (*o.ptr()).code).cast(), e);
     }
 }
 
 /// Element `i` of entries array `e` (within its length).
-fn slot(e: *mut Object, i: usize) -> Value {
+fn slot(e: Obj, i: usize) -> Value {
     e.elem(i)
 }
 
 /// Set element `i` of `e` (an array of any values) to `v`.
-fn put(e: *mut Object, i: usize, v: Value) {
+fn put(e: Obj, i: usize, v: Value) {
     unsafe {
         let at = e.elems().add(i);
-        crate::heap::store(e.cast(), at, v);
+        crate::heap::store(e.ptr().cast(), at, v);
     }
 }
 
-fn len(e: *mut Object) -> usize {
+fn len(e: Obj) -> usize {
     e.elems_len() as usize
 }
 
 /// An int32 element of a header or an index.
-fn int(e: *mut Object, i: usize) -> i32 {
+fn int(e: Obj, i: usize) -> i32 {
     slot(e, i).as_i32_unchecked()
 }
 
 /// A collection's entry width: 2 for the maps, 1 for the sets.
-fn stride(o: *mut Object) -> usize {
+fn stride(o: Obj) -> usize {
     if matches!(o.class(), Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 }
 }
 
 /// The entries array `e` was compacted into, or itself: an iterator's
 /// position `pos` in `e` moves with it, past as many live entries.
-fn current(mut e: *mut Object, pos: &mut usize, s: usize) -> *mut Object {
+fn current(mut e: Obj, pos: &mut usize, s: usize) -> Obj {
     while slot(e, FORWARD).is_cell() {
         let live = (BASE..(*pos).min(len(e))).step_by(s).filter(|&i| slot(e, i) != Value::EMPTY).count();
-        e = as_object(slot(e, FORWARD));
+        e = Obj::of(slot(e, FORWARD));
         *pos = BASE + live * s;
     }
     e
@@ -337,7 +338,7 @@ fn current(mut e: *mut Object, pos: &mut usize, s: usize) -> *mut Object {
 /// of 2) buckets: an array of int32s, `n`, then each bucket's last entry,
 /// then each entry's previous one in its bucket ([`NONE`] for none). An
 /// entry is numbered by its position: `BASE + number * s`.
-fn new_index(vm: &mut Vm, e: *mut Object, s: usize, n: usize) -> Result<Value> {
+fn new_index(vm: &mut Vm, e: Obj, s: usize, n: usize) -> Result<Value> {
     let total = (len(e) - BASE) / s;
     let mut ix = vec![Value::from_i32(NONE); 1 + n + total];
     ix[0] = Value::from_i32(n as i32);
@@ -355,9 +356,9 @@ fn new_index(vm: &mut Vm, e: *mut Object, s: usize, n: usize) -> Result<Value> {
 }
 
 /// The position of `key`'s entry in collection `o`, if it has one.
-fn find(o: *mut Object, key: Value) -> Option<usize> {
+fn find(o: Obj, key: Value) -> Option<usize> {
     let (e, s) = (entries(o), stride(o));
-    let ix = as_object(slot(e, INDEX));
+    let ix = Obj::of(slot(e, INDEX));
     let n = int(ix, 0) as usize;
     let mut j = int(ix, 1 + (hash(key) as usize & (n - 1)));
     while j != NONE {
@@ -372,18 +373,18 @@ fn find(o: *mut Object, key: Value) -> Option<usize> {
 }
 
 /// The entries collection `o` has.
-fn live(o: *mut Object) -> usize {
+fn live(o: Obj) -> usize {
     int(entries(o), COUNT) as usize
 }
 
 /// The entries collection `o` has (for `Vm::weak_entry_count`).
-pub(crate) fn live_entries(o: *mut Object) -> usize {
+pub(crate) fn live_entries(o: Obj) -> usize {
     live(o)
 }
 
 /// A new entries array for entries `s` wide: `entries`' live ones (none if
 /// null), indexed.
-fn new_entries(vm: &mut Vm, from: Option<*mut Object>, s: usize) -> Result<*mut Object> {
+fn new_entries(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Obj> {
     let mut kv = vec![Value::UNDEFINED, Value::UNDEFINED, Value::from_i32(0)];
     if let Some(old) = from {
         for i in (BASE..len(old)).step_by(s) {
@@ -396,7 +397,7 @@ fn new_entries(vm: &mut Vm, from: Option<*mut Object>, s: usize) -> Result<*mut 
     kv[COUNT] = Value::from_i32(count as i32);
     let fresh = vm.new_array();
     array_push(vm, fresh, &kv)?;
-    let e = as_object(fresh);
+    let e = Obj::of(fresh);
     let ix = new_index(vm, e, s, (count * 2).next_power_of_two().max(8))?;
     put(e, INDEX, ix);
     Ok(e)
@@ -404,11 +405,11 @@ fn new_entries(vm: &mut Vm, from: Option<*mut Object>, s: usize) -> Result<*mut 
 
 /// Move collection `o` to a new entries array of its live entries: the old
 /// one forwards to it, for iterators in progress (see [`current`]).
-fn move_entries(vm: &mut Vm, o: *mut Object) -> Result<()> {
+fn move_entries(vm: &mut Vm, o: Obj) -> Result<()> {
     let old = entries(o);
     let fresh = new_entries(vm, Some(old), stride(o))?;
-    put(old, FORWARD, object_value(fresh));
-    hold_entries(o, object_value(fresh));
+    put(old, FORWARD, object_value(fresh.ptr()));
+    hold_entries(o, object_value(fresh.ptr()));
     weaken(o);
     Ok(())
 }
@@ -416,7 +417,7 @@ fn move_entries(vm: &mut Vm, o: *mut Object) -> Result<()> {
 /// Append `entry` (a key, or a key and value) to collection `o`'s
 /// entries, compacting them first when more than half are holes, and
 /// index it (the index grown once entries outnumber its buckets).
-fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
+fn append(vm: &mut Vm, o: Obj, entry: &[Value]) -> Result<()> {
     let s = stride(o);
     let total = (len(entries(o)) - BASE) / s;
     if total >= 32 && live(o) * 2 < total {
@@ -424,11 +425,11 @@ fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
     }
     let e = entries(o);
     let j = (len(e) - BASE) / s;
-    array_push(vm, object_value(e), entry)?;
+    array_push(vm, object_value(e.ptr()), entry)?;
     weaken(o);
     put(e, COUNT, Value::from_i32(int(e, COUNT) + 1));
     let mut ix = as_object(slot(e, INDEX));
-    let n = int(ix, 0) as usize;
+    let n = int(unsafe { Obj::from_ptr(ix) }, 0) as usize;
     if j >= n {
         let fresh = new_index(vm, e, s, n * 2)?;
         put(e, INDEX, fresh);
@@ -437,13 +438,13 @@ fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
     array_push(vm, object_value(ix), &[Value::from_i32(NONE)])?;
     ix = as_object(slot(e, INDEX));
     let b = 1 + (hash(entry[0]) as usize & (n - 1));
-    put(ix, 1 + n + j, slot(ix, b));
-    put(ix, b, Value::from_i32(j as i32));
+    put(unsafe { Obj::from_ptr(ix) }, 1 + n + j, slot(unsafe { Obj::from_ptr(ix) }, b));
+    put(unsafe { Obj::from_ptr(ix) }, b, Value::from_i32(j as i32));
     Ok(())
 }
 
 /// Remove the entry at `i` of collection `o`: its slots become holes.
-fn remove(o: *mut Object, i: usize) {
+fn remove(o: Obj, i: usize) {
     let e = entries(o);
     for j in 0..stride(o) {
         e.clear_elem(i + j);
@@ -452,18 +453,18 @@ fn remove(o: *mut Object, i: usize) {
 }
 
 /// A new, empty collection of class `class`.
-fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object> {
+fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
     let s = if matches!(class, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
     let e = new_entries(vm, None, s)?;
     let p = object_value(vm.collection_prototypes[proto as usize]);
-    let o = vm.new_object_with(class, p, 0);
-    hold_entries(o, object_value(e));
+    let o = unsafe { Obj::from_ptr(vm.new_object_with(class, p, 0)) };
+    hold_entries(o, object_value(e.ptr()));
     if class != Class::WeakRef {
-        vm.collections.push(o);
+        vm.collections.push(o.ptr());
     }
     // (The collector's to find: see `Vm::ephemerons`.)
     if matches!(class, Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
-        vm.weak_tables.push(o);
+        vm.weak_tables.push(o.ptr());
         weaken(o);
     }
     Ok(o)
@@ -471,25 +472,25 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object
 
 /// A new weak set for the runtime's own use, never seen by scripts (a
 /// resizable buffer's views: see `typed`).
-pub(crate) fn new_weak_set(vm: &mut Vm) -> Result<*mut Object> {
+pub(crate) fn new_weak_set(vm: &mut Vm) -> Result<Obj> {
     new_collection(vm, Class::WeakSet, Proto::WeakSet)
 }
 
 /// Add object `v`, which isn't in it, to weak set `o` (see
 /// [`new_weak_set`]).
-pub(crate) fn weak_set_insert(vm: &mut Vm, o: *mut Object, v: Value) -> Result<()> {
+pub(crate) fn weak_set_insert(vm: &mut Vm, o: Obj, v: Value) -> Result<()> {
     append(vm, o, &[v])
 }
 
 /// The values of weak set `o` (see [`new_weak_set`]) not collected.
-pub(crate) fn weak_set_values(o: *mut Object) -> Vec<Value> {
+pub(crate) fn weak_set_values(o: Obj) -> Vec<Value> {
     let e = entries(o);
     (BASE..len(e)).map(|i| slot(e, i)).filter(|&v| v != Value::EMPTY).collect()
 }
 
 /// `f` called with each value of weak set `o` not collected, with no
 /// allocation (`f` mustn't change the set, nor allocate in the heap).
-pub(crate) fn weak_set_each(o: *mut Object, mut f: impl FnMut(Value)) {
+pub(crate) fn weak_set_each(o: Obj, mut f: impl FnMut(Value)) {
     let e = entries(o);
     for i in BASE..len(e) {
         let v = slot(e, i);
@@ -502,7 +503,7 @@ pub(crate) fn weak_set_each(o: *mut Object, mut f: impl FnMut(Value)) {
 /// A weak collection `o`'s entries buffer (new, or grown) tagged so the
 /// collector leaves its keys and values to the ephemeron pass (see
 /// `heap::WEAK_VALUES`).
-fn weaken(o: *mut Object) {
+fn weaken(o: Obj) {
     unsafe {
         if !matches!(o.class(), Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
             return;
@@ -545,9 +546,9 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     let p = vm.take_new_target(f, default)?;
     let c = new_collection(vm, class, proto)?;
     if p != default {
-        vm.set_prototype_of(c, p);
+        vm.set_prototype_of(c.ptr(), p);
     }
-    let o = object_value(c);
+    let o = object_value(c.ptr());
     let iterable = arg(a, 0);
     if iterable.is_undefined() || iterable.is_null() {
         return Ok(o);
@@ -592,11 +593,11 @@ fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
 }
 
 /// An iterator over collection `o`'s entries from the start.
-fn new_iterator(vm: &mut Vm, o: *mut Object, mode: IterMode) -> Value {
+fn new_iterator(vm: &mut Vm, o: Obj, mode: IterMode) -> Value {
     let s = stride(o);
     let proto = vm.collection_prototypes[if s == 2 { Proto::MapIterator } else { Proto::SetIterator } as usize];
     let it = vm.new_object_with(Class::CollectionIterator, object_value(proto), 0);
-    hold_entries(it, Value::from_bits(o.code() as u64));
+    hold_entries(unsafe { Obj::from_ptr(it) }, Value::from_bits(o.code() as u64));
     unsafe {
         *Object::aux(it) = mode as u32 | (s as u32) << 2;
         it.set_elems_len(BASE as u32);
@@ -620,7 +621,7 @@ fn map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.set")?;
     let (k, v) = (normalize(arg(a, 0)), arg(a, 1));
     match find(o, k) {
-        Some(i) => vm.set_keyed(object_value(entries(o)), Value::from_i32(i as i32 + 1), v)?,
+        Some(i) => vm.set_keyed(object_value(entries(o).ptr()), Value::from_i32(i as i32 + 1), v)?,
         None => append(vm, o, &[k, v])?,
     }
     Ok(this)
@@ -645,7 +646,7 @@ fn map_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(Value::UNDEFINED)
 }
 
-fn clear(vm: &mut Vm, o: *mut Object) -> Result<()> {
+fn clear(vm: &mut Vm, o: Obj) -> Result<()> {
     let e = entries(o);
     for i in BASE..len(e) {
         e.clear_elem(i);
@@ -660,7 +661,7 @@ fn map_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     for_each(vm, o, a, this)
 }
 
-fn for_each(vm: &mut Vm, o: *mut Object, a: &[Value], this: Value) -> Result<Value> {
+fn for_each(vm: &mut Vm, o: Obj, a: &[Value], this: Value) -> Result<Value> {
     let f = arg(a, 0);
     if !is_callable(f) {
         return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(f))));
@@ -771,27 +772,27 @@ pub(crate) fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
 
 /// A map's or a set's iterator as its `@@iterator` makes it (`entries`,
 /// `values`): for `IteratorOpen`.
-pub(crate) fn default_iterator(vm: &mut Vm, o: *mut Object) -> Value {
+pub(crate) fn default_iterator(vm: &mut Vm, o: Obj) -> Value {
     new_iterator(vm, o, if stride(o) == 2 { IterMode::Entries } else { IterMode::Values })
 }
 
 /// [`iterator_next`]'s value, without its result object: `None` once
 /// exhausted (for good).
-pub(crate) fn step(vm: &mut Vm, it: *mut Object) -> Result<Option<Value>> {
+pub(crate) fn step(vm: &mut Vm, it: Obj) -> Result<Option<Value>> {
     if it.code().is_null() {
         return Ok(None);
     }
-    let (mode, s) = unsafe { (*Object::aux(it) & 3, (*Object::aux(it) >> 2) as usize) };
+    let (mode, s) = unsafe { (*Object::aux(it.ptr()) & 3, (*Object::aux(it.ptr()) >> 2) as usize) };
     let mut i = it.elems_len() as usize;
     let e = current(entries(it), &mut i, s);
-    hold_entries(it, object_value(e));
+    hold_entries(it, object_value(e.ptr()));
     while i < len(e) {
         let k = slot(e, i);
         i += s;
         if k == Value::EMPTY {
             continue;
         }
-        unsafe { (*it).elems_len = i as u32 };
+        unsafe { (*it.ptr()).elems_len = i as u32 };
         let v = if s == 2 { slot(e, i - 1) } else { k };
         let value = match mode {
             0 => k,
@@ -805,7 +806,7 @@ pub(crate) fn step(vm: &mut Vm, it: *mut Object) -> Result<Option<Value>> {
         return Ok(Some(value));
     }
     // (`it` may be old: the marker may be reading `code`.)
-    unsafe { crate::layout::store_word(&raw mut (*it).code, std::ptr::null()) };
+    unsafe { crate::layout::store_word(&raw mut (*it.ptr()).code, std::ptr::null()) };
     Ok(None)
 }
 
@@ -829,7 +830,7 @@ fn weak_map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Invalid value used as weak map key"));
     }
     match find(o, k) {
-        Some(i) => vm.set_keyed(object_value(entries(o)), Value::from_i32(i as i32 + 1), v)?,
+        Some(i) => vm.set_keyed(object_value(entries(o).ptr()), Value::from_i32(i as i32 + 1), v)?,
         None => append(vm, o, &[k, v])?,
     }
     Ok(this)
@@ -867,13 +868,13 @@ fn get_or_insert_computed<const WEAK: bool>(vm: &mut Vm, this: Value, a: &[Value
     }
     let v = call_function(vm, f, Value::UNDEFINED, &[k])?;
     match find(o, k) {
-        Some(i) => vm.set_keyed(object_value(entries(o)), Value::from_i32(i as i32 + 1), v)?,
+        Some(i) => vm.set_keyed(object_value(entries(o).ptr()), Value::from_i32(i as i32 + 1), v)?,
         None => append(vm, o, &[k, v])?,
     }
     Ok(v)
 }
 
-fn this_of_map<const WEAK: bool>(this: Value, method: &str) -> Result<*mut Object> {
+fn this_of_map<const WEAK: bool>(this: Value, method: &str) -> Result<Obj> {
     if WEAK {
         this_of(this, Class::WeakMap, &format!("WeakMap.prototype.{method}"))
     } else {
@@ -955,13 +956,13 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_class(buffer, Class::ArrayBuffer) && !is_class(buffer, Class::SharedArrayBuffer) {
         return Err(Error::type_error("First argument to DataView constructor must be an ArrayBuffer"));
     }
-    let b = as_object(buffer);
+    let b = Obj::of(buffer);
     let offset = to_index(vm, arg(a, 1))?;
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }
     // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
-    let bytes = crate::shared::read_length(vm, b);
+    let bytes = crate::shared::read_length(vm, b.ptr());
     if offset > bytes {
         return Err(Error::range_error(format!("Start offset {offset} is outside the bounds of the buffer")));
     }
@@ -981,7 +982,7 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }
-    let bytes = crate::shared::read_length(vm, b);
+    let bytes = crate::shared::read_length(vm, b.ptr());
     if offset > bytes || len.is_some_and(|n| offset + n > bytes) {
         return Err(Error::range_error(format!("Invalid DataView length {}", len.unwrap_or(0))));
     }
@@ -989,13 +990,13 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     crate::typed::make_view(vm, Class::DataView, proto, crate::object::TypedKind::U8, b, offset, len)
 }
 
-fn this_view(this: Value) -> Result<*mut Object> {
+fn this_view(this: Value) -> Result<Obj> {
     this_of(this, Class::DataView, "DataView.prototype method")
 }
 
 /// `DataView` `o` and its byte length if in bounds (`n`, its buffer
 /// attached), else a TypeError.
-fn live_view(o: *mut Object, n: Option<usize>) -> Result<(*mut Object, usize)> {
+fn live_view(o: Obj, n: Option<usize>) -> Result<(Obj, usize)> {
     match n {
         Some(n) => Ok((o, n)),
         None => Err(Error::type_error("Cannot perform DataView operation on a detached or out of bounds ArrayBuffer")),
@@ -1004,18 +1005,18 @@ fn live_view(o: *mut Object, n: Option<usize>) -> Result<(*mut Object, usize)> {
 
 /// `this` as a `DataView` in bounds (its buffer attached), and its byte
 /// length.
-fn this_live_view(this: Value) -> Result<(*mut Object, usize)> {
+fn this_live_view(this: Value) -> Result<(Obj, usize)> {
     let o = this_view(this)?;
     live_view(o, crate::typed::view_byte_length(o))
 }
 
 fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(object_value(unsafe { (*this_view(this)?).code } as *mut Object))
+    Ok(object_value(this_view(this)?.code() as *mut Object))
 }
 
 /// `this` as by [`this_live_view`], its record made seq-cst (the getters,
 /// 25.3.4): a growable shared buffer's length read from its block.
-fn this_live_view_seq_cst(vm: &mut Vm, this: Value) -> Result<(*mut Object, usize)> {
+fn this_live_view_seq_cst(vm: &mut Vm, this: Value) -> Result<(Obj, usize)> {
     let o = this_view(this)?;
     live_view(o, crate::typed::view_byte_length_seq_cst(vm, o))
 }
@@ -1030,8 +1031,8 @@ fn view_byte_offset(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// The address of the `size` bytes at `i` in view `o`, if within it.
-fn view_bytes(o: *mut Object, i: usize, size: usize) -> Result<*mut u8> {
-    let (o, len) = this_live_view(object_value(o))?;
+fn view_bytes(o: Obj, i: usize, size: usize) -> Result<*mut u8> {
+    let (o, len) = this_live_view(object_value(o.ptr()))?;
     if i + size > len {
         return Err(Error::range_error("Offset is outside the bounds of the DataView"));
     }
@@ -1105,7 +1106,7 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 
 /// `Map.groupBy(items, callback)`: a Map of arrays.
 fn map_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let out = object_value(new_collection(vm, Class::Map, Proto::Map)?);
+    let out = object_value((new_collection(vm, Class::Map, Proto::Map)?).ptr());
     // (Its data made directly, as the spec has it: not through `get` and
     // `set`, which code may have replaced.)
     crate::props::group_by(vm, a, |vm, key, v| {
@@ -1210,7 +1211,7 @@ fn each_key(
 /// Each value set `o` has (its entries read as the loop goes on, so a
 /// value added meanwhile is seen) to `f` until it returns false: whether
 /// it went through all of them.
-fn each_value(vm: &mut Vm, o: *mut Object, mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
+fn each_value(vm: &mut Vm, o: Obj, mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
     let mut e = entries(o);
     let mut pos = BASE;
     loop {
@@ -1227,20 +1228,20 @@ fn each_value(vm: &mut Vm, o: *mut Object, mut f: impl FnMut(&mut Vm, Value) -> 
 }
 
 /// A new set of set `o`'s values.
-fn copy_set(vm: &mut Vm, o: *mut Object) -> Result<*mut Object> {
+fn copy_set(vm: &mut Vm, o: Obj) -> Result<Obj> {
     let out = new_collection(vm, Class::Set, Proto::Set)?;
     each_value(vm, o, |vm, v| append(vm, out, &[v]).map(|()| true))?;
     Ok(out)
 }
 
-fn set_add_value(vm: &mut Vm, o: *mut Object, v: Value) -> Result<()> {
+fn set_add_value(vm: &mut Vm, o: Obj, v: Value) -> Result<()> {
     if find(o, v).is_none() {
         append(vm, o, &[v])?;
     }
     Ok(())
 }
 
-fn set_remove_value(o: *mut Object, v: Value) {
+fn set_remove_value(o: Obj, v: Value) {
     if let Some(i) = find(o, v) {
         remove(o, i);
     }
@@ -1254,7 +1255,7 @@ fn set_union(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let iterator = record_iterator(vm, &rec)?;
     let out = copy_set(vm, o)?;
     each_key(vm, iterator, |vm, v| set_add_value(vm, out, v).map(|()| true))?;
-    Ok(object_value(out))
+    Ok(object_value(out.ptr()))
 }
 
 fn set_intersection(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1276,7 +1277,7 @@ fn set_intersection(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             Ok(true)
         })?;
     }
-    Ok(object_value(out))
+    Ok(object_value(out.ptr()))
 }
 
 fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1297,7 +1298,7 @@ fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             Ok(true)
         })?;
     }
-    Ok(object_value(out))
+    Ok(object_value(out.ptr()))
 }
 
 fn set_symmetric_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1313,7 +1314,7 @@ fn set_symmetric_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
         }
         Ok(true)
     })?;
-    Ok(object_value(out))
+    Ok(object_value(out.ptr()))
 }
 
 fn set_is_subset_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1368,7 +1369,7 @@ fn weak_ref_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = new_collection(vm, Class::WeakRef, Proto::WeakRef)?;
     append(vm, o, &[t])?;
     vm.kept_alive.push(t);
-    Ok(object_value(o))
+    Ok(object_value(o.ptr()))
 }
 
 /// `weakRef.deref()`: its target, or `undefined` once collected.
@@ -1399,7 +1400,7 @@ fn finalization_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("FinalizationRegistry: cleanup must be callable"));
     }
     let o = new_collection(vm, Class::FinalizationRegistry, Proto::FinalizationRegistry)?;
-    Ok(object_value(o))
+    Ok(object_value(o.ptr()))
 }
 
 /// `registry.register(target, held, token)`.

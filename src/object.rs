@@ -1582,10 +1582,13 @@ impl Obj {
         unsafe { (*self.ptr()).elems_len }
     }
 
-    /// The word past the header (see [`Object::code`]): only for the
-    /// classes with it.
+    /// The word past the header (see [`Object::code`]). Panics for a
+    /// class without it (`layout::extra_words` 0: a plain object's or an
+    /// array's first slot is there, past the end of one with none).
     #[inline(always)]
+    #[track_caller]
     pub(crate) fn code(self) -> *const Code {
+        assert!(crate::layout::extra_words(self.class()) > 0, "no code word in a {:?}", self.class());
         unsafe { (*self.ptr()).code }
     }
 

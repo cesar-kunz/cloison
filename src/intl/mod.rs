@@ -61,7 +61,7 @@ fn root(vm: &Vm, r: Root) -> *mut Object {
 }
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let intl = vm.new_plain(op);
     let a = vm.intern_name("Intl");

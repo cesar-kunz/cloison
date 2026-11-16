@@ -1879,7 +1879,7 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
                 // `cell_size` has it: the marker thread reads no shape.
                 let ups = (&(*(*o).code).upvalues).len();
                 let up = (slots + 8 * cap) as *const usize;
-                debug_assert_eq!(up as usize, crate::vm::Vm::upvalues(o) as usize);
+                debug_assert_eq!(up as usize, crate::vm::Vm::upvalues(Obj::from_ptr(o)) as usize);
                 for k in 0..ups {
                     if within(up.add(k) as usize) {
                         v.payload_slot(up.add(k) as *mut usize);
@@ -2428,7 +2428,7 @@ impl Vm {
                 self.prune_symbols(m.mode);
                 let color = m.mode.color;
                 self.prune_strings(|v| !v.is_cell() || *crate::heap::meta(v.to_bits() as usize) & COLOR == color);
-                self.prune_templates(|o| *crate::heap::meta(o as usize) & COLOR == color);
+                self.prune_templates(|o| *crate::heap::meta(o.ptr() as usize) & COLOR == color);
             }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
@@ -5367,7 +5367,7 @@ mod tests {
             if !jit {
                 vm.set_tier_back_edges(i64::MAX);
             }
-            let g = vm.global;
+            let g = vm.global_obj();
             vm.define_native(g, "fail_marker", fail_marker, 0, crate::jit::Ty::Any, false);
             let e = vm.run(&module).unwrap_err().0;
             let expected =
@@ -5446,7 +5446,7 @@ mod tests {
             return;
         }
         vm.heap.gc.cycles = true;
-        let g = vm.global;
+        let g = vm.global_obj();
         vm.define_native(g, "verify", verify_now, 0, crate::jit::Ty::Any, false);
         vm.define_native(g, "marking", marking, 0, crate::jit::Ty::Any, false);
         vm.define_native(g, "stop_cycles", stop_cycles, 0, crate::jit::Ty::Any, false);
@@ -5563,7 +5563,7 @@ mod tests {
         "#;
         let module = crate::js::compile(src).unwrap();
         let mut vm = Vm::new();
-        let g = vm.global;
+        let g = vm.global_obj();
         vm.define_natives(
             g,
             &[("stop_after_final", stop_after_final as crate::vm::NativeFn, 0), ("int32s", int32s, 1)],

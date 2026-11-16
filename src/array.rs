@@ -14,7 +14,7 @@ use crate::vm::{
 };
 
 pub(crate) fn install(vm: &mut Vm) {
-    let ap = vm.array_prototype;
+    let ap = vm.array_prototype_obj();
     vm.define_natives(
         ap,
         &[
@@ -53,7 +53,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     let a_array = vm.intern_name("Array");
-    let array = as_object(vm.get(object_value(vm.global), a_array).unwrap());
+    let array = Obj::of(vm.get(object_value(vm.global), a_array).unwrap());
     vm.define_natives(
         array,
         &[
@@ -272,9 +272,9 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
         return false;
     }
     let o = Obj::of(original);
-    let ap = vm.array_prototype;
+    let ap = vm.array_prototype_obj();
     let s = o.shape().live();
-    if o.class() != Class::Array || s.proto != object_value(ap) || s.lookup(vm.a_constructor).is_some() {
+    if o.class() != Class::Array || s.proto != object_value(ap.ptr()) || s.lookup(vm.a_constructor).is_some() {
         return false;
     }
     let ps = ap.shape().live();
@@ -383,7 +383,7 @@ pub(crate) fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
 fn create(vm: &mut Vm, o: Value, i: f64, v: Value) -> Result<()> {
     // An ordinary array's element within its length (a hole `map`'s
     // result has for each) or the next one: stored.
-    let obj = as_object(o);
+    let obj = Obj::of(o);
     {
         if obj.class() == Class::Array && obj.flags() & !(EXTERNAL | PROTOTYPE) == 0 {
             let len = obj.elems_len() as f64;
@@ -567,14 +567,14 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         {
             unsafe {
                 let m = obj.elems_len() as usize;
-                let oo = as_object(out);
+                let oo = Obj::of(out);
                 let at = oo.elems_len() as usize;
                 vm.reserve_elems(oo, at + m);
                 // (As `slice`: the result takes the item's elements' type
                 // at once.)
                 let want = oo.shape().live().elems.join(obj.shape().live().elems);
                 if want != oo.shape().live().elems {
-                    crate::object::set_shape(oo, vm.elements_transition(oo.shape(), want));
+                    crate::object::set_shape(oo.ptr(), vm.elements_transition(oo.shape(), want));
                 }
                 if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
                     vm.heap.move_values(obj.elems(), oo.elems().add(at), m);
@@ -729,7 +729,7 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             return Err(Error::type_error("Array length exceeds the maximum"));
         }
         if dense(vm, Obj::of(o)) {
-            let obj = as_object(o);
+            let obj = Obj::of(o);
             unsafe {
                 let m = obj.elems_len() as usize;
                 vm.reserve_elems(obj, m + a.len());
@@ -783,7 +783,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         && Obj::of(o).elems_len() as f64 == len
     {
         let obj = as_object(o);
-        let oo = as_object(out);
+        let oo = Obj::of(out);
         unsafe {
             let (k, count) = (k as usize, count as usize);
             vm.reserve_elems(oo, count);
@@ -793,7 +793,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             // than in its loop).
             let want = oo.shape().live().elems.join(obj.shape().live().elems);
             if want != oo.shape().live().elems {
-                crate::object::set_shape(oo, vm.elements_transition(oo.shape(), want));
+                crate::object::set_shape(oo.ptr(), vm.elements_transition(oo.shape(), want));
             }
             // (Numbers alone, no cells: nothing for the barrier to note.)
             if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
@@ -851,8 +851,8 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         && is_object(removed)
         && dense(vm, Obj::of(removed))
     {
-        let obj = as_object(o);
-        let ro = as_object(removed);
+        let obj = Obj::of(o);
+        let ro = Obj::of(removed);
         // (Raw in the loops: a dense array, its length checked above.)
         unsafe {
             let (start, del) = (start as usize, del as usize);
@@ -1302,7 +1302,7 @@ fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let obj = Obj::of(o);
     if dense(vm, obj) && k < end && end <= obj.elems_len() as f64 {
         let (from, to) = (k as usize, end as usize);
-        vm.store_element(obj.ptr(), from, v);
+        vm.store_element(obj, from, v);
         unsafe {
             let e = obj.elems();
             if !v.is_cell() {

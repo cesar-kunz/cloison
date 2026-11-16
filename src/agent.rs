@@ -337,9 +337,9 @@ pub(crate) fn install(vm: &mut Vm, host: *mut Object) {
     let op = object_value(vm.object_prototype);
     let agent = vm.new_plain(op);
     let a_agent = vm.intern_name("agent");
-    vm.add_property_with(host, a_agent, object_value(agent.ptr()), crate::object::DONT_ENUM);
+    vm.add_property_with(unsafe { Obj::from_ptr(host) }, a_agent, object_value(agent.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
-        agent.ptr(),
+        agent,
         &[
             ("start", agent_start as NativeFn, 1),
             ("broadcast", agent_broadcast, 2),

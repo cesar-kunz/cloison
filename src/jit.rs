@@ -971,7 +971,7 @@ extern "C" fn cloison_rt_create_closure(callee: Value, current: Value) -> u64 {
         return 0;
     }
     let current = current.to_bits() as *const Object;
-    vm.closure_of(callee, std::ptr::null_mut(), current).to_bits()
+    vm.closure_of(callee, std::ptr::null_mut(), unsafe { Obj::from_ptr(current.cast_mut()) }).to_bits()
 }
 
 /// `CreateClosure` of `callee` (a `Code`) in the compiled frame `regs` of
@@ -4209,7 +4209,7 @@ fn typed_lengths_standard() -> bool {
             if s.dictionary
                 || s.lookup(name).is_some()
                 || s.proto != crate::object::object_value(sp)
-                || crate::proxy::is_proxy(vm, p)
+                || crate::proxy::is_proxy(vm, p.ptr())
             {
                 return false;
             }
@@ -4245,7 +4245,10 @@ fn typed_length_known(t: Ty) -> bool {
         }
         let o = as_object(p);
         unsafe {
-            if o.flags() & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, o) || vm.virtual_own(o, name).is_some() {
+            if o.flags() & PROTOTYPE == 0
+                || crate::proxy::is_proxy(vm, o)
+                || vm.virtual_own(Obj::from_ptr(o), name).is_some()
+            {
                 return false;
             }
             let ps = o.shape().live();
@@ -5632,7 +5635,7 @@ fn typed_kind(s: u64) -> Option<u8> {
         if s.class != crate::object::Class::TypedArray || vm.typed_protos_crossed {
             return None;
         }
-        (vm.typed_prototypes.iter()).position(|&p| crate::object::object_value(p) == s.proto).map(|k| k as u8)
+        (vm.typed_prototypes.iter()).position(|&p| crate::object::object_value(p.ptr()) == s.proto).map(|k| k as u8)
     }
 }
 
@@ -14545,7 +14548,8 @@ impl Lowering<'_> {
                 }
                 Op::LdaUpvalue | Op::StaUpvalue => {
                     let func = self.out.frames[frame].func;
-                    let cell = |f: *mut Object| unsafe { *crate::vm::Vm::upvalues(f).add(i.imm as usize) };
+                    let cell =
+                        |f: *mut Object| unsafe { *crate::vm::Vm::upvalues(Obj::from_ptr(f)).add(i.imm as usize) };
                     // An int32 now (the root's: when it was first entered,
                     // see `VmState::int_upvalues`), and not exited at
                     // since: speculated to stay one.
@@ -14760,7 +14764,7 @@ impl Lowering<'_> {
         unsafe {
             let vm = &mut *self.state.vm;
             let callee = fo.code();
-            let shape = vm.ctor_root(fo);
+            let shape = vm.ctor_root(Obj::from_ptr(fo));
             // (The site allocates `this` with it.)
             crate::object::pin_shape(shape);
             let proto_at = Object::inline(fo, 0).cast::<u64>();
@@ -15610,7 +15614,7 @@ impl Lowering<'_> {
         // settled: its objects would get room for `MAX_INLINE_CAPACITY`.)
         if code.ctor_shared.get() {
             let vm = unsafe { &mut *self.state.vm };
-            let proto = unsafe { (*vm.ctor_root(fo)).proto };
+            let proto = unsafe { (*vm.ctor_root(Obj::from_ptr(fo))).proto };
             if vm.ctor_proto(code, proto).is_some_and(|e| unsafe { !(*e).settled() }) {
                 return None;
             }
@@ -15677,7 +15681,7 @@ impl Lowering<'_> {
             return None;
         }
         let v = unsafe {
-            let u = *crate::vm::Vm::upvalues(func).add(k);
+            let u = *crate::vm::Vm::upvalues(Obj::from_ptr(func)).add(k);
             if (*u).at != &raw mut (*u).closed {
                 return None;
             }
@@ -16122,7 +16126,7 @@ impl Lowering<'_> {
     /// prototype holding the property, if one does with a data property.
     fn this_proto_load(&mut self, fo: *mut Object, i: &Insn, frame: usize) -> Option<Prop> {
         unsafe {
-            let shape = (*self.state.vm).ctor_root(fo);
+            let shape = (*self.state.vm).ctor_root(Obj::from_ptr(fo));
             let name = self.out.fbs[frame].name(i);
             if shape.live().lookup(name).is_some() {
                 return None;
@@ -16132,7 +16136,7 @@ impl Lowering<'_> {
                 let o = crate::object::as_object(p);
                 // (A slotless `length` or `name` nearer: see
                 // `Vm::virtual_before`.)
-                if (*self.state.vm).virtual_own(o, name).is_some() {
+                if (*self.state.vm).virtual_own(Obj::from_ptr(o), name).is_some() {
                     return None;
                 }
                 let s = o.shape().live();
@@ -16701,7 +16705,7 @@ impl JitFunction {
                     vm.root_func = f;
                     vm.int_upvalues = (0..n)
                         .map(|k| unsafe {
-                            let cell = *crate::vm::Vm::upvalues(f).add(k);
+                            let cell = *crate::vm::Vm::upvalues(Obj::from_ptr(f)).add(k);
                             (**(cell as *const *const Value)).is_int32()
                         })
                         .collect();
@@ -18086,7 +18090,7 @@ extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
         let s = site.to_bits() as *mut CallSite;
         let vm = &mut *(*s).vm;
         vm.safepoint(regs.to_bits() as *mut Value);
-        let this = vm.construct_this((*s).closure as *mut Object);
+        let this = vm.construct_this(Obj::from_ptr((*s).closure as *mut Object));
         let o = crate::object::as_object(this);
         if (*s).this_shape != 0 && o.shape() as u64 != (*s).this_shape {
             (*s).entry = 0;
@@ -18100,7 +18104,7 @@ extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
             // string: a primitive, though a cell.)
             v
         } else {
-            crate::vm::Vm::construct_done(&*(*s).callee, o);
+            crate::vm::Vm::construct_done(&*(*s).callee, Obj::from_ptr(o));
             this
         }
     }
@@ -18116,7 +18120,7 @@ extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
         let vm = &mut *crate::interp::current_vm();
         let o = vm.heap.alloc_object(m.shape.live());
         for (k, &r) in m.fields.iter().enumerate() {
-            vm.store_field(o, k as u32, *regs.add(r as usize));
+            vm.store_field(Obj::from_ptr(o), k as u32, *regs.add(r as usize));
         }
         for &r in &m.regs {
             *regs.add(r as usize) = crate::object::object_value(o);
@@ -18134,7 +18138,7 @@ extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
 /// transition's store there (`set_tro` stencils): 1.
 extern "C" fn cloison_rt_props_room(o: Value, i: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.reserve_props(crate::object::as_object(o), i.as_i32_unchecked() as u32);
+    vm.reserve_props(unsafe { Obj::from_ptr(crate::object::as_object(o)) }, i.as_i32_unchecked() as u32);
     1
 }
 
@@ -18185,12 +18189,12 @@ extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
         let s = &mut *(site.to_bits() as *mut CallSite);
         let o = crate::object::as_object(this);
         let code = s.callee.live();
-        crate::vm::Vm::construct_done(code, o);
+        crate::vm::Vm::construct_done(code, Obj::from_ptr(o));
         let shape = o.shape();
         let seen = code.ctor_result.get();
         if code.ctor_settled.get()
             && shape.live().keys().len() as u32
-                <= crate::vm::Vm::shared_proto(code, o).map_or(code.ctor_capacity.get(), |e| e.cap.get())
+                <= crate::vm::Vm::shared_proto(code, Obj::from_ptr(o)).map_or(code.ctor_capacity.get(), |e| e.cap.get())
             && (seen == shape || seen == crate::vm::MANY_SHAPES)
         {
             crate::object::pin_shape(shape);

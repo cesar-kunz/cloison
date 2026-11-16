@@ -406,7 +406,7 @@ fn entries(o: Obj) -> Vec<(u32, Value)> {
 fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> Obj {
     let e = Obj::of(vm.new_array());
     let n = BASE + 2 * buckets;
-    vm.reserve_elems(e.ptr(), n);
+    vm.reserve_elems(e, n);
     for k in 0..n {
         e.clear_elem(k);
     }
@@ -468,7 +468,7 @@ pub(crate) fn make_far(vm: &mut Vm, o: Obj, len: u32) {
     let buckets = (rest.len() * 2).next_power_of_two().max(MIN_BUCKETS);
     let e = new_store(vm, buckets, len.max(n as u32));
     // A slot for the store past the elements, whose room shrinks by it.
-    vm.reserve_elems(o.ptr(), n + 1);
+    vm.reserve_elems(o, n + 1);
     hold(o, e);
     vm.far_elements(o);
     unsafe {
@@ -476,7 +476,7 @@ pub(crate) fn make_far(vm: &mut Vm, o: Obj, len: u32) {
         vm.heap.fill_values(o.elems().add(first_hole), n.saturating_sub(first_hole), Value::EMPTY);
         o.set_elems_len(first_hole as u32);
         if first_hole * 2 < Object::elems_cap(o.ptr().cast_const()) as usize {
-            vm.shrink_elems(o.ptr());
+            vm.shrink_elems(o);
         }
     }
     for (k, v) in rest {
@@ -492,8 +492,8 @@ pub(crate) fn set(vm: &mut Vm, o: Obj, i: u32, v: Value) {
     let n = o.elems_len();
     if i == n && (i as usize) < MAX_ELEMENTS {
         remove(o, i);
-        vm.reserve_elems(o.ptr(), i as usize + 1);
-        vm.store_element(o.ptr(), i as usize, v);
+        vm.reserve_elems(o, i as usize + 1);
+        vm.store_element(o, i as usize, v);
         // SAFETY: within the capacity `reserve_elems` made above.
         unsafe { o.set_elems_len(i + 1) };
         pull(vm, o);
@@ -518,8 +518,8 @@ fn pull(vm: &mut Vm, o: Obj) {
         }
         let Some(v) = get(o, n) else { return };
         remove(o, n);
-        vm.reserve_elems(o.ptr(), n as usize + 1);
-        vm.store_element(o.ptr(), n as usize, v);
+        vm.reserve_elems(o, n as usize + 1);
+        vm.store_element(o, n as usize, v);
         // SAFETY: within the capacity `reserve_elems` made above.
         unsafe { o.set_elems_len(n + 1) };
     }
@@ -558,11 +558,11 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: Obj) {
     let all = entries(o);
     unsafe {
         let n = o.elems_len() as usize;
-        vm.reserve_elems(o.ptr(), len);
+        vm.reserve_elems(o, len);
         vm.heap.fill_values(o.elems().add(n), len.saturating_sub(n), Value::EMPTY);
         o.set_elems_len(len as u32);
         for (i, v) in all {
-            vm.store_element(o.ptr(), i as usize, v);
+            vm.store_element(o, i as usize, v);
         }
         // The store's slot one of the elements' room again.
         crate::layout::store_word(store_slot(o), Value::UNDEFINED);

@@ -42,23 +42,23 @@ const WORD: usize = Granularity::Word as usize;
 pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
     let op = object_value(vm.object_prototype);
     let proto = vm.new_plain(op);
-    let c = vm.define_native(intl, "Segmenter", segmenter_ctor, 0, crate::jit::Ty::Any, true);
-    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
-    vm.define_natives(c.ptr(), &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
-    vm.define_natives(proto.ptr(), &[("resolvedOptions", resolved_options as NativeFn, 0), ("segment", segment, 1)]);
+    let c = vm.define_native(unsafe { Obj::from_ptr(intl) }, "Segmenter", segmenter_ctor, 0, crate::jit::Ty::Any, true);
+    crate::builtins::link_constructor(vm, c, proto);
+    vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
+    vm.define_natives(proto, &[("resolvedOptions", resolved_options as NativeFn, 0), ("segment", segment, 1)]);
     crate::symbol::to_string_tag(vm, proto, "Intl.Segmenter");
     vm.intl_roots[Root::SegmenterPrototype as usize] = proto.ptr();
 
     let segments = vm.new_plain(op);
-    vm.define_natives(segments.ptr(), &[("containing", containing as NativeFn, 1)]);
+    vm.define_natives(segments, &[("containing", containing as NativeFn, 1)]);
     let iterator = vm.native_function("[Symbol.iterator]", segments_iterator, 0, crate::jit::Ty::Any, false);
     let a = vm.a_sym_iterator;
-    vm.add_property_with(segments.ptr(), a, object_value(iterator.ptr()), DONT_ENUM);
+    vm.add_property_with(segments, a, object_value(iterator.ptr()), DONT_ENUM);
     vm.intl_roots[Root::SegmentsPrototype as usize] = segments.ptr();
 
-    let ip = object_value(vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize]);
+    let ip = object_value((vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize]).ptr());
     let iterators = vm.new_plain(ip);
-    vm.define_natives(iterators.ptr(), &[("next", iterator_next as NativeFn, 0)]);
+    vm.define_natives(iterators, &[("next", iterator_next as NativeFn, 0)]);
     crate::symbol::to_string_tag(vm, iterators, "Segmenter String Iterator");
     vm.intl_roots[Root::SegmentIteratorPrototype as usize] = iterators.ptr();
 }
@@ -68,7 +68,7 @@ fn segmenter_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor Intl.Segmenter requires 'new'"));
     }
-    let f = vm.callee;
+    let f = vm.callee_obj();
     let default = object_value(root(vm, Root::SegmenterPrototype));
     let proto = vm.take_new_target(f, default)?;
     // ResolveOptions (no relevant extension keys).
@@ -101,10 +101,10 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let op = object_value(vm.object_prototype);
     let r = vm.new_plain(op);
     let a = vm.intern_name("locale");
-    vm.add_property(r.ptr(), a, slot(o, LOCALE));
+    vm.add_property(r, a, slot(o, LOCALE));
     let granularity = crate::temporal::string(vm, GRANULARITIES[granularity(o)]);
     let a = vm.intern_name("granularity");
-    vm.add_property(r.ptr(), a, granularity);
+    vm.add_property(r, a, granularity);
     Ok(object_value(r.ptr()))
 }
 
@@ -238,14 +238,14 @@ fn segment_data(vm: &mut Vm, o: *mut Object, start: usize, end: usize, word_like
     let op = object_value(vm.object_prototype);
     let r = vm.new_plain(op);
     let a = vm.intern_name("segment");
-    vm.add_property(r.ptr(), a, segment);
+    vm.add_property(r, a, segment);
     let a = vm.intern_name("index");
-    vm.add_property(r.ptr(), a, Value::number(start as f64));
+    vm.add_property(r, a, Value::number(start as f64));
     let a = vm.intern_name("input");
-    vm.add_property(r.ptr(), a, slot(o, STRING));
+    vm.add_property(r, a, slot(o, STRING));
     if granularity(o) == WORD {
         let a = vm.intern_name("isWordLike");
-        vm.add_property(r.ptr(), a, Value::from_bool(word_like));
+        vm.add_property(r, a, Value::from_bool(word_like));
     }
     Ok(object_value(r.ptr()))
 }

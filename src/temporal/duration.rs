@@ -6,6 +6,7 @@
 use super::fields;
 use super::iso::{self, DateTime, IsoDate, RoundingMode, TIME_DURATION_MAX, Time, Unit};
 use super::*;
+use crate::object::Obj;
 
 /// A duration's fields: years, months, weeks, days, hours, minutes,
 /// seconds, milliseconds, microseconds, nanoseconds.
@@ -992,7 +993,7 @@ fn options_or_string(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     if is_string(v) {
         let o = object_value(vm.new_plain(Value::NULL).ptr());
         let a = vm.intern_name(name);
-        vm.add_property(as_object(o), a, v);
+        vm.add_property(Obj::of(o), a, v);
         return Ok(o);
     }
     options_object(vm, v)

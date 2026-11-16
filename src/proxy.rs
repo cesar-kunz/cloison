@@ -25,10 +25,10 @@ use crate::value::Value;
 use crate::vm::{Error, Key, Result, Vm};
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let any = crate::jit::Ty::Any;
     let c = vm.define_native(g, "Proxy", proxy_ctor, 2, any, true);
-    vm.define_native(c.ptr(), "revocable", proxy_revocable, 2, any, false);
+    vm.define_native(c, "revocable", proxy_revocable, 2, any, false);
     vm.proxy_codes = [
         vm.native_function("", trampoline, 0, any, false),
         vm.native_function("", trampoline, 0, any, true),

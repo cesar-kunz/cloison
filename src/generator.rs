@@ -119,7 +119,7 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
     let is_async = f.code().live().kind == 6;
     let root =
         if is_async { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
-    let proto = if crate::props::is_object(p) { p } else { object_value(vm.symbol_roots[root as usize]) };
+    let proto = if crate::props::is_object(p) { p } else { object_value((vm.symbol_roots[root as usize]).ptr()) };
     let code = f.code();
     let n = cells_for(code.live().kind) + code.live().nregs as usize;
     let queue = if is_async { vm.new_array() } else { Value::UNDEFINED };
@@ -443,19 +443,19 @@ fn generator_throw(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `%GeneratorPrototype%`: next, return, throw; its iterator itself.
 pub(crate) fn install(vm: &mut Vm) {
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
-    let gp = vm.new_plain(object_value(ip));
-    vm.symbol_roots.push(gp.ptr());
+    let gp = vm.new_plain(object_value(ip.ptr()));
+    vm.symbol_roots.push(gp);
     // `%AsyncIteratorPrototype%` (its async iterator itself) and
     // `%AsyncGeneratorPrototype%`.
     let op = object_value(vm.object_prototype);
     let aip = vm.new_plain(op);
     let a_async_iterator = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     let f = vm.native_function("[Symbol.asyncIterator]", return_this, 0, crate::jit::Ty::Any, false);
-    vm.add_property_with(aip.ptr(), a_async_iterator, object_value(f.ptr()), DONT_ENUM);
+    vm.add_property_with(aip, a_async_iterator, object_value(f.ptr()), DONT_ENUM);
     let agp = vm.new_plain(object_value(aip.ptr()));
-    vm.symbol_roots.push(agp.ptr());
+    vm.symbol_roots.push(agp);
     vm.define_natives(
-        agp.ptr(),
+        agp,
         &[
             ("next", async_generator_next as crate::vm::NativeFn, 1),
             ("return", async_generator_return, 1),
@@ -468,7 +468,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let d = crate::props::Desc::data(s, false, false, true);
     let _ = vm.define_own_property(agp, crate::vm::Key::Name(a), &d);
     vm.define_natives(
-        gp.ptr(),
+        gp,
         &[
             ("next", generator_next as crate::vm::NativeFn, 1),
             ("return", generator_return, 1),
@@ -497,9 +497,9 @@ pub(crate) fn install(vm: &mut Vm) {
     ] {
         let generator = !instances.is_null();
         let proto = vm.new_plain(fp);
-        vm.symbol_roots.push(proto.ptr());
+        vm.symbol_roots.push(proto);
         let c = vm.native_function(name, ctor, 1, crate::jit::Ty::Any, true);
-        vm.symbol_roots.push(c.ptr());
+        vm.symbol_roots.push(c);
         vm.set_prototype_of(c, function);
         let d = crate::props::Desc::data(object_value(proto.ptr()), false, false, false);
         let _ = vm.define_own_property(c, crate::vm::Key::Name(a_p), &d);

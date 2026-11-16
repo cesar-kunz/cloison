@@ -480,7 +480,7 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::range_error("SharedArrayBuffer length exceeds its maxByteLength"));
     }
     let c = vm.shared.constructor;
-    let proto = vm.take_new_target(c, object_value(vm.shared.prototype))?;
+    let proto = vm.take_new_target(unsafe { Obj::from_ptr(c) }, object_value(vm.shared.prototype))?;
     let room = max.unwrap_or(n);
     if n > MAX_BYTES || room > if max.is_some() { MAX_RESIZABLE } else { MAX_BYTES } {
         return Err(Error::range_error("Array buffer allocation failed"));
@@ -915,8 +915,8 @@ fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     let r = vm.new_plain(op);
     let a_async = vm.intern_name("async");
     let a_value = vm.intern_name("value");
-    vm.add_property(r.ptr(), a_async, Value::from_bool(async_));
-    vm.add_property(r.ptr(), a_value, value);
+    vm.add_property(r, a_async, Value::from_bool(async_));
+    vm.add_property(r, a_value, value);
     Ok(object_value(r.ptr()))
 }
 
@@ -1039,24 +1039,24 @@ pub(crate) fn idle(vm: &mut Vm) {
 }
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
     let sp = vm.new_plain(op);
     vm.shared.prototype = sp.ptr();
     let c = vm.define_native(g, "SharedArrayBuffer", shared_ctor, 1, any, true);
     vm.shared.constructor = c.ptr();
-    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(sp.ptr()) });
+    crate::builtins::link_constructor(vm, c, sp);
     getter(vm, sp, "byteLength", shared_byte_length);
     getter(vm, sp, "growable", shared_growable);
     getter(vm, sp, "maxByteLength", shared_max_byte_length);
-    vm.define_natives(sp.ptr(), &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
+    vm.define_natives(sp, &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
 
     let atomics = vm.new_plain(op);
     let a_atomics = vm.intern_name("Atomics");
     vm.add_property_with(g, a_atomics, object_value(atomics.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
-        atomics.ptr(),
+        atomics,
         &[
             ("add", atomics_add as NativeFn, 3),
             ("and", atomics_and, 3),

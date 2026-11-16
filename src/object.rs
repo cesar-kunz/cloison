@@ -1600,6 +1600,14 @@ impl Obj {
     }
 }
 
+/// Cells `v` as slots, for a collection that moves them (`gc::Root`):
+/// what it writes there is where each moved, never null, as `Obj` holds.
+pub(crate) fn obj_slots(v: &mut [Obj]) -> &mut [*mut Object] {
+    // SAFETY: `Obj` is a transparent `NonNull<Object>`, of `*mut Object`'s
+    // layout; the collector writes only cells' new addresses.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), v.len()) }
+}
+
 /// The object `o` as a value. Crate-internal: a cell value is trusted to
 /// be one (#71); a host gets the VM's objects as values (`Vm::global_object`).
 #[inline(always)]

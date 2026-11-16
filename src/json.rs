@@ -4,20 +4,20 @@
 //! [`install`].
 
 use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
-use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, RAW_JSON, as_object, object_value};
+use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, RAW_JSON, object_value};
 use crate::props::{is_callable, is_object};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, string_len, string_units, wrapped};
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let json = vm.new_plain(op);
     let a_json = vm.intern_name("JSON");
     vm.add_property_with(g, a_json, object_value(json.ptr()), DONT_ENUM);
     vm.define_natives(
-        json.ptr(),
+        json,
         &[
             ("stringify", json_stringify as NativeFn, 3),
             ("parse", json_parse, 2),
@@ -732,7 +732,7 @@ impl<'a> Parser<'a> {
                         // new one added: no string of it, no descriptor.)
                         match property_key(vm, &k) {
                             Key::Name(a) => {
-                                let ob = as_object(o);
+                                let ob = Obj::of(o);
                                 match ob.shape().live().lookup(a) {
                                     Some(slot) => vm.store_field(ob, slot, v),
                                     None => {
@@ -758,7 +758,7 @@ impl<'a> Parser<'a> {
             Some('[') if self.peek() < Some(128) => {
                 self.i += 1;
                 let arr = vm.new_array();
-                let ao = as_object(arr);
+                let ao = Obj::of(arr);
                 let mut n = 0;
                 if !self.eat(b']') {
                     loop {

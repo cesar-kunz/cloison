@@ -32,7 +32,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
     let r = vm.new_plain(op);
     vm.define_natives(
-        r.ptr(),
+        r,
         &[
             ("apply", reflect_apply as NativeFn, 3),
             ("construct", reflect_construct, 2),
@@ -49,7 +49,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("setPrototypeOf", reflect_set_prototype_of, 2),
         ],
     );
-    let g = vm.global;
+    let g = vm.global_obj();
     let a = vm.intern_name("Reflect");
     vm.add_property_with(g, a, object_value(r.ptr()), DONT_ENUM);
 }

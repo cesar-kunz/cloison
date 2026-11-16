@@ -86,7 +86,7 @@ const REACTION: usize = 5;
 const JOB: usize = 6;
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
     let proto = vm.new_plain(op);
@@ -99,15 +99,15 @@ pub(crate) fn install(vm: &mut Vm) {
     let jobs = vm.job_queue;
 
     // `AggregateError`, as the error kinds are made in `builtins`.
-    let ep = object_value(vm.error_prototypes[0]);
+    let ep = object_value((vm.error_prototypes[0]).ptr());
     let aep = vm.new_plain(ep);
     let ac = vm.define_native(g, "AggregateError", aggregate_error_ctor, 2, any, true);
     link_constructor(vm, ac, aep);
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = string(vm, "AggregateError");
-    vm.add_property_with(aep.ptr(), a_name, name, DONT_ENUM);
+    vm.add_property_with(aep, a_name, name, DONT_ENUM);
     let empty = string(vm, "");
-    vm.add_property_with(aep.ptr(), a_message, empty, DONT_ENUM);
+    vm.add_property_with(aep, a_message, empty, DONT_ENUM);
 
     vm.promise_roots = vec![proto.ptr(), c.ptr(), jobs, aep.ptr(), std::ptr::null_mut()];
     let templates: [(NativeFn, u32); 14] = [
@@ -128,10 +128,10 @@ pub(crate) fn install(vm: &mut Vm) {
     ];
     for (f, n) in templates {
         let t = vm.native_function("", f, n, any, false);
-        vm.promise_roots.push(t.ptr());
+        vm.promise_roots.push((t).ptr());
     }
     vm.define_natives(
-        c.ptr(),
+        c,
         &[
             ("resolve", promise_resolve as NativeFn, 1),
             ("reject", promise_reject, 1),
@@ -146,7 +146,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     vm.define_natives(
-        proto.ptr(),
+        proto,
         &[("then", promise_then as NativeFn, 2), ("catch", promise_catch, 1), ("finally", promise_finally, 1)],
     );
 }
@@ -242,7 +242,7 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, record: Value, close: Value
 /// keep it.
 pub(crate) fn resolve_iter_result(vm: &mut Vm, p: Obj, v: Value, record: Value) -> Result<()> {
     let a_then = vm.a_then;
-    if vm.lookup(vm.object_prototype, a_then).is_none() {
+    if vm.lookup(vm.object_prototype_obj(), a_then).is_none() {
         return settle(vm, p, FULFILLED, v);
     }
     let r = crate::symbol::iter_result(vm, v, crate::symbol::sync_done(record))?;
@@ -279,7 +279,7 @@ pub(crate) fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
 /// [`async_from_sync`]'s rejection handler: the iterator in slot 0
 /// closed (its own errors lost), the reason thrown on.
 fn close_on_rejection(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let _ = crate::symbol::close(vm, slot(unsafe { Obj::from_ptr(vm.callee) }, 0));
+    let _ = crate::symbol::close(vm, slot(vm.callee_obj(), 0));
     Err(Error::thrown(arg(a, 0)))
 }
 
@@ -518,7 +518,7 @@ fn resolving_functions(vm: &mut Vm, promise: Value) -> (Value, Value) {
 /// The resolving function now called, if neither of its pair was called
 /// before (both are marked called).
 fn take_pair(vm: &mut Vm) -> Option<Obj> {
-    let me = unsafe { Obj::from_ptr(vm.callee) };
+    let me = vm.callee_obj();
     if slot(me, 2) == Value::TRUE {
         return None;
     }
@@ -595,7 +595,7 @@ fn construct(vm: &mut Vm, c: Value, executor: Value) -> Result<Value> {
     let k = Root::Construct as usize;
     if vm.promise_roots[k].is_null() {
         let h = run_source(vm, "(function (C, executor) { return new C(executor); })")?;
-        vm.promise_roots[k] = as_object(h);
+        vm.promise_roots[k] = Obj::of(h).ptr();
     }
     let h = object_value(vm.promise_roots[k]);
     call_function(vm, h, Value::UNDEFINED, &[c, executor])
@@ -604,7 +604,7 @@ fn construct(vm: &mut Vm, c: Value, executor: Value) -> Result<Value> {
 /// The capability's executor: keeps the resolve and reject functions it
 /// is called with (slots 0 and 1), once.
 fn executor_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let me = unsafe { Obj::from_ptr(vm.callee) };
+    let me = vm.callee_obj();
     if !slot(me, 0).is_undefined() {
         return Err(Error::type_error("Promise executor has already been invoked with non-undefined arguments"));
     }
@@ -846,7 +846,7 @@ fn promise_finally(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `finally`'s fulfillment handler: `onFinally()`, then the value again
 /// once a promise for the result settles. Slots: `onFinally`, `C`.
 fn then_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let me = unsafe { Obj::from_ptr(vm.callee) };
+    let me = vm.callee_obj();
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
     let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
     let p = promise_resolve_with(vm, c, result)?;
@@ -859,7 +859,7 @@ fn then_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `finally`'s rejection handler: as [`then_finally`], the reason thrown
 /// again.
 fn catch_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let me = unsafe { Obj::from_ptr(vm.callee) };
+    let me = vm.callee_obj();
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
     let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
     let p = promise_resolve_with(vm, c, result)?;
@@ -870,11 +870,11 @@ fn catch_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn value_thunk(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Ok(slot(unsafe { Obj::from_ptr(vm.callee) }, 0))
+    Ok(slot(vm.callee_obj(), 0))
 }
 
 fn thrower(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Err(Error::thrown(slot(unsafe { Obj::from_ptr(vm.callee) }, 0)))
+    Err(Error::thrown(slot(vm.callee_obj(), 0)))
 }
 
 // ---- The statics ----
@@ -919,7 +919,7 @@ fn promise_with_resolvers(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
     let op = object_value(vm.object_prototype);
     let o = vm.new_plain(op);
     let names = [vm.intern_name("promise"), vm.intern_name("resolve"), vm.intern_name("reject")];
-    vm.add_properties(o.ptr(), &names, &[cap.promise, cap.resolve, cap.reject], 0);
+    vm.add_properties(o, &names, &[cap.promise, cap.resolve, cap.reject], 0);
     Ok(object_value(o.ptr()))
 }
 
@@ -1174,7 +1174,7 @@ fn element_done(vm: &mut Vm, me: Obj, v: Value) -> Result<Value> {
 /// The element function now called, if not called before (it is marked,
 /// and its partner if it has one).
 fn take_element(vm: &mut Vm) -> Option<Obj> {
-    let me = unsafe { Obj::from_ptr(vm.callee) };
+    let me = vm.callee_obj();
     if slot(me, CALLED) == Value::TRUE {
         return None;
     }
@@ -1220,7 +1220,7 @@ fn settled_result(vm: &mut Vm, status: &str, key: &str, v: Value) -> Value {
     let o = vm.new_plain(op);
     let names = [vm.intern_name("status"), vm.intern_name(key)];
     let status = string(vm, status);
-    vm.add_properties(o.ptr(), &names, &[status, v], 0);
+    vm.add_properties(o, &names, &[status, v], 0);
     object_value(o.ptr())
 }
 
@@ -1242,10 +1242,10 @@ fn new_aggregate_error(vm: &mut Vm, errors: Value, message: Option<&[u16]>) -> V
     if let Some(m) = message {
         let a = vm.intern_name("message");
         let m = vm.new_string(m);
-        vm.add_property_with(o.ptr(), a, m, DONT_ENUM);
+        vm.add_property_with(o, a, m, DONT_ENUM);
     }
     let a = vm.intern_name("errors");
-    vm.add_property_with(o.ptr(), a, errors, DONT_ENUM);
+    vm.add_property_with(o, a, errors, DONT_ENUM);
     object_value(o.ptr())
 }
 
@@ -1282,7 +1282,7 @@ fn aggregate_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     iterate(vm, arg(a, 0), |vm, e| array_push(vm, errors, &[e]).map(drop))?;
     let e = new_aggregate_error(vm, errors, message.as_deref());
     if let Some(c) = cause {
-        vm.add_property_with(as_object(e), a_cause, c, crate::object::DONT_ENUM);
+        vm.add_property_with(Obj::of(e), a_cause, c, crate::object::DONT_ENUM);
     }
     Ok(e)
 }

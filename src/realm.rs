@@ -13,7 +13,7 @@
 //! through `interp::enter_compiled` (all codes' `calls_left` kept at 0),
 //! which compares realms, and the JIT is off.
 
-use crate::object::{Atom, Class, FieldType, Object, Shape, as_object, object_value};
+use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, as_object, object_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
@@ -45,6 +45,18 @@ impl Field for *mut Object {
         if !self.is_null() && !other.is_null() {
             f(object_value(*self), object_value(*other));
         }
+    }
+}
+
+impl Field for Obj {
+    fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        f(crate::gc::Root::Object(&mut crate::object::obj_slots(std::slice::from_mut(self))[0]))
+    }
+    fn trace(&self, out: &mut Vec<Value>) {
+        out.push(object_value(self.ptr()));
+    }
+    fn pairs(&self, other: &Self, f: &mut dyn FnMut(Value, Value)) {
+        f(object_value(self.ptr()), object_value(other.ptr()));
     }
 }
 
@@ -232,16 +244,16 @@ realm_fields! {
     math_min_fn: *mut Object = NULL => math_min_fn;
     shared_prototype: *mut Object = NULL => shared.prototype;
     shared_constructor: *mut Object = NULL => shared.constructor;
-    error_prototypes: Vec<*mut Object> = Vec::new() => error_prototypes;
-    typed_prototypes: Vec<*mut Object> = Vec::new() => typed_prototypes;
-    typed_constructors: Vec<*mut Object> = Vec::new() => typed_constructors;
-    collection_prototypes: Vec<*mut Object> = Vec::new() => collection_prototypes;
+    error_prototypes: Vec<Obj> = Vec::new() => error_prototypes;
+    typed_prototypes: Vec<Obj> = Vec::new() => typed_prototypes;
+    typed_constructors: Vec<Obj> = Vec::new() => typed_constructors;
+    collection_prototypes: Vec<Obj> = Vec::new() => collection_prototypes;
     promise_roots: Vec<*mut Object> = Vec::new() => promise_roots;
-    iterator_roots: Vec<*mut Object> = Vec::new() => iterator_roots;
-    symbol_roots: Vec<*mut Object> = Vec::new() => symbol_roots;
+    iterator_roots: Vec<Obj> = Vec::new() => iterator_roots;
+    symbol_roots: Vec<Obj> = Vec::new() => symbol_roots;
     iter_bits: u8 = 0 => iter_bits;
     iter_epoch: Option<u32> = None => iter_epoch;
-    shadow_roots: Vec<*mut Object> = Vec::new() => shadow_roots;
+    shadow_roots: Vec<Obj> = Vec::new() => shadow_roots;
     temporal_protos: Vec<*mut Object> = Vec::new() => temporal.protos;
     temporal_ctors: Vec<*mut Object> = Vec::new() => temporal.ctors;
     intl_roots: Vec<*mut Object> = Vec::new() => intl_roots;

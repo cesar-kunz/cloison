@@ -786,19 +786,16 @@ pub(crate) fn loose_equal(a: Value, b: Value) -> bool {
 // ---- The builtins ----
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
     let proto = vm.new_plain(op);
     vm.bigint_prototype = proto.ptr();
     let c = vm.define_native(g, "BigInt", bigint_fn, 1, any, true);
-    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
+    crate::builtins::link_constructor(vm, c, proto);
+    vm.define_natives(c, &[("asIntN", bigint_as_int_n as crate::vm::NativeFn, 2), ("asUintN", bigint_as_uint_n, 2)]);
     vm.define_natives(
-        c.ptr(),
-        &[("asIntN", bigint_as_int_n as crate::vm::NativeFn, 2), ("asUintN", bigint_as_uint_n, 2)],
-    );
-    vm.define_natives(
-        proto.ptr(),
+        proto,
         &[
             ("toString", bigint_to_string as crate::vm::NativeFn, 0),
             ("toLocaleString", bigint_to_locale_string, 0),

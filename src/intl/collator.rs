@@ -58,11 +58,11 @@ impl Flags {
 pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
     let op = object_value(vm.object_prototype);
     let proto = vm.new_plain(op);
-    let c = vm.define_native(intl, "Collator", collator_ctor, 0, crate::jit::Ty::Any, true);
-    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
-    vm.define_natives(c.ptr(), &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
+    let c = vm.define_native(unsafe { Obj::from_ptr(intl) }, "Collator", collator_ctor, 0, crate::jit::Ty::Any, true);
+    crate::builtins::link_constructor(vm, c, proto);
+    vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
     crate::builtins::getter(vm, proto, "compare", compare_getter);
-    vm.define_natives(proto.ptr(), &[("resolvedOptions", resolved_options as NativeFn, 0)]);
+    vm.define_natives(proto, &[("resolvedOptions", resolved_options as NativeFn, 0)]);
     crate::symbol::to_string_tag(vm, proto, "Intl.Collator");
     vm.intl_roots[Root::CollatorPrototype as usize] = proto.ptr();
     vm.intl_roots[Root::Compare as usize] = vm.native_function("", bound_compare, 2, crate::jit::Ty::Any, false).ptr();
@@ -71,7 +71,7 @@ pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
 /// `Intl.Collator(locales, options)`, with `new` or without.
 fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let construct = vm.is_construct();
-    let f = vm.callee;
+    let f = vm.callee_obj();
     let default = object_value(root(vm, Root::CollatorPrototype));
     let proto = if construct { vm.take_new_target(f, default)? } else { default };
     let (handle, locale, flags) = initialize(vm, arg(a, 0), arg(a, 1))?;
@@ -239,7 +239,7 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             _ => unreachable!(),
         };
         let a = vm.intern_name(name);
-        vm.add_property(r.ptr(), a, v);
+        vm.add_property(r, a, v);
     }
     Ok(object_value(r.ptr()))
 }

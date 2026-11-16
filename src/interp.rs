@@ -959,7 +959,7 @@ handlers! {
         let (args, argc) = frame_args(vm, regs, &mut spread);
         let values = std::slice::from_raw_parts(args, argc);
         let callee: *mut Object = header(regs, FUNC);
-        *reg(pc, 1, regs) = crate::builtins::arguments_object_of(vm, values, unsafe { Obj::from_ptr(callee).ptr() });
+        *reg(pc, 1, regs) = crate::builtins::arguments_object_of(vm, values, callee);
         next!(any, Op::CreateArguments.size(), acc)
     }
 
@@ -1244,7 +1244,7 @@ handlers! {
         let o = if n > 0 {
             crate::builtins::mapped_arguments_object(vm, values, unsafe { Obj::from_ptr(callee) })
         } else {
-            crate::builtins::arguments_object_of(vm, values, unsafe { Obj::from_ptr(callee).ptr() })
+            crate::builtins::arguments_object_of(vm, values, callee)
         };
         if n > 0 {
             let escapes = (*frame_code(regs)).arguments_escape;
@@ -1461,13 +1461,13 @@ handlers! {
 
     fn op_lda_upvalue(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(unsafe { Obj::from_ptr(f.cast_mut()) }).add(*pc.add(1) as usize);
         next!(any, Op::LdaUpvalue.size(), *(*u).at)
     }
 
     fn op_sta_upvalue(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(unsafe { Obj::from_ptr(f.cast_mut()) }).add(*pc.add(1) as usize);
         crate::layout::store_word((*u).at, acc);
         // (A closed upvalue's variable is its own `closed`, in the heap.)
         if (*u).at == &raw mut (*u).closed {
@@ -1879,7 +1879,7 @@ handlers! {
         let a = new_array(regs);
         let n = *pc.add(1) as usize;
         if n > 0 {
-            (*frame_vm(regs)).reserve_elems(as_object(a), n);
+            (*frame_vm(regs)).reserve_elems(unsafe { Obj::from_ptr(as_object(a)) }, n);
         }
         next!(any, Op::CreateArray.size(), a)
     }
@@ -2101,8 +2101,8 @@ handlers! {
         let ic = ic_at(regs, pc, 2);
         if *(&code.ic_names).get_unchecked(index_at(pc, 2) as usize) == vm.a_length
             && o.flags() & crate::object::RUNTIME_LENGTH == 0
-            && let Some(h) = vm.known_typed_length(o)
-            && ((*ic).loc == LENGTH_LOC || (*ic).loc == crate::vm::ACCESSOR_LOC && (*ic).holder == h)
+            && let Some(h) = vm.known_typed_length(unsafe { Obj::from_ptr(o) })
+            && ((*ic).loc == LENGTH_LOC || (*ic).loc == crate::vm::ACCESSOR_LOC && (*ic).holder == h.ptr())
         {
             code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
             let n = crate::typed::ta_length(unsafe { Obj::from_ptr(o) }).unwrap_or(0);
@@ -2186,7 +2186,7 @@ handlers! {
                     || !crate::typed::is_detached(crate::typed::buffer_of(unsafe { Obj::from_ptr(o) })) && !crate::typed::is_immutable_view(unsafe { Obj::from_ptr(o) }))
                 && !crate::object::TypedKind::from_u8(o.kind()).is_big()
             {
-                crate::vm::note_bytes(ic_at(regs, pc, 3), o);
+                crate::vm::note_bytes(ic_at(regs, pc, 3), unsafe { Obj::from_ptr(o) });
                 let kind = crate::object::TypedKind::from_u8(o.kind());
                 if tag.is_int32(acc) {
                     kind.store_i32(o.elems().cast(), i as usize, acc.as_i32_unchecked());
@@ -2963,7 +2963,7 @@ handlers! {
 
     fn op_lda_upvalue_star(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(unsafe { Obj::from_ptr(f.cast_mut()) }).add(*pc.add(1) as usize);
         star!(Op::LdaUpvalue.size(), *(*u).at)
     }
 }
@@ -3437,7 +3437,7 @@ pub(crate) fn create_closure(regs: *mut Value, i: u32) -> Value {
             *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
         }
         let current: *const crate::object::Object = header(regs, FUNC);
-        (*frame_vm(regs)).create_closure_in(code, i, regs, current)
+        (*frame_vm(regs)).create_closure_in(code, i, regs, Obj::from_ptr(current.cast_mut()))
     }
 }
 
@@ -4783,7 +4783,7 @@ pub(crate) unsafe fn create_closure_of(regs: *mut Value, callee: *const Code) ->
         vm.safepoint(regs);
         *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
         let current: *const crate::object::Object = header(regs, FUNC);
-        vm.closure_of(callee, regs, current)
+        vm.closure_of(callee, regs, Obj::from_ptr(current.cast_mut()))
     }
 }
 
@@ -5099,7 +5099,7 @@ fn construct_result(regs: *mut Value, acc: Value) -> Value {
     }
     unsafe {
         let this = *regs;
-        Vm::construct_done(&*frame_code(regs), as_object(this));
+        Vm::construct_done(&*frame_code(regs), Obj::from_ptr(as_object(this)));
         this
     }
 }
@@ -5109,7 +5109,7 @@ fn construct_result(regs: *mut Value, acc: Value) -> Value {
 fn construct_this(regs: *mut Value, f: *mut Object) -> Value {
     unsafe {
         (*frame_vm(regs)).safepoint(regs);
-        (*frame_vm(regs)).construct_this(f)
+        (*frame_vm(regs)).construct_this(Obj::from_ptr(f))
     }
 }
 
@@ -5635,7 +5635,7 @@ pub(crate) unsafe fn call_from_jit(
         let this = if op == Op::Construct {
             // (A derived class's `this` is its base's, from `super()`, as
             // `op_construct` has it.)
-            if callee.live().kind == 3 { Value::HOLE } else { vm.construct_this(fo) }
+            if callee.live().kind == 3 { Value::HOLE } else { vm.construct_this(Obj::from_ptr(fo)) }
         } else if callee.live().strict {
             this
         } else {

@@ -66,12 +66,12 @@ const WRAP_PROTOTYPE: usize = 2;
 
 pub(crate) fn install(vm: &mut Vm) {
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
-    let g = vm.global;
+    let g = vm.global_obj();
     let c = vm.define_native(g, "Iterator", iterator_ctor, 0, crate::jit::Ty::Any, true);
     let a_p = vm.intern_name("prototype");
-    vm.add_property_with(c.ptr(), a_p, object_value(ip), READ_ONLY | DONT_ENUM | DONT_DELETE);
+    vm.add_property_with(c, a_p, object_value(ip.ptr()), READ_ONLY | DONT_ENUM | DONT_DELETE);
     vm.define_natives(
-        c.ptr(),
+        c,
         &[("from", from as NativeFn, 1), ("concat", concat, 0), ("zip", zip, 1), ("zipKeyed", zip_keyed, 1)],
     );
     vm.define_natives(
@@ -105,18 +105,18 @@ pub(crate) fn install(vm: &mut Vm) {
         let get = vm.native_function(&format!("get {name}"), get, 0, crate::jit::Ty::Any, false);
         let set = vm.native_function(&format!("set {name}"), set, 1, crate::jit::Ty::Any, false);
         let _ = vm.define_own_property(
-            unsafe { Obj::from_ptr(ip) },
+            ip,
             key,
             &Desc::accessor(object_value(get.ptr()), object_value(set.ptr()), false, true),
         );
     }
 
-    let hp = vm.new_plain(object_value(ip));
-    vm.define_natives(hp.ptr(), &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
+    let hp = vm.new_plain(object_value(ip.ptr()));
+    vm.define_natives(hp, &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
     crate::symbol::to_string_tag(vm, hp, "Iterator Helper");
-    let wp = vm.new_plain(object_value(ip));
-    vm.define_natives(wp.ptr(), &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
-    vm.iterator_roots = vec![c.ptr(), hp.ptr(), wp.ptr()];
+    let wp = vm.new_plain(object_value(ip.ptr()));
+    vm.define_natives(wp, &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
+    vm.iterator_roots = vec![c, hp, wp];
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -127,15 +127,15 @@ fn arg(a: &[Value], i: usize) -> Value {
 /// constructs one (see `intrinsics::construct_with`).
 fn iterator_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let derived = std::mem::replace(&mut vm.derived_construct, Value::UNDEFINED);
-    if !vm.is_construct() || derived != object_value(vm.iterator_roots[CONSTRUCTOR]) {
+    if !vm.is_construct() || derived != object_value((vm.iterator_roots[CONSTRUCTOR]).ptr()) {
         return Err(Error::type_error("Abstract class Iterator not directly constructable"));
     }
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
-    Ok(object_value((vm.new_plain(object_value(ip))).ptr()))
+    Ok(object_value((vm.new_plain(object_value(ip.ptr()))).ptr()))
 }
 
 fn get_constructor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Ok(object_value(vm.iterator_roots[CONSTRUCTOR]))
+    Ok(object_value((vm.iterator_roots[CONSTRUCTOR]).ptr()))
 }
 
 fn get_tag(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
@@ -158,7 +158,7 @@ fn ignoring_prototype(vm: &mut Vm, this: Value, key: Key, v: Value) -> Result<Va
     if !is_object(this) {
         return Err(Error::type_error("Iterator.prototype setter called on a non-object"));
     }
-    if as_object(this) == ip {
+    if as_object(this) == ip.ptr() {
         return Err(Error::type_error("Cannot assign to a read-only property of Iterator.prototype"));
     }
     if vm.own_property(Obj::of(this), key).is_none() {
@@ -246,7 +246,7 @@ fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: V
         &[Value::from_i32(kind), Value::from_i32(START), it, next, f, count, Value::UNDEFINED, Value::UNDEFINED],
     )?;
     let proto = vm.iterator_roots[if kind == WRAP { WRAP_PROTOTYPE } else { HELPER_PROTOTYPE }];
-    let o = vm.new_object_with(Class::IteratorHelper, object_value(proto), 0);
+    let o = vm.new_object_with(Class::IteratorHelper, object_value(proto.ptr()), 0);
     unsafe { (*o.ptr()).code = state.to_bits() as *const crate::vm::Code };
     Ok(object_value(o.ptr()))
 }
@@ -517,7 +517,7 @@ fn wrap_return(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `Iterator.prototype`.
 fn from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let (it, next) = flattenable(vm, arg(a, 0), true)?;
-    let c = object_value(vm.iterator_roots[CONSTRUCTOR]);
+    let c = object_value((vm.iterator_roots[CONSTRUCTOR]).ptr());
     if vm.instance_of(it, c)? {
         return Ok(it);
     }

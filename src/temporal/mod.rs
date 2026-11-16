@@ -25,7 +25,7 @@ use crate::raw::ObjectPtr;
 use std::collections::HashMap;
 
 use crate::builtins::is_class;
-use crate::object::{Class, Obj, Object, as_object, object_value};
+use crate::object::{Class, Object, as_object, object_value};
 use crate::props::is_object;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, is_string, string_units};
@@ -785,7 +785,7 @@ pub(crate) struct ClassSpec {
 }
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
     let temporal = vm.new_plain(op);
@@ -806,14 +806,14 @@ pub(crate) fn install(vm: &mut Vm) {
     ];
     for spec in specs {
         let proto = vm.new_plain(op);
-        let c = vm.define_native(temporal.ptr(), spec.name, spec.ctor, spec.length, any, true);
-        crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
-        vm.define_natives(c.ptr(), spec.statics);
+        let c = vm.define_native(temporal, spec.name, spec.ctor, spec.length, any, true);
+        crate::builtins::link_constructor(vm, c, proto);
+        vm.define_natives(c, spec.statics);
         for &(name, f) in spec.getters {
             crate::builtins::getter(vm, proto, name, f);
         }
-        vm.define_natives(proto.ptr(), spec.methods);
-        vm.define_natives(proto.ptr(), &[("valueOf", value_of as NativeFn, 0)]);
+        vm.define_natives(proto, spec.methods);
+        vm.define_natives(proto, &[("valueOf", value_of as NativeFn, 0)]);
         crate::symbol::to_string_tag(vm, proto, &format!("Temporal.{}", spec.name));
         vm.temporal.protos[spec.kind as usize] = proto.ptr();
         vm.temporal.ctors[spec.kind as usize] = c.ptr();

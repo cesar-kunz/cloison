@@ -25,7 +25,7 @@ enum Root {
 }
 
 fn root(vm: &Vm, r: Root) -> *mut Object {
-    vm.shadow_roots[r as usize]
+    (vm.shadow_roots[r as usize]).ptr()
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -38,17 +38,17 @@ fn hidden_key(vm: &mut Vm) -> Key {
 
 pub(crate) fn install(vm: &mut Vm) {
     let any = crate::jit::Ty::Any;
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let proto = vm.new_plain(op);
     let c = vm.define_native(g, "ShadowRealm", shadow_realm_ctor, 0, any, true);
-    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
-    vm.define_natives(proto.ptr(), &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
+    crate::builtins::link_constructor(vm, c, proto);
+    vm.define_natives(proto, &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
     crate::symbol::to_string_tag(vm, proto, "ShadowRealm");
     let wrapped = vm.native_function("", wrapped_call, 0, any, false);
     let imported = vm.native_function("", imported, 1, any, false);
     let failed = vm.native_function("", import_failed, 1, any, false);
-    vm.shadow_roots = vec![proto.ptr(), wrapped.ptr(), imported.ptr(), failed.ptr()];
+    vm.shadow_roots = vec![proto, wrapped, imported, failed];
 }
 
 /// `new ShadowRealm()`: a new realm, its global object the host's.
@@ -56,7 +56,7 @@ fn shadow_realm_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor ShadowRealm requires 'new'"));
     }
-    let callee = vm.callee;
+    let callee = vm.callee_obj();
     let default = object_value(root(vm, Root::Prototype));
     let proto = vm.take_new_target(callee, default)?;
     let o = vm.new_plain(proto);
@@ -188,7 +188,7 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
 /// its realm with the arguments and `this` wrapped for it, the result
 /// wrapped back. Whatever is thrown is a `TypeError`.
 fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let target = slot(unsafe { Obj::from_ptr(vm.callee) }, 0);
+    let target = slot(vm.callee_obj(), 0);
     let r = (|| {
         let target_realm = crate::realm::function_realm(vm, target)?;
         vm.handle_scope(|vm| {
@@ -247,7 +247,7 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `importValue`'s module evaluated: its export, wrapped (none: a
 /// `TypeError`).
 fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let me = unsafe { Obj::from_ptr(vm.callee) };
+    let me = vm.callee_obj();
     let (m, name, resolve, reject) = (slot(me, 0), slot(me, 1), slot(me, 2), slot(me, 3));
     let r = (|| {
         let ns = crate::module::namespace(vm, m.as_number().unwrap_or(0.0) as usize)?;
@@ -272,7 +272,7 @@ fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 
 /// `importValue`'s module failed: a `TypeError`.
 fn import_failed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let reject = slot(unsafe { Obj::from_ptr(vm.callee) }, 0);
+    let reject = slot(vm.callee_obj(), 0);
     let e = Error::thrown(arg(a, 0));
     let m = thrown_message(vm, &e);
     let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));

@@ -5,6 +5,7 @@ use super::duration::{self, ZERO_DATE};
 use super::fields::{self, Field, Required};
 use super::iso::{self, DateTime, IsoDate, RoundingMode, Time, Unit};
 use super::*;
+use crate::object::Obj;
 
 // ---- Shared getters ----
 
@@ -96,7 +97,7 @@ fn round_options(vm: &mut Vm, v: Value) -> Result<Value> {
     if is_string(v) {
         let o = object_value(vm.new_plain(Value::NULL).ptr());
         let a = vm.intern_name("smallestUnit");
-        vm.add_property(as_object(o), a, v);
+        vm.add_property(Obj::of(o), a, v);
         return Ok(o);
     }
     options_object(vm, v)

@@ -48,24 +48,24 @@ enum IterMode {
 }
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
     for _ in 0..9 {
         let p = vm.new_plain(op);
-        vm.collection_prototypes.push(p.ptr());
+        vm.collection_prototypes.push(p);
     }
     let protos = vm.collection_prototypes.clone();
     let ctors: [(&str, NativeFn); 4] =
         [("Map", map_ctor), ("Set", set_ctor), ("WeakMap", weak_map_ctor), ("WeakSet", weak_set_ctor)];
     for (k, (name, f)) in ctors.into_iter().enumerate() {
         let c = vm.define_native(g, name, f, 0, any, true);
-        link_constructor(vm, c, unsafe { Obj::from_ptr(protos[k]) });
+        link_constructor(vm, c, unsafe { Obj::from_ptr((protos[k]).ptr()) });
         if name == "Map" {
-            vm.define_native(c.ptr(), "groupBy", map_group_by, 2, any, false);
+            vm.define_native(c, "groupBy", map_group_by, 2, any, false);
         }
     }
-    let mp = protos[Proto::Map as usize];
+    let mp = unsafe { Obj::from_ptr((protos[Proto::Map as usize]).ptr()) };
     vm.define_natives(
         mp,
         &[
@@ -82,8 +82,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("getOrInsertComputed", get_or_insert_computed::<false>, 2),
         ],
     );
-    getter(vm, unsafe { Obj::from_ptr(mp) }, "size", map_size);
-    let sp = protos[Proto::Set as usize];
+    getter(vm, mp, "size", map_size);
+    let sp = unsafe { Obj::from_ptr((protos[Proto::Set as usize]).ptr()) };
     vm.define_natives(
         sp,
         &[
@@ -106,9 +106,9 @@ pub(crate) fn install(vm: &mut Vm) {
     let values = vm.define_native(sp, "values", set_values, 0, any, false);
     let a_keys = vm.intern_name("keys");
     vm.add_property_with(sp, a_keys, object_value(values.ptr()), DONT_ENUM);
-    getter(vm, unsafe { Obj::from_ptr(sp) }, "size", set_size);
+    getter(vm, sp, "size", set_size);
     vm.define_natives(
-        protos[Proto::WeakMap as usize],
+        unsafe { Obj::from_ptr((protos[Proto::WeakMap as usize]).ptr()) },
         &[
             ("get", weak_map_get as NativeFn, 1),
             ("set", weak_map_set, 2),
@@ -119,23 +119,44 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     vm.define_natives(
-        protos[Proto::WeakSet as usize],
+        unsafe { Obj::from_ptr((protos[Proto::WeakSet as usize]).ptr()) },
         &[("add", weak_set_add as NativeFn, 1), ("has", weak_set_has, 1), ("delete", weak_set_delete, 1)],
     );
     let wr = vm.define_native(g, "WeakRef", weak_ref_ctor, 1, any, true);
-    link_constructor(vm, wr, unsafe { Obj::from_ptr(protos[Proto::WeakRef as usize]) });
-    vm.define_native(protos[Proto::WeakRef as usize], "deref", weak_ref_deref, 0, any, false);
+    link_constructor(vm, wr, unsafe { Obj::from_ptr((protos[Proto::WeakRef as usize]).ptr()) });
+    vm.define_native(
+        unsafe { Obj::from_ptr((protos[Proto::WeakRef as usize]).ptr()) },
+        "deref",
+        weak_ref_deref,
+        0,
+        any,
+        false,
+    );
     let fr = vm.define_native(g, "FinalizationRegistry", finalization_ctor, 1, any, true);
-    let frp = protos[Proto::FinalizationRegistry as usize];
-    link_constructor(vm, fr, unsafe { Obj::from_ptr(frp) });
+    let frp = unsafe { Obj::from_ptr((protos[Proto::FinalizationRegistry as usize]).ptr()) };
+    link_constructor(vm, fr, frp);
     vm.define_natives(
         frp,
         &[("register", finalization_register as NativeFn, 2), ("unregister", finalization_unregister, 1)],
     );
-    vm.define_native(protos[Proto::MapIterator as usize], "next", iterator_next, 0, any, false);
-    vm.define_native(protos[Proto::SetIterator as usize], "next", iterator_next, 0, any, false);
+    vm.define_native(
+        unsafe { Obj::from_ptr((protos[Proto::MapIterator as usize]).ptr()) },
+        "next",
+        iterator_next,
+        0,
+        any,
+        false,
+    );
+    vm.define_native(
+        unsafe { Obj::from_ptr((protos[Proto::SetIterator as usize]).ptr()) },
+        "next",
+        iterator_next,
+        0,
+        any,
+        false,
+    );
 
-    let dp = unsafe { Obj::from_ptr(protos[Proto::DataView as usize]) };
+    let dp = unsafe { Obj::from_ptr((protos[Proto::DataView as usize]).ptr()) };
     let c = vm.define_native(g, "DataView", data_view_ctor, 1, any, true);
     link_constructor(vm, c, dp);
     getter(vm, dp, "buffer", view_buffer);
@@ -173,7 +194,7 @@ pub(crate) fn install(vm: &mut Vm) {
         })
         .collect();
     let fs: Vec<(&str, NativeFn, u32)> = names.iter().map(|(n, f, k)| (n.as_str(), *f, *k)).collect();
-    vm.define_natives(dp.ptr(), &fs);
+    vm.define_natives(dp, &fs);
 }
 
 // ---- Helpers ----
@@ -455,7 +476,7 @@ fn remove(o: Obj, i: usize) {
 fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
     let s = if matches!(class, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
     let e = new_entries(vm, None, s)?;
-    let p = object_value(vm.collection_prototypes[proto as usize]);
+    let p = object_value((vm.collection_prototypes[proto as usize]).ptr());
     let o = vm.new_object_with(class, p, 0);
     hold_entries(o, object_value(e.ptr()));
     if class != Class::WeakRef {
@@ -540,8 +561,8 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     }
     // OrdinaryCreateFromConstructor: a subclass's prototype first, where
     // its adder is looked up (an override of `set` or `add` called).
-    let f = vm.callee;
-    let default = object_value(vm.collection_prototypes[proto as usize]);
+    let f = vm.callee_obj();
+    let default = object_value((vm.collection_prototypes[proto as usize]).ptr());
     let p = vm.take_new_target(f, default)?;
     let c = new_collection(vm, class, proto)?;
     if p != default {
@@ -586,8 +607,8 @@ fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
     let op = object_value(vm.object_prototype);
     let r = vm.new_plain(op);
     let (a_value, a_done) = (vm.intern_name("value"), vm.intern_name("done"));
-    vm.add_property(r.ptr(), a_value, value);
-    vm.add_property(r.ptr(), a_done, Value::from_bool(done));
+    vm.add_property(r, a_value, value);
+    vm.add_property(r, a_done, Value::from_bool(done));
     object_value(r.ptr())
 }
 
@@ -595,7 +616,7 @@ fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
 fn new_iterator(vm: &mut Vm, o: Obj, mode: IterMode) -> Value {
     let s = stride(o);
     let proto = vm.collection_prototypes[if s == 2 { Proto::MapIterator } else { Proto::SetIterator } as usize];
-    let it = vm.new_object_with(Class::CollectionIterator, object_value(proto), 0);
+    let it = vm.new_object_with(Class::CollectionIterator, object_value(proto.ptr()), 0);
     hold_entries(it, Value::from_bits(o.code() as u64));
     unsafe {
         *Object::aux(it.ptr()) = mode as u32 | (s as u32) << 2;
@@ -985,7 +1006,7 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if offset > bytes || len.is_some_and(|n| offset + n > bytes) {
         return Err(Error::range_error(format!("Invalid DataView length {}", len.unwrap_or(0))));
     }
-    let proto = object_value(vm.collection_prototypes[Proto::DataView as usize]);
+    let proto = object_value((vm.collection_prototypes[Proto::DataView as usize]).ptr());
     crate::typed::make_view(vm, Class::DataView, proto, crate::object::TypedKind::U8, b, offset, len)
 }
 

@@ -308,12 +308,8 @@ pub(crate) fn make_view(
         (*o.ptr()).elems = b.elems().cast::<u8>().add(offset).cast();
         (*o.ptr()).code = b.ptr().cast();
         *Object::aux(o.ptr()) = len.map_or(TRACKING, |n| n as u32);
-        (*o.ptr()).elems_len = if class == Class::TypedArray {
-            ta_length(Obj::from_ptr(o.ptr()))
-        } else {
-            view_byte_length(Obj::from_ptr(o.ptr()))
-        }
-        .unwrap_or(0) as u32;
+        (*o.ptr()).elems_len =
+            if class == Class::TypedArray { ta_length(o) } else { view_byte_length(o) }.unwrap_or(0) as u32;
         if is_immutable(b) {
             o.set_flags(o.flags() | IMMUTABLE_VIEW);
         }
@@ -384,12 +380,15 @@ pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
     // array makes it one; one is checked where code is compiled, and a
     // change to it moves the prototype epoch.)
     if !vm.typed_length_unusual {
-        let usual = proto.is_cell() && vm.realms.is_empty() && as_object(proto) == vm.typed_prototypes[k as usize] && {
-            let p = as_object(proto);
-            let s = p.shape().live();
-            p.flags() & crate::object::PROTOTYPE != 0
-                || !s.dictionary && s.lookup(vm.a_length).is_none() && s.proto == object_value(vm.typed_array_prototype)
-        };
+        let usual =
+            proto.is_cell() && vm.realms.is_empty() && as_object(proto) == (vm.typed_prototypes[k as usize]).ptr() && {
+                let p = as_object(proto);
+                let s = p.shape().live();
+                p.flags() & crate::object::PROTOTYPE != 0
+                    || !s.dictionary
+                        && s.lookup(vm.a_length).is_none()
+                        && s.proto == object_value(vm.typed_array_prototype)
+            };
         if !usual {
             vm.typed_length_unusual();
         }
@@ -397,7 +396,7 @@ pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
     if vm.typed_protos_crossed || !proto.is_cell() {
         return;
     }
-    let p = as_object(proto);
+    let p = Obj::of(proto);
     if vm.typed_prototypes.iter().enumerate().any(|(i, &q)| q == p && i != k as usize) {
         vm.typed_protos_crossed = true;
         vm.bump_code_epoch();
@@ -405,7 +404,7 @@ pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
 }
 
 fn new_view(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, len: Option<usize>) -> Result<Value> {
-    let proto = object_value(vm.typed_prototypes[k as usize]);
+    let proto = object_value((vm.typed_prototypes[k as usize]).ptr());
     make_view(vm, Class::TypedArray, proto, k, b, offset, len)
 }
 
@@ -505,7 +504,7 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let end = arg(a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
-    let default = object_value(vm.typed_constructors[TypedKind::ALL.len()]);
+    let default = object_value((vm.typed_constructors[TypedKind::ALL.len()]).ptr());
     let c = species_constructor(vm, this, default)?;
     let out = crate::intrinsics::construct(vm, c, &[Value::number(n as f64)])?;
     if !is_class(out, Class::ArrayBuffer) {
@@ -826,7 +825,7 @@ fn find(o: Obj, lo: usize, hi: usize, x: Value, back: bool, zero: bool) -> Optio
 
 /// The intrinsic constructor of kind `k`.
 fn constructor_of(vm: &mut Vm, k: TypedKind) -> Result<Value> {
-    Ok(object_value(vm.typed_constructors[k as usize]))
+    Ok(object_value((vm.typed_constructors[k as usize]).ptr()))
 }
 
 /// TypedArrayCreateFromConstructor(c, args): a typed array in bounds
@@ -1697,7 +1696,7 @@ pub(crate) fn elements(vm: &mut Vm, o: Obj) -> Option<Vec<Value>> {
 }
 
 pub(crate) fn install(vm: &mut Vm) {
-    let g = vm.global;
+    let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
     let abp = vm.new_plain(op);
@@ -1710,7 +1709,7 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, abp, "detached", buffer_detached);
     getter(vm, abp, "immutable", buffer_immutable);
     vm.define_natives(
-        abp.ptr(),
+        abp,
         &[
             ("slice", buffer_slice as NativeFn, 2),
             ("resize", buffer_resize, 1),
@@ -1720,16 +1719,16 @@ pub(crate) fn install(vm: &mut Vm) {
             ("sliceToImmutable", buffer_slice_immutable, 2),
         ],
     );
-    vm.define_native(ab.ptr(), "isView", buffer_is_view, 1, any, false);
+    vm.define_native(ab, "isView", buffer_is_view, 1, any, false);
 
     // `%TypedArray%` (abstract) and its prototype, the concrete kinds'.
     let shared = vm.new_plain(op);
     vm.typed_array_prototype = shared.ptr();
     let ta = vm.native_function("TypedArray", typed_array_abstract, 0, any, true);
     link_constructor(vm, ta, shared);
-    vm.define_natives(ta.ptr(), &[("from", typed_from as NativeFn, 1), ("of", typed_of, 0)]);
+    vm.define_natives(ta, &[("from", typed_from as NativeFn, 1), ("of", typed_of, 0)]);
     vm.define_natives(
-        shared.ptr(),
+        shared,
         &[
             ("at", typed_at as NativeFn, 1),
             ("copyWithin", typed_copy_within, 2),
@@ -1762,11 +1761,11 @@ pub(crate) fn install(vm: &mut Vm) {
             ("with", typed_with, 2),
         ],
     );
-    vm.define_native(shared.ptr(), "values", typed_values, 0, any, false);
+    vm.define_native(shared, "values", typed_values, 0, any, false);
     // (`toString` is `Array.prototype.toString` itself.)
     let a_to_string = vm.intern_name("toString");
     let to_string = vm.get(object_value(vm.array_prototype), a_to_string).unwrap_or(Value::UNDEFINED);
-    vm.add_property_with(shared.ptr(), a_to_string, to_string, DONT_ENUM);
+    vm.add_property_with(shared, a_to_string, to_string, DONT_ENUM);
     getter(vm, shared, "buffer", typed_buffer);
     getter(vm, shared, "byteLength", typed_byte_length);
     getter(vm, shared, "byteOffset", typed_byte_offset);
@@ -1792,12 +1791,12 @@ pub(crate) fn install(vm: &mut Vm) {
         link_constructor(vm, c, proto);
         vm.set_prototype_of(c, object_value(ta.ptr()));
         let size = Value::from_i32(kind.size() as i32);
-        vm.add_property_with(c.ptr(), a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
-        vm.add_property_with(proto.ptr(), a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
-        vm.typed_prototypes.push(proto.ptr());
-        vm.typed_constructors.push(c.ptr());
+        vm.add_property_with(c, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
+        vm.add_property_with(proto, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
+        vm.typed_prototypes.push(proto);
+        vm.typed_constructors.push(c);
     }
-    vm.typed_constructors.push(ab.ptr());
+    vm.typed_constructors.push(ab);
     crate::shared::install(vm);
     crate::base64::install(vm);
 }
@@ -1806,14 +1805,13 @@ pub(crate) fn install(vm: &mut Vm) {
 /// `%TypedArray%.prototype[@@iterator]` (its `values`) and
 /// `[@@toStringTag]`, `ArrayBuffer.prototype[@@toStringTag]`.
 pub(crate) fn install_symbols(vm: &mut Vm) {
-    let shared = as_object(unsafe { (*(*vm.typed_prototypes[0]).shape).proto });
+    let shared = Obj::of(unsafe { (*(*(vm.typed_prototypes[0]).ptr()).shape).proto });
     let a_values = vm.intern_name("values");
-    let values = vm.get(object_value(shared), a_values).unwrap_or(Value::UNDEFINED);
+    let values = vm.get(object_value(shared.ptr()), a_values).unwrap_or(Value::UNDEFINED);
     let a_iter = vm.a_sym_iterator;
     vm.add_property_with(shared, a_iter, values, DONT_ENUM);
     let holder = vm.new_plain(Value::NULL);
-    let tag =
-        vm.define_native(holder.ptr(), "get [Symbol.toStringTag]", typed_to_string_tag, 0, crate::jit::Ty::Any, false);
+    let tag = vm.define_native(holder, "get [Symbol.toStringTag]", typed_to_string_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
     vm.define_accessor(shared, a_tag, Some(object_value(tag.ptr())), None, DONT_ENUM);
     let abp = vm.array_buffer_prototype;

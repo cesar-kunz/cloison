@@ -8,7 +8,7 @@ use crate::raw::ObjectPtr;
 use std::ffi::CStr;
 
 use crate::interp::{call_function, to_number, to_primitive, to_primitive_default, to_string_units};
-use crate::object::{Class, DONT_DELETE, DONT_ENUM, READ_ONLY, as_object, object_value};
+use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, READ_ONLY, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Code, Error, NativeFn, Result, Vm, string_units};
 
@@ -20,16 +20,16 @@ unsafe extern "C" {
 
 pub(crate) fn install(vm: &mut Vm) {
     unsafe { tzset() };
-    let g = vm.global;
+    let g = vm.global_obj();
     let dp = vm.date_prototype;
     let any = crate::jit::Ty::Any;
     let c = vm.define_native(g, "Date", date_constructor, 7, any, true);
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-    vm.add_property_with(c.ptr(), a_p, object_value(dp), READ_ONLY | DONT_ENUM | DONT_DELETE);
-    vm.add_property_with(dp, a_c, object_value(c.ptr()), DONT_ENUM);
-    vm.define_natives(c.ptr(), &[("now", date_now as NativeFn, 0), ("parse", date_parse, 1), ("UTC", date_utc, 7)]);
+    vm.add_property_with(c, a_p, object_value(dp), READ_ONLY | DONT_ENUM | DONT_DELETE);
+    vm.add_property_with(unsafe { Obj::from_ptr(dp) }, a_c, object_value(c.ptr()), DONT_ENUM);
+    vm.define_natives(c, &[("now", date_now as NativeFn, 0), ("parse", date_parse, 1), ("UTC", date_utc, 7)]);
     vm.define_natives(
-        dp,
+        unsafe { Obj::from_ptr(dp) },
         &[
             ("getTime", date_get_time as NativeFn, 0),
             ("valueOf", date_get_time, 0),
@@ -78,9 +78,9 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     // `toGMTString` is the very function `toUTCString` is (Annex B).
-    let f = vm.define_native(dp, "toUTCString", to_utc_string, 0, any, false);
+    let f = vm.define_native(unsafe { Obj::from_ptr(dp) }, "toUTCString", to_utc_string, 0, any, false);
     let a = vm.intern_name("toGMTString");
-    vm.add_property_with(dp, a, object_value(f.ptr()), DONT_ENUM);
+    vm.add_property_with(unsafe { Obj::from_ptr(dp) }, a, object_value(f.ptr()), DONT_ENUM);
 }
 
 // ---- Time values (§21.4.1) ----

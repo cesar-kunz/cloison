@@ -244,7 +244,7 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
 /// [`construct_with`], `args` on the VM stack (or no cell moving).
 fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result<Value> {
     if f.is_cell() && Obj::of(f).class() == Class::Function {
-        let o = as_object(f);
+        let o = Obj::of(f);
         let code = o.code().live();
         if !code.constructor() {
             return Err(Error::type_error(format!("{} is not a constructor", crate::vm::shown(f))));
@@ -1882,11 +1882,11 @@ fn bound_accessors(vm: &mut Vm, o: Value, f: Value, bindings: &[SiteBinding], pl
 /// its kind, its name, and (in a box) the box and its property's key.
 /// (An imported binding's: see [`import_of`].)
 fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Option<(Value, Key)>)> {
-    let me = vm.callee;
-    let slot = |i| crate::promise::slot(unsafe { Obj::from_ptr(me) }, i);
+    let me = vm.callee_obj();
+    let slot = |i| crate::promise::slot(me, i);
     let (f, b, name, var) = (slot(0), slot(1), slot(2), slot(3));
     let b = b.as_number().unwrap_or(0.0) as i32;
-    let u = unsafe { *Vm::upvalues(as_object(f)).add((b >> 4) as usize) };
+    let u = unsafe { *Vm::upvalues(Obj::of(f)).add((b >> 4) as usize) };
     let boxed = if b & EVAL_BOXED as i32 != 0 { Some((unsafe { *(*u).at }, to_property_key(vm, var)?)) } else { None };
     Ok((u, b & 15, name, boxed))
 }
@@ -1896,8 +1896,8 @@ fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Optio
 /// holding it, and its property there (none for a namespace, the holder
 /// itself); none if not an imported binding's.
 fn import_of(vm: &mut Vm) -> Result<Option<(Value, Value, Option<Key>)>> {
-    let me = vm.callee;
-    let slot = |i| crate::promise::slot(unsafe { Obj::from_ptr(me) }, i);
+    let me = vm.callee_obj();
+    let slot = |i| crate::promise::slot(me, i);
     if slot(1).as_number().unwrap_or(0.0) as i32 >> 4 != EVAL_IMPORT {
         return Ok(None);
     }

@@ -6,6 +6,7 @@ use super::fields::{self, Field, Required};
 use super::iso::{self, DateTime, RoundingMode, Unit};
 use super::plain::{self, date_getter, time_getter};
 use super::*;
+use crate::object::Obj;
 
 /// ToBigInt of `v`, as an exact time in range (a RangeError if not).
 fn to_epoch_ns(vm: &mut Vm, v: Value) -> Result<i128> {
@@ -111,7 +112,7 @@ fn round_options(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     if is_string(v) {
         let o = object_value(vm.new_plain(Value::NULL).ptr());
         let a = vm.intern_name(name);
-        vm.add_property(as_object(o), a, v);
+        vm.add_property(Obj::of(o), a, v);
         return Ok(o);
     }
     options_object(vm, v)
@@ -677,9 +678,9 @@ pub(crate) fn install_now(vm: &mut Vm, temporal: *mut Object) {
     let op = object_value(vm.object_prototype);
     let now = vm.new_plain(op);
     let a = vm.intern_name("Now");
-    vm.add_property_with(temporal, a, object_value(now.ptr()), crate::object::DONT_ENUM);
+    vm.add_property_with(unsafe { Obj::from_ptr(temporal) }, a, object_value(now.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
-        now.ptr(),
+        now,
         &[
             ("instant", now_instant as NativeFn, 0),
             ("plainDateTimeISO", now_date_time, 0),
@@ -691,5 +692,5 @@ pub(crate) fn install_now(vm: &mut Vm, temporal: *mut Object) {
     );
     crate::symbol::to_string_tag(vm, now, "Temporal.Now");
     let dp = vm.date_prototype;
-    vm.define_natives(dp, &[("toTemporalInstant", to_temporal_instant as NativeFn, 0)]);
+    vm.define_natives(unsafe { Obj::from_ptr(dp) }, &[("toTemporalInstant", to_temporal_instant as NativeFn, 0)]);
 }

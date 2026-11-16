@@ -985,6 +985,10 @@ pub(crate) fn dense_values(vm: &mut Vm, v: Value, m: Value) -> Option<Vec<Value>
         if crate::far::is_far(s) || vm.length_field(s) as usize != n {
             return None;
         }
+        // (No elements may be a null pointer, which no slice may have.)
+        if n == 0 {
+            return Some(Vec::new());
+        }
         let values = std::slice::from_raw_parts(s.elems(), n);
         (!values.contains(&Value::EMPTY)).then(|| values.to_vec())
     }

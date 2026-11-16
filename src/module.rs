@@ -244,7 +244,7 @@ fn template(vm: &mut Vm, t: Template) -> *mut Object {
             let o = vm.native_function(name, f, n, any, false);
             // (Every realm's: they run in their caller's.)
             unsafe { (*o.code().cast_mut()).realm = crate::realm::NONE };
-            vm.modules.templates.push(o);
+            vm.modules.templates.push(o.ptr());
         }
     }
     vm.modules.templates[t as usize]
@@ -345,13 +345,13 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
     };
     let m = vm.modules.records.len();
     let mut info = ModuleInfo::default();
-    let env = object_value(vm.new_object(Value::NULL));
+    let env = object_value(vm.new_plain(Value::NULL).ptr());
     let source = if kind == Kind::Bytes { String::new() } else { String::from_utf8_lossy(&bytes).into_owned() };
     let mut source_object = Value::UNDEFINED;
     if kind == Kind::Js {
         info = crate::js::module_info(&source, m as i32).map_err(|e| syntax(format!("{path}:{e}")))?;
     } else if kind == Kind::HostSource {
-        source_object = object_value(vm.new_object(vm.modules.abstract_source[1]));
+        source_object = object_value(vm.new_plain(vm.modules.abstract_source[1]).ptr());
     } else {
         let v = match kind {
             Kind::Json => {
@@ -544,7 +544,7 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     // The target: what the proxy's invariants check its traps against
     // (a deferred namespace's `"then"` is an ordinary property's key: it
     // has none).
-    let target = vm.new_object(Value::NULL);
+    let target = vm.new_plain(Value::NULL);
     for name in &names {
         if deferred && name.as_slice() == "then".encode_utf16().collect::<Vec<u16>>().as_slice() {
             continue;
@@ -557,7 +557,7 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     let a_tag = vm.a_sym_to_string_tag;
     vm.define_own_property(target, Key::Name(a_tag), &Desc::data(tag, false, false, false))?;
     vm.prevent_extensions(target);
-    let handler = vm.new_object(Value::NULL);
+    let handler = vm.new_plain(Value::NULL);
     let traps = [
         Template::Get,
         Template::Set,
@@ -571,9 +571,9 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     for (t, n) in traps.into_iter().zip(trap_names) {
         let f = closure(vm, t, &[Value::from_i32(m as i32), Value::from_bool(deferred)]);
         let a = vm.intern_name(n);
-        vm.set(object_value(handler), a, f)?;
+        vm.set(object_value(handler.ptr()), a, f)?;
     }
-    let ns = crate::proxy::create(vm, object_value(target), object_value(handler))?;
+    let ns = crate::proxy::create(vm, object_value(target.ptr()), object_value(handler.ptr()))?;
     let r = rec_mut(vm, m);
     if deferred {
         r.deferred = ns;
@@ -1378,22 +1378,23 @@ fn defer_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 pub(crate) fn install(vm: &mut Vm, host: *mut Object) {
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
-    let proto = vm.new_object(op);
+    let proto = vm.new_plain(op);
     let c = vm.native_function("AbstractModuleSource", abstract_source_ctor, 0, any, true);
-    crate::builtins::link_constructor(vm, c, proto);
+    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(proto.ptr()) });
     let a = vm.intern_name("AbstractModuleSource");
-    vm.add_property_with(host, a, object_value(c), crate::object::DONT_ENUM);
-    vm.modules.abstract_source = vec![object_value(c), object_value(proto)];
+    vm.add_property_with(host, a, object_value(c.ptr()), crate::object::DONT_ENUM);
+    vm.modules.abstract_source = vec![object_value(c.ptr()), object_value(proto.ptr())];
 }
 
 /// `[@@toStringTag]` of `%AbstractModuleSource%.prototype` (see
 /// `symbol::install`).
 pub(crate) fn install_symbols(vm: &mut Vm) {
     let Some(&proto) = vm.modules.abstract_source.get(1) else { return };
-    let holder = vm.new_object(Value::NULL);
-    let f = vm.define_native(holder, "get [Symbol.toStringTag]", abstract_source_tag, 0, crate::jit::Ty::Any, false);
+    let holder = vm.new_plain(Value::NULL);
+    let f =
+        vm.define_native(holder.ptr(), "get [Symbol.toStringTag]", abstract_source_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
-    vm.define_accessor(as_object(proto), a_tag, Some(object_value(f)), None, crate::object::DONT_ENUM);
+    vm.define_accessor(as_object(proto), a_tag, Some(object_value(f.ptr())), None, crate::object::DONT_ENUM);
 }
 
 fn abstract_source_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
@@ -1415,7 +1416,7 @@ fn abstract_source_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 pub(crate) fn import_meta(vm: &mut Vm, m: Value) -> Result<Value> {
     let m = m.as_i32_unchecked() as usize;
     if rec(vm, m).meta.is_undefined() {
-        let o = object_value(vm.new_object(Value::NULL));
+        let o = object_value(vm.new_plain(Value::NULL).ptr());
         rec_mut(vm, m).meta = o;
     }
     Ok(rec(vm, m).meta)

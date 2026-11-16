@@ -277,22 +277,22 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
     let proto = object_value(vm.shared.prototype);
     let o = vm.new_object_with(Class::SharedArrayBuffer, proto, 0);
     unsafe {
-        (*o).elems = bytes_of(b).cast();
+        (*o.ptr()).elems = bytes_of(b).cast();
         o.set_elems_len((*b).len.load(SeqCst) as u32);
         if growable {
             o.set_flags(o.flags() | RESIZABLE);
-            *Object::aux(o) = (*b).room as u32;
+            *Object::aux(o.ptr()) = (*b).room as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
+            (*o.ptr()).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
         }
     }
     let live = vm.shared.live;
-    crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(live) }, object_value(o))?;
+    crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(live) }, object_value(o.ptr()))?;
     if growable {
         let growing = vm.shared.growing;
-        crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(growing) }, object_value(o))?;
+        crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(growing) }, object_value(o.ptr()))?;
     }
-    Ok(object_value(o))
+    Ok(object_value(o.ptr()))
 }
 
 /// Shared buffer `o`'s length, as its block has it now (another agent
@@ -487,7 +487,7 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     let b = new_block(n, room).ok_or_else(|| Error::range_error("Array buffer allocation failed"))?;
     let o = new_shared(vm, b, max.is_some())?;
-    vm.set_prototype_of(as_object(o), proto);
+    vm.set_prototype_of(Obj::of(o), proto);
     Ok(o)
 }
 
@@ -912,12 +912,12 @@ fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(*mut Object, T
 /// `{async, value}`: what `Atomics.waitAsync` returns.
 fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     let op = object_value(vm.object_prototype);
-    let r = vm.new_object(op);
+    let r = vm.new_plain(op);
     let a_async = vm.intern_name("async");
     let a_value = vm.intern_name("value");
-    vm.add_property(r, a_async, Value::from_bool(async_));
-    vm.add_property(r, a_value, value);
-    Ok(object_value(r))
+    vm.add_property(r.ptr(), a_async, Value::from_bool(async_));
+    vm.add_property(r.ptr(), a_value, value);
+    Ok(object_value(r.ptr()))
 }
 
 fn atomics_wait(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -1042,21 +1042,21 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    let sp = vm.new_object(op);
-    vm.shared.prototype = sp;
+    let sp = vm.new_plain(op);
+    vm.shared.prototype = sp.ptr();
     let c = vm.define_native(g, "SharedArrayBuffer", shared_ctor, 1, any, true);
-    vm.shared.constructor = c;
-    crate::builtins::link_constructor(vm, c, sp);
+    vm.shared.constructor = c.ptr();
+    crate::builtins::link_constructor(vm, c, unsafe { Obj::from_ptr(sp.ptr()) });
     getter(vm, sp, "byteLength", shared_byte_length);
     getter(vm, sp, "growable", shared_growable);
     getter(vm, sp, "maxByteLength", shared_max_byte_length);
-    vm.define_natives(sp, &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
+    vm.define_natives(sp.ptr(), &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
 
-    let atomics = vm.new_object(op);
+    let atomics = vm.new_plain(op);
     let a_atomics = vm.intern_name("Atomics");
-    vm.add_property_with(g, a_atomics, object_value(atomics), crate::object::DONT_ENUM);
+    vm.add_property_with(g, a_atomics, object_value(atomics.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
-        atomics,
+        atomics.ptr(),
         &[
             ("add", atomics_add as NativeFn, 3),
             ("and", atomics_and, 3),
@@ -1074,7 +1074,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("xor", atomics_xor, 3),
         ],
     );
-    vm.shared_atomics = atomics;
+    vm.shared_atomics = atomics.ptr();
 }
 
 /// `[@@toStringTag]`s (see `typed::install_symbols`).

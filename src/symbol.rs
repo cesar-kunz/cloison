@@ -141,7 +141,7 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     let proto = object_value(root(vm, Root::SymbolPrototype).ptr());
     let o = vm.new_object_with(Class::Symbol, proto, 0);
     unsafe {
-        (*o).code = desc.to_bits() as *const crate::vm::Code;
+        (*o.ptr()).code = desc.to_bits() as *const crate::vm::Code;
         o.set_elems_len(atom.map_or(NO_ATOM, |a| a.0));
         // (Its class's root shape takes no element store: see
         // `Vm::root_shape`. Not a unique shape of its own, which would
@@ -149,9 +149,9 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
         o.set_flags(o.flags() | crate::object::NOT_EXTENSIBLE);
     }
     if let Some(a) = atom {
-        vm.symbols.insert(a, o);
+        vm.symbols.insert(a, o.ptr());
     }
-    object_value(o)
+    object_value(o.ptr())
 }
 
 /// `Symbol.prototype.toString` of symbol `v`: `Symbol(description)`.
@@ -235,8 +235,8 @@ fn symbol_description(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `Object.getOwnPropertySymbols(o)`.
 fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = vm.to_object(arg(a, 0))?;
-    let keys: Vec<Value> = if vm.proxies_exist && crate::proxy::is_proxy(vm, o) {
-        let ks = crate::proxy::own_keys(vm, o)?;
+    let keys: Vec<Value> = if vm.proxies_exist && crate::proxy::is_proxy(vm, o.ptr()) {
+        let ks = crate::proxy::own_keys(vm, o.ptr())?;
         ks.into_iter()
             .filter_map(|k| match k {
                 Key::Name(a) => atom_symbol(vm, a),
@@ -244,7 +244,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
             })
             .collect()
     } else {
-        own_symbol_keys(vm, unsafe { Obj::from_ptr(o) })
+        own_symbol_keys(vm, o)
     };
     let out = vm.new_array();
     for s in keys {
@@ -265,8 +265,8 @@ pub(crate) fn own_symbol_keys(vm: &mut Vm, o: Obj) -> Vec<Value> {
 /// Define native `f` on `o` under symbol key `a`, named `name`.
 fn define_symbol_native(vm: &mut Vm, o: Obj, a: Atom, name: &str, f: NativeFn, n: u32) -> Obj {
     let fo = vm.native_function(name, f, n, crate::jit::Ty::Any, false);
-    vm.add_property_with(o.ptr(), a, object_value(fo), DONT_ENUM);
-    unsafe { Obj::from_ptr(fo) }
+    vm.add_property_with(o.ptr(), a, object_value(fo.ptr()), DONT_ENUM);
+    fo
 }
 
 /// `Function.prototype[Symbol.hasInstance](v)`: OrdinaryHasInstance.
@@ -279,13 +279,13 @@ fn function_has_instance(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 fn define_getter(vm: &mut Vm, o: Obj, key: Key, name: &str, f: NativeFn) {
     let g = vm.native_function(&format!("get {name}"), f, 0, crate::jit::Ty::Any, false);
     let d = Desc {
-        get: Some(object_value(g)),
+        get: Some(object_value(g.ptr())),
         set: Some(Value::UNDEFINED),
         enumerable: Some(false),
         configurable: Some(true),
         ..Default::default()
     };
-    let _ = vm.define_own_property(o.ptr(), key, &d);
+    let _ = vm.define_own_property(o, key, &d);
 }
 
 /// `o[@@toStringTag] = tag`, read-only.
@@ -294,19 +294,19 @@ pub(crate) fn to_string_tag(vm: &mut Vm, o: Obj, tag: &str) {
     let s = vm.string_constant(&u);
     let a = vm.a_sym_to_string_tag;
     let d = Desc::data(s, false, false, true);
-    let _ = vm.define_own_property(o.ptr(), Key::Name(a), &d);
+    let _ = vm.define_own_property(o, Key::Name(a), &d);
 }
 
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
-    let sp = unsafe { Obj::from_ptr(vm.new_object(op)) };
+    let sp = vm.new_plain(op);
     vm.symbol_roots = vec![sp.ptr()];
-    let ctor = vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true);
+    let ctor = unsafe { Obj::from_ptr(vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true).ptr()) };
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
     let d = Desc::data(object_value(sp.ptr()), false, false, false);
     let _ = vm.define_own_property(ctor, Key::Name(a_p), &d);
-    vm.add_property_with(sp.ptr(), a_c, object_value(ctor), DONT_ENUM);
+    vm.add_property_with(sp.ptr(), a_c, object_value(ctor.ptr()), DONT_ENUM);
     for &w in WELL_KNOWN {
         let desc_units: Vec<u16> = format!("Symbol.{w}").encode_utf16().collect();
         let desc = vm.string_constant(&desc_units);
@@ -325,18 +325,18 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.a_sym_has_instance = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.hasInstance"));
     // `Function.prototype[Symbol.hasInstance]`: fixed.
     let hi = vm.native_function("[Symbol.hasInstance]", function_has_instance, 1, crate::jit::Ty::Any, false);
-    vm.has_instance_fn = hi;
-    let d = Desc::data(object_value(hi), false, false, false);
+    vm.has_instance_fn = hi.ptr();
+    let d = Desc::data(object_value(hi.ptr()), false, false, false);
     let (fp, a_hi) = (vm.function_prototype, vm.a_sym_has_instance);
-    let _ = vm.define_own_property(fp, Key::Name(a_hi), &d);
+    let _ = vm.define_own_property(unsafe { Obj::from_ptr(fp) }, Key::Name(a_hi), &d);
     // `Date.prototype[Symbol.toPrimitive]`.
     let dtp = vm.native_function("[Symbol.toPrimitive]", crate::date::date_to_primitive, 1, crate::jit::Ty::Any, false);
-    let d = Desc::data(object_value(dtp), false, false, true);
+    let d = Desc::data(object_value(dtp.ptr()), false, false, true);
     let (dp, a_tp) = (vm.date_prototype, vm.intern_name(&format!("{SYMBOL_MARK}Symbol.toPrimitive")));
-    let _ = vm.define_own_property(dp, Key::Name(a_tp), &d);
+    let _ = vm.define_own_property(unsafe { Obj::from_ptr(dp) }, Key::Name(a_tp), &d);
     // `Array.prototype[Symbol.unscopables]`: what `with` over an array
     // doesn't find (ES2015 on).
-    let u = vm.new_object(Value::NULL);
+    let u = vm.new_plain(Value::NULL);
     for name in [
         "at",
         "copyWithin",
@@ -356,20 +356,20 @@ pub(crate) fn install(vm: &mut Vm) {
         "values",
     ] {
         let a = vm.intern_name(name);
-        vm.add_property_with(u, a, Value::TRUE, 0);
+        vm.add_property_with(u.ptr(), a, Value::TRUE, 0);
     }
     let a_unscopables = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.unscopables"));
-    let d = Desc::data(object_value(u), false, false, true);
+    let d = Desc::data(object_value(u.ptr()), false, false, true);
     let ap = vm.array_prototype;
-    let _ = vm.define_own_property(ap, Key::Name(a_unscopables), &d);
-    vm.define_natives(ctor, &[("for", symbol_for as NativeFn, 1), ("keyFor", symbol_key_for, 1)]);
+    let _ = vm.define_own_property(unsafe { Obj::from_ptr(ap) }, Key::Name(a_unscopables), &d);
+    vm.define_natives(ctor.ptr(), &[("for", symbol_for as NativeFn, 1), ("keyFor", symbol_key_for, 1)]);
     vm.define_natives(sp.ptr(), &[("toString", symbol_to_string as NativeFn, 0), ("valueOf", symbol_value_of, 0)]);
     let a_description = vm.intern_name("description");
     define_getter(vm, sp, Key::Name(a_description), "description", symbol_description);
     let tp = vm.a_sym_to_primitive;
     let f = vm.native_function("[Symbol.toPrimitive]", symbol_value_of, 1, crate::jit::Ty::Any, false);
-    let d = Desc::data(object_value(f), false, false, true);
-    let _ = vm.define_own_property(sp.ptr(), Key::Name(tp), &d);
+    let d = Desc::data(object_value(f.ptr()), false, false, true);
+    let _ = vm.define_own_property(sp, Key::Name(tp), &d);
     to_string_tag(vm, sp, "Symbol");
     let object_ctor = {
         let a = vm.intern_name("Object");
@@ -394,24 +394,24 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 
     // Iterators.
-    let ip = vm.new_object(op);
-    vm.symbol_roots.push(ip);
+    let ip = vm.new_plain(op);
+    vm.symbol_roots.push(ip.ptr());
     let a_iter = vm.a_sym_iterator;
-    define_symbol_native(vm, unsafe { Obj::from_ptr(ip) }, a_iter, "[Symbol.iterator]", return_this, 0);
-    let aip = vm.new_object(object_value(ip));
-    vm.symbol_roots.push(aip);
-    vm.define_natives(aip, &[("next", array_iterator_next as NativeFn, 0)]);
-    to_string_tag(vm, unsafe { Obj::from_ptr(aip) }, "Array Iterator");
-    let sip = vm.new_object(object_value(ip));
-    vm.symbol_roots.push(sip);
-    vm.define_natives(sip, &[("next", string_iterator_next as NativeFn, 0)]);
-    to_string_tag(vm, unsafe { Obj::from_ptr(sip) }, "String Iterator");
+    define_symbol_native(vm, ip, a_iter, "[Symbol.iterator]", return_this, 0);
+    let aip = vm.new_plain(object_value(ip.ptr()));
+    vm.symbol_roots.push(aip.ptr());
+    vm.define_natives(aip.ptr(), &[("next", array_iterator_next as NativeFn, 0)]);
+    to_string_tag(vm, aip, "Array Iterator");
+    let sip = vm.new_plain(object_value(ip.ptr()));
+    vm.symbol_roots.push(sip.ptr());
+    vm.define_natives(sip.ptr(), &[("next", string_iterator_next as NativeFn, 0)]);
+    to_string_tag(vm, sip, "String Iterator");
 
     let ap = vm.array_prototype;
     vm.define_natives(ap, &[("keys", array_keys as NativeFn, 0), ("entries", array_entries, 0)]);
     let values = vm.define_native(ap, "values", array_values, 0, crate::jit::Ty::Any, false);
-    vm.symbol_roots.push(values);
-    vm.add_property_with(ap, a_iter, object_value(values), DONT_ENUM);
+    vm.symbol_roots.push(values.ptr());
+    vm.add_property_with(ap, a_iter, object_value(values.ptr()), DONT_ENUM);
     // (`%TypedArray%`'s `@@species`: the kinds' constructors' prototype.)
     if let Some(&c) = vm.typed_constructors.first() {
         let ta = Obj::of(c.shape().live().proto);
@@ -425,7 +425,7 @@ pub(crate) fn install(vm: &mut Vm) {
     use crate::collections::Proto;
     let cp = vm.collection_prototypes.clone();
     for (p, method, tag) in [(Proto::Map, "entries", "Map"), (Proto::Set, "values", "Set")] {
-        let o = unsafe { Obj::from_ptr(cp[p as usize]) };
+        let o = unsafe { Obj::from_ptr(Obj::from_ptr(cp[p as usize]).ptr()) };
         let a = vm.intern_name(method);
         let f = vm.get(object_value(o.ptr()), a).unwrap_or(Value::UNDEFINED);
         vm.add_property_with(o.ptr(), a_iter, f, DONT_ENUM);
@@ -433,7 +433,7 @@ pub(crate) fn install(vm: &mut Vm) {
     }
     for (p, tag) in [(Proto::MapIterator, "Map Iterator"), (Proto::SetIterator, "Set Iterator")] {
         let o = cp[p as usize];
-        vm.set_prototype_of(o, object_value(ip));
+        vm.set_prototype_of(unsafe { Obj::from_ptr(o) }, object_value(ip.ptr()));
         to_string_tag(vm, unsafe { Obj::from_ptr(o) }, tag);
     }
     crate::promise::install_symbols(vm);
@@ -477,15 +477,15 @@ fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Va
     let state = crate::array::new_array_of(vm, &[target, Value::from_i32(0), Value::from_i32(kind)])?;
     let p = object_value(root(vm, proto).ptr());
     let it = vm.new_object_with(Class::ArrayIterator, p, 0);
-    unsafe { (*it).code = state.to_bits() as *const crate::vm::Code };
-    Ok(object_value(it))
+    unsafe { (*it.ptr()).code = state.to_bits() as *const crate::vm::Code };
+    Ok(object_value(it.ptr()))
 }
 
 fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("Array.prototype iterator called on null or undefined"));
     }
-    Ok(object_value(vm.to_object(this)?))
+    Ok(object_value((vm.to_object(this)?).ptr()))
 }
 
 pub(crate) fn array_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -528,7 +528,7 @@ pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value
         vm.store_field(o, 1, Value::from_bool(done));
         return Ok(object_value(o));
     }
-    let o = object_value(vm.new_object(object_value(vm.object_prototype)));
+    let o = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     let (a_value, a_done) = (vm.a_value, vm.a_done);
     vm.create_data_property(o, Key::Name(a_value), value)?;
     vm.create_data_property(o, Key::Name(a_done), Value::from_bool(done))?;
@@ -687,11 +687,11 @@ fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     let o = vm.new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32);
     for (i, v) in [it, next].into_iter().chain(done).enumerate() {
         unsafe {
-            let at = crate::object::Object::inline(o, i);
-            crate::heap::store(o.cast(), at, v);
+            let at = crate::object::Object::inline(o.ptr(), i);
+            crate::heap::store(o.ptr().cast(), at, v);
         }
     }
-    Ok(crate::object::object_value(o))
+    Ok(crate::object::object_value(o.ptr()))
 }
 
 /// Whether a [`sync_record`]'s last step was done (false once

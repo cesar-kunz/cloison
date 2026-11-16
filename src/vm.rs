@@ -4,11 +4,11 @@
 //! The interpreter reaches it through each frame's header (see
 //! `src/interp.rs`), which holds the frame's [`Code`] and the `Vm`.
 
+use crate::object::Obj;
 use crate::raw::{Live, ObjectPtr};
 use std::cell::{Cell, RefCell, UnsafeCell};
 // FxHash: interning the builtins' names at startup was mostly SipHash.
 use crate::jit::{HashMap, HashSet};
-use crate::object::Obj;
 use std::fmt;
 
 use crate::asm::Module;
@@ -1688,7 +1688,7 @@ impl Vm {
         vm.a_regexp_source = vm.intern_name("\u{FDD0}Source");
         vm.a_index = vm.intern_name("index");
         vm.a_input = vm.intern_name("input");
-        vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
+        vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1).ptr();
         vm.init_realm();
         vm.atoms_fixed = vm.atoms.len();
         vm
@@ -1698,22 +1698,22 @@ impl Vm {
     /// builtins.
     pub(crate) fn init_realm(&mut self) {
         let vm = self;
-        vm.object_prototype = vm.new_object_with(Class::Plain, Value::NULL, 4);
+        vm.object_prototype = vm.new_object_with(Class::Plain, Value::NULL, 4).ptr();
         let op = object_value(vm.object_prototype);
         // `Function.prototype` is itself a function (returning `undefined`).
         let fp = vm.new_object_with(Class::Native, op, 0);
-        unsafe { (*fp).code = vm.native_code("", function_prototype_fn, 0, crate::jit::Ty::Any, false) };
-        vm.function_prototype = fp;
-        vm.array_prototype = vm.new_object(op);
+        unsafe { (*fp.ptr()).code = vm.native_code("", function_prototype_fn, 0, crate::jit::Ty::Any, false) };
+        vm.function_prototype = fp.ptr();
+        vm.array_prototype = vm.new_plain(op).ptr();
         // `String.prototype` is a string object (of `""`, set below) and
         // `Number.prototype` a number object (of 0).
-        vm.string_prototype = vm.new_object_with(Class::Wrapper, op, 4);
+        vm.string_prototype = vm.new_object_with(Class::Wrapper, op, 4).ptr();
         // Room for the builtins and the script's globals in the object
         // itself: out-of-line globals cost compiled code a load each, and
         // aren't folded as constants. (64 slots, the builtins took them
         // all: DeltaBlue +20% instructions.)
-        vm.global = vm.new_object_with(Class::Plain, op, GLOBAL_CAPACITY);
-        vm.global_lexicals = vm.new_object_with(Class::Plain, Value::NULL, LEXICAL_CAPACITY);
+        vm.global = vm.new_object_with(Class::Plain, op, GLOBAL_CAPACITY).ptr();
+        vm.global_lexicals = vm.new_object_with(Class::Plain, Value::NULL, LEXICAL_CAPACITY).ptr();
 
         let fp = object_value(vm.function_prototype);
         let root = vm.root_shape(Class::Function, fp, FUNCTION_CAPACITY);
@@ -1742,12 +1742,12 @@ impl Vm {
         let empty = vm.new_string(&[]);
         unsafe { (*vm.string_prototype).code = empty.to_bits() as *const Code };
         let ap = vm.array_prototype;
-        vm.array_push_fn = vm.define_native(ap, "push", array_push_method, 1, crate::jit::Ty::I32, false);
-        vm.array_pop_fn = vm.define_native(ap, "pop", crate::array::array_pop, 0, crate::jit::Ty::Any, false);
+        vm.array_push_fn = vm.define_native(ap, "push", array_push_method, 1, crate::jit::Ty::I32, false).ptr();
+        vm.array_pop_fn = vm.define_native(ap, "pop", crate::array::array_pop, 0, crate::jit::Ty::Any, false).ptr();
         let fp = vm.function_prototype;
         let call = vm.define_native(fp, "call", function_call, 1, crate::jit::Ty::Any, false);
         vm.function_call = call.code();
-        vm.function_call_fn = call;
+        vm.function_call_fn = call.ptr();
         // The constructors, with `prototype` and `constructor` links.
         let g = vm.global;
         for (name, v) in [
@@ -1758,7 +1758,7 @@ impl Vm {
             let a = vm.intern_name(name);
             vm.add_property_with(g, a, v, READ_ONLY | DONT_ENUM | DONT_DELETE);
         }
-        vm.number_prototype = vm.new_object_with(Class::Wrapper, op, 4);
+        vm.number_prototype = vm.new_object_with(Class::Wrapper, op, 4).ptr();
         unsafe { (*vm.number_prototype).code = Value::from_i32(0).to_bits() as *const Code };
         let np = vm.number_prototype;
         vm.define_native(np, "toFixed", number_to_fixed, 1, crate::jit::Ty::Any, false);
@@ -1767,7 +1767,7 @@ impl Vm {
         vm.define_native(ap, "indexOf", crate::array::array_index_of, 1, crate::jit::Ty::I32, false);
         let math = vm.new_object_with(Class::Plain, op, 16);
         let a = vm.intern_name("Math");
-        vm.add_property_with(g, a, object_value(math), DONT_ENUM);
+        vm.add_property_with(g, a, object_value(math.ptr()), DONT_ENUM);
         for (name, v) in [
             ("E", std::f64::consts::E),
             ("PI", std::f64::consts::PI),
@@ -1778,7 +1778,7 @@ impl Vm {
             ("SQRT2", std::f64::consts::SQRT_2),
         ] {
             let a = vm.intern_name(name);
-            vm.add_property_with(math, a, Value::from_f64(v), READ_ONLY | DONT_ENUM | DONT_DELETE);
+            vm.add_property_with(math.ptr(), a, Value::from_f64(v), READ_ONLY | DONT_ENUM | DONT_DELETE);
         }
         // Results compiled code takes for doubles (checked, and unboxed:
         // `1 / Math.sqrt(x)` divides doubles), for int32s (`Math.floor`'s
@@ -1802,28 +1802,28 @@ impl Vm {
             ("max", math_max, 2, Any),
             ("random", math_random, 0, F64),
         ] {
-            let fo = vm.define_native(math, name, f, n, ty, false);
+            let fo = vm.define_native(math.ptr(), name, f, n, ty, false);
             match name {
-                "sqrt" => vm.math_sqrt_fn = fo,
-                "pow" => vm.math_pow_fn = fo,
-                "max" => vm.math_max_fn = fo,
-                "min" => vm.math_min_fn = fo,
+                "sqrt" => vm.math_sqrt_fn = fo.ptr(),
+                "pow" => vm.math_pow_fn = fo.ptr(),
+                "max" => vm.math_max_fn = fo.ptr(),
+                "min" => vm.math_min_fn = fo.ptr(),
                 _ => {}
             }
         }
-        vm.date_prototype = vm.new_object(op);
+        vm.date_prototype = vm.new_plain(op).ptr();
         for (name, f, proto) in [
             ("Array", array_constructor as NativeFn, vm.array_prototype),
             ("Object", object_constructor as NativeFn, vm.object_prototype),
         ] {
             let c = vm.define_native(g, name, f, 1, crate::jit::Ty::Any, true);
             if name == "Array" {
-                vm.array_fn = c;
+                vm.array_fn = c.ptr();
             }
             let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-            vm.add_property_with(c, a_p, object_value(proto), READ_ONLY | DONT_ENUM | DONT_DELETE);
+            vm.add_property_with(c.ptr(), a_p, object_value(proto), READ_ONLY | DONT_ENUM | DONT_DELETE);
             // Not enumerable, as the builtins' properties.
-            vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
+            vm.add_property_with(proto, a_c, object_value(c.ptr()), DONT_ENUM);
         }
         crate::builtins::install(vm);
     }
@@ -2698,7 +2698,7 @@ impl Vm {
             self.to_primitive_defined = true;
             self.has_instance_defined = true;
         } else {
-            self.protect_prototype_indices(o);
+            self.protect_prototype_indices(unsafe { Obj::from_ptr(o) });
         }
         let s = o.shape().live();
         // The object leaves `s` (for a copy of its own).
@@ -2760,13 +2760,19 @@ impl Vm {
 
     // ---- Objects ----
 
-    pub(crate) fn new_object_with(&mut self, class: Class, proto: Value, capacity: u32) -> *mut Object {
+    pub(crate) fn new_object_with(&mut self, class: Class, proto: Value, capacity: u32) -> Obj {
         let s = self.root_shape(class, proto, capacity);
-        self.heap.alloc_object(s.live())
+        // SAFETY: a new cell.
+        unsafe { Obj::from_ptr(self.heap.alloc_object(s.live())) }
     }
 
     /// A plain object with prototype `proto`.
     pub fn new_object(&mut self, proto: Value) -> *mut Object {
+        self.new_plain(proto).ptr()
+    }
+
+    /// [`Vm::new_object`], as an [`Obj`].
+    pub(crate) fn new_plain(&mut self, proto: Value) -> Obj {
         self.check_own(proto, "Vm::new_object");
         self.new_object_with(Class::Plain, proto, 4)
     }
@@ -3630,7 +3636,7 @@ impl Vm {
         }
         if (name == self.a_length || name == self.a_name)
             && matches!(class, Class::Function | Class::Native | Class::Wrapper)
-            && let Some(d) = self.own_property(o, Key::Name(name))
+            && let Some(d) = self.own_property(unsafe { Obj::from_ptr(o) }, Key::Name(name))
         {
             return Some(d.value.unwrap_or(Value::UNDEFINED));
         }
@@ -3649,7 +3655,7 @@ impl Vm {
                 return Value::number(self.length_field(unsafe { Obj::from_ptr(p) }) as f64);
             }
             if matches!(class, Class::Function | Class::Native | Class::Wrapper)
-                && let Some(d) = self.own_property(p, Key::Name(name))
+                && let Some(d) = self.own_property(unsafe { Obj::from_ptr(p) }, Key::Name(name))
             {
                 return d.value.unwrap_or(Value::UNDEFINED);
             }
@@ -3675,7 +3681,7 @@ impl Vm {
                 return true;
             }
             if matches!(class, Class::Function | Class::Native | Class::Wrapper)
-                && self.own_property(p, Key::Name(name)).is_some()
+                && self.own_property(unsafe { Obj::from_ptr(p) }, Key::Name(name)).is_some()
             {
                 return true;
             }
@@ -3701,8 +3707,8 @@ impl Vm {
             self.string_prototype
         };
         let o = self.new_object_with(Class::Wrapper, object_value(proto), 0);
-        unsafe { (*o).code = v.to_bits() as *const Code };
-        object_value(o)
+        unsafe { (*o.ptr()).code = v.to_bits() as *const Code };
+        object_value(o.ptr())
     }
 
     /// An uncaught error's message: a thrown error object's `name` and
@@ -4544,7 +4550,7 @@ impl Vm {
                     }
                     // (Not on a non-extensible global object: OrdinarySet's
                     // CreateDataProperty fails, 10.1.9.2.)
-                    if !Self::is_extensible(g) {
+                    if !Self::is_extensible(Obj::from_ptr(g)) {
                         self.store_failed = true;
                         return Ok(());
                     }
@@ -4634,7 +4640,7 @@ impl Vm {
 
     /// The function bound function `f` calls, if `f` is one.
     pub(crate) fn bound_target(&self, f: Value) -> Option<Value> {
-        let o = as_object(f);
+        let o = Obj::of(f);
         crate::builtins::is_bound(o).then(|| crate::builtins::bound_target(o))
     }
 
@@ -4735,10 +4741,10 @@ impl Vm {
             }
             return Ok(true);
         }
-        let o = as_object(obj);
+        let o = Obj::of(obj);
         let key = self.property_key(key);
         if self.proxies_exist {
-            return crate::proxy::delete(self, o, key);
+            return crate::proxy::delete(self, o.ptr(), key);
         }
         Ok(self.delete_own(o, key))
     }
@@ -5330,7 +5336,7 @@ impl Vm {
         };
         let o = Obj::of(obj);
         // (A mapped `arguments` element: its parameter too.)
-        if self.mapped_get(o.ptr(), i).is_some() && self.writable_element(o.ptr(), i) {
+        if self.mapped_get(o.ptr(), i).is_some() && self.writable_element(o, i) {
             self.mapped_set(o.ptr(), i, value);
         }
         unsafe {
@@ -5409,12 +5415,12 @@ impl Vm {
     /// (else `obj` gets the element).
     #[cold]
     fn set_new_element(&mut self, obj: Value, o: *mut Object, i: u32, value: Value) -> Result<bool> {
-        if self.own_property(o, Key::Index(i)).is_some() {
+        if self.own_property(unsafe { Obj::from_ptr(o) }, Key::Index(i)).is_some() {
             return Ok(false);
         }
         let mut p = o.shape().live().proto;
         while p.is_cell() {
-            let po = as_object(p);
+            let po = Obj::of(p);
             if let Some(d) = self.own_property(po, Key::Index(i)) {
                 if d.is_accessor() {
                     match d.set.filter(|f| !f.is_undefined()) {
@@ -5494,7 +5500,7 @@ impl Vm {
             }
         }
         if Self::has_element(o, i) {
-            if flags & FROZEN != 0 || !self.writable_element(o, i) {
+            if flags & FROZEN != 0 || !self.writable_element(unsafe { Obj::from_ptr(o) }, i) {
                 self.store_failed = true;
                 return Ok(());
             }
@@ -5661,8 +5667,8 @@ impl Vm {
         // A plain object's own names, when no prototype has an enumerable
         // property (as `Object.prototype` has none): nothing is hidden,
         // nothing seen twice.
-        let o = as_object(v);
-        if self.plain_named(o) && self.chain_lists_nothing(o) {
+        let o = Obj::of(v);
+        if self.plain_named(o) && self.chain_lists_nothing(o.ptr()) {
             let slots = self.listed_slots(o, false, false).unwrap_or_default();
             return self.array_of_with(slots.len(), |vm, i| {
                 let a = o.shape().live().keys()[slots[i] as usize];
@@ -5676,7 +5682,7 @@ impl Vm {
         let mut seen: HashSet<Key> = HashSet::default();
         let mut o = o;
         loop {
-            for (key, enumerable) in self.own_keys(unsafe { Obj::from_ptr(o) }) {
+            for (key, enumerable) in self.own_keys(o) {
                 if seen.insert(key) && enumerable {
                     keys.push(key);
                 }
@@ -5685,7 +5691,7 @@ impl Vm {
             if !proto.is_cell() {
                 break;
             }
-            o = as_object(proto);
+            o = Obj::of(proto);
         }
         // (The names' atoms are their shapes', which the objects keep.)
         self.array_of_with(keys.len(), |vm, i| vm.key_string(keys[i]))
@@ -5697,7 +5703,7 @@ impl Vm {
     fn chain_lists_nothing(&self, o: *mut Object) -> bool {
         let mut p = o.shape().live().proto;
         while p.is_cell() {
-            let o = as_object(p);
+            let o = Obj::of(p);
             let s = o.shape().live();
             if !self.plain_named(o) || s.attrs().iter().any(|&a| a & DONT_ENUM == 0) {
                 return false;
@@ -6055,8 +6061,8 @@ impl Vm {
             };
             let gp = self.symbol_roots.get(root as usize).copied();
             let proto = gp.map_or(Value::NULL, object_value);
-            let p = self.new_object(proto);
-            self.store_field(f, 0, object_value(p));
+            let p = self.new_plain(proto);
+            self.store_field(f, 0, object_value(p.ptr()));
             return object_value(f);
         }
         let p = self.heap.alloc_object(self.proto_object_shape.live());
@@ -6319,13 +6325,13 @@ impl Vm {
                 for &(i, b) in &kept {
                     *e.add(1 + i) = b;
                 }
-                crate::heap::store_young(r.cast(), &raw mut (*r).elems, e);
+                crate::heap::store_young(r.ptr().cast(), &raw mut (*r.ptr()).elems, e);
                 r.set_elems_len(n as u32);
             }
             for &(i, _) in &kept {
                 self.hide_element(o, i as u32);
             }
-            object_value(r)
+            object_value(r.ptr())
         } else if o.shape() == self.mapped_arguments_shape {
             crate::object::set_shape(o, self.arguments_shape);
             return;
@@ -6416,11 +6422,11 @@ impl Vm {
         nparams: u32,
         ret: crate::jit::Ty,
         constructs: bool,
-    ) -> *mut Object {
+    ) -> Obj {
         let fo = self.native_function(name, f, nparams, ret, constructs);
         let a = self.intern_name(name);
         // Builtins' methods aren't enumerable.
-        self.add_property_with(obj, a, object_value(fo), DONT_ENUM);
+        self.add_property_with(obj, a, object_value(fo.ptr()), DONT_ENUM);
         fo
     }
 
@@ -6433,7 +6439,7 @@ impl Vm {
         for &(name, f, n) in fs {
             let fo = self.native_function(name, f, n, crate::jit::Ty::Any, false);
             names.push(self.intern_name(name));
-            values.push(object_value(fo));
+            values.push(object_value(fo.ptr()));
         }
         self.add_properties(obj, &names, &values, DONT_ENUM);
     }
@@ -6446,11 +6452,11 @@ impl Vm {
         nparams: u32,
         ret: crate::jit::Ty,
         constructs: bool,
-    ) -> *mut Object {
+    ) -> Obj {
         let code = self.native_code(name, f, nparams, ret, constructs);
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
-        unsafe { (*fo).code = code };
+        unsafe { (*fo.ptr()).code = code };
         fo
     }
 
@@ -6874,7 +6880,7 @@ impl Vm {
             if self.lexical_declared.contains(&a) {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
             }
-            if let Some(d) = self.own_property(self.global, Key::Name(a))
+            if let Some(d) = self.own_property(unsafe { Obj::from_ptr(self.global) }, Key::Name(a))
                 && d.configurable == Some(false)
             {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
@@ -6908,7 +6914,7 @@ impl Vm {
     /// error, and the function stays its block's (B.3.2.2, B.3.2.3; see
     /// `intrinsics::annex_b_skipped`).
     pub(crate) fn annex_b_skipped(&mut self, module: &Module, n: &str) -> bool {
-        if self.lexical_declared.is_empty() && Self::is_extensible(self.global)
+        if self.lexical_declared.is_empty() && Self::is_extensible(unsafe { Obj::from_ptr(self.global) })
             || !module.annex_b.iter().any(|b| b == n)
         {
             return false;
@@ -6922,7 +6928,8 @@ impl Vm {
     /// non-extensible global object without the property (`fnDefinable`
     /// false, B.3.2.2 and B.3.2.3: the function stays its block's).
     pub(crate) fn annex_b_undefinable(&mut self, a: Atom) -> bool {
-        !Self::is_extensible(self.global) && self.own_property(self.global, Key::Name(a)).is_none()
+        !Self::is_extensible(unsafe { Obj::from_ptr(self.global) })
+            && self.own_property(unsafe { Obj::from_ptr(self.global) }, Key::Name(a)).is_none()
     }
 
     /// GlobalDeclarationInstantiation's (or an eval's, `eval`) checks for
@@ -6946,11 +6953,11 @@ impl Vm {
             }
         }
         let g = self.global;
-        let extensible = Self::is_extensible(g);
+        let extensible = Self::is_extensible(unsafe { Obj::from_ptr(g) });
         for &n in &declared {
             let a = self.intern_name(n);
             let function = module.function_names.contains(n);
-            let ok = match self.own_property(g, Key::Name(a)) {
+            let ok = match self.own_property(unsafe { Obj::from_ptr(g) }, Key::Name(a)) {
                 None => extensible,
                 Some(_) if !function => true,
                 Some(d) => {
@@ -6974,17 +6981,17 @@ impl Vm {
                 && extensible
             {
                 let d = crate::props::Desc::data(Value::UNDEFINED, true, true, eval);
-                self.define_own_property(g, Key::Name(a), &d)?;
+                self.define_own_property(unsafe { Obj::from_ptr(g) }, Key::Name(a), &d)?;
             }
         }
         for n in &module.function_names {
             let a = self.intern_name(n);
-            if let Some(d) = self.own_property(g, Key::Name(a))
+            if let Some(d) = self.own_property(unsafe { Obj::from_ptr(g) }, Key::Name(a))
                 && d.configurable == Some(true)
             {
                 let v = d.value.unwrap_or(Value::UNDEFINED);
                 let d = crate::props::Desc::data(v, true, true, eval);
-                self.define_own_property(g, Key::Name(a), &d)?;
+                self.define_own_property(unsafe { Obj::from_ptr(g) }, Key::Name(a), &d)?;
             }
         }
         if extensible {
@@ -8436,10 +8443,10 @@ pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> 
 fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     vm.is_construct();
     match args.first() {
-        Some(&v) if !v.is_undefined() && !v.is_null() => Ok(object_value(vm.to_object(v)?)),
+        Some(&v) if !v.is_undefined() && !v.is_null() => Ok(object_value((vm.to_object(v)?).ptr())),
         _ => {
             let op = object_value(vm.object_prototype);
-            Ok(object_value(vm.new_object(op)))
+            Ok(object_value(vm.new_plain(op).ptr()))
         }
     }
 }
@@ -8519,7 +8526,7 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
 /// `this[length++] = v` for each argument (a failed store throws), as
 /// `push` does on an array-like object.
 fn array_push_generic(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
-    let this = object_value(vm.to_object(this)?);
+    let this = object_value((vm.to_object(this)?).ptr());
     let a_length = vm.a_length;
     let n = crate::interp::to_number(vm.get(this, a_length)?);
     let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc().min(9007199254740991.0) };

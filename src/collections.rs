@@ -17,8 +17,7 @@
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_int32, to_number};
 use crate::jit::Ty;
-use crate::object::Obj;
-use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
+use crate::object::{Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::raw::ObjectPtr;
 use crate::value::Value;
@@ -53,17 +52,17 @@ pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
     for _ in 0..9 {
-        let p = vm.new_object(op);
-        vm.collection_prototypes.push(p);
+        let p = vm.new_plain(op);
+        vm.collection_prototypes.push(p.ptr());
     }
     let protos = vm.collection_prototypes.clone();
     let ctors: [(&str, NativeFn); 4] =
         [("Map", map_ctor), ("Set", set_ctor), ("WeakMap", weak_map_ctor), ("WeakSet", weak_set_ctor)];
     for (k, (name, f)) in ctors.into_iter().enumerate() {
         let c = vm.define_native(g, name, f, 0, any, true);
-        link_constructor(vm, c, protos[k]);
+        link_constructor(vm, c, unsafe { Obj::from_ptr(protos[k]) });
         if name == "Map" {
-            vm.define_native(c, "groupBy", map_group_by, 2, any, false);
+            vm.define_native(c.ptr(), "groupBy", map_group_by, 2, any, false);
         }
     }
     let mp = protos[Proto::Map as usize];
@@ -83,7 +82,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("getOrInsertComputed", get_or_insert_computed::<false>, 2),
         ],
     );
-    getter(vm, mp, "size", map_size);
+    getter(vm, unsafe { Obj::from_ptr(mp) }, "size", map_size);
     let sp = protos[Proto::Set as usize];
     vm.define_natives(
         sp,
@@ -106,8 +105,8 @@ pub(crate) fn install(vm: &mut Vm) {
     // `keys` is the very function `values` is.
     let values = vm.define_native(sp, "values", set_values, 0, any, false);
     let a_keys = vm.intern_name("keys");
-    vm.add_property_with(sp, a_keys, object_value(values), DONT_ENUM);
-    getter(vm, sp, "size", set_size);
+    vm.add_property_with(sp, a_keys, object_value(values.ptr()), DONT_ENUM);
+    getter(vm, unsafe { Obj::from_ptr(sp) }, "size", set_size);
     vm.define_natives(
         protos[Proto::WeakMap as usize],
         &[
@@ -124,11 +123,11 @@ pub(crate) fn install(vm: &mut Vm) {
         &[("add", weak_set_add as NativeFn, 1), ("has", weak_set_has, 1), ("delete", weak_set_delete, 1)],
     );
     let wr = vm.define_native(g, "WeakRef", weak_ref_ctor, 1, any, true);
-    link_constructor(vm, wr, protos[Proto::WeakRef as usize]);
+    link_constructor(vm, wr, unsafe { Obj::from_ptr(protos[Proto::WeakRef as usize]) });
     vm.define_native(protos[Proto::WeakRef as usize], "deref", weak_ref_deref, 0, any, false);
     let fr = vm.define_native(g, "FinalizationRegistry", finalization_ctor, 1, any, true);
     let frp = protos[Proto::FinalizationRegistry as usize];
-    link_constructor(vm, fr, frp);
+    link_constructor(vm, fr, unsafe { Obj::from_ptr(frp) });
     vm.define_natives(
         frp,
         &[("register", finalization_register as NativeFn, 2), ("unregister", finalization_unregister, 1)],
@@ -136,7 +135,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.define_native(protos[Proto::MapIterator as usize], "next", iterator_next, 0, any, false);
     vm.define_native(protos[Proto::SetIterator as usize], "next", iterator_next, 0, any, false);
 
-    let dp = protos[Proto::DataView as usize];
+    let dp = unsafe { Obj::from_ptr(protos[Proto::DataView as usize]) };
     let c = vm.define_native(g, "DataView", data_view_ctor, 1, any, true);
     link_constructor(vm, c, dp);
     getter(vm, dp, "buffer", view_buffer);
@@ -174,7 +173,7 @@ pub(crate) fn install(vm: &mut Vm) {
         })
         .collect();
     let fs: Vec<(&str, NativeFn, u32)> = names.iter().map(|(n, f, k)| (n.as_str(), *f, *k)).collect();
-    vm.define_natives(dp, &fs);
+    vm.define_natives(dp.ptr(), &fs);
 }
 
 // ---- Helpers ----
@@ -457,7 +456,7 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
     let s = if matches!(class, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
     let e = new_entries(vm, None, s)?;
     let p = object_value(vm.collection_prototypes[proto as usize]);
-    let o = unsafe { Obj::from_ptr(vm.new_object_with(class, p, 0)) };
+    let o = vm.new_object_with(class, p, 0);
     hold_entries(o, object_value(e.ptr()));
     if class != Class::WeakRef {
         vm.collections.push(o.ptr());
@@ -546,7 +545,7 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     let p = vm.take_new_target(f, default)?;
     let c = new_collection(vm, class, proto)?;
     if p != default {
-        vm.set_prototype_of(c.ptr(), p);
+        vm.set_prototype_of(c, p);
     }
     let o = object_value(c.ptr());
     let iterable = arg(a, 0);
@@ -585,11 +584,11 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
 /// `{ value, done }`.
 fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
     let op = object_value(vm.object_prototype);
-    let r = vm.new_object(op);
+    let r = vm.new_plain(op);
     let (a_value, a_done) = (vm.intern_name("value"), vm.intern_name("done"));
-    vm.add_property(r, a_value, value);
-    vm.add_property(r, a_done, Value::from_bool(done));
-    object_value(r)
+    vm.add_property(r.ptr(), a_value, value);
+    vm.add_property(r.ptr(), a_done, Value::from_bool(done));
+    object_value(r.ptr())
 }
 
 /// An iterator over collection `o`'s entries from the start.
@@ -597,12 +596,12 @@ fn new_iterator(vm: &mut Vm, o: Obj, mode: IterMode) -> Value {
     let s = stride(o);
     let proto = vm.collection_prototypes[if s == 2 { Proto::MapIterator } else { Proto::SetIterator } as usize];
     let it = vm.new_object_with(Class::CollectionIterator, object_value(proto), 0);
-    hold_entries(unsafe { Obj::from_ptr(it) }, Value::from_bits(o.code() as u64));
+    hold_entries(it, Value::from_bits(o.code() as u64));
     unsafe {
-        *Object::aux(it) = mode as u32 | (s as u32) << 2;
+        *Object::aux(it.ptr()) = mode as u32 | (s as u32) << 2;
         it.set_elems_len(BASE as u32);
     }
-    object_value(it)
+    object_value(it.ptr())
 }
 
 // ---- Map ----

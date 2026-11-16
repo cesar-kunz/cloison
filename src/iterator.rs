@@ -69,9 +69,9 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let c = vm.define_native(g, "Iterator", iterator_ctor, 0, crate::jit::Ty::Any, true);
     let a_p = vm.intern_name("prototype");
-    vm.add_property_with(c, a_p, object_value(ip), READ_ONLY | DONT_ENUM | DONT_DELETE);
+    vm.add_property_with(c.ptr(), a_p, object_value(ip), READ_ONLY | DONT_ENUM | DONT_DELETE);
     vm.define_natives(
-        c,
+        c.ptr(),
         &[("from", from as NativeFn, 1), ("concat", concat, 0), ("zip", zip, 1), ("zipKeyed", zip_keyed, 1)],
     );
     vm.define_natives(
@@ -104,15 +104,19 @@ pub(crate) fn install(vm: &mut Vm) {
     ] {
         let get = vm.native_function(&format!("get {name}"), get, 0, crate::jit::Ty::Any, false);
         let set = vm.native_function(&format!("set {name}"), set, 1, crate::jit::Ty::Any, false);
-        let _ = vm.define_own_property(ip, key, &Desc::accessor(object_value(get), object_value(set), false, true));
+        let _ = vm.define_own_property(
+            unsafe { Obj::from_ptr(ip) },
+            key,
+            &Desc::accessor(object_value(get.ptr()), object_value(set.ptr()), false, true),
+        );
     }
 
-    let hp = vm.new_object(object_value(ip));
-    vm.define_natives(hp, &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
-    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(hp) }, "Iterator Helper");
-    let wp = vm.new_object(object_value(ip));
-    vm.define_natives(wp, &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
-    vm.iterator_roots = vec![c, hp, wp];
+    let hp = vm.new_plain(object_value(ip));
+    vm.define_natives(hp.ptr(), &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
+    crate::symbol::to_string_tag(vm, hp, "Iterator Helper");
+    let wp = vm.new_plain(object_value(ip));
+    vm.define_natives(wp.ptr(), &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
+    vm.iterator_roots = vec![c.ptr(), hp.ptr(), wp.ptr()];
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -127,7 +131,7 @@ fn iterator_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Abstract class Iterator not directly constructable"));
     }
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
-    Ok(object_value(vm.new_object(object_value(ip))))
+    Ok(object_value((vm.new_plain(object_value(ip))).ptr()))
 }
 
 fn get_constructor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
@@ -157,7 +161,7 @@ fn ignoring_prototype(vm: &mut Vm, this: Value, key: Key, v: Value) -> Result<Va
     if as_object(this) == ip {
         return Err(Error::type_error("Cannot assign to a read-only property of Iterator.prototype"));
     }
-    if vm.own_property(as_object(this), key).is_none() {
+    if vm.own_property(Obj::of(this), key).is_none() {
         vm.create_data_property(this, key, v)?;
     } else {
         vm.put_key(this, key, v)?;
@@ -243,8 +247,8 @@ fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: V
     )?;
     let proto = vm.iterator_roots[if kind == WRAP { WRAP_PROTOTYPE } else { HELPER_PROTOTYPE }];
     let o = vm.new_object_with(Class::IteratorHelper, object_value(proto), 0);
-    unsafe { (*o).code = state.to_bits() as *const crate::vm::Code };
-    Ok(object_value(o))
+    unsafe { (*o.ptr()).code = state.to_bits() as *const crate::vm::Code };
+    Ok(object_value(o.ptr()))
 }
 
 /// The state of `this`, a helper (`wrap`: a wrapper), else a TypeError.
@@ -1111,7 +1115,7 @@ fn zip_results(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
     if keys.is_undefined() {
         return crate::array::new_array_of(vm, &results).map(Some);
     }
-    let o = object_value(vm.new_object(Value::NULL));
+    let o = object_value(vm.new_plain(Value::NULL).ptr());
     for (i, v) in results.into_iter().enumerate() {
         let k = vm.get_keyed(keys, Value::from_i32(i as i32))?;
         let key = crate::intrinsics::to_property_key(vm, k)?;

@@ -25,9 +25,9 @@ pub(crate) fn install(vm: &mut Vm) {
     let any = crate::jit::Ty::Any;
     let c = vm.define_native(g, "Date", date_constructor, 7, any, true);
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-    vm.add_property_with(c, a_p, object_value(dp), READ_ONLY | DONT_ENUM | DONT_DELETE);
-    vm.add_property_with(dp, a_c, object_value(c), DONT_ENUM);
-    vm.define_natives(c, &[("now", date_now as NativeFn, 0), ("parse", date_parse, 1), ("UTC", date_utc, 7)]);
+    vm.add_property_with(c.ptr(), a_p, object_value(dp), READ_ONLY | DONT_ENUM | DONT_DELETE);
+    vm.add_property_with(dp, a_c, object_value(c.ptr()), DONT_ENUM);
+    vm.define_natives(c.ptr(), &[("now", date_now as NativeFn, 0), ("parse", date_parse, 1), ("UTC", date_utc, 7)]);
     vm.define_natives(
         dp,
         &[
@@ -80,7 +80,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // `toGMTString` is the very function `toUTCString` is (Annex B).
     let f = vm.define_native(dp, "toUTCString", to_utc_string, 0, any, false);
     let a = vm.intern_name("toGMTString");
-    vm.add_property_with(dp, a, object_value(f), DONT_ENUM);
+    vm.add_property_with(dp, a, object_value(f.ptr()), DONT_ENUM);
 }
 
 // ---- Time values (§21.4.1) ----
@@ -389,8 +389,8 @@ fn str_value(vm: &mut Vm, s: &str) -> Value {
 fn new_date(vm: &mut Vm, t: f64) -> Value {
     let dp = object_value(vm.date_prototype);
     let o = vm.new_object_with(Class::Date, dp, 0);
-    unsafe { (*o).code = t.to_bits() as *const Code };
-    object_value(o)
+    unsafe { (*o.ptr()).code = t.to_bits() as *const Code };
+    object_value(o.ptr())
 }
 
 // ---- The constructor and its functions ----

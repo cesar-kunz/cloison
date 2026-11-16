@@ -5,7 +5,7 @@
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number, to_string_units};
 use crate::layout::swap_words;
-use crate::object::{Class, EXTERNAL, Obj, Object, PROTOTYPE, as_object, object_value};
+use crate::object::{Class, EXTERNAL, Obj, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -89,7 +89,7 @@ fn relative(v: Value, len: f64, default: f64) -> f64 {
 /// directly: no attributes on them, and nothing indexed on its prototype
 /// chain (holes are then absent), `Array.prototype` then
 /// `Object.prototype`.
-fn dense(vm: &Vm, o: *mut Object) -> bool {
+fn dense(vm: &Vm, o: Obj) -> bool {
     o.class() == Class::Array && o.flags() & !(EXTERNAL | PROTOTYPE) == 0 && plain_protos(vm, o)
 }
 
@@ -98,7 +98,7 @@ fn dense(vm: &Vm, o: *mut Object) -> bool {
 /// common one, its elements not its function's parameters), with nothing
 /// indexed on `Object.prototype`: its elements read directly, as `dense`'s
 /// (`slice.call(arguments)`, `forEach.call(arguments, …)`).
-fn plain_arguments(vm: &Vm, o: *mut Object) -> bool {
+fn plain_arguments(vm: &Vm, o: Obj) -> bool {
     o.shape() == vm.arguments_shape
         && o.flags() & !(EXTERNAL | PROTOTYPE) == 0
         && vm.object_prototype.shape().live().proto.is_null()
@@ -108,7 +108,7 @@ fn plain_arguments(vm: &Vm, o: *mut Object) -> bool {
 
 /// Whether `o`'s prototypes are `Array.prototype` then `Object.prototype`
 /// with nothing indexed (`dense`'s condition on them).
-fn plain_protos(vm: &Vm, o: *mut Object) -> bool {
+fn plain_protos(vm: &Vm, o: Obj) -> bool {
     o.shape().live().proto == object_value(vm.array_prototype)
         && vm.array_prototype.shape().live().proto == object_value(vm.object_prototype)
         && vm.object_prototype.shape().live().proto.is_null()
@@ -120,8 +120,8 @@ fn plain_protos(vm: &Vm, o: *mut Object) -> bool {
 
 /// Whether `o` is a far array whose missing indices nothing sees: none of
 /// its own a named property (`SPARSE`), and its prototypes `plain_protos`.
-fn skips(vm: &Vm, o: *mut Object) -> bool {
-    crate::far::is_far(unsafe { Obj::from_ptr(o) }) && o.flags() & crate::object::SPARSE == 0 && plain_protos(vm, o)
+fn skips(vm: &Vm, o: Obj) -> bool {
+    crate::far::is_far(o) && o.flags() & crate::object::SPARSE == 0 && plain_protos(vm, o)
 }
 
 /// Where a loop over `o`'s present elements, at `k` and below `len`, goes
@@ -129,7 +129,7 @@ fn skips(vm: &Vm, o: *mut Object) -> bool {
 /// far key or `len`; else `k`.
 fn skip(vm: &mut Vm, o: Value, k: f64, len: f64) -> f64 {
     let obj = Obj::of(o);
-    if k >= u32::MAX as f64 || !skips(vm, obj.ptr()) || k < obj.elems_len() as f64 {
+    if k >= u32::MAX as f64 || !skips(vm, obj) || k < obj.elems_len() as f64 {
         return k;
     }
     crate::far::next_key(vm, obj, k as u32).map_or(len, |i| (i as f64).min(len))
@@ -140,7 +140,7 @@ fn skip(vm: &mut Vm, o: Value, k: f64, len: f64) -> f64 {
 fn skip_back(vm: &mut Vm, o: Value, k: f64) -> f64 {
     let obj = Obj::of(o);
     let n = obj.elems_len() as f64;
-    if k >= u32::MAX as f64 || !skips(vm, obj.ptr()) || k < n {
+    if k >= u32::MAX as f64 || !skips(vm, obj) || k < n {
         return k;
     }
     crate::far::prev_key(vm, obj, k as u32).map_or(n - 1.0, |i| i as f64)
@@ -158,7 +158,7 @@ fn key(i: f64) -> Key {
 
 /// `o`'s element `i`, `has` saying whether it is there (`HasProperty`).
 fn element(vm: &mut Vm, o: Value, i: f64) -> Result<(bool, Value)> {
-    let obj = as_object(o);
+    let obj = Obj::of(o);
     if (dense(vm, obj) || plain_arguments(vm, obj)) && i < u32::MAX as f64 {
         let i = i as u32;
         if i < obj.elems_len() {
@@ -202,7 +202,7 @@ fn this_object(vm: &mut Vm, this: Value) -> Result<(Value, f64)> {
             return Ok((this, o.elems_len() as f64));
         }
     }
-    let o = object_value(vm.to_object(this)?);
+    let o = object_value((vm.to_object(this)?).ptr());
     let len = vm.length_of(o)?;
     Ok((o, len))
 }
@@ -444,7 +444,7 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
             }
             // (A plain array's element in place; a number's digits
             // without a string of its own.)
-            let v = if dense(vm, as_object(o)) { element(vm, o, i)?.1 } else { get(vm, o, i)? };
+            let v = if dense(vm, Obj::of(o)) { element(vm, o, i)?.1 } else { get(vm, o, i)? };
             if string_len(v).is_some() {
                 // (Past the longest string: thrown before its units are read.)
                 push_string(&mut out, v)?;
@@ -492,7 +492,7 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 /// `Array.prototype.toString()`: `join()`, or `Object.prototype.toString`
 /// where there is no callable `join`.
 pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = object_value(vm.to_object(this)?);
+    let o = object_value((vm.to_object(this)?).ptr());
     let a_join = vm.intern_name("join");
     let f = vm.get(o, a_join)?;
     if is_callable(f) {
@@ -540,7 +540,7 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> R
 
 /// `Array.prototype.concat(…items)`: arrays spread, other values appended.
 fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let o = object_value(vm.to_object(this)?);
+    let o = object_value((vm.to_object(this)?).ptr());
     let out = species_create(vm, o, 0.0)?;
     let mut n = 0.0;
     for &item in std::iter::once(&o).chain(a) {
@@ -557,12 +557,12 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if n + len > 9007199254740991.0 {
             return Err(Error::type_error("Array length exceeds the maximum"));
         }
-        let obj = as_object(item);
+        let obj = Obj::of(item);
         // (Only where `out`'s elements end at `n`: an item before may have
         // been copied element by element, its holes only counted.)
         if obj.class() == Class::Array
             && dense(vm, obj)
-            && dense(vm, as_object(out))
+            && dense(vm, Obj::of(out))
             && Obj::of(out).elems_len() as f64 == n
         {
             unsafe {
@@ -608,7 +608,7 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `Array.prototype.pop()`.
 pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    if this.is_cell() && dense(vm, as_object(this)) {
+    if this.is_cell() && dense(vm, Obj::of(this)) {
         let o = as_object(this);
         let len = o.elems_len() as usize;
         if len == 0 {
@@ -634,7 +634,7 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
 /// `Array.prototype.reverse()`, in place.
 pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    if dense(vm, as_object(o)) {
+    if dense(vm, Obj::of(o)) {
         let obj = as_object(o);
         unsafe {
             let n = obj.elems_len() as usize;
@@ -689,7 +689,7 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         set_length(vm, o, 0.0)?;
         return Ok(Value::UNDEFINED);
     }
-    if dense(vm, as_object(o)) {
+    if dense(vm, Obj::of(o)) {
         let obj = as_object(o);
         unsafe {
             let n = obj.elems_len() as usize;
@@ -728,7 +728,7 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if len + n > 9007199254740991.0 {
             return Err(Error::type_error("Array length exceeds the maximum"));
         }
-        if dense(vm, as_object(o)) {
+        if dense(vm, Obj::of(o)) {
             let obj = as_object(o);
             unsafe {
                 let m = obj.elems_len() as usize;
@@ -778,8 +778,8 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // code that changed the length: the fast path only over the one
     // measured. A species may return `o` itself: the copy then overlaps.)
     if out != o
-        && (dense(vm, as_object(o)) || plain_arguments(vm, as_object(o)))
-        && dense(vm, as_object(out))
+        && (dense(vm, Obj::of(o)) || plain_arguments(vm, Obj::of(o)))
+        && dense(vm, Obj::of(out))
         && Obj::of(o).elems_len() as f64 == len
     {
         let obj = as_object(o);
@@ -846,10 +846,10 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // array's of its own, not `o`, which a species may return and whose
     // `length` set would then truncate it before the shift.)
     if removed != o
-        && dense(vm, as_object(o))
+        && dense(vm, Obj::of(o))
         && Obj::of(o).elems_len() as f64 == len
         && is_object(removed)
-        && dense(vm, as_object(removed))
+        && dense(vm, Obj::of(removed))
     {
         let obj = as_object(o);
         let ro = as_object(removed);
@@ -1049,7 +1049,7 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
         return Ok(Value::from_i32(-1));
     }
     let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
-    if dense(vm, as_object(o)) {
+    if dense(vm, Obj::of(o)) {
         let obj = as_object(o);
         // (Not past the length it had: `fromIndex`'s conversion may have
         // pushed more.)
@@ -1299,10 +1299,10 @@ fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // A plain array's elements, holes too (nothing indexed above it to
     // see a store), written in place: the first takes the elements to a
     // type the value fits, the rest are it again.
-    let obj = as_object(o);
+    let obj = Obj::of(o);
     if dense(vm, obj) && k < end && end <= obj.elems_len() as f64 {
         let (from, to) = (k as usize, end as usize);
-        vm.store_element(obj, from, v);
+        vm.store_element(obj.ptr(), from, v);
         unsafe {
             let e = obj.elems();
             if !v.is_cell() {
@@ -1387,7 +1387,7 @@ fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 ("syncStep", from_async_sync_step, 2),
                 ("syncDone", from_async_sync_done, 1),
             ] {
-                let f = object_value(vm.native_function(name, f, n, crate::jit::Ty::Any, false));
+                let f = object_value(vm.native_function(name, f, n, crate::jit::Ty::Any, false).ptr());
                 vm.handles.push(f);
                 natives.push(f);
             }

@@ -990,7 +990,7 @@ fn options_or_string(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
         return Err(type_err("options parameter is required"));
     }
     if is_string(v) {
-        let o = object_value(vm.new_object(Value::NULL));
+        let o = object_value(vm.new_plain(Value::NULL).ptr());
         let a = vm.intern_name(name);
         vm.add_property(as_object(o), a, v);
         return Ok(o);

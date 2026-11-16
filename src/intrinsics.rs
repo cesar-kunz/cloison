@@ -255,7 +255,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
             vm.construct_this(o)
         } else {
             let proto = prototype_of_target(vm, nt)?;
-            object_value(vm.new_object(proto))
+            object_value(vm.new_plain(proto).ptr())
         };
         if code.uses_new_target {
             vm.new_target = nt;
@@ -288,13 +288,13 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         let a = vm.a_prototype;
         let proto = vm.get(nt, a)?;
         if crate::props::is_object(proto) {
-            vm.set_prototype_of(as_object(r), proto);
+            vm.set_prototype_of(Obj::of(r), proto);
         } else if !vm.realms.is_empty() {
             // (The builtin's prototype of `nt`'s realm.)
             let own = unsafe { (*Obj::of(r).shape()).proto };
             let p = crate::realm::default_proto(vm, nt, own)?;
             if p != own {
-                vm.set_prototype_of(as_object(r), p);
+                vm.set_prototype_of(Obj::of(r), p);
             }
         }
         // (A view's buffer checked again after: the spec reads the
@@ -414,7 +414,7 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         (strings, raw)
     };
-    vm.seal(as_object(raw), true);
+    vm.seal(Obj::of(raw), true);
     let a_raw = vm.intern_name("raw");
     let d = Desc {
         value: Some(raw),
@@ -423,8 +423,8 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         configurable: Some(false),
         ..Default::default()
     };
-    vm.define_own_property(as_object(strings), Key::Name(a_raw), &d)?;
-    vm.seal(as_object(strings), true);
+    vm.define_own_property(Obj::of(strings), Key::Name(a_raw), &d)?;
+    vm.seal(Obj::of(strings), true);
     vm.template_cache.insert(site, (as_object(strings), vec![code]));
     Ok(strings)
 }
@@ -442,7 +442,7 @@ fn define_field(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn define_named_field(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
     let a_name = vm.a_name;
-    let own = vm.own_property(as_object(a[2]), Key::Name(a_name));
+    let own = vm.own_property(Obj::of(a[2]), Key::Name(a_name));
     if own.is_none_or(|d| d.value.is_some_and(|v| crate::vm::string_units(v).is_some_and(|u| u.is_empty()))) {
         set_function_name(vm, a[2], key, "")?;
     }
@@ -464,7 +464,7 @@ fn define_accessor(vm: &mut Vm, a: &[Value], set: bool) -> Result<Value> {
         configurable: Some(true),
         ..Default::default()
     };
-    if !vm.define_own_property(as_object(a[0]), key, &d)? {
+    if !vm.define_own_property(Obj::of(a[0]), key, &d)? {
         return Err(Error::type_error("Cannot redefine a non-configurable property"));
     }
     Ok(a[0])
@@ -492,7 +492,7 @@ fn property_key(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn literal_proto(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (o, v) = (a[0], a[1]);
     if crate::props::is_object(v) || v.is_null() {
-        vm.set_prototype_of(as_object(o), v);
+        vm.set_prototype_of(Obj::of(o), v);
     }
     Ok(o)
 }
@@ -532,14 +532,14 @@ fn class_setup(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         (p, h)
     };
-    let proto = object_value(vm.new_object(proto_parent));
+    let proto = object_value(vm.new_plain(proto_parent).ptr());
     let a_constructor = vm.intern_name("constructor");
     let d = Desc::data(f, true, false, true);
-    vm.define_own_property(as_object(proto), Key::Name(a_constructor), &d)?;
+    vm.define_own_property(Obj::of(proto), Key::Name(a_constructor), &d)?;
     let a_prototype = vm.a_prototype;
     let d = Desc::data(proto, false, false, false);
-    vm.define_own_property(as_object(f), Key::Name(a_prototype), &d)?;
-    vm.set_prototype_of(as_object(f), ctor_parent);
+    vm.define_own_property(Obj::of(f), Key::Name(a_prototype), &d)?;
+    vm.set_prototype_of(Obj::of(f), ctor_parent);
     Ok(proto)
 }
 
@@ -551,7 +551,7 @@ fn define_method(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         set_function_name(vm, a[2], key, "")?;
     }
     let d = Desc::data(a[2], true, false, true);
-    if !vm.define_own_property(as_object(a[0]), key, &d)? {
+    if !vm.define_own_property(Obj::of(a[0]), key, &d)? {
         return Err(Error::type_error("Cannot redefine a non-configurable property"));
     }
     Ok(a[0])
@@ -580,7 +580,7 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
     let name = vm.new_string(&units);
     let a_name = vm.a_name;
     let d = Desc::data(name, false, false, true);
-    vm.define_own_property(as_object(f), Key::Name(a_name), &d)?;
+    vm.define_own_property(Obj::of(f), Key::Name(a_name), &d)?;
     Ok(())
 }
 
@@ -588,7 +588,7 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
 pub(crate) fn get_from(vm: &mut Vm, start: Value, key: Key, receiver: Value) -> Result<Value> {
     let mut o = start;
     while crate::props::is_object(o) {
-        if let Some(d) = vm.own_property(as_object(o), key) {
+        if let Some(d) = vm.own_property(Obj::of(o), key) {
             if d.get.is_some() || d.set.is_some() {
                 return match d.get {
                     Some(g) if !g.is_undefined() => call_function(vm, g, receiver, &[]),
@@ -660,7 +660,7 @@ fn super_set_sloppy(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 pub(crate) fn ordinary_set(vm: &mut Vm, start: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
     let mut o = start;
     while crate::props::is_object(o) {
-        if let Some(d) = vm.own_property(as_object(o), key) {
+        if let Some(d) = vm.own_property(Obj::of(o), key) {
             if d.get.is_some() || d.set.is_some() {
                 return match d.set {
                     Some(s) if !s.is_undefined() => call_function(vm, s, receiver, &[v]).map(|_| true),
@@ -837,14 +837,14 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         out
     };
-    let out = object_value(vm.new_object(object_value(vm.object_prototype)));
-    for key in crate::proxy::own_keys(vm, src)? {
+    let out = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
+    for key in crate::proxy::own_keys(vm, src.ptr())? {
         if excluded.contains(&key)
-            || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
+            || !crate::proxy::get_own_property(vm, src.ptr(), key)?.is_some_and(|d| d.enumerable == Some(true))
         {
             continue;
         }
-        let v = vm.get_key(object_value(src), key)?;
+        let v = vm.get_key(object_value(src.ptr()), key)?;
         vm.create_data_property(out, key, v)?;
     }
     Ok(out)
@@ -933,7 +933,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     if a.get(5) == Some(&Value::TRUE) && !own_strict && declared.iter().any(|&n| vm.atom_name(n) == "arguments") {
         return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
     }
-    let local = object_value(vm.new_object(Value::NULL));
+    let local = object_value(vm.new_plain(Value::NULL).ptr());
     // (Declared in the function's scope object, under the scope objects
     // of the other bindings it sees: see `Gen::call`.)
     let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
@@ -974,7 +974,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     }
     let made: Vec<_> = declared.iter().copied().filter(|&n| !skipped(vm, n)).collect();
     for atom in made {
-        if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
+        if vm.own_property(Obj::of(target), Key::Name(atom)).is_none() {
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
         }
     }
@@ -1114,13 +1114,13 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // `parse::parse_pass`.)
     let decl = a[6];
     let local = if own_strict || !crate::props::is_object(decl) {
-        object_value(vm.new_object(Value::NULL))
+        object_value(vm.new_plain(Value::NULL).ptr())
     } else {
         Value::UNDEFINED
     };
     let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
     for &atom in declared.iter() {
-        if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
+        if vm.own_property(Obj::of(target), Key::Name(atom)).is_none() {
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
         }
     }
@@ -1183,7 +1183,7 @@ fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) 
     let mut made = Vec::new();
     for i in 0..=scopes.len() {
         if places.contains(&i) {
-            let s = object_value(vm.new_object(Value::NULL));
+            let s = object_value(vm.new_plain(Value::NULL).ptr());
             vm.handles.push(s);
             bound_accessors(vm, s, carrier, &bindings, i)?;
             made.push(s);
@@ -1259,12 +1259,12 @@ fn eval_env(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// a prototype drops every function's compiled code.)
 fn null_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let capacity = a[0].as_number().unwrap_or(0.0) as u32;
-    Ok(object_value(vm.new_object_with(crate::object::Class::Plain, Value::NULL, capacity)))
+    Ok(object_value(vm.new_object_with(crate::object::Class::Plain, Value::NULL, capacity).ptr()))
 }
 
 /// ToObject: `[v]` (a `with` statement's object).
 fn to_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    Ok(object_value(vm.to_object(a[0])?))
+    Ok(object_value((vm.to_object(a[0])?).ptr()))
 }
 
 /// `[scope, name, value]`: a binding of a function's scope object, its
@@ -1274,7 +1274,7 @@ fn to_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn scope_var(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let name = vm.property_key(a[1]);
     let d = Desc::data(a[2], true, true, false);
-    vm.define_own_property(as_object(a[0]), name, &d)?;
+    vm.define_own_property(Obj::of(a[0]), name, &d)?;
     Ok(a[0])
 }
 
@@ -1334,7 +1334,7 @@ fn scope_delete(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[0])?;
     let mut o = a[1];
     while crate::props::is_object(o) {
-        if vm.own_property(as_object(o), key).is_some() {
+        if vm.own_property(Obj::of(o), key).is_some() {
             return Ok(Value::from_bool(vm.delete_property(o, a[0])?));
         }
         o = unsafe { (*Obj::of(o).shape()).proto };
@@ -1549,16 +1549,16 @@ fn copy_data_properties(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(target);
     }
     let src = vm.to_object(source)?;
-    if crate::props::is_object(target) && vm.copy_plain_properties(as_object(target), src)? {
+    if crate::props::is_object(target) && vm.copy_plain_properties(Obj::of(target), src)? {
         return Ok(target);
     }
-    let keys = crate::proxy::own_keys(vm, src)?;
+    let keys = crate::proxy::own_keys(vm, src.ptr())?;
     for key in keys {
         // (Enumerable when reached: a getter may change that.)
-        if !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+        if !crate::proxy::get_own_property(vm, src.ptr(), key)?.is_some_and(|d| d.enumerable == Some(true)) {
             continue;
         }
-        let v = vm.get_key(object_value(src), key)?;
+        let v = vm.get_key(object_value(src.ptr()), key)?;
         vm.create_data_property(target, key, v)?;
     }
     Ok(target)
@@ -1575,7 +1575,7 @@ fn private_property(vm: &mut Vm, o: Value, s: Value) -> Option<Desc> {
         return None;
     }
     let key = Key::Name(crate::symbol::symbol_atom(vm, s));
-    vm.own_property(as_object(o), key)
+    vm.own_property(Obj::of(o), key)
 }
 
 /// `o.#x`: `[o, symbol]`.
@@ -1626,7 +1626,7 @@ fn private_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         Some(_) => {
             let d = Desc { value: Some(v), ..Desc::default() };
-            vm.define_own_property(as_object(o), key, &d)?;
+            vm.define_own_property(Obj::of(o), key, &d)?;
         }
         None => {
             return Err(Error::type_error(format!(
@@ -1647,7 +1647,7 @@ fn private_add(vm: &mut Vm, o: Value, s: Value, d: &Desc) -> Result<()> {
         )));
     }
     let key = Key::Name(crate::symbol::symbol_atom(vm, s));
-    if !vm.define_own_property(as_object(o), key, d)? {
+    if !vm.define_own_property(Obj::of(o), key, d)? {
         return Err(Error::type_error(format!(
             "Cannot define private member {} on a non-extensible object",
             crate::symbol::description_string(s)
@@ -1720,7 +1720,7 @@ fn async_gen_yield(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `[v]`'s `Symbol.asyncIterator` method, if it has one.
 fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
     let a = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
-    let o = object_value(vm.to_object(v)?);
+    let o = object_value((vm.to_object(v)?).ptr());
     let m = vm.get(o, a)?;
     Ok((!m.is_undefined() && !m.is_null()).then_some(m))
 }
@@ -1838,7 +1838,7 @@ fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let o = if crate::props::is_object(a[3]) {
         a[3]
     } else {
-        let o = object_value(vm.new_object(Value::NULL));
+        let o = object_value(vm.new_plain(Value::NULL).ptr());
         bound_accessors(vm, o, bindings, &site_bindings(a[2]).2, place)?;
         o
     };
@@ -1849,7 +1849,7 @@ fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             let data = [t[1], Value::from_i32(b), t[0], t[2]];
             let get = crate::promise::binding_accessor(vm, false, &data);
             let set = crate::promise::binding_accessor(vm, true, &data);
-            vm.define_own_property(as_object(o), key, &Desc::accessor(get, set, true, false))?;
+            vm.define_own_property(Obj::of(o), key, &Desc::accessor(get, set, true, false))?;
         } else if t[1] != Value::HOLE {
             vm.create_data_property(o, key, t[1])?;
         }
@@ -1872,7 +1872,7 @@ fn bound_accessors(vm: &mut Vm, o: Value, f: Value, bindings: &[SiteBinding], pl
         let data = [f, Value::from_i32(((up as i32) << 4) | kind), n, v];
         let get = crate::promise::binding_accessor(vm, false, &data);
         let set = crate::promise::binding_accessor(vm, true, &data);
-        vm.define_own_property(as_object(o), key, &Desc::accessor(get, set, true, false))?;
+        vm.define_own_property(Obj::of(o), key, &Desc::accessor(get, set, true, false))?;
     }
     Ok(())
 }
@@ -1978,7 +1978,7 @@ pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// The kind of `scope`'s own property `key` if it is a binding's accessor
 /// (see `eval_scope`).
 fn binding_kind(vm: &mut Vm, scope: Value, key: Key) -> Option<i32> {
-    let d = vm.own_property(as_object(scope), key)?;
+    let d = vm.own_property(Obj::of(scope), key)?;
     let get = d.get.filter(|&g| crate::promise::is_binding_get(vm, g))?;
     crate::promise::slot(Obj::of(get), 1).as_number().map(|b| b as i32 & 15)
 }
@@ -2033,7 +2033,7 @@ fn annex_b_skipped(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let Key::Name(name) = to_property_key(vm, a[0])? else {
         return Ok(Value::FALSE);
     };
-    let skipped = crate::props::is_object(a[1]) && vm.own_property(as_object(a[1]), Key::Name(name)).is_some();
+    let skipped = crate::props::is_object(a[1]) && vm.own_property(Obj::of(a[1]), Key::Name(name)).is_some();
     Ok(Value::from_bool(skipped))
 }
 
@@ -2050,7 +2050,7 @@ fn annex_b_start(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             continue;
         }
         if record.is_undefined() {
-            record = object_value(vm.new_object(Value::NULL));
+            record = object_value(vm.new_plain(Value::NULL).ptr());
         }
         vm.create_data_property(record, Key::Name(name), Value::TRUE)?;
     }
@@ -2060,7 +2060,7 @@ fn annex_b_start(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// Whether an enclosing function's binding by `key` is shadowed by a `var`
 /// of the function's an `eval` declared, in its scope object `decl`.
 fn shadowed(vm: &mut Vm, decl: Value, key: Key) -> bool {
-    crate::props::is_object(decl) && vm.own_property(as_object(decl), key).is_some()
+    crate::props::is_object(decl) && vm.own_property(Obj::of(decl), key).is_some()
 }
 
 /// After a direct `eval`: binding `[scope, name, current, decl]`'s value,
@@ -2072,7 +2072,7 @@ fn eval_scope_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if shadowed(vm, a[3], key) {
         return Ok(a[2]);
     }
-    Ok(match vm.own_property(as_object(a[0]), key) {
+    Ok(match vm.own_property(Obj::of(a[0]), key) {
         Some(d) if d.is_data() => d.value.unwrap_or(Value::UNDEFINED),
         _ => a[2],
     })
@@ -2102,7 +2102,7 @@ fn flush_scope(vm: &mut Vm, scope: Value, target: Value, bindings: &[Key]) -> Re
         if bindings.contains(&key) {
             continue;
         }
-        if let Some(d) = vm.own_property(as_object(scope), key)
+        if let Some(d) = vm.own_property(Obj::of(scope), key)
             && let Some(v) = d.value
         {
             vm.put_key(target, key, v)?;

@@ -63,13 +63,13 @@ fn root(vm: &Vm, r: Root) -> *mut Object {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
-    let intl = vm.new_object(op);
+    let intl = vm.new_plain(op);
     let a = vm.intern_name("Intl");
-    vm.add_property_with(g, a, object_value(intl), DONT_ENUM);
-    crate::symbol::to_string_tag(vm, unsafe { Obj::from_ptr(intl) }, "Intl");
+    vm.add_property_with(g, a, object_value(intl.ptr()), DONT_ENUM);
+    crate::symbol::to_string_tag(vm, intl, "Intl");
     vm.intl_roots = vec![std::ptr::null_mut(); 5];
-    collator::install(vm, intl);
-    segmenter::install(vm, intl);
+    collator::install(vm, intl.ptr());
+    segmenter::install(vm, intl.ptr());
 }
 
 fn data_error(e: String) -> Error {
@@ -129,7 +129,7 @@ fn canonicalize_locale_list(vm: &mut Vm, locales: Value) -> Result<Vec<String>> 
         seen.push(canonical_tag(&to_rust_string(vm, locales)?)?);
         return Ok(seen);
     }
-    let o = object_value(vm.to_object(locales)?);
+    let o = object_value((vm.to_object(locales)?).ptr());
     let len = vm.length_of(o)?;
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
@@ -308,15 +308,15 @@ fn resolve_locale(
 /// CoerceOptionsToObject.
 fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
-        return Ok(object_value(vm.new_object(Value::NULL)));
+        return Ok(object_value(vm.new_plain(Value::NULL).ptr()));
     }
-    Ok(object_value(vm.to_object(v)?))
+    Ok(object_value((vm.to_object(v)?).ptr()))
 }
 
 /// GetOptionsObject.
 fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
-        return Ok(object_value(vm.new_object(Value::NULL)));
+        return Ok(object_value(vm.new_plain(Value::NULL).ptr()));
     }
     if is_object(v) {
         return Ok(v);

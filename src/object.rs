@@ -1542,7 +1542,8 @@ pub fn as_object(v: Value) -> *mut Object {
     v.to_bits() as *mut Object
 }
 
-/// A cell, as a handle whose header fields read without `unsafe`.
+/// A cell, as a handle whose header fields read without `unsafe` (through
+/// `raw::ObjectPtr`).
 ///
 /// The trust is where one is made: [`Obj::of`] takes a cell value, which
 /// the crate alone makes (`Value::from_bits` is crate-internal, #71) and
@@ -1574,42 +1575,6 @@ impl Obj {
     #[inline(always)]
     pub(crate) fn ptr(self) -> *mut Object {
         self.0.as_ptr()
-    }
-
-    #[inline(always)]
-    pub(crate) fn class(self) -> Class {
-        unsafe { (*self.ptr()).class }
-    }
-
-    #[inline(always)]
-    pub(crate) fn flags(self) -> u8 {
-        unsafe { (*self.ptr()).flags }
-    }
-
-    /// A typed array's element type (see [`Object::kind`]).
-    #[inline(always)]
-    pub(crate) fn kind(self) -> u8 {
-        unsafe { (*self.ptr()).kind }
-    }
-
-    #[inline(always)]
-    pub(crate) fn elems_len(self) -> u32 {
-        unsafe { (*self.ptr()).elems_len }
-    }
-
-    /// The word past the header (see [`Object::code`]). Panics for a
-    /// class without it (`layout::extra_words` 0: a plain object's or an
-    /// array's first slot is there, past the end of one with none).
-    #[inline(always)]
-    #[track_caller]
-    pub(crate) fn code(self) -> *const Code {
-        assert!(crate::layout::extra_words(self.class()) > 0, "no code word in a {:?}", self.class());
-        unsafe { (*self.ptr()).code }
-    }
-
-    #[inline(always)]
-    pub(crate) fn shape(self) -> *const Shape {
-        unsafe { (*self.ptr()).shape }
     }
 }
 

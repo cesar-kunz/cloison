@@ -23,7 +23,7 @@
 1 src/json.rs
 62 src/layout.rs
 1 src/module.rs
-75 src/object.rs
+69 src/object.rs
 12 src/promise.rs
 11 src/props.rs
 5 src/proxy.rs

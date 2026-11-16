@@ -6,7 +6,7 @@
 4 src/bin/cloison.rs
 2 src/bin/dispatch_bench.rs
 27 src/builtins.rs
-24 src/collections.rs
+13 src/collections.rs
 11 src/date.rs
 6 src/dispose.rs
 11 src/far.rs
@@ -20,7 +20,7 @@
 13 src/intrinsics.rs
 2 src/iterator.rs
 1 src/jit/rx.rs
-337 src/jit.rs
+336 src/jit.rs
 1 src/js/ast.rs
 1 src/js/mod.rs
 2 src/json.rs
@@ -37,9 +37,9 @@
 4 src/shadow.rs
 32 src/shared.rs
 2 src/stack.rs
-46 src/symbol.rs
+44 src/symbol.rs
 2 src/temporal/mod.rs
 2 src/temporal/zoned.rs
-44 src/typed.rs
+43 src/typed.rs
 1 src/value.rs
 174 src/vm.rs

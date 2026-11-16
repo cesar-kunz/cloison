@@ -971,7 +971,7 @@ extern "C" fn cloison_rt_create_closure(callee: Value, current: Value) -> u64 {
         return 0;
     }
     let current = current.to_bits() as *const Object;
-    vm.closure_of(callee, std::ptr::null_mut(), unsafe { Obj::from_ptr(current.cast_mut()) }).to_bits()
+    vm.closure_of(callee, std::ptr::null_mut(), current.cast_mut()).to_bits()
 }
 
 /// `CreateClosure` of `callee` (a `Code`) in the compiled frame `regs` of
@@ -1002,8 +1002,7 @@ extern "C" fn cloison_rt_create_arguments(regs: Value, _: Value) -> u64 {
         let mut spread = Vec::new();
         let (args, n) = interp::frame_args(vm, regs.to_bits() as *mut Value, &mut spread);
         let callee = interp::frame_callee(regs.to_bits() as *mut Value);
-        crate::builtins::arguments_object_of(vm, std::slice::from_raw_parts(args, n), Obj::from_ptr(callee).ptr())
-            .to_bits()
+        crate::builtins::arguments_object_of(vm, std::slice::from_raw_parts(args, n), callee).to_bits()
     }
 }
 
@@ -1015,8 +1014,7 @@ extern "C" fn cloison_rt_arguments_of(array: Value, func: Value) -> u64 {
     unsafe {
         let vm = &mut *crate::interp::current_vm();
         let a = crate::object::as_object(array);
-        crate::builtins::arguments_object_of(vm, Object::elems(a), (Obj::from_ptr(func.to_bits() as *mut Object)).ptr())
-            .to_bits()
+        crate::builtins::arguments_object_of(vm, Object::elems(a), func.to_bits() as *mut Object).to_bits()
     }
 }
 
@@ -17790,7 +17788,7 @@ unsafe fn materialize(
             crate::builtins::arguments_object_of(
                 &mut *crate::interp::current_vm(),
                 Object::elems(o),
-                (Obj::from_ptr(interp::frame_callee(at))).ptr(),
+                interp::frame_callee(at),
             )
         };
         for r in regs_of() {

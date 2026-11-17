@@ -1910,6 +1910,14 @@ handlers! {
 
     // Ignores `acc`: also the I32 entry.
     fn op_create_object(pc, acc, regs, tag) {
+        // The site's shape made already and no collection asked for: no
+        // call into the VM to allocate it.
+        let vm = frame_vm(regs);
+        let s = (*ic_at(regs, pc, 2)).shape;
+        if !s.is_null() && !(*s).is_zombie() && !(*vm).heap.requested.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::object::mark_shape(s);
+            next!(any, Op::CreateObject.size(), object_value((*vm).heap.alloc_plain(&*s)))
+        }
         let o = create_object(regs, index_at(pc, 2), *pc.add(1) as u32);
         next!(any, Op::CreateObject.size(), o)
     }

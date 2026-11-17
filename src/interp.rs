@@ -114,18 +114,19 @@ fn unboxed(i: i32) -> Value {
     Value::from_bits(i as u32 as u64)
 }
 
-/// [`note_callee`] where it calls nothing: `f` way 0's already, or
+/// [`note_callee`] where it calls nothing: `f` in a way already, or
 /// another closure of its code replacing a young one (a function made per
 /// call). False for the rest. (In a handler.)
 macro_rules! callee_noted {
     ($regs:expr, $ic:expr, $f:expr) => {{
         let (ic, f): (*mut Ic, Obj) = ($ic, $f);
         let old = (*ic).holder;
-        old == f.ptr() || {
+        let p = f.ptr();
+        old == p || (*ic.add(1)).holder == p || (*ic.add(2)).holder == p || (*ic.add(3)).holder == p || {
             let fits = Obj::cell(object_value(old)).is_some_and(|o| o.code_or_null() == f.code_or_null())
                 && (*frame_vm($regs)).heap.is_young(object_value(old));
             if fits {
-                (*ic).holder = f.ptr();
+                (*ic).holder = p;
             }
             fits
         }

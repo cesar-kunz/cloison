@@ -10330,3 +10330,26 @@ log.push(a1(), a2(), a3(), a4(), a5(), a6(), a7(), a8(), a9());
 log.join(" ");"#;
     assert_eq!(value(src), "1 z undefined 1 k 1 1  1 ab 12 123undefined");
 }
+
+/// `for (let …; …; …)` copies its bindings into the first iteration's
+/// environment before the first test (ForBodyEvaluation step 2): a
+/// closure made in the declarations keeps the initial bindings, not
+/// what the body writes (#345).
+#[test]
+fn a_for_let_heads_closures_keep_the_initial_bindings() {
+    let src = r#"
+var log = [];
+var f; for (let i = 0, g = f = () => i; i < 2;) { i += 10 } log.push(f());
+var s, t; for (let i = 0, g = s = () => i; i < 1; i++) { t = () => i; i = 5 } log.push(s(), t());
+var k = []; for (let i = 0, g = k.push(() => i); i < 3; i++, k.push(() => i)) k.push(() => i);
+log.push(k.map(x => x()).join(""));
+var r = []; for (let i = 0; r.push(() => i), i < 2; i++); log.push(r.map(x => x()).join(""));
+function z() { var f; for (let [a] = [0], g = f = () => a; a < 2;) { a += 10 } return f() }
+log.push(z());
+var bx; for (let i = 0, g = bx = () => i++; i < 3; i++); log.push(bx(), bx());
+var ev; for (let i = 0, g = ev = eval("() => i"); i < 2;) { i += 10 } log.push(ev());
+var n = 0; for (var j = 0; j < 100; j++) for (let i = 0, g = () => i; i < 3; i++) n += g();
+log.push(n);
+log.join(" ");"#;
+    assert_eq!(value(src), "0 0 5 0011223 012 0 0 1 0 0");
+}

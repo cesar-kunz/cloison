@@ -7033,6 +7033,13 @@ impl<'a> Gen<'a> {
                             }
                         }
                         self.lexical_decls(ds)?;
+                        // The first iteration's copy, before the first test:
+                        // closures made in the declarations keep theirs
+                        // (CreatePerIterationEnvironment, ForBodyEvaluation
+                        // step 2).
+                        for n in &fresh {
+                            self.fresh_binding(n, false, s.pos)?;
+                        }
                     }
                     Some(ForInit::Expr(e)) => self.effect(e)?,
                     None => {}

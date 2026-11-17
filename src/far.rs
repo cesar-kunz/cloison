@@ -245,8 +245,9 @@ pub(crate) struct SortedKeys {
 }
 
 impl SortedKeys {
-    /// Forget the keys: the store they are of, compared by address, may
-    /// have moved (`gc::Evacuation`).
+    /// Forget the keys, at every collection: the store they are of,
+    /// compared by address, may be freed, and another made at its address
+    /// with as many mutations, or moved (`gc::Evacuation`) (#332).
     pub(crate) fn invalidate(&mut self) {
         self.store = 0;
         self.keys.clear();
@@ -570,5 +571,49 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: Obj) {
     }
     if flags & (NOT_EXTENSIBLE | SEALED | FROZEN | LENGTH_READ_ONLY) == 0 {
         vm.dense_elements(o);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::value::Value;
+    use crate::vm::{Result, Vm};
+
+    /// Make `vm.far_keys` hold an empty key list for far array `a`'s store
+    /// as it is: what a freed store's list would be for a new store made
+    /// at its address with as many mutations.
+    fn fake(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+        let e = super::store(crate::object::Obj::of(args[0]));
+        vm.far_keys =
+            super::SortedKeys { store: e.ptr() as usize, mutations: super::int(e, super::MUTATIONS), keys: vec![] };
+        Ok(Value::UNDEFINED)
+    }
+
+    /// A full collection that moves nothing.
+    fn collect(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        vm.heap.gc.set_evacuate(false);
+        vm.collect_full_now();
+        Ok(Value::UNDEFINED)
+    }
+
+    /// A collection that moves no cell forgets the sorted far keys all
+    /// the same: the store they were of may be freed and another made at
+    /// its address (#332).
+    #[test]
+    fn far_keys_are_forgotten_by_a_collection_moving_nothing() {
+        let src = r#"
+            var a = []; a[1e8] = 1; a[5] = 2;
+            var count = () => { var n = 0; a.forEach(() => n++); return n; };
+            fake(a);
+            var before = count();
+            collect();
+            before + "," + count()
+        "#;
+        let module = crate::js::compile(src).unwrap();
+        let mut vm = Vm::new();
+        let g = vm.global_obj();
+        vm.define_native(g, "fake", fake, 1, crate::jit::Ty::Any, false);
+        vm.define_native(g, "collect", collect, 0, crate::jit::Ty::Any, false);
+        assert_eq!(vm.run(&module).map(crate::vm::display).as_deref(), Ok("0,2"));
     }
 }

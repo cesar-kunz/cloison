@@ -741,7 +741,11 @@ fn has_stencil(name: &str) -> bool {
 /// operands go to the generic runtime in that order. `AddSmi` (`acc + imm`)
 /// shares it, which is fine while `+` is only numeric; strings will need a
 /// helper per order.
-extern "C" fn cloison_rt_add(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_add(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_add(a, b))
+}
+
+fn rt_add(acc: Value, r: Value) -> u64 {
     match (r.as_number(), acc.as_number()) {
         (Some(x), Some(y)) => Value::from_f64_arith(x + y).to_bits(),
         _ => {
@@ -753,6 +757,54 @@ extern "C" fn cloison_rt_add(acc: Value, r: Value) -> u64 {
             converting(|| crate::interp::generic_add(r, acc).to_bits())
         }
     }
+}
+
+/// `f`, a runtime call compiled code makes, or `leave` if it panicked:
+/// the copied stencils have no unwind tables, so a panic can't unwind
+/// through compiled code (the process aborted, #324: the heap limit's, an
+/// embedder's `catch_unwind` around `Vm::run` couldn't catch it). The
+/// panic is kept ([`JIT_PANIC`]), and `leave` (the call's "leave"
+/// result: `RT_REDO`, 0, `EMPTY`) has the code leave at once, to
+/// `vm_run`, which resumes it. A call from a frame under that code, made
+/// through the runtime (`cloison_rt_call`), catches it again and leaves
+/// in turn. (Release builds abort on a panic: this is only a call then.)
+#[inline(always)]
+fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(p) => {
+            keep_panic(p);
+            leave
+        }
+    }
+}
+
+thread_local! {
+    /// A panic in a runtime call compiled code made, kept till the code
+    /// has left, as it can't unwind through it (see [`unwinding`]). The
+    /// thread's: the code entered last on it leaves first.
+    static JIT_PANIC: std::cell::Cell<Option<Box<dyn std::any::Any + Send>>> = const { std::cell::Cell::new(None) };
+}
+
+#[cold]
+#[inline(never)]
+fn keep_panic(p: Box<dyn std::any::Any + Send>) {
+    // (The first one: a panic in what the code ran while leaving, a
+    // nested call's, is a consequence.)
+    JIT_PANIC.with(|k| {
+        let first = k.take().unwrap_or(p);
+        k.set(Some(first));
+    });
+}
+
+/// Whether a runtime call's panic waits for compiled code to leave.
+pub(crate) fn panic_pending() -> bool {
+    JIT_PANIC.with(|k| {
+        let p = k.take();
+        let pending = p.is_some();
+        k.set(p);
+        pending
+    })
 }
 
 /// What a runtime call compiled code makes for an operation returns for
@@ -786,6 +838,10 @@ fn converting(f: impl FnOnce() -> u64) -> u64 {
 }
 
 extern "C" fn cloison_rt_inc(a: Value) -> u64 {
+    unwinding(RT_REDO, || rt_inc(a))
+}
+
+fn rt_inc(a: Value) -> u64 {
     match a.as_number() {
         Some(x) => Value::from_f64_arith(x + 1.0).to_bits(),
         None => converting(|| crate::interp::generic_inc(a, 1).to_bits()),
@@ -793,6 +849,10 @@ extern "C" fn cloison_rt_inc(a: Value) -> u64 {
 }
 
 extern "C" fn cloison_rt_less_than(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_less_than(a, b))
+}
+
+fn rt_less_than(a: Value, b: Value) -> u64 {
     match (a.as_number(), b.as_number()) {
         (Some(x), Some(y)) => (x < y) as u64,
         _ => converting(|| crate::interp::generic_less_than(a, b) as u64),
@@ -802,7 +862,11 @@ extern "C" fn cloison_rt_less_than(a: Value, b: Value) -> u64 {
 /// `for … in`'s keys of `v` (`for_in_keys`; `vm` is the VM's address); 0
 /// for a proxy's, which its traps, bytecode functions, find: the
 /// interpreter calls them.
-extern "C" fn cloison_rt_for_in_keys(vm: Value, v: Value) -> u64 {
+extern "C" fn cloison_rt_for_in_keys(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_for_in_keys(a, b))
+}
+
+fn rt_for_in_keys(vm: Value, v: Value) -> u64 {
     unsafe {
         let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
         if v.is_cell() && crate::proxy::chain_has_proxy(vm, Obj::from_ptr(crate::object::as_object(v))) {
@@ -815,7 +879,11 @@ extern "C" fn cloison_rt_for_in_keys(vm: Value, v: Value) -> u64 {
 
 /// A new object of shape `shape` (`create_object` and `create_array`,
 /// when the heap's chunk is full).
-extern "C" fn cloison_rt_create_object(shape: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_create_object(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_create_object(a, b))
+}
+
+fn rt_create_object(shape: Value, _: Value) -> u64 {
     unsafe {
         let vm = crate::interp::current_vm();
         (*vm).safepoint(std::ptr::null_mut());
@@ -826,6 +894,10 @@ extern "C" fn cloison_rt_create_object(shape: Value, _: Value) -> u64 {
 
 /// How `a` compares with `b`: 0 less, 1 equal, 2 greater, 3 unordered.
 extern "C" fn cloison_rt_compare(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_compare(a, b))
+}
+
+fn rt_compare(a: Value, b: Value) -> u64 {
     if a.is_cell() || b.is_cell() { converting(|| compare(a, b)) } else { compare(a, b) }
 }
 
@@ -849,15 +921,27 @@ fn compare(a: Value, b: Value) -> u64 {
 
 /// Stencils call these as `(acc, r)` for `r - acc` (and `DivSmi`'s as
 /// `(k, acc)` for `acc / k`).
-extern "C" fn cloison_rt_sub(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_sub(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_sub(a, b))
+}
+
+fn rt_sub(acc: Value, r: Value) -> u64 {
     arith(Op::Sub, r, acc)
 }
 
-extern "C" fn cloison_rt_mul(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_mul(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_mul(a, b))
+}
+
+fn rt_mul(acc: Value, r: Value) -> u64 {
     arith(Op::Mul, r, acc)
 }
 
-extern "C" fn cloison_rt_div(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_div(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_div(a, b))
+}
+
+fn rt_div(acc: Value, r: Value) -> u64 {
     arith(Op::Div, r, acc)
 }
 
@@ -877,18 +961,30 @@ extern "C" fn cloison_rt_strict_eq(a: Value, b: Value) -> bool {
 
 /// `a % b` (`ModSmi`'s slow path; `b` is the immediate).
 extern "C" fn cloison_rt_mod(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_mod(a, b))
+}
+
+fn rt_mod(a: Value, b: Value) -> u64 {
     let f = || Value::number(crate::interp::to_number(a) % crate::interp::to_number(b)).to_bits();
     if a.is_cell() || b.is_cell() { converting(f) } else { f() }
 }
 
 /// ToInt32(ToNumber(a)), in the low 32 bits.
-extern "C" fn cloison_rt_to_int32(a: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_to_int32(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_to_int32(a, b))
+}
+
+fn rt_to_int32(a: Value, _: Value) -> u64 {
     let f = || crate::interp::to_int32(crate::interp::to_number(a)) as u32 as u64;
     if a.is_cell() { converting(f) } else { f() }
 }
 
 /// `a == b`.
 extern "C" fn cloison_rt_loose_eq(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || rt_loose_eq(a, b))
+}
+
+fn rt_loose_eq(a: Value, b: Value) -> u64 {
     let f = || crate::interp::loose_equals(a, b).unwrap_or_else(|e| panic!("JIT code: {e}")) as u64;
     if a.is_cell() || b.is_cell() { converting(f) } else { f() }
 }
@@ -898,6 +994,10 @@ extern "C" fn cloison_rt_loose_eq(a: Value, b: Value) -> u64 {
 /// function (the interpreter does), as an object key's ToPropertyKey may,
 /// or a native getter's conversion (see [`reading`]).
 extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_get_keyed(a, b))
+}
+
+fn rt_get_keyed(a: Value, b: Value) -> u64 {
     if crate::props::is_object(b) {
         return 0;
     }
@@ -964,7 +1064,11 @@ fn reading(vm: &mut crate::vm::Vm, f: impl FnOnce(&mut crate::vm::Vm) -> u64) ->
 /// A new closure of `callee` (a `Code`) taking its upvalues from function
 /// `current` (`create_closure` stencils); 0 if it would capture the
 /// frame's registers (a function doing that isn't compiled).
-extern "C" fn cloison_rt_create_closure(callee: Value, current: Value) -> u64 {
+extern "C" fn cloison_rt_create_closure(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_create_closure(a, b))
+}
+
+fn rt_create_closure(callee: Value, current: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let callee = callee.to_bits() as *const crate::vm::Code;
     if callee.live().upvalues.iter().any(|&(local, _)| local) {
@@ -1022,6 +1126,10 @@ extern "C" fn cloison_rt_arguments_of(array: Value, func: Value) -> u64 {
 /// would call a function (an object key's ToPropertyKey), or a proxy's
 /// native trap's conversion would (see [`reading`]).
 extern "C" fn cloison_rt_delete(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_delete(a, b))
+}
+
+fn rt_delete(a: Value, b: Value) -> u64 {
     if crate::props::is_object(b) {
         return 0;
     }
@@ -1030,7 +1138,11 @@ extern "C" fn cloison_rt_delete(a: Value, b: Value) -> u64 {
 }
 
 /// `delete g`, `b` the global's name (`delete_global_m` stencils).
-extern "C" fn cloison_rt_delete_global(_: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_delete_global(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_delete_global(a, b))
+}
+
+fn rt_delete_global(_: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = crate::js::lex::units_to_string(crate::vm::string_units(b).unwrap_or(&[]));
     let a = vm.intern_name(&name);
@@ -1046,7 +1158,11 @@ extern "C" fn cloison_rt_type_of(a: Value, _: Value) -> u64 {
 /// A regular expression literal's new `RegExp`, of pattern `p` and flags
 /// `f` (`create_regexp` stencils); 0 where it would throw (the
 /// interpreter does it).
-extern "C" fn cloison_rt_create_regexp(p: Value, f: Value) -> u64 {
+extern "C" fn cloison_rt_create_regexp(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_create_regexp(a, b))
+}
+
+fn rt_create_regexp(p: Value, f: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     crate::builtins::regexp_literal(vm, p, f).map_or(0, |v| v.to_bits())
 }
@@ -1059,7 +1175,11 @@ extern "C" fn cloison_rt_create_regexp(p: Value, f: Value) -> u64 {
 /// no epoch says, #333). It may change the elements' type, so the
 /// receiver's shape: `set_keyed_rt` forgets exact shapes (a named
 /// property's transition gives a shape extending the old one).
-extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_set_keyed(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_set_keyed(a, b))
+}
+
+fn rt_set_keyed(args: Value, _: Value) -> u64 {
     use crate::object::Class;
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
@@ -1135,7 +1255,11 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
 /// `o.name` (`name` an `Atom`), or 0 where it would throw or call a
 /// bytecode getter, or a native one's conversion would (`get_named_rt`
 /// stencils; see [`reading`]).
-extern "C" fn cloison_rt_get_named(o: Value, name: Value) -> u64 {
+extern "C" fn cloison_rt_get_named(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_get_named(a, b))
+}
+
+fn rt_get_named(o: Value, name: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = crate::object::Atom(name.to_bits() as u32);
     let v = reading(vm, |vm| vm.get_named_rt(o, name).map_or(0, |v| v.to_bits()));
@@ -1149,7 +1273,11 @@ extern "C" fn cloison_rt_get_named(o: Value, name: Value) -> u64 {
 /// (`set_named_rt` stencils). As `cloison_rt_set_keyed`'s named stores: if
 /// the store changed what compiled code relies on (an epoch moved), leave;
 /// the interpreter stores again, the same.
-extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_set_named(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_set_named(a, b))
+}
+
+fn rt_set_named(args: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
     let name = crate::object::Atom(a[1].to_bits() as u32);
@@ -1176,7 +1304,11 @@ extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
 /// `a instanceof b`, or 0 where it would throw (the interpreter does), or
 /// a native `Symbol.hasInstance`'s conversion would call a function (see
 /// [`reading`]).
-extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_instance_of(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_instance_of(a, b))
+}
+
+fn rt_instance_of(args: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
     let (v, f, cache) = (a[0], a[1], a[2].to_bits() as *const InstanceOfCache);
@@ -1210,6 +1342,10 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
 /// key's ToPropertyKey may, or a proxy's native `has` trap's conversion
 /// (the interpreter does; see [`reading`]).
 extern "C" fn cloison_rt_in(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_in(a, b))
+}
+
+fn rt_in(a: Value, b: Value) -> u64 {
     if crate::props::is_object(a) {
         return 0;
     }
@@ -17731,7 +17867,17 @@ unsafe fn vm_run_(vm: &mut crate::vm::Vm, code: &crate::vm::Code, regs: *mut Val
             };
         };
         let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };
-        let (record, exit_acc) = match unsafe { jit_code.enter(entry_acc, regs_slice) } {
+        let outcome = unsafe { jit_code.enter(entry_acc, regs_slice) };
+        // A runtime call the code made panicked: on with it, out of the
+        // compiled code now (see `unwinding`).
+        // (Never with `panic = "abort"`, the release builds': nothing to
+        // check then.)
+        if cfg!(panic = "unwind")
+            && let Some(p) = JIT_PANIC.with(|k| k.take())
+        {
+            std::panic::resume_unwind(p);
+        }
+        let (record, exit_acc) = match outcome {
             Outcome::Return(v) => return VmRun::Returned(v),
             Outcome::Exit { pc: record, acc } => (record, acc),
         };
@@ -18155,7 +18301,11 @@ impl EnterConsts {
 /// keeps `this` and makes the result, also after an exit (the interpreter
 /// finishes the frame as a plain call) and after a self tail call reused
 /// the frame (whose `this` is then the tail call's).
-extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
+extern "C" fn cloison_rt_construct(a: Value, b: Value) -> Value {
+    unwinding(Value::EMPTY, || rt_construct(a, b))
+}
+
+fn rt_construct(regs: Value, site: Value) -> Value {
     unsafe {
         let s = site.to_bits() as *mut CallSite;
         let vm = &mut *(*s).vm;
@@ -18191,7 +18341,11 @@ extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
 /// `materialize` stencils, in an exit: allocate the object `mat` (a
 /// [`Mat`]) describes, its fields from the frame `regs` (spilled), and
 /// put it in its registers.
-extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
+extern "C" fn cloison_rt_materialize(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_materialize(a, b))
+}
+
+fn rt_materialize(regs: Value, mat: Value) -> u64 {
     unsafe {
         let m = &*(mat.to_bits() as *const Mat);
         let regs = regs.to_bits() as *mut Value;
@@ -18214,7 +18368,11 @@ extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
 /// call an inherited setter. The stencils leave for it first.)
 /// Room in object `o`'s out-of-line slots for slot `i` (an int32), for a
 /// transition's store there (`set_tro` stencils): 1.
-extern "C" fn cloison_rt_props_room(o: Value, i: Value) -> u64 {
+extern "C" fn cloison_rt_props_room(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_props_room(a, b))
+}
+
+fn rt_props_room(o: Value, i: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.reserve_props(unsafe { Obj::from_ptr(crate::object::as_object(o)) }, i.as_i32_unchecked() as u32);
     1
@@ -18223,7 +18381,11 @@ extern "C" fn cloison_rt_props_room(o: Value, i: Value) -> u64 {
 /// `s.charCodeAt(k)` for `char_code_at` stencils: the unit, boxed (a cons
 /// string flattened), or 0 to leave where there is none or `s` is no
 /// string (the interpreter calls it).
-extern "C" fn cloison_rt_char_code_at(s: Value, k: Value) -> u64 {
+extern "C" fn cloison_rt_char_code_at(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_char_code_at(a, b))
+}
+
+fn rt_char_code_at(s: Value, k: Value) -> u64 {
     match (crate::vm::string_units(s), k.is_int32()) {
         (Some(u), true) => {
             u.get(k.as_i32_unchecked() as u32 as usize).map_or(0, |&c| Value::from_i32(c as i32).to_bits())
@@ -18244,14 +18406,22 @@ extern "C" fn cloison_rt_pow(x: Value, y: Value) -> u64 {
 /// `String.fromCharCode(c)` for `from_char_code` stencils, `c` an int32 or
 /// (`from_char_code`) any value: the string, or 0 to leave where `c` isn't
 /// a number (converting it may run code).
-extern "C" fn cloison_rt_from_char_code(c: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_from_char_code(a: Value, b: Value) -> u64 {
+    unwinding(0, || rt_from_char_code(a, b))
+}
+
+fn rt_from_char_code(c: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let Some(d) = c.as_number() else { return 0 };
     vm.safepoint(std::ptr::null_mut());
     vm.single_char(crate::interp::to_int32(d) as u16).to_bits()
 }
 
-extern "C" fn cloison_rt_array_push(a: Value, v: Value) -> Value {
+extern "C" fn cloison_rt_array_push(a: Value, b: Value) -> Value {
+    unwinding(Value::EMPTY, || rt_array_push(a, b))
+}
+
+fn rt_array_push(a: Value, v: Value) -> Value {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.safepoint(std::ptr::null_mut());
     crate::vm::array_push(vm, a, &[v]).expect("a push onto an array")
@@ -18284,7 +18454,7 @@ extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
 
 /// [`cloison_rt_enter`]: the callee's code exited with `record` and `acc`.
 extern "C" fn cloison_direct_exit(regs: *mut Value, site: *mut CallSite, record: u32, acc: Value) -> Value {
-    unsafe { direct_exit(&mut *(*site).vm, regs, &mut *site, record, acc) }
+    unwinding(Value::EMPTY, || unsafe { direct_exit(&mut *(*site).vm, regs, &mut *site, record, acc) })
 }
 
 /// A direct call's callee code exited with `record` and `acc`. Account for
@@ -18308,6 +18478,10 @@ unsafe fn direct_exit(
         // else their upvalues stay open on the stack past it.)
         if vm.error.is_some() {
             interp::close_frame_upvalues(vm, caller.add(site.frame));
+            return Value::EMPTY;
+        }
+        // (A panic left the code: on to the caller's, which leaves too.)
+        if cfg!(panic = "unwind") && panic_pending() {
             return Value::EMPTY;
         }
         // Through the runtime from now on, or for a site claimed by types,
@@ -18361,7 +18535,11 @@ unsafe fn direct_exit(
 
 /// `call` stencils: run the call `site` (a `CallSite`) describes, over the
 /// compiled frame `regs`. `EMPTY` on an error.
-extern "C" fn cloison_rt_call(regs: Value, site: Value) -> Value {
+extern "C" fn cloison_rt_call(a: Value, b: Value) -> Value {
+    unwinding(Value::EMPTY, || rt_call(a, b))
+}
+
+fn rt_call(regs: Value, site: Value) -> Value {
     unsafe {
         let site = &mut *(site.to_bits() as *mut CallSite);
         (*site.vm).safepoint(regs.to_bits() as *mut Value);

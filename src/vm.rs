@@ -7389,9 +7389,12 @@ impl Vm {
     /// LIMIT`, under an embedder's `catch_unwind`) leaves the VM as between
     /// runs (see `RunState`), to run again, unless it unwound out of a
     /// collection: the VM is then [`poisoned`](Vm::poisoned), its runs and
-    /// operations failing. (With the JIT on, a panic in compiled code's
-    /// call of the runtime aborts the process instead: the copied stencils
-    /// have no unwind tables; `CLOISON_NO_JIT` runs nothing compiled.)
+    /// operations failing. With the JIT on, a panic in a runtime call that
+    /// compiled code made is kept till the code has left (the copied
+    /// stencils have no unwind tables), then unwinds the same; a few of
+    /// those calls, which have no way to leave (`typeof`, `arguments`, a
+    /// closure capturing registers, closing upvalues), still abort the
+    /// process (see `jit::unwinding`).
     ///
     /// The VM may move between runs: the code the JIT made for it where it
     /// was is dropped as the next run starts (see `Vm::rehome`).
@@ -9448,6 +9451,38 @@ out.join();"#;
         let r = vm.run(&crate::js::compile(src).unwrap()).map(display);
         assert_eq!(r.as_deref(), Ok("true,true,vvv"));
         assert_eq!((vm.heap.gc.stack_base, vm.unmovable), (0, 0));
+    }
+
+    /// With the JIT on: the heap limit reached in a runtime call compiled
+    /// code made (a push growing the elements, an object out of a full
+    /// chunk, a call through the runtime) unwinds out of the run as in the
+    /// interpreter, not aborting the process: the panic is kept till the
+    /// code left (#324). The VM runs again after.
+    #[test]
+    fn a_panic_under_compiled_code_unwinds_out_of_the_run() {
+        let srcs = [
+            "(function () { var a = []; for (;;) a.push({x: [1, 2, 3]}); })();",
+            "var a = []; for (;;) a.push(1.5);",
+            "function mk(i) { return {i: i, s: [i, i]}; } var a = []; for (var i = 0; ; i++) a.push(mk(i));",
+            "function f(o) { var a = []; for (var i = 0; i < 1000; i++) a.push(o); return a; } \
+             var all = []; for (;;) all.push(f.call(null, {}));",
+            "var a = []; for (var i = 0; ; i++) { var o = {}; o['k' + (i & 7)] = i; o.q = o; a.push(o); }",
+        ];
+        for src in srcs {
+            let mut vm = Vm::new();
+            vm.heap.gc.set_evacuate(false);
+            vm.heap.limit_growth(32 << 20);
+            let m = crate::js::compile(src).unwrap();
+            let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+            let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
+            assert!(msg.is_some_and(|m| m.contains("out of memory")), "{src}");
+            assert!(!vm.poisoned() && crate::interp::current_vm().is_null(), "{src}");
+            assert!(!crate::jit::panic_pending() && vm.native_top.is_null() && vm.error.is_none(), "{src}");
+            vm.heap.limit_growth(usize::MAX);
+            let again = "var s = 0; for (var i = 0; i < 100000; i++) s += [i][0]; s";
+            let r = vm.run(&crate::js::compile(again).unwrap()).map(display);
+            assert_eq!(r.as_deref(), Ok("4999950000"), "{src}");
+        }
     }
 
     /// `squeeze()`: no more fresh blocks.

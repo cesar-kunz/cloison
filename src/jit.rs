@@ -18118,6 +18118,12 @@ extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
             (*s).entry = 0;
             return cloison_rt_call(regs, site);
         }
+        // A collection at the safepoint or the allocation may have unbound
+        // the site (`age_functions`, `retire_functions`): no code to enter
+        // (#321).
+        if (*s).entry == 0 {
+            return cloison_rt_call(regs, site);
+        }
         *(regs.to_bits() as *mut Value).add((*s).frame) = this;
         let v = cloison_rt_enter(regs, site);
         if v.to_bits() == 0 || crate::props::is_object(v) {

@@ -394,6 +394,14 @@ pub(crate) fn mib(mb: usize) -> usize {
 
 impl Heap {
     /// A heap; panics if [`HEAPS`] are alive (see [`Heap::try_new`]).
+    /// Only the VM allocates in it (#340: a cell of a size not a
+    /// multiple of [`GRANULE`], or not written as the collector reads it,
+    /// corrupted the heap of the [`Vm`](crate::vm::Vm) given it):
+    ///
+    /// ```compile_fail,E0624
+    /// let mut heap = cloison::heap::Heap::new();
+    /// heap.alloc(8);
+    /// ```
     pub fn new() -> Heap {
         Self::try_new().unwrap_or_else(|| panic!("more than {HEAPS} heaps alive at once"))
     }
@@ -476,7 +484,7 @@ impl Heap {
     /// [`YOUNG`]: what it holds is left from before, for the caller to
     /// write all a collection may read.
     #[inline]
-    pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
+    pub(crate) fn alloc(&mut self, bytes: usize) -> *mut u8 {
         debug_assert!(bytes.is_multiple_of(GRANULE) && bytes > 0);
         let p = self.ptr;
         // (Past `LARGE`, a cell of its own blocks: in a small block, a card
@@ -1020,14 +1028,14 @@ impl Heap {
     }
 
     /// A new object of `shape`, with its in-object slots `undefined`.
-    pub fn alloc_object(&mut self, shape: &Shape) -> *mut Object {
+    pub(crate) fn alloc_object(&mut self, shape: &Shape) -> *mut Object {
         self.alloc_object_extra(shape, 0)
     }
 
     /// A new object of `shape` with `extra` words after its in-object
     /// slots (a closure's upvalues), its class's words after the header
     /// (`code`, `aux`) and the extra words zero, the slots `undefined`.
-    pub fn alloc_object_extra(&mut self, shape: &Shape, extra: usize) -> *mut Object {
+    pub(crate) fn alloc_object_extra(&mut self, shape: &Shape, extra: usize) -> *mut Object {
         self.alloc_object_with(shape, object_header(shape), crate::layout::extra_words(shape.class), extra)
     }
 
@@ -1036,7 +1044,7 @@ impl Heap {
     /// must be a `Class::Plain` one whose capacity fits the header, as
     /// `object_header` checks (here only in debug builds).
     #[inline(always)]
-    pub fn alloc_plain(&mut self, shape: &Shape) -> *mut Object {
+    pub(crate) fn alloc_plain(&mut self, shape: &Shape) -> *mut Object {
         debug_assert_eq!(crate::layout::extra_words(shape.class), 0);
         // (`object_header`'s, without its checks.)
         let cap = shape.capacity.get() as u64;
@@ -1085,14 +1093,14 @@ impl Heap {
     }
 
     /// Room for `n` values, all `undefined`: the payload of an array cell.
-    pub fn alloc_values(&mut self, n: usize) -> *mut Value {
+    pub(crate) fn alloc_values(&mut self, n: usize) -> *mut Value {
         self.alloc_values_from(n, 0)
     }
 
     /// [`Heap::alloc_values`], the values before `from` left for the caller
     /// to write before anything can collect (a growing array's copied
     /// elements: not written twice).
-    pub fn alloc_values_from(&mut self, n: usize, from: usize) -> *mut Value {
+    pub(crate) fn alloc_values_from(&mut self, n: usize, from: usize) -> *mut Value {
         let cap = u32::try_from(n).expect("array too large") as u64;
         let p = self.alloc((8 + 8 * n).next_multiple_of(GRANULE)).cast::<u64>();
         unsafe {
@@ -1110,7 +1118,7 @@ impl Heap {
     /// see `alloc_large`), and left untouched until written, so a buffer
     /// takes memory only for the pages a program uses (Zlib's 128 MiB
     /// Emscripten heap took 128 MiB of RSS).
-    pub fn alloc_bytes(&mut self, n: usize) -> *mut u8 {
+    pub(crate) fn alloc_bytes(&mut self, n: usize) -> *mut u8 {
         let len = u32::try_from(n).expect("buffer too large") as u64;
         let bytes = (8 + n).next_multiple_of(GRANULE);
         let p = self.alloc(bytes).cast::<u64>();
@@ -1125,7 +1133,7 @@ impl Heap {
 
     /// Room for an upvalue (`vm::Upvalue`, two words), zero: the payload
     /// of an upvalue cell.
-    pub fn alloc_upvalue(&mut self) -> *mut u8 {
+    pub(crate) fn alloc_upvalue(&mut self) -> *mut u8 {
         let p = self.alloc(32).cast::<u64>();
         unsafe {
             *p = UPVALUE;

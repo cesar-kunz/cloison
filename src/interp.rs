@@ -86,7 +86,7 @@
 use crate::bigint::BinOp as BigOp;
 use crate::bytecode::Op;
 use crate::jit::VmRun;
-use crate::object::{Class, Obj, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, Shape, as_object, object_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::{NumberTag, Value};
 use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, is_string, string_len, string_units};
@@ -1827,7 +1827,7 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(acc) {
             let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = acc.as_i32_unchecked() as u32;
-            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+            if elems_hit(o.shape(), (*ic_at(regs, pc, 2)).shape) && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     next!(any, Op::GetKeyed.size(), v)
@@ -1842,7 +1842,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = raw_i32(acc) as u32;
-            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+            if elems_hit(o.shape(), (*ic_at(regs, pc, 2)).shape) && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     next!(any, Op::GetKeyed.size(), v)
@@ -2934,7 +2934,7 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(acc) {
             let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = acc.as_i32_unchecked() as u32;
-            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+            if elems_hit(o.shape(), (*ic_at(regs, pc, 2)).shape) && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     star!(Op::GetKeyed.size(), v)
@@ -2949,7 +2949,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = raw_i32(acc) as u32;
-            if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
+            if elems_hit(o.shape(), (*ic_at(regs, pc, 2)).shape) && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
                 if v != Value::EMPTY {
                     star!(Op::GetKeyed.size(), v)
@@ -5025,6 +5025,15 @@ unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value,
         vm.callee = o;
         code.live().native.unwrap()(vm, this, args).ok()
     }
+}
+
+/// Whether a keyed load cached for shape `c` reads the elements of an
+/// object of shape `s` directly: `c`, or a shape of its family, which
+/// differs in the elements' type only. (A cached shape may be a zombie,
+/// still readable: see `Vm::sweep_shapes`.)
+#[inline(always)]
+fn elems_hit(s: *const Shape, c: *const Shape) -> bool {
+    s == c || !c.is_null() && s.live().family == c.live().family
 }
 
 /// Push a frame for `callee` past the caller's registers: header, `this`,

@@ -1,6 +1,7 @@
 # Once a day (and by hand, from the Actions tab): the tests on arm64 and
-# with the `intl` feature, test262 against the failures known, and both
-# again with debug assertions.
+# with the `intl` feature, test262 against the failures known, and the
+# `intl` tests and test262 again with debug assertions (pull requests run
+# the default tests with them, ci.yml).
 name: Nightly
 
 on:
@@ -52,7 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: debug-assertions
-      - run: cargo test --release
+      - run: cargo test --release --features intl
       - run: cargo build --release
       - name: Check out test262
         run: |

@@ -969,6 +969,11 @@ pub struct Vm {
     pub(crate) relied_slots: crate::jit::HashSet<usize>,
     /// The functions the JIT has state for (see `bump_code_epoch`).
     pub(crate) jitted: Vec<*const Code>,
+    /// Where the VM was when the JIT last made code for it: that code and
+    /// the JIT's tables hold addresses of its fields. A run starting
+    /// elsewhere (the VM moved between runs, as safe code may: returned,
+    /// boxed, swapped) drops them first (see `Vm::rehome`, #330).
+    pub(crate) home: *const Vm,
     /// By field cell (its address), the functions whose compiled code took
     /// its type (see `object::FieldCell::relied`).
     pub(crate) field_deps: HashMap<usize, Vec<usize>>,
@@ -1487,6 +1492,7 @@ impl Vm {
             typed_length_unusual: false,
             relied_slots: Default::default(),
             jitted: Vec::new(),
+            home: std::ptr::null(),
             field_deps: HashMap::default(),
             relied_cells: HashMap::default(),
             through_deps: HashMap::default(),
@@ -7386,6 +7392,9 @@ impl Vm {
     /// operations failing. (With the JIT on, a panic in compiled code's
     /// call of the runtime aborts the process instead: the copied stencils
     /// have no unwind tables; `CLOISON_NO_JIT` runs nothing compiled.)
+    ///
+    /// The VM may move between runs: the code the JIT made for it where it
+    /// was is dropped as the next run starts (see `Vm::rehome`).
     pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
         self.run_owned(module.clone())
     }
@@ -7826,6 +7835,30 @@ impl Vm {
     /// `CLOISON_GC_EVACUATE=all` and `CLOISON_GC_SLOTS` do (for tests).
     pub fn set_gc_evacuate_cycles(&mut self) {
         self.heap.gc.set_evacuate_cycles();
+    }
+
+    /// At a run's start: if the VM moved since the JIT made code for it,
+    /// that code is dropped, all of it, and what the JIT keeps for each
+    /// function, for them to compile anew here. Compiled code, its call
+    /// sites and the JIT's per-function state hold the VM's address and
+    /// its fields' (`native_limit`, the heap's bump pointer and collection
+    /// count), and would read and write where the VM was (#330). Between
+    /// runs no frame runs compiled code, so none is kept for one.
+    pub(crate) fn rehome(&mut self) {
+        let here: *const Vm = self;
+        if self.home == here {
+            return;
+        }
+        if !self.home.is_null() {
+            self.unbind_versions();
+            for c in self.codes.iter().chain(self.condemned.iter()) {
+                if let Ok(mut j) = c.jit.try_borrow_mut() {
+                    drop(j.take());
+                }
+            }
+            self.jitted.clear();
+        }
+        self.home = here;
     }
 
     /// Unbind every compiled version's call sites, the retired ones' too:

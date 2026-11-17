@@ -16648,7 +16648,11 @@ impl JitFunction {
     pub(crate) fn for_vm(code: *const crate::vm::Code, vm: *mut crate::vm::Vm) -> JitFunction {
         // (Its own epoch moves with the VM's from now on: see
         // `Vm::bump_code_epoch`.)
-        unsafe { (*vm).jitted.push(code) };
+        // (Its code is made for the VM where it is: see `Vm::rehome`.)
+        unsafe {
+            (*vm).jitted.push(code);
+            (*vm).home = vm;
+        }
         let root_insns = unsafe { (*vm).jit_caches.decoded(code) }.0.clone();
         let nregs = code.live().nregs as usize;
         let root_len = root_insns.len();

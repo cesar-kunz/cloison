@@ -2428,7 +2428,7 @@ impl Vm {
                 self.prune_symbols(m.mode);
                 let color = m.mode.color;
                 self.prune_strings(|v| !v.is_cell() || *crate::heap::meta(v.to_bits() as usize) & COLOR == color);
-                self.prune_templates(|o| *crate::heap::meta(o.ptr() as usize) & COLOR == color);
+                self.prune_templates(|o| *crate::heap::meta(o as usize) & COLOR == color);
             }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);

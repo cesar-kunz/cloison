@@ -6,7 +6,7 @@
 4 src/bin/cloison.rs
 2 src/bin/dispatch_bench.rs
 29 src/builtins.rs
-13 src/collections.rs
+14 src/collections.rs
 11 src/date.rs
 5 src/dispose.rs
 11 src/far.rs
@@ -35,7 +35,7 @@
 1 src/shadow.rs
 24 src/shared.rs
 2 src/stack.rs
-38 src/symbol.rs
+39 src/symbol.rs
 2 src/temporal/mod.rs
 1 src/temporal/zoned.rs
 43 src/typed.rs

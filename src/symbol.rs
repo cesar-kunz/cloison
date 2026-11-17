@@ -1125,8 +1125,11 @@ pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Option
     if i >= vm.length_field(o) {
         return Ok(None);
     }
-    if i < o.elems_len() {
-        let v = o.elem(i as usize);
+    if i < o.elems_len() && o.class() == Class::Array {
+        // SAFETY: an array's elements are values, `i` below their length.
+        // (Not `elem`, whose checks cost 0.7% instructions on excalidraw,
+        // which steps through arrays with `for … of`.)
+        let v = unsafe { *o.elems().add(i as usize) };
         if v != Value::EMPTY {
             return Ok(Some(v));
         }

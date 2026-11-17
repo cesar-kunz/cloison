@@ -34,7 +34,21 @@ const STORES_BEFORE_EXIT: &[(&str, &str)] = &[
     // Recording the exit is the point: its exit is the code's exit tail,
     // which returns to the driver, never an exit stub that resumes.
     ("exit", "records the exit, then goes to the code's exit tail"),
+    // Before its runtime call, it may give an array without elements an
+    // empty room for some (`first_elements`), which changes nothing a
+    // redo would see; its exit after the call is a panic's in it, never
+    // resumed in the interpreter (`jit::unwinding`).
+    ("array_push*__slow", "gives elements room only, or exits for a panic"),
 ];
+
+/// Whether stencil `name` is what entry `n` of [`STORES_BEFORE_EXIT`]
+/// names: the name, or with a `*` any text there.
+fn names(n: &str, name: &str) -> bool {
+    match n.split_once('*') {
+        Some((a, b)) => name.len() >= a.len() + b.len() && name.starts_with(a) && name.ends_with(b),
+        None => n == name,
+    }
+}
 
 /// The violations in stencil `name` (code and relocations), on `arch`.
 pub fn check(name: &str, arch: &str, code: &[u8], relocs: &[Reloc]) -> Vec<String> {
@@ -111,7 +125,7 @@ pub fn check(name: &str, arch: &str, code: &[u8], relocs: &[Reloc]) -> Vec<Strin
     }
 
     // Stores reaching an exit.
-    if STORES_BEFORE_EXIT.iter().any(|&(n, _)| n == name) {
+    if STORES_BEFORE_EXIT.iter().any(|&(n, _)| names(n, name)) {
         return errors;
     }
     let succ = |k: usize| -> Vec<usize> {

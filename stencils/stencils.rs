@@ -4774,7 +4774,14 @@ macro_rules! create_object_n {
         }; |s| {
             // Each stencil keeps its own helper (LLVM would merge these).
             core::arch::asm!(concat!("/* create_object_", $n, " */"), options(nomem, nostack, preserves_flags));
-            s.acc = Value::from_bits(rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
+            let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+            // (0: it panicked, see `jit::unwinding`; the exit never resumes,
+            // so its `acc` is any: the fast path needn't keep the one before.)
+            if r == 0 {
+                s.acc = Value::UNDEFINED;
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
             next!(s)
         });
     )*};
@@ -4787,7 +4794,14 @@ stencil_slow!("create_object"; |s| {
     s.acc = Value::from_bits(p as u64);
     next!(s)
 }; |s| {
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
+    let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+    // (0: it panicked, see `jit::unwinding`; the exit never resumes,
+    // so its `acc` is any: the fast path needn't keep the one before.)
+    if r == 0 {
+        s.acc = Value::UNDEFINED;
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 
@@ -4807,7 +4821,14 @@ stencil_slow!("create_array"; |s| {
 }; |s| {
     // (Its own helper: LLVM would merge it with `create_object`'s.)
     core::arch::asm!("/* create_array */", options(nomem, nostack, preserves_flags));
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
+    let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+    // (0: it panicked, see `jit::unwinding`; the exit never resumes,
+    // so its `acc` is any: the fast path needn't keep the one before.)
+    if r == 0 {
+        s.acc = Value::UNDEFINED;
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 
@@ -4859,7 +4880,14 @@ stencil_slow!("create_array_n"; |s| {
     next!(s)
 }; |s| {
     core::arch::asm!("/* create_array_n */", options(nomem, nostack, preserves_flags));
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
+    let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+    // (0: it panicked, see `jit::unwinding`; the exit never resumes,
+    // so its `acc` is any: the fast path needn't keep the one before.)
+    if r == 0 {
+        s.acc = Value::UNDEFINED;
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 
@@ -5165,7 +5193,10 @@ macro_rules! set_tro {
         }; |s| {
             core::arch::asm!(concat!("/* ", $name, loc!($loc), " */"), options(nomem, nostack, preserves_flags));
             let o = get!($loc, s).to_bits() as *mut u8;
-            rt_call!(s, cloison_rt_props_room, Value::from_bits(o as u64), Value::from_i32(imm() / 8));
+            // (0: it panicked, see `jit::unwinding`.)
+            if rt_call!(s, cloison_rt_props_room, Value::from_bits(o as u64), Value::from_i32(imm() / 8)) == 0 {
+                exit!(s)
+            }
             let o = get!($loc, s).to_bits() as *mut u8;
             tro_store(s.tag, o, s.acc, $barrier);
             next!(s)
@@ -7374,7 +7405,12 @@ macro_rules! array_methods {
                     next!(s)
                 }
             }
-            s.acc = unboxed(int(Value::from_bits(rt_call!(s, cloison_rt_array_push, a, v))));
+            let r = rt_call!(s, cloison_rt_array_push, a, v);
+            // (`EMPTY`: it panicked, see `jit::unwinding`.)
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = unboxed(int(Value::from_bits(r)));
             next!(s)
         });
         // An int32 fits elements of any type but objects of a shape
@@ -7418,7 +7454,12 @@ macro_rules! array_methods {
                     next!(s)
                 }
             }
-            s.acc = unboxed(int(Value::from_bits(rt_call!(s, cloison_rt_array_push, a, v))));
+            let r = rt_call!(s, cloison_rt_array_push, a, v);
+            // (`EMPTY`: it panicked, see `jit::unwinding`.)
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = unboxed(int(Value::from_bits(r)));
             next!(s)
         });
         // Left to the interpreter's `pop` for an array frozen, sealed, of

@@ -10035,3 +10035,40 @@ true
 [1,2]"##;
     assert_eq!(run(src).as_deref(), Ok(want));
 }
+
+/// `src` with every collection full and moving cells, and one every 64 KiB
+/// allocated, checking references and poisoning what is freed: its
+/// display, or its error.
+fn run_moving(src: &str) -> Result<String, String> {
+    let module = cloison::js::compile(src)?;
+    let mut vm = Vm::new();
+    vm.set_gc_evacuate_all();
+    vm.set_gc_verify(64 << 10);
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    vm.verify_heap();
+    r
+}
+
+/// `return()` on an `Iterator.zip` helper closes its iterators, each
+/// `return()` user code that collects (#322): the ones still to close are
+/// found where the collection moved them. (Its list of them was a Rust
+/// `Vec` no collection updated.)
+#[test]
+fn zip_return_closes_iterators_moved_meanwhile() {
+    let src = r#"
+let log = [];
+function mk(i) {
+  let it = { tag: "it" + i, n: [i, i, i],
+    next() { return { done: false, value: i }; },
+    return() { log.push(this.tag + ":" + this.n[0]); for (let k = 0; k < 3; k++) $262.gc(); return {}; } };
+  return { [Symbol.iterator]() { return it; } };
+}
+let srcs = [];
+for (let i = 0; i < 6; i++) srcs.push(mk(i));
+let z = Iterator.zip(srcs);
+for (let k = 0; k < 3; k++) $262.gc();
+z.return();
+log.join(" ")
+"#;
+    assert_eq!(run_moving(src).as_deref(), Ok("it5:5 it4:4 it3:3 it2:2 it1:1 it0:0"));
+}

@@ -183,14 +183,6 @@ built-ins/RegExp/property-escapes/generated/XID_Continue.js
 built-ins/RegExp/property-escapes/generated/XID_Start.js
 built-ins/RegExp/prototype/Symbol.search/coerce-string-err.js
 built-ins/RegExp/prototype/Symbol.split/coerce-string-err.js
-built-ins/RegExpStringIteratorPrototype/Symbol.toStringTag.js
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-call-throws.js
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-get-throws.js
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-throws.js
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-tostring-throws.js
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec-match-get-0-tostring.js
-built-ins/RegExpStringIteratorPrototype/next/custom-regexpexec.js
-built-ins/RegExpStringIteratorPrototype/next/regexp-tolength-lastindex-throws.js
 built-ins/String/prototype/endsWith/return-abrupt-from-searchstring-regexp-test.js
 built-ins/String/prototype/includes/return-abrupt-from-searchstring-regexp-test.js
 built-ins/String/prototype/indexOf/searchstring-tostring-errors.js

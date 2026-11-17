@@ -1833,6 +1833,7 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
             | Class::CollectionIterator
             | Class::Symbol
             | Class::ArrayIterator
+            | Class::RegExpStringIterator
             | Class::IteratorHelper
             | Class::DisposableStack => {
                 // The primitive it wraps (a string is a cell), or a

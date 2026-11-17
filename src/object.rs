@@ -1528,10 +1528,17 @@ impl Shape {
     /// Where slot `i` lives, as an inline cache records it: the byte offset
     /// of an in-object slot, or `!index` into the out-of-line slots.
     pub fn location(&self, i: u32) -> i32 {
-        if i < self.capacity.get() {
-            (crate::layout::slots_offset(self.class) + 8 * i as usize) as i32
+        Shape::location_of(self.class, self.capacity.get(), i)
+    }
+
+    /// [`Shape::location`] for a shape of `class` with `capacity`
+    /// in-object slots: what it depends on, read before its slots are
+    /// borrowed to change (`Shape::dictionary_slots`).
+    pub(crate) fn location_of(class: Class, capacity: u32, i: u32) -> i32 {
+        if i < capacity {
+            (crate::layout::slots_offset(class) + 8 * i as usize) as i32
         } else {
-            !((i - self.capacity.get()) as i32)
+            !((i - capacity) as i32)
         }
     }
 }

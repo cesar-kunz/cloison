@@ -767,7 +767,8 @@ impl<'a> Parser<'a> {
                         vm.reserve_elems(ao, n + 1);
                         vm.store_element(ao, n, v);
                         n += 1;
-                        ao.set_elems_len(n as u32);
+                        // SAFETY: within the capacity `reserve_elems` made above.
+                        unsafe { ao.set_elems_len(n as u32) };
                         if self.eat(b']') {
                             break;
                         }

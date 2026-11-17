@@ -2689,7 +2689,8 @@ impl Vm {
         }
         // (V8 makes a prototype fast again: `ReoptimizeIfPrototype`.)
         self.leave_dictionary(o);
-        o.set_flags(o.flags() | PROTOTYPE);
+        // SAFETY: the prototype mark, after the object left dictionary mode (as it implies).
+        unsafe { o.set_flags(o.flags() | PROTOTYPE) };
         // (A proxy's traps may take any new element's store, and give
         // any symbol's method.)
         if self.proxies_exist && crate::proxy::is_proxy(self, o) {
@@ -4957,13 +4958,16 @@ impl Vm {
         unsafe {
             let s = o.shape();
             let n = s.live().keys().len() as u32;
+            // (Read before the slots are borrowed: no `&Shape` while they are.)
+            let (class, cap) = (s.live().class, s.live().capacity.get());
+            let loc = |i| Shape::location_of(class, cap, i);
             let slots = Shape::dictionary_slots(s);
             slots.bury(k, self.a_hole);
             for j in slots.len() as u32..n {
-                crate::layout::store_word(Object::slot(o, s.live().location(j)), Value::UNDEFINED);
+                crate::layout::store_word(Object::slot(o, loc(j)), Value::UNDEFINED);
             }
             if slots.len() == n as usize {
-                crate::layout::store_word(Object::slot(o, s.live().location(k)), Value::UNDEFINED);
+                crate::layout::store_word(Object::slot(o, loc(k)), Value::UNDEFINED);
             }
             if slots.holes() > DICTIONARY_HOLES && 2 * slots.holes() as usize > slots.len() {
                 self.dict_compact(o);
@@ -4977,17 +4981,20 @@ impl Vm {
     fn dict_compact(&mut self, o: *mut Object) {
         unsafe {
             let s = o.shape();
+            // (Read before the slots are borrowed: no `&Shape` while they are.)
+            let (class, cap) = (s.live().class, s.live().capacity.get());
+            let loc = |i| Shape::location_of(class, cap, i);
             let slots = Shape::dictionary_slots(s);
             if slots.holes() == 0 {
                 return;
             }
             let n = slots.len() as u32;
             slots.compact(self.a_hole, |from, to| {
-                let v = o.slot_value(s.live().location(from));
-                crate::heap::store(o.cast(), Object::slot(o, s.live().location(to)), v);
+                let v = o.slot_value(loc(from));
+                crate::heap::store(o.cast(), Object::slot(o, loc(to)), v);
             });
             for j in slots.len() as u32..n {
-                crate::layout::store_word(Object::slot(o, s.live().location(j)), Value::UNDEFINED);
+                crate::layout::store_word(Object::slot(o, loc(j)), Value::UNDEFINED);
             }
         }
     }
@@ -5498,7 +5505,8 @@ impl Vm {
             for j in o.elems_len()..i {
                 o.clear_elem(j as usize);
             }
-            o.set_elems_len(i + 1);
+            // SAFETY: within the capacity `reserve_elems` made above.
+            unsafe { o.set_elems_len(i + 1) };
         }
         self.store_element(o, i as usize, value);
         Ok(())
@@ -5539,7 +5547,8 @@ impl Vm {
         for i in n.min(len)..n.max(len) {
             o.clear_elem(i);
         }
-        o.set_elems_len(n as u32);
+        // SAFETY: within the capacity: `clear_elem` checked the indices below it.
+        unsafe { o.set_elems_len(n as u32) };
         Ok(())
     }
 
@@ -8075,7 +8084,8 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
             vm.store_element(o, i, v);
         }
     }
-    o.set_elems_len(elems.len() as u32);
+    // SAFETY: within the capacity `reserve_elems` made above.
+    unsafe { o.set_elems_len(elems.len() as u32) };
     Ok(a)
 }
 
@@ -8541,7 +8551,8 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
     for (i, &v) in args.iter().enumerate() {
         vm.store_element(o, len + i, v);
     }
-    o.set_elems_len((len + args.len()) as u32);
+    // SAFETY: within the capacity `reserve_elems` made above.
+    unsafe { o.set_elems_len((len + args.len()) as u32) };
     Ok(Value::from_i32(o.elems_len() as i32))
 }
 

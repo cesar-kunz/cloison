@@ -625,7 +625,8 @@ impl Vm {
             let v = at(self, i);
             self.store_element(o, i, v);
             // (What `at` makes next may collect: this one is traced.)
-            o.set_elems_len(i as u32 + 1);
+            // SAFETY: within the capacity `reserve_elems` made above.
+            unsafe { o.set_elems_len(i as u32 + 1) };
         }
         a
     }
@@ -654,7 +655,8 @@ impl Vm {
         if o.flags() & NOT_EXTENSIBLE != 0 {
             return;
         }
-        o.set_flags(o.flags() | NOT_EXTENSIBLE);
+        // SAFETY: the object's extensibility, which nothing else implies.
+        unsafe { o.set_flags(o.flags() | NOT_EXTENSIBLE) };
         self.fix_shape(o, None, 0);
     }
 
@@ -679,7 +681,8 @@ impl Vm {
                 a
             })
             .collect();
-        o.set_flags(o.flags() | NOT_EXTENSIBLE | SEALED);
+        // SAFETY: set with the sealed shape just given.
+        unsafe { o.set_flags(o.flags() | NOT_EXTENSIBLE | SEALED) };
         // Read-only elements only affect other objects' stores when
         // this object is on their prototype chain.
         if freeze
@@ -690,10 +693,12 @@ impl Vm {
         }
         if freeze {
             self.unmap_arguments(o);
-            o.set_flags(o.flags() | FROZEN);
+            // SAFETY: set with the frozen shape just given.
+            unsafe { o.set_flags(o.flags() | FROZEN) };
             // (The bit is a function's `FN_LENGTH_DELETED`.)
             if o.class() == Class::Array {
-                o.set_flags(o.flags() | LENGTH_READ_ONLY);
+                // SAFETY: an array's own flag, with its length made read-only by the freeze.
+                unsafe { o.set_flags(o.flags() | LENGTH_READ_ONLY) };
             }
         }
         self.fix_shape(o, Some(attrs), 1 + freeze as u8);
@@ -1166,9 +1171,11 @@ impl Vm {
                             return false;
                         }
                         if a == self.a_length {
-                            o.set_flags(o.flags() | FN_LENGTH_DELETED);
+                            // SAFETY: a function's own flag: its `length` deleted.
+                            unsafe { o.set_flags(o.flags() | FN_LENGTH_DELETED) };
                         } else if a == self.a_name {
-                            o.set_flags(o.flags() | FN_NAME_DELETED);
+                            // SAFETY: a function's own flag: its `name` deleted.
+                            unsafe { o.set_flags(o.flags() | FN_NAME_DELETED) };
                         }
                         return true;
                     }
@@ -1178,9 +1185,11 @@ impl Vm {
                 let deleted = self.delete_named(o, a);
                 if deleted && matches!(class, Class::Function | Class::Native) {
                     if a == self.a_length {
-                        o.set_flags(o.flags() | FN_LENGTH_DELETED);
+                        // SAFETY: a function's own flag: its `length` deleted.
+                        unsafe { o.set_flags(o.flags() | FN_LENGTH_DELETED) };
                     } else if a == self.a_name {
-                        o.set_flags(o.flags() | FN_NAME_DELETED);
+                        // SAFETY: a function's own flag: its `name` deleted.
+                        unsafe { o.set_flags(o.flags() | FN_NAME_DELETED) };
                     }
                 }
                 deleted

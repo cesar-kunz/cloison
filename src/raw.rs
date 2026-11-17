@@ -20,9 +20,18 @@
 //! element index against the elements' array (its header word says it
 //! holds values, and its capacity), a slot location against the object's
 //! slots, the code word against the class, and a shape given to an object
-//! against its class and its room ([`crate::object::set_shape`]). Writes
-//! are of what needs no barrier: a hole ([`ObjectPtr::clear_elem`]), the
-//! flags, a length (`elems_len`, which nothing here trusts).
+//! against its class and its room ([`crate::object::set_shape`]). The one
+//! write is of what needs no barrier: a hole ([`ObjectPtr::clear_elem`]).
+//! The flags' and the length's writes stay `unsafe`: fast paths trust
+//! both (what a flag bit means depends on the class; element reads test
+//! an index against `elems_len` alone).
+//!
+//! [`Live::live`] tests for null in debug builds only (the nightly job
+//! with debug assertions runs them): in release builds the test cost up
+//! to 0.8% instructions on Octane. A pointer that isn't null may still
+//! not be a shape (the `MANY_SHAPES` sentinel of a megamorphic cache):
+//! only a cache's readers know which it holds. So `live` is a trusted
+//! helper, as the module is, not a check.
 //!
 //! What stays out of here, and `unsafe` where it is: a precondition no
 //! cheap check covers (a store the collector must see through a barrier,
@@ -135,7 +144,10 @@ pub(crate) trait ObjectPtr: Copy {
     #[track_caller]
     fn elem_at(self, i: usize) -> *mut Value {
         assert!(
-            !matches!(self.class(), Class::String | Class::TypedArray | Class::DataView),
+            !matches!(
+                self.class(),
+                Class::String | Class::TypedArray | Class::DataView | Class::ArrayBuffer | Class::SharedArrayBuffer
+            ),
             "no values in a {:?}'s elements",
             self.class()
         );
@@ -181,13 +193,41 @@ pub(crate) trait ObjectPtr: Copy {
         }
     }
 
+    /// Give the object `flags`.
+    ///
+    /// # Safety
+    /// The bits must mean for the object what its class's code reads them
+    /// as, which a fast path may trust (a bit's meaning depends on the
+    /// class): `FAR` only on an array whose last element slot holds its
+    /// far store (`far`), `RESIZABLE` and `DETACHED` only as `typed` keeps
+    /// the lengths they imply, `FROZEN` and the like only with the shape
+    /// that goes with them.
     #[inline(always)]
-    fn set_flags(self, flags: u8) {
+    unsafe fn set_flags(self, flags: u8) {
         unsafe { (*self.object_ptr()).flags = flags }
     }
 
+    /// Make `elems_len` `n`.
+    ///
+    /// # Safety
+    /// For a class with elements of its own (not a string, symbol,
+    /// BigInt, typed array, or one of `Class::no_elements`', whose
+    /// `elems_len` counts something else: a collection iterator's
+    /// position), `n` must be within their array's capacity: element
+    /// reads trust `elems_len` (the interpreter's fast paths test an index
+    /// against it alone). Debug builds check it. (Not checked in release
+    /// builds: it cost 3.5% instructions on Octane's Splay without the
+    /// JIT.)
     #[inline(always)]
-    fn set_elems_len(self, n: u32) {
+    #[track_caller]
+    unsafe fn set_elems_len(self, n: u32) {
+        let c = self.class();
+        if !(c.no_elements() || matches!(c, Class::String | Class::Symbol | Class::BigInt | Class::TypedArray)) {
+            debug_assert!(
+                n == 0 || (n as usize) <= values_cap(self.elems()).unwrap_or(0),
+                "a length {n} past the elements"
+            );
+        }
         unsafe { (*self.object_ptr()).elems_len = n }
     }
 }
@@ -244,8 +284,9 @@ macro_rules! live {
     ($($p:ty => $t:ty),*) => {$(
         impl Live<$t> for $p {
             #[inline(always)]
+            #[track_caller]
             fn live<'a>(self) -> &'a $t {
-                debug_assert!(!self.is_null());
+                debug_assert!(!self.is_null(), "a null pointer to a {}", stringify!($t));
                 unsafe { &*self }
             }
         }
@@ -357,5 +398,27 @@ mod tests {
         );
         let (_vm2, small) = value("Object.create(null)");
         set_shape(small, big.shape());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a length 1048576 past the elements")]
+    fn a_length_past_the_elements_panics() {
+        let (_vm, a) = value("[1, 2, 3]");
+        unsafe { a.set_elems_len(1 << 20) };
+    }
+
+    #[test]
+    fn a_strings_length_isnt_its_elements() {
+        let (_vm, s) = value("'abc'.repeat(10)");
+        let n = s.elems_len();
+        unsafe { s.set_elems_len(n) };
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a null pointer to a Shape")]
+    fn a_null_shape_pointer_panics() {
+        std::ptr::null::<Shape>().live();
     }
 }

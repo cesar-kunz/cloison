@@ -410,7 +410,8 @@ fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> *mut Object {
     for k in 0..n {
         e.clear_elem(k);
     }
-    e.set_elems_len(n as u32);
+    // SAFETY: within the capacity `reserve_elems` made above.
+    unsafe { e.set_elems_len(n as u32) };
     put(e, LENGTH, Value::number(len as f64));
     set_int(e, COUNT, 0);
     set_int(e, USED, 0);
@@ -493,7 +494,8 @@ pub(crate) fn set(vm: &mut Vm, o: *mut Object, i: u32, v: Value) {
         remove(o, i);
         vm.reserve_elems(o, i as usize + 1);
         vm.store_element(o, i as usize, v);
-        o.set_elems_len(i + 1);
+        // SAFETY: within the capacity `reserve_elems` made above.
+        unsafe { o.set_elems_len(i + 1) };
         pull(vm, o);
     } else {
         insert(vm, o, i, v);
@@ -518,7 +520,8 @@ fn pull(vm: &mut Vm, o: *mut Object) {
         remove(o, n);
         vm.reserve_elems(o, n as usize + 1);
         vm.store_element(o, n as usize, v);
-        o.set_elems_len(n + 1);
+        // SAFETY: within the capacity `reserve_elems` made above.
+        unsafe { o.set_elems_len(n + 1) };
     }
 }
 
@@ -530,7 +533,8 @@ pub(crate) fn truncate(o: *mut Object, n: u32) {
         for k in n..len {
             o.clear_elem(k as usize);
         }
-        o.set_elems_len(n);
+        // SAFETY: less than the length.
+        unsafe { o.set_elems_len(n) };
     }
     for k in keys(o) {
         if k >= n {

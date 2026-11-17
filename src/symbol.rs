@@ -1088,7 +1088,8 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
         }
         vm.reserve_elems(d, len + n);
         vm.store_elements(d, len, values.as_ptr(), n);
-        d.set_elems_len((len + n) as u32);
+        // SAFETY: within the capacity `reserve_elems` made above.
+        unsafe { d.set_elems_len((len + n) as u32) };
         return true;
     }
     if !iterates_as_array(vm, src) || crate::far::is_far(s) {
@@ -1101,7 +1102,8 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
     let len = d.elems_len() as usize;
     vm.reserve_elems(d, len + n);
     vm.store_elements(d, len, s.elems(), n);
-    d.set_elems_len((len + n) as u32);
+    // SAFETY: within the capacity `reserve_elems` made above.
+    unsafe { d.set_elems_len((len + n) as u32) };
     true
 }
 

@@ -8881,6 +8881,33 @@ fn display_checks_the_value_against_its_vm() {
     assert_eq!(display(c.run(&cloison::js::compile("'ok'").unwrap()).unwrap(), &c), "ok");
 }
 
+/// #343: the host's ToNumber is the VM's, a string parsed, an object's
+/// `valueOf` run, what a conversion throws the error.
+#[test]
+fn host_to_number() {
+    let mut vm = Vm::new();
+    let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let s = run(&mut vm, "'12'");
+    assert_eq!(vm.to_number(s).unwrap(), 12.0);
+    let s = run(&mut vm, "' 0x1F '");
+    assert_eq!(vm.to_number(s).unwrap(), 31.0);
+    let o = run(&mut vm, "({valueOf() { return 5; }})");
+    assert_eq!(vm.to_number(o).unwrap(), 5.0);
+    let o = run(&mut vm, "[]");
+    assert_eq!(vm.to_number(o).unwrap(), 0.0);
+    let o = run(&mut vm, "({})");
+    assert!(vm.to_number(o).unwrap().is_nan());
+    let e = run(&mut vm, "Symbol()");
+    assert!(vm.to_number(e).unwrap_err().to_string().starts_with("TypeError"));
+    let e = run(&mut vm, "10n");
+    assert!(vm.to_number(e).unwrap_err().to_string().starts_with("TypeError"));
+    let e = run(&mut vm, "({valueOf() { throw new RangeError('no'); }})");
+    let e = vm.to_number(e).unwrap_err();
+    assert_eq!(vm.uncaught_message(&e), "RangeError: no");
+    assert_eq!(vm.to_number(cloison::value::Value::TRUE).unwrap(), 1.0);
+    assert_eq!(display(run(&mut vm, "1 + 1"), &vm), "2");
+}
+
 /// #163's records (an index mapped after the return, to an upvalue's cell
 /// or to a scope object's property) while every collection moves cells:
 /// both links survive, the cells found where they moved. What

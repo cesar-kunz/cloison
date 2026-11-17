@@ -198,8 +198,10 @@ impl Value {
         }
     }
 
-    /// ECMAScript ToNumber, for the primitives representable so far.
-    pub fn to_number(self) -> f64 {
+    /// ECMAScript ToNumber of a primitive not a cell; a cell's (a string,
+    /// an object) needs the VM: `interp::to_number`, or the host's
+    /// [`Vm::to_number`](crate::vm::Vm::to_number) (#343).
+    pub(crate) fn to_number(self) -> f64 {
         if let Some(d) = self.as_number() {
             d
         } else if self.is_undefined() {

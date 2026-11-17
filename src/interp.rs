@@ -3870,6 +3870,8 @@ pub(crate) struct Running {
 
 impl Running {
     pub(crate) fn new(vm: &mut Vm) -> Running {
+        // (Compiled code made where the VM was before it moved: dropped.)
+        vm.rehome();
         let p: *mut Vm = vm;
         let owner = vm.heap.set_owner(p);
         Running { vm: p, current: CURRENT_VM.with(|v| v.replace(p)), owner }

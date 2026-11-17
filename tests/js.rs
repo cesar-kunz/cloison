@@ -10224,3 +10224,54 @@ out.join(" ")"#;
          [1,101,100] [1,101,100] [1,101,100]"
     );
 }
+
+/// A VM moved between runs (out of its box, swapped with another, its
+/// vector growing) runs its hot code again: the code compiled where it
+/// was, which held its fields' addresses, is dropped (#330: it read and
+/// wrote the old place, a crash once that was reused). With every
+/// collection moving cells too.
+#[test]
+fn a_vm_moved_between_runs_runs_again() {
+    const WARM: &str = r#"
+        function mk(i) { return {a: i, b: i + 1}; }
+        function cnt(n) { var s = 0; for (var i = 0; i < n; i++) s += mk(i).b; return s; }
+        function rec(n) { return n == 0 ? 0 : 1 + rec(n - 1); }
+        var r = 0; for (var k = 0; k < 200; k++) { r += cnt(1000) + rec(50); }
+        r"#;
+    const AGAIN: &str = "var t = 0; for (var k = 0; k < 50; k++) { t += cnt(1000) + rec(50); } t";
+    let warm = cloison::js::compile(WARM).unwrap();
+    let again = cloison::js::compile(AGAIN).unwrap();
+    // Compiled in a box, which is freed once the VM is moved out of it.
+    let warmed = |evacuate: bool| {
+        let mut vm = Box::new(Vm::new());
+        if evacuate {
+            vm.set_gc_evacuate_all();
+        }
+        assert_eq!(vm.run(&warm).map(display).as_deref(), Ok("100110000"));
+        vm
+    };
+    // Memory freed reused: what a VM's old place holds then.
+    let junk = || -> Vec<Box<[u8]>> { (0..64).map(|_| vec![0x41u8; std::mem::size_of::<Vm>()].into()).collect() };
+    for evacuate in [false, true] {
+        let mut vm = *warmed(evacuate);
+        let j = junk();
+        assert_eq!(vm.run(&again).map(display).as_deref(), Ok("25027500"));
+        vm.verify_heap();
+        drop(j);
+        let (mut a, mut b) = (warmed(evacuate), warmed(evacuate));
+        std::mem::swap(&mut *a, &mut *b);
+        for vm in [&mut a, &mut b] {
+            assert_eq!(vm.run(&again).map(display).as_deref(), Ok("25027500"));
+            vm.verify_heap();
+        }
+        let mut moved = vec![*a];
+        drop(b);
+        let j = junk();
+        moved.reserve(64);
+        for vm in &mut moved {
+            assert_eq!(vm.run(&again).map(display).as_deref(), Ok("25027500"));
+            vm.verify_heap();
+        }
+        drop(j);
+    }
+}

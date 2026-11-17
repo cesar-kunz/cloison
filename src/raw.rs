@@ -297,14 +297,14 @@ live!(*const Shape => Shape, *mut Shape => Shape, *const Code => Code, *mut Code
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{as_object, set_shape};
+    use crate::object::{Obj, set_shape};
     use crate::vm::Vm;
 
     /// `src`'s completion value, with its VM (kept alive with it).
-    fn value(src: &str) -> (Vm, *mut Object) {
+    fn value(src: &str) -> (Vm, Obj) {
         let mut vm = Vm::new();
         let v = vm.run(&crate::js::compile(src).unwrap()).unwrap();
-        (vm, as_object(v))
+        (vm, Obj::of(v))
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
     #[should_panic(expected = "a shape of another class")]
     fn a_shape_of_another_class_panics() {
         let (vm, o) = value("({})");
-        set_shape(o, vm.array_shape);
+        set_shape(o.ptr(), vm.array_shape);
     }
 
     #[test]
@@ -397,7 +397,7 @@ mod tests {
             "({a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, n: 14, o: 15, p: 16, q: 17, r: 18})",
         );
         let (_vm2, small) = value("Object.create(null)");
-        set_shape(small, big.shape());
+        set_shape(small.ptr(), big.shape());
     }
 
     #[test]

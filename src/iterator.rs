@@ -255,7 +255,7 @@ fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: V
 fn state_of(this: Value, wrap: bool, what: &str) -> Result<Value> {
     if this.is_cell() && Obj::of(this).class() == Class::IteratorHelper {
         let state = Value::from_bits(Obj::of(this).code() as u64);
-        let kind = unsafe { *as_object(state).elems() };
+        let kind = unsafe { *Obj::of(state).elems() };
         if (kind == Value::from_i32(WRAP)) == wrap {
             return Ok(state);
         }

@@ -8,7 +8,7 @@
 //! much they read and wrote.
 
 use crate::interp::to_boolean;
-use crate::object::{Class, Obj, TypedKind, as_object, object_value};
+use crate::object::{Class, Obj, TypedKind, object_value};
 use crate::props::is_object;
 use crate::raw::ObjectPtr;
 use crate::value::Value;
@@ -243,7 +243,7 @@ fn decode_hex(s: &[u16], max: usize) -> Decoded {
 /// A new `Uint8Array` of `bytes`.
 fn new_uint8_array(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
     let ta = crate::typed::allocate(vm, TypedKind::U8, bytes.len())?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), as_object(ta).elems().cast::<u8>(), bytes.len()) };
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), Obj::of(ta).elems().cast::<u8>(), bytes.len()) };
     Ok(ta)
 }
 

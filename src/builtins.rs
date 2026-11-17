@@ -1040,11 +1040,11 @@ fn plain_list(list: Value, holes: bool) -> Option<Vec<Value>> {
     if !list.is_cell() || Obj::of(list).class() != Class::Array {
         return None;
     }
-    let o = as_object(list);
+    let o = Obj::of(list);
     if o.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 {
         return None;
     }
-    let elems = unsafe { Object::elems(o) };
+    let elems = unsafe { Object::elems(o.ptr().cast_const()) };
     if !elems.contains(&Value::EMPTY) {
         return Some(elems.to_vec());
     }
@@ -3920,7 +3920,7 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     let builtin = |vm: &Vm, h: Obj, slot: u32, i: usize| unsafe {
         let v = h.field(slot);
         let v = match (vm.is_accessor(h, slot), i >= 6) {
-            (true, true) => *as_object(v).elems(),
+            (true, true) => *Obj::of(v).elems(),
             (false, false) => v,
             _ => return false,
         };
@@ -4321,7 +4321,7 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
 /// Whether `g` is `RegExp`'s builtin `@@species` getter.
 fn builtin_species(g: Value) -> bool {
     g.is_cell() && {
-        let g = as_object(g);
+        let g = Obj::of(g);
         g.class() == Class::Native && g.code().live().name == "get [Symbol.species]"
     }
 }

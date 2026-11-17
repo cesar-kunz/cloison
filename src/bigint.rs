@@ -12,7 +12,7 @@
 use crate::raw::ObjectPtr;
 use std::cmp::Ordering;
 
-use crate::object::{Class, Obj, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, object_value};
 use crate::value::Value;
 use crate::vm::{Error, Result, Vm};
 
@@ -515,10 +515,10 @@ pub(crate) fn is_bigint(v: Value) -> bool {
 /// BigInt `v`'s value.
 pub(crate) fn big_of(v: Value) -> Big {
     unsafe {
-        let o = as_object(v);
+        let o = Obj::of(v);
         let n = o.elems_len() as usize;
         let limbs = if n == 0 { &[][..] } else { std::slice::from_raw_parts(o.elems().cast::<u32>(), n) };
-        Big { neg: *Object::aux(o) == 1, mag: limbs.to_vec() }
+        Big { neg: *Object::aux(o.ptr()) == 1, mag: limbs.to_vec() }
     }
 }
 

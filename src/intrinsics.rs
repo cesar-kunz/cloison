@@ -220,7 +220,7 @@ pub(crate) fn is_constructor(f: Value) -> bool {
     if !f.is_cell() {
         return false;
     }
-    let o = as_object(f);
+    let o = Obj::of(f);
     match o.class() {
         Class::Function => o.code().live().constructor(),
         Class::Native => o.code().live().constructs,

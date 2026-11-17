@@ -10490,8 +10490,19 @@ function a9() {
     return r.join("") + e;
 }
 log.push(a1(), a2(), a3(), a4(), a5(), a6(), a7(), a8(), a9());
+// (A loop in the head's iterable or object declares nothing of its own.)
+function b1() { try { throw 0 } catch (e) { for (var e of (function () { for (var x of []); return [1] })()); (() => e) } return e }
+function b2() { try { throw 0 } catch (e) { for (var e in (function () { for (var x in {}); return {k: 1} })()); (() => e) } return e }
+function b3() {
+    try { throw 0 } catch (e) {
+        for (var e of (function () { try { throw 1 } catch (y) { for (var y of [5]); return [y] } })());
+        return [(() => e)(), typeof x].join("");
+    }
+}
+function b4() { try { throw 0 } catch (e) { for (var [e] of (function () { for (var x of []); return [[2]] })()); (() => e) } return e }
+log.push(b1(), b2(), b3(), b4());
 log.join(" ");"#;
-    assert_eq!(value(src), "1 z undefined 1 k 1 1  1 ab 12 123undefined");
+    assert_eq!(value(src), "1 z undefined 1 k 1 1  1 ab 12 123undefined   5undefined ");
 }
 
 /// `for (let …; …; …)` copies its bindings into the first iteration's

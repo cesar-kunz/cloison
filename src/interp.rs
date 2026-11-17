@@ -1102,7 +1102,7 @@ handlers! {
             configurable: Some(true),
             ..Default::default()
         };
-        let r = vm.define_own_property(unsafe { Obj::from_ptr(o) }, key, &d).map(|_| acc);
+        let r = vm.define_own_property(Obj::from_ptr(o), key, &d).map(|_| acc);
         next_or_throw!(Op::DefineAccessor.size(), r)
     }
 
@@ -1192,7 +1192,7 @@ handlers! {
 
     fn op_initial_yield(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
-        match with_top(regs, None, |vm| crate::generator::create(vm, unsafe { Obj::from_ptr(f) })) {
+        match with_top(regs, None, |vm| crate::generator::create(vm, Obj::from_ptr(f))) {
             Ok(g) => {
                 *reg(pc, 1, regs) = g;
                 let code = frame_code(regs);
@@ -1210,7 +1210,7 @@ handlers! {
     fn op_async_start(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
         let r = with_top(regs, None, |vm| {
-            let g = crate::generator::create(vm, unsafe { Obj::from_ptr(f) })?;
+            let g = crate::generator::create(vm, Obj::from_ptr(f))?;
             *reg(pc, 1, regs) = g;
             let code = frame_code(regs);
             let at = pc.add(Op::AsyncStart.size()).offset_from(code.live().bytecode.as_ptr()) as usize;
@@ -1242,7 +1242,7 @@ handlers! {
         let callee: *mut Object = header(regs, FUNC);
         let n = argc.min((*frame_code(regs)).nparams as usize);
         let o = if n > 0 {
-            crate::builtins::mapped_arguments_object(vm, values, unsafe { Obj::from_ptr(callee) })
+            crate::builtins::mapped_arguments_object(vm, values, Obj::from_ptr(callee))
         } else {
             crate::builtins::arguments_object_of(vm, values, callee)
         };
@@ -1461,13 +1461,13 @@ handlers! {
 
     fn op_lda_upvalue(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(unsafe { Obj::from_ptr(f.cast_mut()) }).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(*pc.add(1) as usize);
         next!(any, Op::LdaUpvalue.size(), *(*u).at)
     }
 
     fn op_sta_upvalue(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(unsafe { Obj::from_ptr(f.cast_mut()) }).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(*pc.add(1) as usize);
         crate::layout::store_word((*u).at, acc);
         // (A closed upvalue's variable is its own `closed`, in the heap.)
         if (*u).at == &raw mut (*u).closed {
@@ -1689,7 +1689,7 @@ handlers! {
     // receivers changed shape for good.
     #[inline(never)]
     fn poly_get_named(pc, acc, regs, tag) {
-        let o = as_object(*reg(pc, 1, regs));
+        let o = crate::object::Obj::from_ptr(as_object(*reg(pc, 1, regs)));
         let ic = ic_at(regs, pc, 2);
         // An array's or a string's `length` (cached without a shape).
         if (*ic).loc == LENGTH_LOC && matches!(o.class(), Class::Array | Class::String) && o.flags() & crate::far::FAR == 0 {
@@ -1697,10 +1697,10 @@ handlers! {
         }
         for k in 1..IC_WAYS {
             let w = ic.add(k);
-            if (*o).shape == (*w).shape {
+            if (*o.ptr()).shape == (*w).shape {
                 let holder = (*w).holder;
                 if holder.is_null() {
-                    next!(any, Op::GetNamed.size(), *Object::slot(o, (*w).loc))
+                    next!(any, Op::GetNamed.size(), *Object::slot(o.ptr(), (*w).loc))
                 }
                 if (*w).epoch == (*frame_vm(regs)).proto_epoch {
                     next!(any, Op::GetNamed.size(), *Object::slot(holder, (*w).loc))
@@ -1723,7 +1723,7 @@ handlers! {
     // miss counted (`Code::ic_misses`).
     #[inline(never)]
     fn mega_get_named(pc, acc, regs, tag) {
-        let o = as_object(*reg(pc, 1, regs));
+        let o = crate::object::Obj::from_ptr(as_object(*reg(pc, 1, regs)));
         let ic = ic_at(regs, pc, 2);
         let vm = &mut *frame_vm(regs);
         let code = &*frame_code(regs);
@@ -1733,7 +1733,7 @@ handlers! {
         if e.shape == sh && e.name == name.0 && vm.megamorphic.contains(&(ic as usize)) {
             code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
             *ic = Ic { shape: sh, holder: std::ptr::null_mut(), new_shape: std::ptr::null(), loc: e.loc, epoch: vm.proto_epoch };
-            next!(any, Op::GetNamed.size(), *Object::slot(o, e.loc))
+            next!(any, Op::GetNamed.size(), *Object::slot(o.ptr(), e.loc))
         }
         tail!(slow_get_named, acc)
     }
@@ -1749,7 +1749,7 @@ handlers! {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
                     // (See `Ic::epoch`.)
-                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*ic).loc) {
+                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(crate::object::Obj::from_ptr(o), (*ic).loc) {
                         tail!(slow_set_named, acc)
                     }
                     crate::object::set_shape_unchecked(o, new);
@@ -1776,7 +1776,7 @@ handlers! {
                 if fits_field(tag, (*w).holder as u64, acc) {
                     let new = (*w).new_shape;
                     if !new.is_null() {
-                        if (*w).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*w).loc) {
+                        if (*w).epoch != (*frame_vm(regs)).proto_epoch || !has_room(crate::object::Obj::from_ptr(o), (*w).loc) {
                             break;
                         }
                         crate::object::set_shape_unchecked(o, new);
@@ -1805,7 +1805,7 @@ handlers! {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
                     // (See `Ic::epoch`.)
-                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*ic).loc) {
+                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(crate::object::Obj::from_ptr(o), (*ic).loc) {
                         tail!(slow_set_named, acc)
                     }
                     crate::object::set_shape_unchecked(o, new);
@@ -1823,7 +1823,7 @@ handlers! {
     fn op_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         if is_cell(tag, obj) && tag.is_int32(acc) {
-            let o = as_object(obj);
+            let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = acc.as_i32_unchecked() as u32;
             if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
@@ -1838,7 +1838,7 @@ handlers! {
     fn i32_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         if is_cell(tag, obj) {
-            let o = as_object(obj);
+            let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = raw_i32(acc) as u32;
             if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
@@ -1854,7 +1854,7 @@ handlers! {
         let obj = *reg(pc, 1, regs);
         let key = *reg(pc, 2, regs);
         if is_cell(tag, obj) && tag.is_int32(key) {
-            let o = as_object(obj);
+            let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = key.as_i32_unchecked() as u32;
             if i < o.elems_len()
                 && fits_field(tag, o.shape().live().elems_code, acc)
@@ -1879,7 +1879,7 @@ handlers! {
         let a = new_array(regs);
         let n = *pc.add(1) as usize;
         if n > 0 {
-            (*frame_vm(regs)).reserve_elems(unsafe { Obj::from_ptr(as_object(a)) }, n);
+            (*frame_vm(regs)).reserve_elems(Obj::from_ptr(as_object(a)), n);
         }
         next!(any, Op::CreateArray.size(), a)
     }
@@ -1888,9 +1888,9 @@ handlers! {
         let a = *reg(pc, 1, regs);
         // Room reserved by `CreateArray`, plain elements, and a value of
         // their type: stored in place, no call.
-        let o = as_object(a);
+        let o = crate::object::Obj::from_ptr(as_object(a));
         let len = o.elems_len();
-        if len < Object::elems_cap(o) && o.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0 {
+        if len < Object::elems_cap(o.ptr().cast_const()) && o.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0 {
             let s = o.shape().live();
             if s.elems.join(crate::object::FieldType::of(acc)) == s.elems {
                 let at = o.elems().add(len as usize);
@@ -1933,9 +1933,11 @@ handlers! {
     fn op_call(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && as_object(f).class() == Class::Function {
-            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
+            // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
+            let fo = crate::object::Obj::from_ptr(as_object(f));
+            note_callee(regs, ic_at(regs, pc, 4), fo);
             let w = reg(pc, 2, regs);
-            enter!(as_object(f), *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
+            enter!(fo, *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
         }
         tail!(slow_call, acc)
     }
@@ -1943,7 +1945,9 @@ handlers! {
     fn op_call_undefined(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && as_object(f).class() == Class::Function {
-            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
+            // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
+            let fo = crate::object::Obj::from_ptr(as_object(f));
+            note_callee(regs, ic_at(regs, pc, 4), fo);
             let args = reg(pc, 2, regs);
             // Sloppy mode: `this` is the global object; strict: `undefined`.
             let this = if (*as_object(f).code()).strict {
@@ -1951,7 +1955,7 @@ handlers! {
             } else {
                 object_value((*frame_vm(regs)).global)
             };
-            enter!(as_object(f), this, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
+            enter!(fo, this, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
         tail!(slow_call_undefined, acc)
     }
@@ -1959,15 +1963,17 @@ handlers! {
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && as_object(f).class() == Class::Function && (*as_object(f).code()).constructor() {
+            // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
+            let fo = crate::object::Obj::from_ptr(as_object(f));
             let this = if (*as_object(f).code()).kind == 3 {
                 // (A derived class's `this` is its base's, from `super()`.)
                 Value::HOLE
             } else {
-                note_callee(regs, ic_at(regs, pc, 4), as_object(f));
-                construct_this(regs, as_object(f))
+                note_callee(regs, ic_at(regs, pc, 4), fo);
+                construct_this(regs, fo)
             };
             let args = reg(pc, 2, regs);
-            enter!(as_object(f), this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
+            enter!(fo, this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
         }
         tail!(slow_construct, acc)
     }
@@ -2095,17 +2101,17 @@ handlers! {
     #[inline(never)]
     fn typed_get_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let o = as_object(obj);
+        let o = crate::object::Obj::from_ptr(as_object(obj));
         let vm = &*frame_vm(regs);
         let code = &*frame_code(regs);
         let ic = ic_at(regs, pc, 2);
         if *(&code.ic_names).get_unchecked(index_at(pc, 2) as usize) == vm.a_length
             && o.flags() & crate::object::RUNTIME_LENGTH == 0
-            && let Some(h) = vm.known_typed_length(unsafe { Obj::from_ptr(o) })
+            && let Some(h) = vm.known_typed_length(o)
             && ((*ic).loc == LENGTH_LOC || (*ic).loc == crate::vm::ACCESSOR_LOC && (*ic).holder == h.ptr())
         {
             code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
-            let n = crate::typed::ta_length(unsafe { Obj::from_ptr(o) }).unwrap_or(0);
+            let n = crate::typed::ta_length(o).unwrap_or(0);
             next!(any, Op::GetNamed.size(), Value::from_i32(n as i32))
         }
         let r = with_top(regs, None, |vm| vm.get_named_miss(code, index_at(pc, 2), obj));
@@ -2132,12 +2138,12 @@ handlers! {
         // A typed array's element, once the cache has its kind (see
         // `Vm::get_keyed_miss`): read directly.
         if is_cell(tag, obj) && tag.is_int32(acc) {
-            let o = as_object(obj);
+            let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = acc.as_i32_unchecked() as u32;
             let ic = ic_at(regs, pc, 2);
             if o.class() == Class::TypedArray
                 && i < o.elems_len()
-                && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(unsafe { Obj::from_ptr(o) })))
+                && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(o)))
                 && (*ic).loc == crate::vm::BYTES_LOC
                 && (*ic).epoch == o.kind() as u32 + 1
             {
@@ -2178,15 +2184,15 @@ handlers! {
         // noted for the JIT.
         let (obj, key) = (*reg(pc, 1, regs), *reg(pc, 2, regs));
         if is_cell(tag, obj) && tag.is_int32(key) && acc.is_number() {
-            let o = as_object(obj);
+            let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = key.as_i32_unchecked() as u32;
             if o.class() == Class::TypedArray
                 && i < o.elems_len()
                 && (!(*frame_vm(regs)).views_detached
-                    || !crate::typed::is_detached(crate::typed::buffer_of(unsafe { Obj::from_ptr(o) })) && !crate::typed::is_immutable_view(unsafe { Obj::from_ptr(o) }))
+                    || !crate::typed::is_detached(crate::typed::buffer_of(o)) && !crate::typed::is_immutable_view(o))
                 && !crate::object::TypedKind::from_u8(o.kind()).is_big()
             {
-                crate::vm::note_bytes(ic_at(regs, pc, 3), unsafe { Obj::from_ptr(o) });
+                crate::vm::note_bytes(ic_at(regs, pc, 3), o);
                 let kind = crate::object::TypedKind::from_u8(o.kind());
                 if tag.is_int32(acc) {
                     kind.store_i32(o.elems().cast(), i as usize, acc.as_i32_unchecked());
@@ -2299,7 +2305,7 @@ handlers! {
         // A bound function of a bytecode one, with no arguments bound: its
         // target, entered here with the bound `this`.
         if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
-            enter!(fo.ptr(), that, w.add(1), argc, 0, Op::Call.size())
+            enter!(fo, that, w.add(1), argc, 0, Op::Call.size())
         }
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
         let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
@@ -2311,7 +2317,7 @@ handlers! {
     fn slow_call_undefined_other(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
-            enter!(fo.ptr(), that, reg(pc, 2, regs), *pc.add(3) as usize, 0, Op::CallUndefined.size())
+            enter!(fo, that, reg(pc, 2, regs), *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
         let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
@@ -2924,7 +2930,7 @@ handlers! {
     fn op_get_keyed_star(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         if is_cell(tag, obj) && tag.is_int32(acc) {
-            let o = as_object(obj);
+            let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = acc.as_i32_unchecked() as u32;
             if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
@@ -2939,7 +2945,7 @@ handlers! {
     fn i32_get_keyed_star(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         if is_cell(tag, obj) {
-            let o = as_object(obj);
+            let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = raw_i32(acc) as u32;
             if o.shape() == (*ic_at(regs, pc, 2)).shape && i < o.elems_len() {
                 let v = *o.elems().add(i as usize);
@@ -2963,7 +2969,7 @@ handlers! {
 
     fn op_lda_upvalue_star(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(unsafe { Obj::from_ptr(f.cast_mut()) }).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(*pc.add(1) as usize);
         star!(Op::LdaUpvalue.size(), *(*u).at)
     }
 }
@@ -3596,7 +3602,7 @@ fn raw_units(v: Value) -> Option<(*const u16, usize)> {
     if !v.is_cell() {
         return None;
     }
-    let o = as_object(v);
+    let o = Obj::of(v);
     (o.class() == Class::String).then(|| (o.elems().cast::<u16>().cast_const(), o.elems_len() as usize))
 }
 
@@ -3835,8 +3841,8 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
 /// the object, or out of line within its `props`' room (else the slow
 /// path grows them).
 #[inline(always)]
-unsafe fn has_room(o: *mut Object, loc: i32) -> bool {
-    loc >= 0 || unsafe { (!loc as u32) < Object::props_cap(o) }
+unsafe fn has_room(o: Obj, loc: i32) -> bool {
+    loc >= 0 || unsafe { (!loc as u32) < Object::props_cap(o.ptr().cast_const()) }
 }
 
 /// The VM running (stencils' runtime calls and slow paths reach it this
@@ -4540,7 +4546,7 @@ const NO_TOP: &str = "calling a function from here (compiled code)";
 /// it is redone (see [`to_primitive_hint`]): one that only reads.
 #[inline(always)]
 fn replays(f: Value) -> bool {
-    let o = as_object(f);
+    let o = unsafe { crate::object::Obj::from_ptr(as_object(f)) };
     o.class() == Class::Native && o.code().live().reads_only
 }
 
@@ -4862,11 +4868,11 @@ pub(crate) unsafe fn frame_args(vm: &mut Vm, regs: *mut Value, spread: &mut Vec<
 /// For a call of `f` with receiver `this`: if `f` is
 /// `Function.prototype.apply` and `this` a bytecode function, `this`, which
 /// is what the call calls.
-pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
+pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Option<Obj> {
     unsafe {
         let is = |v: Value, c: Class| v.is_cell() && Obj::of(v).class() == c;
         (is(f, Class::Native) && Obj::of(f).code() == (*vm).function_apply && is(this, Class::Function))
-            .then(|| as_object(this))
+            .then(|| Obj::from_ptr(as_object(this)))
     }
 }
 
@@ -4895,11 +4901,11 @@ unsafe fn box_this(vm: *mut Vm, this: Value) -> Value {
 /// For a call of `f` with receiver `this`: if `f` is
 /// `Function.prototype.call` and `this` a bytecode function, `this`, which
 /// is what the call calls.
-pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
+pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option<Obj> {
     unsafe {
         let is = |v: Value, c: Class| v.is_cell() && Obj::of(v).class() == c;
         (is(f, Class::Native) && Obj::of(f).code() == (*vm).function_call && is(this, Class::Function))
-            .then(|| as_object(this))
+            .then(|| Obj::from_ptr(as_object(this)))
     }
 }
 
@@ -4911,19 +4917,19 @@ pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option
 /// The cache is a Rust structure: a young `f` is logged for the next
 /// minor collection (`Heap::note`).
 #[inline(always)]
-unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: *mut Object) {
+unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: Obj) {
     unsafe {
         let old = (*ic).holder;
-        if old != f {
+        if old != f.ptr() {
             if !old.is_null() && old.code_or_null() != f.code_or_null() {
-                keep_callee(ic, old, f);
+                keep_callee(ic, crate::object::Obj::from_ptr(old), f);
             }
-            (*ic).holder = f;
+            (*ic).holder = f.ptr();
             // A Rust structure: its slot is a root of the next minor
             // collection, logged once (an old callee replaced by a young
             // one; a closure made per call replaces a young one each time).
             let heap = &mut (*frame_vm(regs)).heap;
-            if heap.is_young(object_value(f)) && (old.is_null() || !heap.is_young(object_value(old))) {
+            if heap.is_young(object_value(f.ptr())) && (old.is_null() || !heap.is_young(object_value(old))) {
                 heap.note_slot(&raw const (*ic).holder);
             }
         }
@@ -4933,27 +4939,27 @@ unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: *mut Object) {
 /// `note_callee`'s slow path: keep `old` in ways 1-3, unless there, and
 /// take `new` out of them (it goes to way 0).
 #[inline(never)]
-unsafe fn keep_callee(ic: *mut Ic, old: *mut Object, new: *mut Object) {
+unsafe fn keep_callee(ic: *mut Ic, old: Obj, new: Obj) {
     unsafe {
         for k in 1..IC_WAYS {
             let w = &mut *ic.add(k);
-            if w.holder == new {
-                w.holder = old;
+            if w.holder == new.ptr() {
+                w.holder = old.ptr();
                 log_ways(ic);
                 return;
             }
         }
         for k in 1..IC_WAYS {
             let w = &mut *ic.add(k);
-            if w.holder.is_null() || w.holder == old {
-                w.holder = old;
+            if w.holder.is_null() || w.holder == old.ptr() {
+                w.holder = old.ptr();
                 log_ways(ic);
                 return;
             }
         }
         // Megamorphic: the oldest goes.
         std::ptr::copy(ic.add(2), ic.add(1), IC_WAYS - 2);
-        (*ic.add(IC_WAYS - 1)).holder = old;
+        (*ic.add(IC_WAYS - 1)).holder = old.ptr();
         log_ways(ic);
     }
 }
@@ -4977,7 +4983,7 @@ unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
     unsafe {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) {
-            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
+            note_callee(regs, ic_at(regs, pc, 4), crate::object::Obj::from_ptr(as_object(f)));
         }
     }
 }
@@ -5018,7 +5024,7 @@ unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value,
 #[allow(clippy::too_many_arguments)]
 unsafe fn push_frame(
     regs: *mut Value,
-    fo: *mut crate::object::Object,
+    fo: Obj,
     callee: *const Code,
     this: Value,
     args: *const Value,
@@ -5041,7 +5047,7 @@ unsafe fn push_frame(
         set_header(new, RET_PC, ret);
         set_header(new, CALLER, regs);
         *new.sub(FLAGS) = Value::from_bits(flags);
-        set_header(new, FUNC, fo);
+        set_header(new, FUNC, fo.ptr());
         // Sloppy mode: a primitive `this` is boxed (a string, a symbol or a
         // bigint is a cell).
         *new = if callee.live().strict || crate::props::is_object(this) { this } else { sloppy_this(vm, this) };
@@ -5106,10 +5112,10 @@ fn construct_result(regs: *mut Value, acc: Value) -> Value {
 
 /// The receiver of a `new` on bytecode function `f`.
 #[inline(never)]
-fn construct_this(regs: *mut Value, f: *mut Object) -> Value {
+fn construct_this(regs: *mut Value, f: Obj) -> Value {
     unsafe {
         (*frame_vm(regs)).safepoint(regs);
-        (*frame_vm(regs)).construct_this(Obj::from_ptr(f))
+        (*frame_vm(regs)).construct_this(f)
     }
 }
 
@@ -5468,7 +5474,7 @@ pub(crate) unsafe fn write_frame_header(
 ///
 /// # Safety
 /// `regs` must be a frame's registers.
-pub(crate) unsafe fn set_frame_func(regs: *mut Value, f: *const Object) {
+pub(crate) unsafe fn set_frame_func(regs: *mut Value, f: *mut Object) {
     unsafe { set_header(regs, FUNC, f) }
 }
 
@@ -5569,7 +5575,7 @@ pub(crate) unsafe fn call_from_jit(
         let op = if op == Op::CallApplyArguments {
             let (a, n) = frame_args(vm, regs, &mut forwarded);
             if let Some(fo) = unwrap_apply(vm, fv, this) {
-                (fv, this) = (object_value(fo), *args);
+                (fv, this) = (object_value(fo.ptr()), *args);
                 (args, argc) = (a.cast_mut(), n);
             } else {
                 pair = [*args, crate::builtins::arguments_object(vm, std::slice::from_raw_parts(a, n))];
@@ -5598,14 +5604,14 @@ pub(crate) unsafe fn call_from_jit(
                     crate::builtins::apply_list_fast(if argc < 2 { Value::UNDEFINED } else { *args.add(1) })
             {
                 spread = s;
-                fv = object_value(fo);
+                fv = object_value(fo.ptr());
                 this = if argc == 0 { Value::UNDEFINED } else { *args };
                 args = spread.as_ptr().cast_mut();
                 argc = spread.len();
             } else {
                 match unwrap_call(vm, fv, this) {
                     Some(fo) if op == Op::Call => {
-                        fv = object_value(fo);
+                        fv = object_value(fo.ptr());
                         this = if argc == 0 { Value::UNDEFINED } else { *args };
                         args = args.add(1);
                         argc = argc.saturating_sub(1);

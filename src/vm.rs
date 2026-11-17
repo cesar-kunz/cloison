@@ -3556,10 +3556,14 @@ impl Vm {
     /// getter), its native stack's limit from here, the VM stack free from
     /// its base for the JS functions it calls (getters, traps, a key's
     /// `toString`), and `roots`, the host's values it operates on, checked
-    /// (`check_value`, for operation `what`). What a conversion threw is
-    /// `f`'s error, none left pending for the next operation. (No
-    /// collection runs: the host's values aren't on the stack the collector
-    /// scans, which starts at a run's frame.)
+    /// (`check_value`, for operation `what`) and rooted, with what is
+    /// pushed to `handles`. What a conversion threw is `f`'s error, none
+    /// left pending for the next operation. The JavaScript it runs
+    /// collects as a run's would (#342): the collector's native stack
+    /// starts here, as a run's at its frame, and no cell moves meanwhile
+    /// (`unmovable`: the host's slices of arguments, `call_other`'s,
+    /// aren't updated). A raw value the host kept from before is then as
+    /// stale as after a run (see [`Vm::run`]).
     #[cold]
     #[inline(never)]
     fn host<R>(&mut self, what: &str, roots: &[Value], f: impl FnOnce(&mut Vm) -> Result<R>) -> Result<R> {
@@ -3571,11 +3575,16 @@ impl Vm {
             top: *mut Value,
             limit: usize,
             handles: usize,
+            outer: bool,
         }
         impl Drop for Entered {
             fn drop(&mut self) {
                 unsafe {
                     let vm = &mut *self.vm;
+                    if self.outer {
+                        vm.heap.gc.stack_base = 0;
+                        vm.pause_marker();
+                    }
                     vm.native_top = self.top;
                     vm.native_limit = self.limit;
                     vm.unmovable -= 1;
@@ -3592,9 +3601,14 @@ impl Vm {
         // `interp::current_vm`, not `self`, and mustn't miss them.)
         let vm: *mut Vm = self;
         unsafe {
+            let outer = (*vm).heap.gc.stack_base == 0;
             let _entered =
-                Entered { vm, top: (*vm).native_top, limit: (*vm).native_limit, handles: (*vm).handles.len() };
+                Entered { vm, top: (*vm).native_top, limit: (*vm).native_limit, handles: (*vm).handles.len(), outer };
             (*vm).unmovable += 1;
+            (*vm).handles.extend_from_slice(roots);
+            if outer {
+                std::ptr::write_volatile(&raw mut (*vm).heap.gc.stack_base, &raw const here as usize & !7);
+            }
             std::ptr::write_volatile(
                 &raw mut (*vm).native_limit,
                 (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK),
@@ -7453,13 +7467,15 @@ impl Vm {
     ///
     /// The [`Value`]s it returns, and those the host has from the VM
     /// otherwise, are valid only until the next run (or
-    /// [`Vm::run_module`]) begins: no collection runs between runs, but
-    /// one in a run frees the cells nothing in the VM refers to and moves
-    /// others, the host's copies left pointing at memory reused. A value
-    /// kept past it is held as a [`Global`], which the collector keeps and
-    /// updates. The VM's operations, [`display`] and [`Global::new`] refuse
-    /// (panic on) one a collection freed or moved (#323); one pointing at a
-    /// cell made there since reads that cell.
+    /// [`Vm::run_module`], or an operation that runs JavaScript: a getter
+    /// [`Vm::get`] reads, a function [`Vm::call_other`] calls) begins: no
+    /// collection runs between them, but one in them frees the cells
+    /// nothing in the VM refers to and moves others, the host's copies left
+    /// pointing at memory reused. A value kept past it is held as a
+    /// [`Global`], which the collector keeps and updates. The VM's
+    /// operations, [`display`] and [`Global::new`] refuse (panic on) one a
+    /// collection freed or moved (#323); one pointing at a cell made there
+    /// since reads that cell.
     ///
     /// A panic unwinding out of the run (the heap limit's, `CLOISON_HEAP_
     /// LIMIT`, under an embedder's `catch_unwind`) leaves the VM as between

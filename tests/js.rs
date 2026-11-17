@@ -8881,6 +8881,28 @@ fn display_checks_the_value_against_its_vm() {
     assert_eq!(display(c.run(&cloison::js::compile("'ok'").unwrap()).unwrap(), &c), "ok");
 }
 
+/// #342: JavaScript a host operation runs (a getter `Vm::get` reads, the
+/// callback of a native `Vm::call_other` calls) collects as a run's does:
+/// the heap stays near what the same code takes run from a script, not
+/// growing with all it allocated. The operation's own values (the array
+/// `forEach` walks, raw from the run before) are rooted meanwhile.
+#[test]
+fn host_operations_collect() {
+    let mut vm = Vm::new();
+    let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let o = run(&mut vm, "({get x() { for (var i = 0; i < 3e6; i++) var a = {b: [i]}; return 1; }})");
+    let x = vm.intern("x");
+    assert_eq!(display(vm.get(o, x).unwrap(), &vm), "1");
+    // (3e6 objects and arrays: over 200 MiB uncollected.)
+    assert!(vm.heap_allocated() < 96 << 20, "heap {} MiB", vm.heap_allocated() >> 20);
+    let arr = run(&mut vm, "var n = 0; [{v: 1}, {v: 2}, {v: 3}].concat(Array(500).fill(0).map((_, i) => ({v: i})))");
+    let cb = run(&mut vm, "(function (e) { for (var i = 0; i < 6000; i++) var a = {b: [i]}; n += e.v; })");
+    let each = run(&mut vm, "Array.prototype.forEach");
+    vm.call_other(each, arr, &[cb]).unwrap();
+    assert!(vm.heap_allocated() < 96 << 20, "heap {} MiB", vm.heap_allocated() >> 20);
+    assert_eq!(display(run(&mut vm, "n"), &vm), (6 + 499 * 500 / 2).to_string());
+}
+
 /// #343: the host's ToNumber is the VM's, a string parsed, an object's
 /// `valueOf` run, what a conversion throws the error.
 #[test]

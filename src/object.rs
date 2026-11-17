@@ -170,6 +170,7 @@ impl TypedKind {
     ///
     /// # Safety
     /// `p` must point to at least `i + 1` elements of this kind.
+    #[inline(always)]
     pub unsafe fn load(self, p: *const u8, i: usize) -> Value {
         use crate::racy::load;
         unsafe {
@@ -194,6 +195,7 @@ impl TypedKind {
     ///
     /// # Safety
     /// As [`TypedKind::load`].
+    #[inline(always)]
     pub unsafe fn store_i32(self, p: *mut u8, i: usize, v: i32) {
         use crate::racy::store;
         unsafe {
@@ -216,6 +218,7 @@ impl TypedKind {
     ///
     /// # Safety
     /// As [`TypedKind::load`].
+    #[inline(always)]
     pub unsafe fn store(self, p: *mut u8, i: usize, d: f64) {
         use crate::racy::store;
         let int = || crate::interp::to_int32(d) as u32 as u64;

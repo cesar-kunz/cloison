@@ -1892,7 +1892,7 @@ handlers! {
                 }
             }
         }
-        tail!(slow_get_keyed, acc)
+        tail!(typed_get_keyed, acc)
     }
 
     fn i32_get_keyed(pc, acc, regs, tag) {
@@ -1907,7 +1907,7 @@ handlers! {
                 }
             }
         }
-        tail!(slow_get_keyed, tag.rebox(acc))
+        tail!(typed_get_keyed, tag.rebox(acc))
     }
 
     fn op_set_keyed(pc, acc, regs, tag) {
@@ -1925,7 +1925,7 @@ handlers! {
                 next!(any, Op::SetKeyed.size(), acc)
             }
         }
-        tail!(slow_set_keyed, acc)
+        tail!(typed_set_keyed, acc)
     }
 
     // ---- Allocation (ignore `acc`: also I32 entries) ----
@@ -2205,26 +2205,33 @@ handlers! {
         next_or_throw!(Op::SetNamed.size(), r.map(|()| acc))
     }
 
-    #[cold]
+    // A typed array's element, once the cache has its kind (see
+    // `Vm::get_keyed_miss`) or met several (none a BigInt one's, whose
+    // loads allocate): read directly. Not cold, unlike `slow_get_keyed`:
+    // the keyed loads' misses come here first.
     #[inline(never)]
-    fn slow_get_keyed(pc, acc, regs, tag) {
+    fn typed_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        // A typed array's element, once the cache has its kind (see
-        // `Vm::get_keyed_miss`): read directly.
         if is_cell(tag, obj) && tag.is_int32(acc) {
             let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = acc.as_i32_unchecked() as u32;
             let ic = ic_at(regs, pc, 2);
-            if o.class() == Class::TypedArray
-                && i < o.elems_len()
-                && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(o)))
-                && (*ic).loc == crate::vm::BYTES_LOC
-                && (*ic).epoch == o.kind() as u32 + 1
-            {
+            if (*ic).loc == crate::vm::BYTES_LOC && o.class() == Class::TypedArray && i < o.elems_len() {
                 let kind = crate::object::TypedKind::from_u8(o.kind());
-                next!(any, Op::GetKeyed.size(), kind.load(o.elems().cast(), i as usize))
+                if ((*ic).epoch == o.kind() as u32 + 1 || (*ic).epoch == u32::MAX && !kind.is_big())
+                    && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(o)))
+                {
+                    next!(any, Op::GetKeyed.size(), kind.load(o.elems().cast(), i as usize))
+                }
             }
         }
+        tail!(slow_get_keyed, acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_get_keyed(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
         let r = with_top(regs, None, |vm| {
             // An object key converted once, and kept for the `SetKeyed`
             // storing back to it if any (a compound assignment's, an
@@ -2251,11 +2258,11 @@ handlers! {
         next_or_throw!(Op::GetKeyed.size(), r)
     }
 
-    #[cold]
+    // A number into a typed array's element: stored directly, its kind
+    // noted for the JIT. Not cold, unlike `slow_set_keyed`: the keyed
+    // stores' misses come here first.
     #[inline(never)]
-    fn slow_set_keyed(pc, acc, regs, tag) {
-        // A number into a typed array's element: stored directly, its kind
-        // noted for the JIT.
+    fn typed_set_keyed(pc, acc, regs, tag) {
         let (obj, key) = (*reg(pc, 1, regs), *reg(pc, 2, regs));
         if is_cell(tag, obj) && tag.is_int32(key) && acc.is_number() {
             let o = crate::object::Obj::from_ptr(as_object(obj));
@@ -2275,6 +2282,17 @@ handlers! {
                 }
                 next!(any, Op::SetKeyed.size(), acc)
             }
+        }
+        tail!(slow_set_keyed, acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_set_keyed(pc, acc, regs, tag) {
+        let (obj, key) = (*reg(pc, 1, regs), *reg(pc, 2, regs));
+        if is_cell(tag, obj) && tag.is_int32(key) && acc.is_number() {
+            let o = Obj::of(obj);
+            let i = key.as_i32_unchecked() as u32;
             // An append, noted for the JIT (unless the site met bytes).
             let ic = ic_at(regs, pc, 3);
             if o.class() == Class::Array && i == o.elems_len() && (*ic).loc == 0 {
@@ -3098,7 +3116,7 @@ handlers! {
                 }
             }
         }
-        tail!(slow_get_keyed, acc)
+        tail!(typed_get_keyed, acc)
     }
 
     fn i32_get_keyed_star(pc, acc, regs, tag) {
@@ -3113,7 +3131,7 @@ handlers! {
                 }
             }
         }
-        tail!(slow_get_keyed, tag.rebox(acc))
+        tail!(typed_get_keyed, tag.rebox(acc))
     }
 
     // Loads ignore `acc`: also the I32 entries.

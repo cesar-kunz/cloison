@@ -925,7 +925,8 @@ fn array_copy(vm: &mut Vm, from: Value) -> Value {
         vm.reserve_elems(o, n);
         crate::object::set_shape(o, from.shape());
         vm.store_elements(o, 0, from.elems(), n);
-        o.set_elems_len(n as u32);
+        // SAFETY: within the capacity `reserve_elems` made above.
+        unsafe { o.set_elems_len(n as u32) };
     }
     arr
 }
@@ -985,7 +986,8 @@ fn append(vm: &mut Vm, arr: Value, v: Value) {
     let len = o.elems_len() as usize;
     vm.reserve_elems(o, len + 1);
     vm.store_element(o, len, v);
-    o.set_elems_len(len as u32 + 1);
+    // SAFETY: within the capacity `reserve_elems` made above.
+    unsafe { o.set_elems_len(len as u32 + 1) };
 }
 
 /// `this` as a string value (itself if one).

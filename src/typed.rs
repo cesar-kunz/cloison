@@ -239,8 +239,10 @@ pub(crate) fn detach(vm: &mut Vm, b: *mut Object) -> Result<()> {
     if is_immutable(b) {
         return Err(Error::type_error("Cannot detach an immutable ArrayBuffer"));
     }
-    b.set_elems_len(0);
-    b.set_flags(b.flags() | DETACHED);
+    // SAFETY: 0, for a buffer (whose `elems_len` is its byte length).
+    unsafe { b.set_elems_len(0) };
+    // SAFETY: a detached buffer's flag, its length made 0 above (as `typed` reads them).
+    unsafe { b.set_flags(b.flags() | DETACHED) };
     if !is_resizable(b) && !vm.views_detached {
         vm.views_detached = true;
         vm.bump_code_epoch();

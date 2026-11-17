@@ -391,7 +391,8 @@ fn create(vm: &mut Vm, o: Value, i: f64, v: Value) -> Result<()> {
                 let i = i as usize;
                 if i as f64 == len {
                     vm.reserve_elems(obj, i + 1);
-                    obj.set_elems_len(i as u32 + 1);
+                    // SAFETY: within the capacity `reserve_elems` made above.
+                    unsafe { obj.set_elems_len(i as u32 + 1) };
                 }
                 vm.store_element(obj, i, v);
                 return Ok(());
@@ -615,7 +616,8 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
         }
         let v = o.elem(len - 1);
         o.clear_elem(len - 1);
-        o.set_elems_len((len - 1) as u32);
+        // SAFETY: one less than the length.
+        unsafe { o.set_elems_len((len - 1) as u32) };
         return Ok(if v == Value::EMPTY { Value::UNDEFINED } else { v });
     }
     let (o, len) = this_object(vm, this)?;

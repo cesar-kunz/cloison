@@ -61,7 +61,7 @@ pub struct FunctionDef {
     /// Where each upvalue `CreateClosure` gives the function comes from in
     /// the function creating it: a register (`true`) or an upvalue of its
     /// own (see `vm::Upvalue`).
-    pub upvalues: Vec<(bool, u8)>,
+    pub upvalues: Vec<(bool, u32)>,
     /// Nested functions use some of its variables (they stay in its
     /// registers, which its closures' upvalues point to until it returns).
     pub captures: bool,
@@ -386,6 +386,9 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                     }
                     Operand::Imm => Arg::Imm(t.parse().map_err(|_| err(format!("expected an integer, got `{t}`")))?),
                     Operand::Count => Arg::Count(t.parse().map_err(|_| err(format!("expected a count, got `{t}`")))?),
+                    Operand::Upvalue => {
+                        Arg::Index(t.parse().map_err(|_| err(format!("expected an upvalue index, got `{t}`")))?)
+                    }
                     Operand::Off => {
                         if !is_ident(t) {
                             return Err(err(format!("expected a label, got `{t}`")));
@@ -515,7 +518,7 @@ pub fn verify(m: &Module) -> Result<(), String> {
         // Where a closure's upvalues come from: here.
         for &c in &f.closures {
             for &(local, k) in &m.functions[c].upvalues {
-                if local && k as u32 >= f.nregs || !local && k as usize >= f.upvalues.len() {
+                if local && k >= f.nregs || !local && k as usize >= f.upvalues.len() {
                     return Err(format!("{}: an upvalue of {} out of range", f.name, m.functions[c].name));
                 }
             }
@@ -777,6 +780,7 @@ pub fn disassemble(m: &Module) -> String {
                     Operand::Ic => args.push(f.ics[index()].to_string()),
                     Operand::Fn => args.push(names[f.closures[index()]].clone()),
                     Operand::Const => args.push(f.constants[index()].text()),
+                    Operand::Upvalue => args.push(index().to_string()),
                     Operand::AutoIc => {}
                 }
                 at += k.width();
@@ -919,7 +923,7 @@ mod tests {
         assert!(
             bad(&|f| {
                 f.nregs = 1;
-                f.code = vec![Op::LdaUpvalueStar as u8, 0, Op::Star as u8, 0, Op::Return as u8];
+                f.code = vec![Op::LdaUpvalueStar as u8, 0, 0, 0, 0, Op::Star as u8, 0, Op::Return as u8];
             })
             .contains("upvalue 0 out of range")
         );

@@ -450,7 +450,7 @@ pub struct Code {
     /// See `FunctionDef::compound_keys`.
     pub compound_keys: Box<[(u32, u32)]>,
     /// Where its upvalues come from (see `FunctionDef::upvalues`).
-    pub upvalues: Box<[(bool, u8)]>,
+    pub upvalues: Box<[(bool, u32)]>,
     /// Runs only in the interpreter: it has exception handlers or variables
     /// its nested functions use (frames the interpreter manages: unwinding,
     /// closing upvalues). (One with upvalues is compiled: see

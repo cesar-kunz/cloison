@@ -872,7 +872,7 @@ fn protector_again(vm: &mut Vm) -> u8 {
         while !o.is_null() {
             proxied |= crate::proxy::is_proxy(vm, unsafe { Obj::from_ptr(o) });
             vm.make_prototype(unsafe { Obj::from_ptr(o) });
-            let p = o.shape().live().proto;
+            let p = unsafe { Obj::from_ptr(o) }.shape().live().proto;
             o = if p.is_cell() { as_object(p) } else { std::ptr::null_mut() };
         }
     }
@@ -1076,35 +1076,37 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
     if !is_open_array(dst) {
         return false;
     }
-    let (d, s) = (as_object(dst), as_object(src));
-    if d.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0
-        || crate::far::is_far(unsafe { Obj::from_ptr(d) })
-    {
+    let d = Obj::of(dst);
+    if d.flags() & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 || crate::far::is_far(d) {
         return false;
     }
     // (A typed array's, loaded.)
     if iterates_as_typed(vm, src) {
-        let Some(values) = crate::typed::elements(vm, unsafe { Obj::from_ptr(s) }) else { return false };
+        let Some(values) = crate::typed::elements(vm, Obj::of(src)) else { return false };
         let (len, n) = (d.elems_len() as usize, values.len());
         if len + n >= 1 << 28 {
             return false;
         }
-        vm.reserve_elems(unsafe { Obj::from_ptr(d) }, len + n);
-        vm.store_elements(unsafe { Obj::from_ptr(d) }, len, values.as_ptr(), n);
+        vm.reserve_elems(d, len + n);
+        vm.store_elements(d, len, values.as_ptr(), n);
         // SAFETY: within the capacity `reserve_elems` made above.
         unsafe { d.set_elems_len((len + n) as u32) };
         return true;
     }
-    if !iterates_as_array(vm, src) || crate::far::is_far(unsafe { Obj::from_ptr(s) }) {
+    if !iterates_as_array(vm, src) {
+        return false;
+    }
+    let s = Obj::of(src);
+    if crate::far::is_far(s) {
         return false;
     }
     let n = s.elems_len() as usize;
-    if vm.length_field(unsafe { Obj::from_ptr(s) }) as usize != n || (0..n).any(|i| s.elem(i) == Value::EMPTY) {
+    if vm.length_field(s) as usize != n || (0..n).any(|i| s.elem(i) == Value::EMPTY) {
         return false;
     }
     let len = d.elems_len() as usize;
-    vm.reserve_elems(unsafe { Obj::from_ptr(d) }, len + n);
-    vm.store_elements(unsafe { Obj::from_ptr(d) }, len, s.elems(), n);
+    vm.reserve_elems(d, len + n);
+    vm.store_elements(d, len, s.elems(), n);
     // SAFETY: within the capacity `reserve_elems` made above.
     unsafe { d.set_elems_len((len + n) as u32) };
     true

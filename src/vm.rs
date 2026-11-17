@@ -2044,7 +2044,7 @@ impl Vm {
         }
         self.symbols.keys().for_each(|&a| keep(a));
         for &o in self.symbol_registry.values() {
-            let a = o.elems_len();
+            let a = unsafe { Obj::from_ptr(o) }.elems_len();
             if a != crate::symbol::NO_ATOM {
                 keep(Atom(a));
             }
@@ -3156,7 +3156,7 @@ impl Vm {
                 unsafe {
                     if *(p as *const u64) & 1 == 0 {
                         let o = p as *mut Object;
-                        let shape = o.shape();
+                        let shape = Obj::from_ptr(o).shape();
                         if shape != last.0 {
                             let at = slots.entry(shape).or_insert_with(|| {
                                 let s = shape.live();
@@ -3170,7 +3170,8 @@ impl Vm {
                         }
                         for &l in last.1.iter() {
                             debug_assert!(
-                                (l as usize) < crate::layout::slots_offset(o.class()) + 8 * Object::inline_cap(o),
+                                (l as usize)
+                                    < crate::layout::slots_offset(Obj::from_ptr(o).class()) + 8 * Object::inline_cap(o),
                                 "slot {l} past the object at {p:#x}"
                             );
                             let v = Object::slot(o, l);
@@ -4305,11 +4306,13 @@ impl Vm {
         }
         while o != until {
             // (Not one a slot of its own redefined.)
-            let own = o.shape().live().lookup(name).is_none()
-                && match o.class() {
+            let own = unsafe { Obj::from_ptr(o) }.shape().live().lookup(name).is_none()
+                && match unsafe { Obj::from_ptr(o) }.class() {
                     Class::Function | Class::Native => {
-                        name == self.a_length && o.flags() & crate::object::FN_LENGTH_DELETED == 0
-                            || name == self.a_name && o.flags() & crate::object::FN_NAME_DELETED == 0
+                        name == self.a_length
+                            && unsafe { Obj::from_ptr(o) }.flags() & crate::object::FN_LENGTH_DELETED == 0
+                            || name == self.a_name
+                                && unsafe { Obj::from_ptr(o) }.flags() & crate::object::FN_NAME_DELETED == 0
                     }
                     Class::Wrapper => {
                         name == self.a_length && wrapped(object_value(o)).and_then(string_units).is_some()
@@ -4319,7 +4322,7 @@ impl Vm {
             if own {
                 return true;
             }
-            let proto = o.shape().live().proto;
+            let proto = unsafe { Obj::from_ptr(o) }.shape().live().proto;
             if !proto.is_cell() {
                 return false;
             }
@@ -4696,7 +4699,7 @@ impl Vm {
             let proto = if self.proxies_exist {
                 crate::proxy::get_prototype_of(self, unsafe { Obj::from_ptr(o) })?
             } else {
-                o.shape().live().proto
+                unsafe { Obj::from_ptr(o) }.shape().live().proto
             };
             if !proto.is_cell() {
                 return Ok(false);
@@ -4771,17 +4774,16 @@ impl Vm {
                 shown(obj)
             )));
         }
-        let mut o = as_object(obj);
-        if crate::proxy::chain_has_proxy(self, unsafe { Obj::from_ptr(o) }) {
+        let mut o = Obj::of(obj);
+        if crate::proxy::chain_has_proxy(self, o) {
             let k = self.property_key(key);
             return crate::proxy::generic_has(self, obj, k);
         }
         match self.property_key(key) {
-            Key::Name(a) if self.typed_numeric(unsafe { Obj::from_ptr(o) }, a) => Ok(false),
-            Key::Name(a) => Ok(self.lookup(unsafe { Obj::from_ptr(o) }, a).is_some()
-                || self.virtual_has(unsafe { Obj::from_ptr(o) }, a)),
+            Key::Name(a) if self.typed_numeric(o, a) => Ok(false),
+            Key::Name(a) => Ok(self.lookup(o, a).is_some() || self.virtual_has(o, a)),
             Key::Index(i) => loop {
-                if o.class() != Class::String && self.has_own_index(unsafe { Obj::from_ptr(o) }, i) {
+                if o.class() != Class::String && self.has_own_index(o, i) {
                     return Ok(true);
                 }
                 // (A typed array's indices are its own, or none.)
@@ -4792,7 +4794,7 @@ impl Vm {
                 if !proto.is_cell() {
                     return Ok(false);
                 }
-                o = as_object(proto);
+                o = Obj::of(proto);
             },
         }
     }
@@ -6007,7 +6009,7 @@ impl Vm {
             let units = p.elems() as usize;
             // A slice's parent is its root's: one level only.
             let root = if !p.props().is_null() { p.props().cast::<Object>() } else { p.ptr() };
-            let ru = root.elems() as usize;
+            let ru = Obj::from_ptr(root).elems() as usize;
             // The cell holding the root's units: itself, or the buffer a
             // flattening made (past its header word).
             let cell = if ru == root as usize + STRING_UNITS { root as usize } else { ru - 8 };
@@ -6196,7 +6198,7 @@ impl Vm {
     fn released_get(&self, o: Obj, i: u32) -> Option<Value> {
         match self.released_binding(o, i)? {
             Binding::Upvalue(u) => Some(unsafe { *(*u).at }),
-            Binding::Scope(env, slot) => Some(env.field(slot)),
+            Binding::Scope(env, slot) => Some(unsafe { Obj::from_ptr(env) }.field(slot)),
         }
     }
 
@@ -6333,10 +6335,10 @@ impl Vm {
             // `keep_mapped`.)
             unsafe { (*o).flags &= !crate::object::MAPPED };
             for (i, &on) in m.mapped.iter().enumerate() {
-                if on && (i as u32) < o.elems_len() {
+                if on && (i as u32) < unsafe { Obj::from_ptr(o) }.elems_len() {
                     unsafe {
                         let v = m.value(i);
-                        let at = o.elems().add(i);
+                        let at = Obj::from_ptr(o).elems().add(i);
                         crate::heap::store(o.cast(), at, v);
                     }
                 }
@@ -6400,7 +6402,7 @@ impl Vm {
                 self.hide_element(unsafe { Obj::from_ptr(o) }, i as u32);
             }
             object_value(r.ptr())
-        } else if o.shape() == self.mapped_arguments_shape {
+        } else if unsafe { Obj::from_ptr(o) }.shape() == self.mapped_arguments_shape {
             crate::object::set_shape(o, self.arguments_shape);
             return;
         } else {
@@ -6414,7 +6416,7 @@ impl Vm {
                 a
             }
         };
-        if let Some(slot) = o.shape().live().lookup(mark) {
+        if let Some(slot) = unsafe { Obj::from_ptr(o) }.shape().live().lookup(mark) {
             self.store_field(unsafe { Obj::from_ptr(o) }, slot, record);
         }
     }
@@ -8567,7 +8569,7 @@ impl MappedArgs {
         if env.is_null() {
             return None;
         }
-        let slot = (env.shape().live().lookup(*self.scope.1.get(i)?))?;
+        let slot = (unsafe { Obj::from_ptr(env) }.shape().live().lookup(*self.scope.1.get(i)?))?;
         Some((unsafe { Obj::from_ptr(env) }, slot))
     }
 
@@ -8736,6 +8738,7 @@ pub(crate) fn string_prefix(v: Value, n: usize) -> Vec<u16> {
     let mut stack = vec![as_object(v)];
     unsafe {
         while let Some(s) = stack.pop() {
+            let s = Obj::from_ptr(s);
             let left = n - out.len();
             if left == 0 {
                 break;
@@ -8745,7 +8748,7 @@ pub(crate) fn string_prefix(v: Value, n: usize) -> Vec<u16> {
                 // stack stays as deep as `n`, not as the chain `s += c`
                 // makes.)
                 let (a, b) = (s.props().cast::<Object>(), s.code() as *mut Object);
-                if (a.elems_len() as usize) < left {
+                if (Obj::from_ptr(a).elems_len() as usize) < left {
                     stack.push(b);
                 }
                 stack.push(a);
@@ -8913,6 +8916,7 @@ unsafe fn copy_units(o: Obj, buf: *mut u16) {
         let mut at = 0;
         let mut stack: Vec<*mut Object> = vec![o.code() as *mut Object, o.props().cast::<Object>()];
         while let Some(s) = stack.pop() {
+            let s = Obj::from_ptr(s);
             if s.elems().is_null() {
                 stack.push(s.code() as *mut Object);
                 stack.push(s.props().cast::<Object>());

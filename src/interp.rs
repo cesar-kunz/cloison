@@ -1009,7 +1009,7 @@ handlers! {
         // not bound, `prototype` where the shape has it) and no proxies:
         // the prototype walk alone.
         let vm = frame_vm(regs);
-        if is_cell(tag, acc) && as_object(acc).shape() == (*vm).function_shape && !(*vm).proxies_exist {
+        if is_cell(tag, acc) && crate::object::Obj::from_ptr(as_object(acc)).shape() == (*vm).function_shape && !(*vm).proxies_exist {
             let p = *Object::slot(as_object(acc), (*vm).function_prototype_loc);
             if crate::props::is_object(p) {
                 let v = *reg(pc, 1, regs);
@@ -1017,7 +1017,7 @@ handlers! {
                 if crate::props::is_object(v) {
                     let mut o = as_object(v);
                     loop {
-                        let proto = o.shape().live().proto;
+                        let proto = crate::object::Obj::from_ptr(o).shape().live().proto;
                         if !proto.is_cell() {
                             break;
                         }
@@ -1932,7 +1932,7 @@ handlers! {
 
     fn op_call(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && as_object(f).class() == Class::Function {
+        if is_cell(tag, f) && crate::object::Obj::from_ptr(as_object(f)).class() == Class::Function {
             // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
             let fo = crate::object::Obj::from_ptr(as_object(f));
             note_callee(regs, ic_at(regs, pc, 4), fo);
@@ -1944,13 +1944,13 @@ handlers! {
 
     fn op_call_undefined(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && as_object(f).class() == Class::Function {
+        if is_cell(tag, f) && crate::object::Obj::from_ptr(as_object(f)).class() == Class::Function {
             // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
             let fo = crate::object::Obj::from_ptr(as_object(f));
             note_callee(regs, ic_at(regs, pc, 4), fo);
             let args = reg(pc, 2, regs);
             // Sloppy mode: `this` is the global object; strict: `undefined`.
-            let this = if (*as_object(f).code()).strict {
+            let this = if (*crate::object::Obj::from_ptr(as_object(f)).code()).strict {
                 Value::UNDEFINED
             } else {
                 object_value((*frame_vm(regs)).global)
@@ -1962,10 +1962,10 @@ handlers! {
 
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && as_object(f).class() == Class::Function && (*as_object(f).code()).constructor() {
+        if is_cell(tag, f) && crate::object::Obj::from_ptr(as_object(f)).class() == Class::Function && (*crate::object::Obj::from_ptr(as_object(f)).code()).constructor() {
             // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
             let fo = crate::object::Obj::from_ptr(as_object(f));
-            let this = if (*as_object(f).code()).kind == 3 {
+            let this = if (*crate::object::Obj::from_ptr(as_object(f)).code()).kind == 3 {
                 // (A derived class's `this` is its base's, from `super()`.)
                 Value::HOLE
             } else {
@@ -2085,7 +2085,7 @@ handlers! {
     fn slow_get_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         // (A typed array's `length`: see `typed_get_named`.)
-        if is_cell(tag, obj) && as_object(obj).class() == Class::TypedArray {
+        if is_cell(tag, obj) && crate::object::Obj::from_ptr(as_object(obj)).class() == Class::TypedArray {
             tail!(typed_get_named, acc)
         }
         let r = with_top(regs, None, |vm| vm.get_named_miss(&*frame_code(regs), index_at(pc, 2), obj));
@@ -4921,7 +4921,7 @@ unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: Obj) {
     unsafe {
         let old = (*ic).holder;
         if old != f.ptr() {
-            if !old.is_null() && old.code_or_null() != f.code_or_null() {
+            if !old.is_null() && crate::object::Obj::from_ptr(old).code_or_null() != f.code_or_null() {
                 keep_callee(ic, crate::object::Obj::from_ptr(old), f);
             }
             (*ic).holder = f.ptr();
@@ -4991,7 +4991,11 @@ unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
 /// Whether `f` is a leaf native (`Code::leaf`).
 #[inline(always)]
 unsafe fn is_leaf(tag: NumberTag, f: Value) -> bool {
-    unsafe { is_cell(tag, f) && as_object(f).class() == Class::Native && (*as_object(f).code()).leaf }
+    unsafe {
+        is_cell(tag, f)
+            && crate::object::Obj::from_ptr(as_object(f)).class() == Class::Native
+            && (*crate::object::Obj::from_ptr(as_object(f)).code()).leaf
+    }
 }
 
 /// A call of leaf native `f` (`is_leaf`) whose arguments let it run as

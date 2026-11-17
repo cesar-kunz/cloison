@@ -40,6 +40,6 @@
 1 src/temporal/zoned.rs
 43 src/typed.rs
 1 src/value.rs
-183 src/vm.rs
+182 src/vm.rs
 187 stencils/stencils.rs
 237 (Obj::from_ptr bridges)

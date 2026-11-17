@@ -569,12 +569,24 @@ impl Code {
         (self.ics()[i as usize].get().cast(), self.ic_names[i as usize])
     }
 
+    /// Its inline caches if [`Code::ics`] made them already (unlike
+    /// [`Code::made_ics`], also when it has none).
+    #[inline(always)]
+    pub(crate) fn ics_if_made(&self) -> Option<*const UnsafeCell<[Ic; IC_WAYS]>> {
+        self.ics_cell().get().map(|b| b.as_ptr())
+    }
+
     /// Its inline caches, made (empty) the first time.
     pub fn ics(&self) -> &[UnsafeCell<[Ic; IC_WAYS]>] {
-        unsafe { &*self.ics.get() }.get_or_init(|| {
+        self.ics_cell().get_or_init(|| {
             crate::gc::code_bytes(self.ic_names.len() * size_of::<[Ic; IC_WAYS]>());
             (0..self.ic_names.len()).map(|_| UnsafeCell::new([Ic::EMPTY; IC_WAYS])).collect()
         })
+    }
+
+    #[inline(always)]
+    fn ics_cell(&self) -> &std::cell::OnceCell<Box<[UnsafeCell<[Ic; IC_WAYS]>]>> {
+        unsafe { &*self.ics.get() }
     }
 
     /// About the bytes it takes, but for compiled code: the collector
@@ -612,7 +624,7 @@ impl Code {
     /// Its inline caches if it has made them (for the collector: those it
     /// hasn't hold nothing).
     pub(crate) fn made_ics(&self) -> &[UnsafeCell<[Ic; IC_WAYS]>] {
-        unsafe { &*self.ics.get() }.get().map_or(&[], |b| b)
+        self.ics_cell().get().map_or(&[], |b| b)
     }
 }
 

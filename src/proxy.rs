@@ -321,7 +321,7 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
             }
             return Ok(d.value.unwrap_or(Value::UNDEFINED));
         }
-        let p = cur.shape().live().proto;
+        let p = unsafe { Obj::from_ptr(cur.ptr()) }.shape().live().proto;
         if !p.is_cell() {
             return Ok(Value::UNDEFINED);
         }
@@ -339,7 +339,7 @@ pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: V
         if let Some(d) = vm.own_property(cur, key) {
             break Some(d);
         }
-        let p = cur.shape().live().proto;
+        let p = unsafe { Obj::from_ptr(cur.ptr()) }.shape().live().proto;
         if !p.is_cell() {
             break None;
         }
@@ -378,7 +378,7 @@ pub(crate) fn generic_has(vm: &mut Vm, o: Value, key: Key) -> Result<bool> {
         if vm.own_property(cur, key).is_some() {
             return Ok(true);
         }
-        let p = cur.shape().live().proto;
+        let p = unsafe { Obj::from_ptr(cur.ptr()) }.shape().live().proto;
         if !p.is_cell() {
             return Ok(false);
         }

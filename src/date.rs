@@ -327,7 +327,7 @@ pub(crate) fn now_ms() -> f64 {
 
 /// The time value of `v` if it is a `Date`.
 pub(crate) fn date_value(v: Value) -> Option<f64> {
-    let o = v.is_cell().then(|| as_object(v))?;
+    let o = Obj::cell(v)?;
     (o.class() == Class::Date).then(|| f64::from_bits(o.code() as u64))
 }
 

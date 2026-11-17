@@ -1,16 +1,24 @@
 //! The crate's raw heap reads and writes, behind safe helpers.
 //!
-//! Inside the crate, an object pointer (`*mut Object`), a shape pointer
+//! An object's accessors ([`ObjectPtr`]) are on [`Obj`]
+//! alone, the handle made from a cell value (`Obj::of`, which tests it)
+//! or, where a raw pointer is all there is (a cache's holder, a frame's
+//! function, the collector), through `Obj::from_ptr(p)`: the
+//! trust in a pointer is stated where one becomes a handle, not at every
+//! read (`scripts/unsafe-count.py` counts those bridges). Not yet
+//! everywhere: some safe functions still take a raw pointer and bridge
+//! it inside (`object::is_error`, `object::set_shape`, `Object::inline_cap`,
+//! the JIT lowering's helpers such as `binds_by_code` and `inlinable`,
+//! which take a cache's holder, null when the cache is empty and not
+//! always an object), so their callers' trust is implicit there, until
+//! they take `Obj` (and a cache's holder is typed). A shape pointer
 //! (`*const Shape`), a code pointer (`*const Code`) and an inline cache
 //! slot (`*mut Ic`, see `vm::note_bytes`) are trusted to point to a live
-//! cell, shape, code or cache: the crate alone makes cell values (#71),
-//! the native stack's conservative scan keeps the cells Rust code holds
-//! alive and in place, a cell keeps its shape, a function its code, and a
-//! code its caches (which go when the code is retired, `gc.md`, "Compiled
-//! code's cells"). Hundreds of safe functions already take such pointers
-//! on that trust (`object::is_error`, `far::is_far`, …). These helpers
-//! state it once, so a field read through one needs no `unsafe` block at
-//! each use: the dereferences are here.
+//! shape, code or cache: a cell keeps its shape, a function its code, and
+//! a code its caches (which go when the code is retired, `gc.md`,
+//! "Compiled code's cells"). These helpers state that once, so a field
+//! read through one needs no `unsafe` block at each use: the dereferences
+//! are here.
 //!
 //! So these are trusted helpers, not a safety boundary the compiler
 //! enforces: fewer `unsafe` blocks don't remove the obligations, they
@@ -236,20 +244,6 @@ impl ObjectPtr for Obj {
     #[inline(always)]
     fn object_ptr(self) -> *mut Object {
         self.ptr()
-    }
-}
-
-impl ObjectPtr for *mut Object {
-    #[inline(always)]
-    fn object_ptr(self) -> *mut Object {
-        self
-    }
-}
-
-impl ObjectPtr for *const Object {
-    #[inline(always)]
-    fn object_ptr(self) -> *mut Object {
-        self.cast_mut()
     }
 }
 

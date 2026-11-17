@@ -285,12 +285,12 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
         return false;
     }
     let a = vm.array_fn;
-    let cs = a.shape().live();
+    let cs = unsafe { Obj::from_ptr(a) }.shape().live();
     let Some(k) = cs.lookup(vm.a_sym_species) else { return false };
     if cs.attrs()[k as usize] & crate::object::ACCESSOR == 0 {
         return false;
     }
-    let pair = Obj::of(a.slot_value(cs.location(k)));
+    let pair = Obj::of(unsafe { Obj::from_ptr(a) }.slot_value(cs.location(k)));
     let g = pair.elem(0);
     g.is_cell() && {
         let g = Obj::of(g);

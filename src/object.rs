@@ -311,6 +311,8 @@ pub const ERROR: u8 = 128;
 /// Whether `o` is an error object ([[ErrorData]]): a plain object with
 /// flag `ERROR` (the bit is other flags in other classes).
 pub(crate) fn is_error(o: *mut Object) -> bool {
+    // SAFETY: a live cell, never null here.
+    let o = unsafe { Obj::from_ptr(o) };
     o.class() == Class::Plain && o.flags() & ERROR != 0
 }
 
@@ -362,11 +364,9 @@ impl Object {
     /// trusted live, see `raw`.)
     #[inline(always)]
     pub(crate) fn inline_cap(this: *const Object) -> usize {
-        if this.class() == Class::TypedArray {
-            0
-        } else {
-            this.kind() as usize | (unsafe { (*this).cap_hi } as usize) << 8
-        }
+        // SAFETY: a live cell, never null here.
+        let o = unsafe { Obj::from_ptr(this.cast_mut()) };
+        if o.class() == Class::TypedArray { 0 } else { o.kind() as usize | (unsafe { (*this).cap_hi } as usize) << 8 }
     }
 
     /// The capacity of `this`'s out-of-line slots: their cell's (see
@@ -406,11 +406,8 @@ impl Object {
     #[inline(always)]
     pub unsafe fn elems<'a>(this: *const Object) -> &'a [Value] {
         unsafe {
-            if this.elems().is_null() {
-                &[]
-            } else {
-                std::slice::from_raw_parts(this.elems(), this.elems_len() as usize)
-            }
+            let o = Obj::from_ptr(this.cast_mut());
+            if o.elems().is_null() { &[] } else { std::slice::from_raw_parts(o.elems(), o.elems_len() as usize) }
         }
     }
 
@@ -424,7 +421,7 @@ impl Object {
     #[inline(always)]
     pub unsafe fn aux(this: *mut Object) -> *mut u32 {
         unsafe {
-            debug_assert_eq!(crate::layout::extra_words(this.class()), 2);
+            debug_assert_eq!(crate::layout::extra_words(Obj::from_ptr(this).class()), 2);
             this.cast::<u8>().add(HEADER_BYTES + 8).cast()
         }
     }
@@ -474,8 +471,10 @@ impl Object {
     /// `code` is its right half).
     #[inline(always)]
     pub unsafe fn string_atom(this: *const Object) -> u32 {
-        debug_assert!(this.class() == Class::String && !this.elems().is_null());
-        (this.code() as usize >> 32) as u32 & !ATOM_TAG
+        // SAFETY: a live cell (a string), never null here.
+        let o = unsafe { Obj::from_ptr(this.cast_mut()) };
+        debug_assert!(o.class() == Class::String && !o.elems().is_null());
+        (o.code() as usize >> 32) as u32 & !ATOM_TAG
     }
 
     /// Set [`Object::string_atom`] to `a` (below [`ATOM_TAG`]): `code` as a
@@ -489,6 +488,8 @@ impl Object {
     /// As [`Object::string_atom`].
     #[inline(always)]
     pub unsafe fn set_string_atom(this: *mut Object, a: u32) {
+        // SAFETY: a live cell, never null here.
+        let this = unsafe { Obj::from_ptr(this) };
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         unsafe {
             debug_assert!(this.class() == Class::String && !this.elems().is_null());
@@ -496,7 +497,7 @@ impl Object {
             let words = this.code() as usize as u32 as u64;
             let code = words | ((a | ATOM_TAG) as u64) << 32;
             debug_assert!(!Value::from_bits(code).is_cell());
-            (*(&raw const (*this).code as *const AtomicU64)).store(code, Relaxed);
+            (*(&raw const (*this.ptr()).code as *const AtomicU64)).store(code, Relaxed);
         }
     }
 
@@ -506,7 +507,13 @@ impl Object {
     /// `this` must be a live object and `loc` a location in its shape.
     #[inline(always)]
     pub unsafe fn slot(this: *mut Object, loc: i32) -> *mut Value {
-        unsafe { if loc >= 0 { this.cast::<u8>().add(loc as usize).cast() } else { this.props().add(!loc as usize) } }
+        unsafe {
+            if loc >= 0 {
+                this.cast::<u8>().add(loc as usize).cast()
+            } else {
+                Obj::from_ptr(this).props().add(!loc as usize)
+            }
+        }
     }
 
     /// In-object slot `i`.
@@ -515,7 +522,9 @@ impl Object {
     /// `this` must be a live object with more than `i` inline slots.
     #[inline(always)]
     pub unsafe fn inline(this: *mut Object, i: usize) -> *mut Value {
-        unsafe { this.cast::<u8>().add(crate::layout::slots_offset(this.class())).cast::<Value>().add(i) }
+        unsafe {
+            this.cast::<u8>().add(crate::layout::slots_offset(Obj::from_ptr(this).class())).cast::<Value>().add(i)
+        }
     }
 }
 
@@ -1060,6 +1069,8 @@ pub(crate) fn mark_shape(s: *const Shape) {
 /// first).
 #[inline]
 pub(crate) fn set_shape(o: *mut Object, s: *const Shape) {
+    // SAFETY: a live cell, never null here.
+    let o = unsafe { Obj::from_ptr(o) };
     // (Where the slots are depends on the class: `layout::slots_offset`.)
     assert_eq!(s.live().class, o.class(), "a shape of another class");
     // Room for its slots: the first `capacity` in the object, the rest
@@ -1067,12 +1078,12 @@ pub(crate) fn set_shape(o: *mut Object, s: *const Shape) {
     if o.class() != Class::String {
         let (n, cap) = (s.live().slots.len(), s.live().capacity.get() as usize);
         assert!(
-            n.min(cap) <= Object::inline_cap(o)
+            n.min(cap) <= Object::inline_cap(o.ptr().cast_const())
                 && n.saturating_sub(cap) <= crate::raw::values_cap(o.props()).unwrap_or(0),
             "no room for the shape's slots"
         );
     }
-    unsafe { set_shape_unchecked(o, s) }
+    unsafe { set_shape_unchecked(o.ptr(), s) }
 }
 
 /// [`set_shape`] without its test of the class, for the interpreter's
@@ -1083,7 +1094,7 @@ pub(crate) fn set_shape(o: *mut Object, s: *const Shape) {
 /// `s` must be a shape of `o`'s class.
 #[inline]
 pub(crate) unsafe fn set_shape_unchecked(o: *mut Object, s: *const Shape) {
-    debug_assert_eq!(s.live().class, o.class(), "a shape of another class");
+    debug_assert_eq!(s.live().class, unsafe { Obj::from_ptr(o) }.class(), "a shape of another class");
     unsafe {
         // (Atomic: the marker thread reads an old object's header while
         // the mutator gives it a shape; `Vm::add_shape`'s fence orders a
@@ -1660,7 +1671,7 @@ mod tests {
         unsafe {
             *Object::slot(o, s.location(1)) = Value::from_i32(5);
             assert_eq!(*Object::inline(o, 1), Value::from_i32(5));
-            assert_eq!(o.flags() & EXTERNAL, EXTERNAL);
+            assert_eq!(Obj::from_ptr(o).flags() & EXTERNAL, EXTERNAL);
         }
     }
 

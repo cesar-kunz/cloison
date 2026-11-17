@@ -920,12 +920,12 @@ fn split_key(this: Value, a: &[Value]) -> Option<(u64, u64, usize)> {
 /// of the array shape with its elements' type).
 fn array_copy(vm: &mut Vm, from: Value) -> Value {
     let arr = vm.new_array();
-    let (o, from) = (as_object(arr), as_object(from));
+    let (o, from) = (Obj::of(arr), Obj::of(from));
     let n = from.elems_len() as usize;
     if n > 0 {
-        vm.reserve_elems(unsafe { Obj::from_ptr(o) }, n);
-        crate::object::set_shape(o, from.shape());
-        vm.store_elements(unsafe { Obj::from_ptr(o) }, 0, from.elems(), n);
+        vm.reserve_elems(o, n);
+        crate::object::set_shape(o.ptr(), from.shape());
+        vm.store_elements(o, 0, from.elems(), n);
         // SAFETY: within the capacity `reserve_elems` made above.
         unsafe { o.set_elems_len(n as u32) };
     }
@@ -1488,7 +1488,7 @@ pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: Obj
 /// hidden mark `Object.prototype.toString` knows it by.
 pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
     let unmapped = callee.is_null() || {
-        let code = callee.code().live();
+        let code = unsafe { Obj::from_ptr(callee) }.code().live();
         code.strict || !code.simple_parameters
     };
     if !unmapped {
@@ -3882,7 +3882,7 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     }
     unsafe {
         let rp = vm.regexp_prototype;
-        if Obj::of(rx).shape() == vm.regexp_shapes.1 && rp.shape() == vm.regexp_proto_shape {
+        if Obj::of(rx).shape() == vm.regexp_shapes.1 && Obj::from_ptr(rp).shape() == vm.regexp_proto_shape {
             let at = |i: usize| *Object::slot(rp, vm.regexp_slots[i]);
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
             // (An accessor's slot holds its getter-setter pair.)
@@ -3933,7 +3933,7 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     }
     // (Where the prototype's are, for the next time.)
     let rp = vm.regexp_prototype;
-    let s = rp.shape().live();
+    let s = unsafe { Obj::from_ptr(rp) }.shape().live();
     let mut slots = [0; crate::vm::REGEXP_FNS];
     for (i, slot) in slots.iter_mut().enumerate() {
         match s.lookup(vm.regexp_atoms[i]) {
@@ -3942,7 +3942,7 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
         }
     }
     vm.regexp_slots = slots;
-    vm.regexp_proto_shape = rp.shape();
+    vm.regexp_proto_shape = unsafe { Obj::from_ptr(rp) }.shape();
     Ok(true)
 }
 
@@ -4308,7 +4308,10 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
     unsafe {
         let (rp, rc) = (vm.regexp_prototype, vm.regexp_constructor);
         let (ps, cs) = vm.regexp_species_shapes;
-        if Obj::of(r).shape() == vm.regexp_shapes.1 && rp.shape() == ps && rc.shape() == cs {
+        if Obj::of(r).shape() == vm.regexp_shapes.1
+            && Obj::from_ptr(rp).shape() == ps
+            && Obj::from_ptr(rc).shape() == cs
+        {
             let [pl, cl] = vm.regexp_species_slots;
             // (An accessor's slot holds its getter-setter pair.)
             return *Object::slot(rp, pl) == object_value(rc)
@@ -4359,12 +4362,12 @@ fn species_pristine_slow(vm: &mut Vm, r: Value) -> bool {
     // (Where they are, for the next time: `constructor` a data property
     // of the prototype, `@@species` an accessor of `RegExp`.)
     let rp = vm.regexp_prototype;
-    let (ps, cs) = (rp.shape().live(), rc.shape().live());
+    let (ps, cs) = (unsafe { Obj::from_ptr(rp) }.shape().live(), rc.shape().live());
     if let (Some(i), Some(j)) = (ps.lookup(a_c), cs.lookup(a_s))
         && !vm.is_accessor(unsafe { Obj::from_ptr(rp) }, i)
         && vm.is_accessor(rc, j)
     {
-        vm.regexp_species_shapes = (rp.shape(), rc.shape());
+        vm.regexp_species_shapes = (unsafe { Obj::from_ptr(rp) }.shape(), rc.shape());
         vm.regexp_species_slots = [ps.location(i), cs.location(j)];
         vm.regexp_species_getter = g;
     }

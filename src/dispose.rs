@@ -16,7 +16,7 @@
 
 use crate::builtins::{getter, link_constructor};
 use crate::interp::{call_function, to_string_units};
-use crate::object::{Class, DONT_ENUM, Obj, as_object, object_value};
+use crate::object::{Class, DONT_ENUM, Obj, object_value};
 use crate::props::{Desc, is_callable, is_object};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -141,11 +141,11 @@ fn root(vm: &Vm, r: Root) -> Value {
 // ---- Hidden arrays ----
 
 fn elem(o: Value, i: usize) -> Value {
-    unsafe { *as_object(o).elems().add(i) }
+    unsafe { *Obj::of(o).elems().add(i) }
 }
 
 fn put(o: Value, i: usize, v: Value) {
-    let o = as_object(o);
+    let o = Obj::of(o);
     unsafe {
         let at = o.elems().add(i);
         crate::heap::store(o.elems().cast::<u8>().sub(8), at, v);

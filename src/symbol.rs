@@ -73,15 +73,15 @@ pub(crate) const NO_ATOM: u32 = u32::MAX;
 /// (Most symbols never are: made for each, at a million `Symbol()`s
 /// atoms and symbols kept for good took 215 MB.)
 pub(crate) fn symbol_atom(vm: &mut Vm, v: Value) -> Atom {
-    let o = as_object(v);
+    let o = Obj::of(v);
     let a = o.elems_len();
     if a != NO_ATOM {
         return Atom(a);
     }
     vm.symbol_count += 1;
     let atom = vm.intern_name(&format!("{SYMBOL_MARK}{}", vm.symbol_count));
-    unsafe { (*o).elems_len = atom.0 };
-    vm.symbols.insert(atom, o);
+    unsafe { (*o.ptr()).elems_len = atom.0 };
+    vm.symbols.insert(atom, o.ptr());
     atom
 }
 
@@ -564,7 +564,7 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
             let e = st.elems();
             let (target, i, kind) = (*e, *e.add(1), *e.add(2));
             if target.is_cell() && i.is_int32() && kind == Value::from_i32(1) {
-                let t = as_object(target);
+                let t = Obj::of(target);
                 let n = i.as_i32_unchecked();
                 if t.class() == Class::Array && t.flags() & crate::far::FAR == 0 && (0..i32::MAX).contains(&n) {
                     if n as u32 >= t.elems_len() {
@@ -934,7 +934,7 @@ fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
     if !v.is_cell() || Obj::of(v).class() != Class::Array {
         return false;
     }
-    let o = as_object(v);
+    let o = Obj::of(v);
     if o.shape().live().proto != object_value(vm.array_prototype) {
         return false;
     }

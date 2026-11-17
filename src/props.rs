@@ -95,7 +95,7 @@ impl Desc {
     fn from_attrs(attrs: u8, v: Value) -> Desc {
         let (enumerable, configurable) = (attrs & DONT_ENUM == 0, attrs & DONT_DELETE == 0);
         if attrs & ACCESSOR != 0 {
-            let pair = as_object(v);
+            let pair = Obj::of(v);
             Desc::accessor(pair.elem(0), pair.elem(1), enumerable, configurable)
         } else {
             Desc::data(v, attrs & READ_ONLY == 0, enumerable, configurable)

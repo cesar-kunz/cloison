@@ -25,7 +25,7 @@ use crate::raw::ObjectPtr;
 use std::collections::HashMap;
 
 use crate::builtins::is_class;
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, object_value};
 use crate::props::is_object;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, is_string, string_units};
@@ -113,7 +113,7 @@ pub(crate) fn slots(v: Value) -> Option<Slots> {
     if !is_class(v, Class::Temporal) {
         return None;
     }
-    Some(unsafe { as_object(v).elems().cast::<Slots>().read_unaligned() })
+    Some(unsafe { Obj::of(v).elems().cast::<Slots>().read_unaligned() })
 }
 
 /// A new object of `slots`'s class (its intrinsic prototype).

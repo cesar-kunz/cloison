@@ -3375,8 +3375,12 @@ impl Vm {
         if !o.is_cell() || self.proxies_exist || !self.realms.is_empty() {
             return;
         }
-        let o = as_object(o);
-        if o.class() != Class::Plain || o.flags() & PROTOTYPE != 0 || o == self.global || o.shape().live().dictionary {
+        let o = Obj::of(o);
+        if o.class() != Class::Plain
+            || o.flags() & PROTOTYPE != 0
+            || o == self.global_obj()
+            || o.shape().live().dictionary
+        {
             return;
         }
         let new = o.shape();
@@ -3822,7 +3826,7 @@ impl Vm {
     /// `this.name` through an accessor `pair`'s getter (`undefined`
     /// without one).
     fn call_getter(&mut self, pair: Value, this: Value) -> Result<Value> {
-        let g = unsafe { *as_object(pair).elems() };
+        let g = unsafe { *Obj::of(pair).elems() };
         if g.is_undefined() {
             return Ok(Value::UNDEFINED);
         }
@@ -3833,7 +3837,7 @@ impl Vm {
     /// `this.name = value` through an accessor `pair`'s setter (nothing
     /// without one: sloppy mode).
     fn call_setter(&mut self, pair: Value, this: Value, value: Value) -> Result<()> {
-        let s = unsafe { *as_object(pair).elems().add(1) };
+        let s = unsafe { *Obj::of(pair).elems().add(1) };
         if s.is_undefined() {
             self.store_failed = true;
             return Ok(());
@@ -3863,7 +3867,7 @@ impl Vm {
         let old = s.lookup(name).filter(|&k| s.attrs()[k as usize] & ACCESSOR != 0);
         let (mut g, mut st) = (Value::UNDEFINED, Value::UNDEFINED);
         if let Some(k) = old {
-            let pair = as_object(o.slot_value(s.location(k)));
+            let pair = Obj::of(o.slot_value(s.location(k)));
             (g, st) = (pair.elem(0), pair.elem(1));
         }
         let pair = self.new_array();
@@ -4379,7 +4383,7 @@ impl Vm {
     /// The slot of the global scope's block-scoped binding `name` in
     /// `global_lexicals`, if a script declared one.
     pub(crate) fn global_lexical_slot(&self, name: Atom) -> Option<u32> {
-        self.global_lexicals.shape().live().lookup(name)
+        self.global_lexicals_obj().shape().live().lookup(name)
     }
 
     /// A global name's load (GetBindingValue) finding the global scope's
@@ -5148,7 +5152,7 @@ impl Vm {
         // A string's atom, once found, is kept in it (`Object::string_atom`,
         // a flat string's): a key looked up again isn't converted and hashed
         // again (PdfJS's `map[command]`).
-        let flat = |key: Value| string_len(key).is_some() && (!as_object(key).elems().is_null());
+        let flat = |key: Value| string_len(key).is_some() && (!Obj::of(key).elems().is_null());
         if flat(key) {
             let cached = unsafe { Object::string_atom(as_object(key)) };
             if cached != 0 {
@@ -5365,7 +5369,7 @@ impl Vm {
             return None;
         };
         if let Some(pair) = self.accessor(unsafe { Obj::from_ptr(holder) }, name) {
-            let g = unsafe { *as_object(pair).elems() };
+            let g = unsafe { *Obj::of(pair).elems() };
             if g.is_cell() && Obj::of(g).class() != Class::Native {
                 return None;
             }
@@ -5996,13 +6000,13 @@ impl Vm {
             return None;
         }
         unsafe {
-            let p = as_object(parent);
+            let p = Obj::of(parent);
             if p.class() != Class::String || p.elems().is_null() {
                 return None;
             }
             let units = p.elems() as usize;
             // A slice's parent is its root's: one level only.
-            let root = if !p.props().is_null() { p.props().cast::<Object>() } else { p };
+            let root = if !p.props().is_null() { p.props().cast::<Object>() } else { p.ptr() };
             let ru = root.elems() as usize;
             // The cell holding the root's units: itself, or the buffer a
             // flattening made (past its header word).
@@ -6300,9 +6304,9 @@ impl Vm {
         }
         let env = r.elem(0);
         if env.is_cell() {
-            let env = as_object(env);
+            let env = Obj::of(env);
             let slot = env.shape().live().lookup(Atom(e.as_i32_unchecked() as u32))?;
-            Some(Binding::Scope(env, slot))
+            Some(Binding::Scope(env.ptr(), slot))
         } else {
             Some(Binding::Upvalue((e.to_bits() + 8) as *mut Upvalue))
         }
@@ -6860,7 +6864,7 @@ impl Vm {
         self.check_own(this, "Vm::call_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::call_other"));
         if f.is_cell() {
-            let o = as_object(f);
+            let o = Obj::of(f);
             if o.class() == Class::Native {
                 // (A native calling natives, as iterator helpers' chains
                 // or a proxy's of proxies do, recurses natively alone.)
@@ -6869,12 +6873,12 @@ impl Vm {
                 if !self.realms.is_empty() && o.code().live().realm != self.realm {
                     return crate::realm::run_in(self, o.code().live().realm, |vm| {
                         vm.constructing = false;
-                        vm.callee = o;
+                        vm.callee = o.ptr();
                         vm.run_native(|vm| native(vm, this, args))
                     });
                 }
                 self.constructing = false;
-                self.callee = o;
+                self.callee = o.ptr();
                 return self.run_native(|vm| native(vm, this, args));
             }
         }
@@ -6890,21 +6894,21 @@ impl Vm {
         self.check_own(f, "Vm::construct_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::construct_other"));
         if f.is_cell() {
-            let o = as_object(f);
+            let o = Obj::of(f);
             if o.class() == Class::Native && o.code().live().constructs {
                 crate::interp::check_native_stack(self)?;
                 let native = o.code().live().native.unwrap();
                 if !self.realms.is_empty() && o.code().live().realm != self.realm {
                     return crate::realm::run_in(self, o.code().live().realm, |vm| {
                         vm.constructing = true;
-                        vm.callee = o;
+                        vm.callee = o.ptr();
                         let r = vm.run_native(|vm| native(vm, Value::UNDEFINED, args));
                         vm.constructing = false;
                         r
                     });
                 }
                 self.constructing = true;
-                self.callee = o;
+                self.callee = o.ptr();
                 let r = self.run_native(|vm| native(vm, Value::UNDEFINED, args));
                 self.constructing = false;
                 return r;
@@ -9315,7 +9319,7 @@ out.join();"#;
     fn cons(vm: &mut Vm) -> Value {
         let src = "'x'.repeat(40) + 'y'.repeat(40)";
         let s = vm.run(&crate::js::compile(src).unwrap()).unwrap();
-        assert!(as_object(s).elems().is_null());
+        assert!(Obj::of(s).elems().is_null());
         s
     }
 

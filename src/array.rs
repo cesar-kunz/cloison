@@ -101,21 +101,21 @@ fn dense(vm: &Vm, o: Obj) -> bool {
 fn plain_arguments(vm: &Vm, o: Obj) -> bool {
     o.shape() == vm.arguments_shape
         && o.flags() & !(EXTERNAL | PROTOTYPE) == 0
-        && vm.object_prototype.shape().live().proto.is_null()
-        && vm.object_prototype.elems_len() == 0
-        && vm.object_prototype.flags() & crate::object::SPARSE == 0
+        && vm.object_prototype_obj().shape().live().proto.is_null()
+        && vm.object_prototype_obj().elems_len() == 0
+        && vm.object_prototype_obj().flags() & crate::object::SPARSE == 0
 }
 
 /// Whether `o`'s prototypes are `Array.prototype` then `Object.prototype`
 /// with nothing indexed (`dense`'s condition on them).
 fn plain_protos(vm: &Vm, o: Obj) -> bool {
     o.shape().live().proto == object_value(vm.array_prototype)
-        && vm.array_prototype.shape().live().proto == object_value(vm.object_prototype)
-        && vm.object_prototype.shape().live().proto.is_null()
-        && vm.array_prototype.elems_len() == 0
-        && vm.object_prototype.elems_len() == 0
-        && vm.array_prototype.flags() & (crate::object::SPARSE | crate::far::FAR) == 0
-        && vm.object_prototype.flags() & crate::object::SPARSE == 0
+        && vm.array_prototype_obj().shape().live().proto == object_value(vm.object_prototype)
+        && vm.object_prototype_obj().shape().live().proto.is_null()
+        && vm.array_prototype_obj().elems_len() == 0
+        && vm.object_prototype_obj().elems_len() == 0
+        && vm.array_prototype_obj().flags() & (crate::object::SPARSE | crate::far::FAR) == 0
+        && vm.object_prototype_obj().flags() & crate::object::SPARSE == 0
 }
 
 /// Whether `o` is a far array whose missing indices nothing sees: none of
@@ -290,10 +290,10 @@ fn species_pristine(vm: &Vm, original: Value) -> bool {
     if cs.attrs()[k as usize] & crate::object::ACCESSOR == 0 {
         return false;
     }
-    let pair = as_object(a.slot_value(cs.location(k)));
+    let pair = Obj::of(a.slot_value(cs.location(k)));
     let g = pair.elem(0);
     g.is_cell() && {
-        let g = as_object(g);
+        let g = Obj::of(g);
         g.class() == Class::Native
             && g.code().live().native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
     }
@@ -609,7 +609,7 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `Array.prototype.pop()`.
 pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if this.is_cell() && dense(vm, Obj::of(this)) {
-        let o = as_object(this);
+        let o = Obj::of(this);
         let len = o.elems_len() as usize;
         if len == 0 {
             return Ok(Value::UNDEFINED);
@@ -635,7 +635,7 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
 pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     if dense(vm, Obj::of(o)) {
-        let obj = as_object(o);
+        let obj = Obj::of(o);
         unsafe {
             let n = obj.elems_len() as usize;
             // (Word by word while a marking runs, not a slice's `reverse`:
@@ -690,7 +690,7 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         return Ok(Value::UNDEFINED);
     }
     if dense(vm, Obj::of(o)) {
-        let obj = as_object(o);
+        let obj = Obj::of(o);
         unsafe {
             let n = obj.elems_len() as usize;
             let first = obj.elem(0);
@@ -782,7 +782,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         && dense(vm, Obj::of(out))
         && Obj::of(o).elems_len() as f64 == len
     {
-        let obj = as_object(o);
+        let obj = Obj::of(o);
         let oo = Obj::of(out);
         unsafe {
             let (k, count) = (k as usize, count as usize);
@@ -1050,7 +1050,7 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
     }
     let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
     if dense(vm, Obj::of(o)) {
-        let obj = as_object(o);
+        let obj = Obj::of(o);
         // (Not past the length it had: `fromIndex`'s conversion may have
         // pushed more.)
         let m = (obj.elems_len() as usize).min(len as usize);

@@ -382,7 +382,7 @@ pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
     if !vm.typed_length_unusual {
         let usual =
             proto.is_cell() && vm.realms.is_empty() && as_object(proto) == (vm.typed_prototypes[k as usize]).ptr() && {
-                let p = as_object(proto);
+                let p = Obj::of(proto);
                 let s = p.shape().live();
                 p.flags() & crate::object::PROTOTYPE != 0
                     || !s.dictionary
@@ -897,7 +897,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
                 )));
             }
             let out = allocate(vm, k, n)?;
-            let o = as_object(out);
+            let o = Obj::of(out);
             if sk == k {
                 // (Its bytes, as they are.)
                 let (from, to) = (fo.elems().cast::<u8>(), o.elems().cast::<u8>());
@@ -1096,7 +1096,7 @@ fn typed_length_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// typed array receiver, its length (0 if detached or out of bounds).
 pub(crate) fn is_length_getter(v: Value) -> bool {
     v.is_cell() && {
-        let o = as_object(v);
+        let o = Obj::of(v);
         o.class() == Class::Native
             && !o.code().is_null()
             && o.code().live().native.is_some_and(|g| g as usize == (typed_length_getter as NativeFn) as usize)

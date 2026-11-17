@@ -7753,7 +7753,10 @@ total;
 /// inside that call (`fire`, reached by a call with too many callees to
 /// be bound, so that no frame leaves its code for it), `loop` is lowered
 /// again for a second closure, made and dropped at a depth the
-/// collections' frames don't reach, and two collections run: the first
+/// collections' frames don't reach (2000 calls: a debug build's frames
+/// between the script and the collector reach 100, and a return address
+/// into `deep`'s code left in one counts as a frame running it, which
+/// keeps the closure: #346), and two collections run: the first
 /// keeps what code took since the last one, the second finds the closure
 /// dead, so `loop` is retired (and `other`, and the closure's code). The
 /// version under way stays, kept apart, with what it refers to; its call
@@ -7770,7 +7773,7 @@ fn code_retired_under_a_running_frame_runs_to_its_exit() {
 var gcs = 0, ints = { v: 1 }, mode = 0, next = [1, 2, 3, 4, 0, 5];
 function fire() {
   mode = 0;
-  deep(100, function () { return other(mk(10 + gcs)); });
+  deep(2000, function () { return other(mk(10 + gcs)); });
   $262.gc();
   $262.gc();
   gcs++;

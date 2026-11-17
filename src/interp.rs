@@ -114,6 +114,24 @@ fn unboxed(i: i32) -> Value {
     Value::from_bits(i as u32 as u64)
 }
 
+/// [`note_callee`] where it calls nothing: `f` way 0's already, or
+/// another closure of its code replacing a young one (a function made per
+/// call). False for the rest. (In a handler.)
+macro_rules! callee_noted {
+    ($regs:expr, $ic:expr, $f:expr) => {{
+        let (ic, f): (*mut Ic, Obj) = ($ic, $f);
+        let old = (*ic).holder;
+        old == f.ptr() || {
+            let fits = Obj::cell(object_value(old)).is_some_and(|o| o.code_or_null() == f.code_or_null())
+                && (*frame_vm($regs)).heap.is_young(object_value(old));
+            if fits {
+                (*ic).holder = f.ptr();
+            }
+            fits
+        }
+    }};
+}
+
 /// Tail-call the handler of the instruction at `$pc + $off` (bytes, signed)
 /// through `$via`, one of the two tables.
 macro_rules! dispatch {
@@ -275,16 +293,27 @@ macro_rules! handlers {
             macro_rules! jump_to {
                 ($p:expr, $a:expr, $r:expr) => { dispatch!(tbl, $p, 0, $a, $r, $tag, tbl, ti32) };
             }
+            // Unwind from instruction `$p` of frame `$r`.
+            #[allow(unused_macros)]
+            macro_rules! unwind_from {
+                ($p:expr, $r:expr) => { become op_unwind($p, Value::EMPTY, $r, $tag, tbl, ti32) };
+            }
             // Enter bytecode function object `fo` in a new frame: in its
             // compiled code, once its call countdown has run out.
             macro_rules! enter {
                 ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
                     let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code;
-                    let new = push_frame($regs, $fo, callee, $this, $args, $argc, $flags, $pc.add($size));
+                    let this: Value = $this;
+                    let new = push_frame($regs, $fo, callee, callee.live().ics().as_ptr(), this, $args, $argc, $flags, $pc.add($size));
                     // (Thrown from the call: a `catch` around it catches it.)
                     if new.is_null() {
                         stack_overflow($regs);
                         tail!(op_unwind, Value::EMPTY)
+                    }
+                    // Sloppy mode: a primitive `this` is boxed (a string, a
+                    // symbol or a bigint is a cell).
+                    if !callee.live().strict {
+                        *new = sloppy_this(frame_vm($regs), this);
                     }
                     let left = callee.live().calls_left.get() - 1;
                     callee.live().calls_left.set(left);
@@ -297,6 +326,31 @@ macro_rules! handlers {
                             ENTER_UNWIND => become op_unwind(e.pc.sub(1), Value::EMPTY, e.regs, $tag, tbl, ti32),
                             _ => {}
                         }
+                    }
+                    jump_to!(callee.live().bytecode.as_ptr(), Value::UNDEFINED, new)
+                }};
+            }
+            // `enter!` for the instructions that call most, `Call`,
+            // `CallUndefined` and `Construct` (callee in `r1`), calling
+            // nothing: a first call (its caches to make) runs the
+            // instruction again after `first_entry`; a full stack, a
+            // primitive `this` to box or a countdown run out go on in
+            // `call_overflow` or `enter_slow`.
+            macro_rules! enter_fast {
+                ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
+                    let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code;
+                    let Some(ics) = callee.live().ics_if_made() else {
+                        tail!(first_entry, Value::UNDEFINED)
+                    };
+                    let this: Value = $this;
+                    let new = push_frame($regs, $fo, callee, ics, this, $args, $argc, $flags, $pc.add($size));
+                    if new.is_null() {
+                        tail!(call_overflow, Value::EMPTY)
+                    }
+                    let left = callee.live().calls_left.get() - 1;
+                    callee.live().calls_left.set(left);
+                    if left < 0 || !(callee.live().strict || crate::props::is_object(this)) {
+                        become enter_slow($pc, Value::UNDEFINED, new, $tag, tbl, ti32)
                     }
                     jump_to!(callee.live().bytecode.as_ptr(), Value::UNDEFINED, new)
                 }};
@@ -998,7 +1052,7 @@ handlers! {
         let mut spread = Vec::new();
         let (args, argc) = frame_args(&mut *vm, regs, &mut spread);
         if let Some(fo) = unwrap_apply(vm, *reg(pc, 1, regs), *w) {
-            // (`push_frame` boxes `this` as the callee wants.)
+            // (`enter!` boxes `this` as the callee wants.)
             let that = *w.add(1);
             enter!(fo, that, args, argc, 0, Op::CallApplyArguments.size())
         }
@@ -1948,9 +2002,11 @@ handlers! {
         if is_cell(tag, f) && crate::object::Obj::from_ptr(as_object(f)).class() == Class::Function {
             // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
             let fo = crate::object::Obj::from_ptr(as_object(f));
-            note_callee(regs, ic_at(regs, pc, 4), fo);
+            if !callee_noted!(regs, ic_at(regs, pc, 4), fo) {
+                tail!(note_again, Value::UNDEFINED)
+            }
             let w = reg(pc, 2, regs);
-            enter!(fo, *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
+            enter_fast!(fo, *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
         }
         tail!(slow_call, acc)
     }
@@ -1960,7 +2016,9 @@ handlers! {
         if is_cell(tag, f) && crate::object::Obj::from_ptr(as_object(f)).class() == Class::Function {
             // (The bridge after the class test: `Obj::of` wouldn't fold behind it.)
             let fo = crate::object::Obj::from_ptr(as_object(f));
-            note_callee(regs, ic_at(regs, pc, 4), fo);
+            if !callee_noted!(regs, ic_at(regs, pc, 4), fo) {
+                tail!(note_again, Value::UNDEFINED)
+            }
             let args = reg(pc, 2, regs);
             // Sloppy mode: `this` is the global object; strict: `undefined`.
             let this = if (*crate::object::Obj::from_ptr(as_object(f)).code()).strict {
@@ -1968,7 +2026,7 @@ handlers! {
             } else {
                 object_value((*frame_vm(regs)).global)
             };
-            enter!(fo, this, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
+            enter_fast!(fo, this, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
         tail!(slow_call_undefined, acc)
     }
@@ -1982,11 +2040,13 @@ handlers! {
                 // (A derived class's `this` is its base's, from `super()`.)
                 Value::HOLE
             } else {
-                note_callee(regs, ic_at(regs, pc, 4), fo);
+                if !callee_noted!(regs, ic_at(regs, pc, 4), fo) {
+                    tail!(note_again, Value::UNDEFINED)
+                }
                 construct_this(regs, fo)
             };
             let args = reg(pc, 2, regs);
-            enter!(fo, this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
+            enter_fast!(fo, this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
         }
         tail!(slow_construct, acc)
     }
@@ -2239,6 +2299,59 @@ handlers! {
             strict_store_check(vm, &*frame_code(regs), r, |_| crate::vm::shown(key))
         });
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
+    }
+
+    // `enter_fast!`'s ways out. A call instruction run again starts in
+    // ANY state, `acc` overwritten by the call.
+
+    /// The callee's first call: its caches made, the call run again.
+    #[cold]
+    #[inline(never)]
+    fn first_entry(pc, acc, regs, tag) {
+        (*Obj::of(*reg(pc, 1, regs)).code()).ics();
+        next!(any, 0, Value::UNDEFINED)
+    }
+
+    /// Another callee than way 0's: recorded, the call run again.
+    #[cold]
+    #[inline(never)]
+    fn note_again(pc, acc, regs, tag) {
+        note_callee(regs, ic_at(regs, pc, 4), Obj::of(*reg(pc, 1, regs)));
+        next!(any, 0, Value::UNDEFINED)
+    }
+
+    /// The VM stack full: a `RangeError`, which a `catch` around the call
+    /// catches.
+    #[cold]
+    #[inline(never)]
+    fn call_overflow(pc, acc, regs, tag) {
+        stack_overflow(regs);
+        tail!(op_unwind, Value::EMPTY)
+    }
+
+    /// The callee's frame `regs` pushed for call `pc`: its `this` boxed if
+    /// it must be, and its compiled code entered once its countdown ran
+    /// out (as `enter!`).
+    #[cold]
+    #[inline(never)]
+    fn enter_slow(pc, acc, regs, tag) {
+        let callee: *const Code = header(regs, CODE);
+        if !callee.live().strict {
+            *regs = sloppy_this(frame_vm(regs), *regs);
+        }
+        if callee.live().calls_left.get() < 0 {
+            let caller: *mut Value = header(regs, CALLER);
+            let ret: *const u8 = header(regs, RET_PC);
+            let e = enter_compiled(regs);
+            match e.kind {
+                ENTER_RETURNED => jump_to!(ret, e.acc, caller),
+                ENTER_RESUME => jump_to!(e.pc, e.acc, e.regs),
+                ENTER_ERROR => unwind_from!(pc, caller),
+                ENTER_UNWIND => unwind_from!(e.pc.sub(1), e.regs),
+                _ => {}
+            }
+        }
+        jump_to!(callee.live().bytecode.as_ptr(), Value::UNDEFINED, regs)
     }
 
     /// `Call` of what isn't a bytecode function: a leaf native (`is_leaf`)
@@ -5079,15 +5192,17 @@ fn elems_hit(s: *const Shape, c: *const Shape) -> bool {
     s == c || !c.is_null() && s.live().family == c.live().family
 }
 
-/// Push a frame for `callee` past the caller's registers: header, `this`,
-/// the first `argc` values at `args` as parameters, the rest `undefined`.
-/// Null if the VM stack is full.
+/// Push a frame for `callee`, whose caches are `ics`, past the caller's
+/// registers: header, `this` (as it is: `enter!` boxes it for a sloppy
+/// callee), the first `argc` values at `args` as parameters, the rest
+/// `undefined`. Null if the VM stack is full.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn push_frame(
     regs: *mut Value,
     fo: Obj,
     callee: *const Code,
+    ics: *const std::cell::UnsafeCell<[Ic; IC_WAYS]>,
     this: Value,
     args: *const Value,
     argc: usize,
@@ -5104,15 +5219,13 @@ unsafe fn push_frame(
         *new.sub(BUDGET) = Value::from_bits(callee.live().loop_budget.get() as u64);
         clear_osr(new);
         set_header(new, CODE, callee);
-        set_header(new, ICS, callee.live().ics().as_ptr());
+        set_header(new, ICS, ics);
         set_header(new, VM, vm);
         set_header(new, RET_PC, ret);
         set_header(new, CALLER, regs);
         *new.sub(FLAGS) = Value::from_bits(flags);
         set_header(new, FUNC, fo.ptr());
-        // Sloppy mode: a primitive `this` is boxed (a string, a symbol or a
-        // bigint is a cell).
-        *new = if callee.live().strict || crate::props::is_object(this) { this } else { sloppy_this(vm, this) };
+        *new = this;
         // Scalar loops: counts are small, and vectorized ones would bloat
         // the handler with prologues and remainders.
         let k = argc.min(callee.live().nparams as usize);

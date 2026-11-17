@@ -2805,7 +2805,12 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 | Op::ToNumber
                 | Op::Negate
                 | Op::BitNot => {}
-                Op::LdaUpvalue | Op::StaUpvalue if vm => imm = code[pc + 1] as i32,
+                // (Past the offset the stencils reach in the function
+                // object, see `MAX_SLOT_OFF`: the interpreter's.)
+                Op::LdaUpvalue | Op::StaUpvalue if vm => {
+                    imm = index_at(code, pc + 1) as i32;
+                    bail = crate::vm::UPVALUES_OFF + 8 * imm as usize > MAX_SLOT_OFF as usize;
+                }
                 Op::Nop | Op::Return | Op::LdaTrue | Op::LdaFalse | Op::LdaUndefined | Op::LdaNull | Op::LdaHole => {}
                 // (The binding's name, for the interpreter's error: an
                 // exit leaves the throw to it.)

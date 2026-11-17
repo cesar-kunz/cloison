@@ -2989,16 +2989,14 @@ fn upvalues_of_two_functions(a: usize, b: usize) -> String {
     )
 }
 
-/// An upvalue's index is a byte: 256 upvalues compile, more are refused
-/// (#136: they read the wrong variables). The expected values are
-/// SpiderMonkey's, JSC's and QuickJS's.
+/// Each upvalue reads its own variable, past 256 too: an upvalue's index
+/// is 4 bytes (#136 read the wrong variables past a byte, #325 refused
+/// them). The expected values are SpiderMonkey's, JSC's and QuickJS's.
 #[test]
-fn more_than_256_upvalues_are_refused() {
+fn more_than_256_upvalues_read_their_variables() {
     assert_eq!(value(&upvalues_of_two_functions(128, 128)), "256,1127,1127");
-    for (a, b) in [(150, 107), (150, 150)] {
-        let e = compile_error(&upvalues_of_two_functions(a, b));
-        assert!(e.contains("unsupported: more than 256 upvalues"), "{a} + {b}: {e}");
-    }
+    assert_eq!(value(&upvalues_of_two_functions(150, 107)), "257,1105,1106");
+    assert_eq!(value(&upvalues_of_two_functions(150, 150)), "300,1105,1149");
 }
 
 /// Cons strings (long strings built by `+`, flattened when read) and
@@ -10352,4 +10350,47 @@ var n = 0; for (var j = 0; j < 100; j++) for (let i = 0, g = () => i; i < 3; i++
 log.push(n);
 log.join(" ");"#;
     assert_eq!(value(src), "0 0 5 0011223 012 0 0 1 0 0");
+}
+
+/// Nested functions `f0`… with `per` variables each, all captured by
+/// `inner`: its upvalues, `levels * per` of them, read in a hot loop,
+/// the first and the last also written.
+fn many_upvalues(levels: usize, per: usize) -> String {
+    let names: Vec<String> = (0..levels).flat_map(|l| (0..per).map(move |i| format!("v{l}_{i}"))).collect();
+    let mut src = String::new();
+    for l in 0..levels {
+        src += &format!("function f{l}() {{");
+        for i in 0..per {
+            src += &format!("var v{l}_{i} = {};", l * 1000 + i);
+        }
+    }
+    let (first, last, mid) = (&names[0], &names[names.len() - 1], &names[names.len() / 2]);
+    src += &format!("function inner(n) {{ var s = 0; for (var k = 0; k < n; k++) {{ {last}++; {first}++;");
+    for chunk in names.chunks(100) {
+        src += &format!("s += {};", chunk.join(" + "));
+    }
+    src += &format!("}} return s + ' ' + {first} + ' ' + {last} + ' ' + {mid}; }} return inner;");
+    for l in (0..levels).rev() {
+        src += "}";
+        if l > 0 {
+            src += &format!("return f{l}();");
+        }
+    }
+    src += "\nvar g = f0(), r; for (var t = 0; t < 30; t++) r = g(5); r;";
+    src
+}
+
+/// Thousands of upvalues (#325), read and written in compiled loops.
+/// Past what the JIT's stencils reach in the function object, the
+/// instruction is the interpreter's.
+#[test]
+fn a_function_with_thousands_of_upvalues_reads_each() {
+    // (The last call's 5 rounds of 150: the first and the last variable
+    // one more each round.)
+    let sum = |levels: usize, per: usize| {
+        let base: usize = (0..levels).flat_map(|l| (0..per).map(move |i| l * 1000 + i)).sum();
+        (146..=150).map(|k| base + 2 * k).sum::<usize>()
+    };
+    assert_eq!(value(&many_upvalues(3, 100)), format!("{} 150 2249 1050", sum(3, 100)));
+    assert_eq!(value(&many_upvalues(60, 150)), format!("{} 150 59299 30000", sum(60, 150)));
 }

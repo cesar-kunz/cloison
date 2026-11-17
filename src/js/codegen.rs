@@ -595,7 +595,7 @@ fn global_lexical(p: &Program, n: &str) -> bool {
 
 /// Where each of function `i`'s upvalues comes from, in its parent: a
 /// register of the parent's (`true`), or an upvalue of its own.
-fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> R<Vec<(bool, u8)>> {
+fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> R<Vec<(bool, u32)>> {
     let Some(parent) = p.functions[i].parent else {
         return Ok(Vec::new());
     };
@@ -608,21 +608,20 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> R
         })
         .map(|n| match decls[parent].position(n) {
             Some(k) if parent != 0 || script_local(p, n) => match u8::try_from(k + 1) {
-                Ok(r) => Ok((true, r)),
+                Ok(r) => Ok((true, r as u32)),
                 Err(_) => unsupported(pos, "more variables than registers"),
             },
             _ => {
                 let k = scopes.upvalues[parent].iter().position(|&d| d == n);
-                Ok((false, upvalue(k.expect("passed down by the parent"), pos)?))
+                Ok((false, upvalue(k.expect("passed down by the parent"))))
             }
         })
         .collect()
 }
 
-/// Upvalue `k`'s operand (`LdaUpvalue k`): a byte, so a function with more
-/// than 256 upvalues is refused (see `Gen::function`).
-fn upvalue(k: usize, pos: Pos) -> R<u8> {
-    u8::try_from(k).or_else(|_| unsupported(pos, "more than 256 upvalues"))
+/// Upvalue `k`'s operand (`LdaUpvalue k`), 4 bytes, as a table index.
+fn upvalue(k: usize) -> u32 {
+    index(k)
 }
 
 /// The kind of direct `eval` site binding `name` (`EVAL_CONST`…) if its
@@ -1962,17 +1961,17 @@ enum Var {
     Scope(u8),
     /// A property of an enclosing function's scope object, that object
     /// this function's upvalue.
-    ScopeUpvalue(u8),
+    ScopeUpvalue(u32),
     /// An enclosing function's variable: upvalue `k` of this one's.
-    Upvalue(u8),
+    Upvalue(u32),
     /// A direct `eval`'s site's binding (`Program::eval_upvalues`), upvalue
     /// `k`: not initialized yet a ReferenceError, a constant's store a
     /// TypeError (as `intrinsics::binding_get` and `binding_set`).
-    Bound(u8),
+    Bound(u32),
     /// As `Bound`, a binding in a box (a generator's block-scoped variable
     /// a nested function uses: see `boxed_lexicals`), upvalue `k` the box:
     /// the variable its property `bound_box_key`.
-    BoundBox(u8),
+    BoundBox(u32),
     Global,
     Undefined,
     /// A module's imported binding (see `ast::Import`).
@@ -2341,9 +2340,6 @@ impl<'a> Gen<'a> {
         }
         if self.temp > 256 {
             return unsupported(self.f.pos, "more variables than registers");
-        }
-        if self.scopes.upvalues[self.index].len() > 256 {
-            return unsupported(self.f.pos, "more than 256 upvalues");
         }
         // `new.target` first (see `Op::LdaNewTarget`).
         if self.index == 0 && self.p.direct_eval {
@@ -3728,21 +3724,21 @@ impl<'a> Gen<'a> {
                     if let Some(u) =
                         ups.iter().position(|n| Some(n) == outer).or_else(|| ups.iter().position(|&n| n == ENV))
                     {
-                        return Ok(Var::ScopeUpvalue(upvalue(u, pos)?));
+                        return Ok(Var::ScopeUpvalue(upvalue(u)));
                     }
                 }
                 // (In its box, the upvalue.)
                 if self.boxed[k].contains(&name)
                     && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == name)
                 {
-                    return Ok(Var::ScopeUpvalue(upvalue(u, pos)?));
+                    return Ok(Var::ScopeUpvalue(upvalue(u)));
                 }
                 break;
             }
             f = self.p.functions[k].parent;
         }
         if let Some(k) = self.scopes.upvalues[self.index].iter().position(|&n| n == name) {
-            let k = upvalue(k, pos)?;
+            let k = upvalue(k);
             if let Some(kind) = bound_kind(self.p, name) {
                 return Ok(if kind & EVAL_BOXED != 0 { Var::BoundBox(k) } else { Var::Bound(k) });
             }
@@ -4189,14 +4185,14 @@ impl<'a> Gen<'a> {
         match self.resolve(name, pos)? {
             Var::Reg(r) => self.star(r),
             Var::Upvalue(k) => {
-                self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::StaUpvalue, &[Arg::Index(k)]);
             }
             Var::Bound(k) => {
                 // (`acc` stays the value.)
                 let mark = self.temp;
                 let v = self.alloc(pos)?;
                 self.star(v);
-                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::LdaUpvalue, &[Arg::Index(k)]);
                 let c = self.const_str(original(name));
                 self.emit(Op::CheckHole, &[Arg::Index(c)]);
                 if bound_kind(self.p, name).is_some_and(|k| k & EVAL_CONST != 0) {
@@ -4205,7 +4201,7 @@ impl<'a> Gen<'a> {
                     self.intrinsic("throw_const", v, 1);
                 } else {
                     self.ldar(v);
-                    self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
+                    self.emit(Op::StaUpvalue, &[Arg::Index(k)]);
                 }
                 self.temp = mark;
             }
@@ -4215,7 +4211,7 @@ impl<'a> Gen<'a> {
                 let v = self.alloc(pos)?;
                 self.star(v);
                 let b = self.alloc(pos)?;
-                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::LdaUpvalue, &[Arg::Index(k)]);
                 self.star(b);
                 let key = bound_box_key(self.p, name);
                 self.named(Op::GetNamed, b, key);
@@ -4238,7 +4234,7 @@ impl<'a> Gen<'a> {
                 let v = self.alloc(pos)?;
                 self.star(v);
                 let env = self.alloc(pos)?;
-                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::LdaUpvalue, &[Arg::Index(k)]);
                 self.star(env);
                 self.ldar(v);
                 self.named(Op::SetNamed, env, &self.env_key(name));
@@ -4513,17 +4509,17 @@ impl<'a> Gen<'a> {
         match self.resolve(n, e.pos)? {
             Var::Reg(r) => self.ldar(r),
             Var::Upvalue(k) => {
-                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::LdaUpvalue, &[Arg::Index(k)]);
             }
             Var::Bound(k) => {
-                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::LdaUpvalue, &[Arg::Index(k)]);
                 let c = self.const_str(original(n));
                 self.emit(Op::CheckHole, &[Arg::Index(c)]);
             }
             Var::BoundBox(k) => {
                 let mark = self.temp;
                 let b = self.alloc(e.pos)?;
-                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::LdaUpvalue, &[Arg::Index(k)]);
                 self.star(b);
                 self.named(Op::GetNamed, b, bound_box_key(self.p, n));
                 let c = self.const_str(original(n));
@@ -4534,7 +4530,7 @@ impl<'a> Gen<'a> {
             Var::ScopeUpvalue(k) => {
                 let mark = self.temp;
                 let env = self.alloc(e.pos)?;
-                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.emit(Op::LdaUpvalue, &[Arg::Index(k)]);
                 self.star(env);
                 self.named(Op::GetNamed, env, &self.env_key(n));
                 self.temp = mark;

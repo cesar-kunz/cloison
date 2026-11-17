@@ -1529,13 +1529,13 @@ handlers! {
 
     fn op_lda_upvalue(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(index_at(pc, 1) as usize);
         next!(any, Op::LdaUpvalue.size(), *(*u).at)
     }
 
     fn op_sta_upvalue(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(index_at(pc, 1) as usize);
         crate::layout::store_word((*u).at, acc);
         // (A closed upvalue's variable is its own `closed`, in the heap.)
         if (*u).at == &raw mut (*u).closed {
@@ -3172,7 +3172,7 @@ handlers! {
 
     fn op_lda_upvalue_star(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
-        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(*pc.add(1) as usize);
+        let u = *Vm::upvalues(Obj::from_ptr(f.cast_mut())).add(index_at(pc, 1) as usize);
         star!(Op::LdaUpvalue.size(), *(*u).at)
     }
 }

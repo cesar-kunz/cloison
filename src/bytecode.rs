@@ -24,13 +24,15 @@ pub enum Operand {
     /// An index into the function's constants (4 bytes): a string, or a
     /// number that isn't an int32.
     Const,
+    /// An index into the function's upvalues (4 bytes).
+    Upvalue,
 }
 
 impl Operand {
     pub const fn width(self) -> usize {
         match self {
             Operand::Reg | Operand::Count => 1,
-            Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const => 4,
+            Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const | Operand::Upvalue => 4,
             Operand::Imm | Operand::Off => 4,
         }
     }
@@ -129,9 +131,9 @@ define_ops! {
     BitNot(),
     /// `acc` = the function's upvalue `k` (an enclosing function's
     /// variable).
-    LdaUpvalue(Count),
+    LdaUpvalue(Upvalue),
     /// Upvalue `k` = `acc`.
-    StaUpvalue(Count),
+    StaUpvalue(Upvalue),
 
     // ---- Constants and registers ----
     /// `acc = undefined`
@@ -472,7 +474,7 @@ define_ops! {
     /// `LdaGlobal n; Star s`.
     LdaGlobalStar(Ic),
     /// `LdaUpvalue u; Star s`.
-    LdaUpvalueStar(Count),
+    LdaUpvalueStar(Upvalue),
     /// `Star r; LdaUpvalue u`.
     StarLdaUpvalue(Reg),
     /// `Star r; LdaGlobal n`.
@@ -917,7 +919,7 @@ impl Assembler {
                     self.imm(v);
                 }
                 (Operand::Off, Arg::Label(l)) => self.jump_to(start, l),
-                (Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const, Arg::Index(i)) => {
+                (Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const | Operand::Upvalue, Arg::Index(i)) => {
                     self.code.extend_from_slice(&i.to_le_bytes());
                 }
                 (k, a) => panic!("{op:?}: operand {a:?} is not a {k:?}"),

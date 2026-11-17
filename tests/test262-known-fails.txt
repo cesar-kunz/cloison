@@ -724,7 +724,6 @@ language/statements/for/labelled-fn-stmt-expr.js
 language/statements/for/labelled-fn-stmt-let.js
 language/statements/for/labelled-fn-stmt-var.js
 language/statements/for/let-array-with-newline.js
-language/statements/for/scope-body-lex-open.js
 language/statements/for/tco-const-body.js
 language/statements/for/tco-let-body.js
 language/statements/for/tco-lhs-body.js

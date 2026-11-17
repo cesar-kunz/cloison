@@ -26,7 +26,7 @@ fn run(src: &str) -> Result<String, String> {
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         vm.verify_heap();
         match &result {
             None => result = Some(r),
@@ -57,7 +57,7 @@ fn light_value(src: &str) -> String {
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        let r = vm.run(&module).map(|v| display(v, &vm)).unwrap_or_else(|e| panic!("{e}\n{src}"));
         vm.verify_heap();
         let used = vm.heap_allocated();
         assert!(used < 256 << 20, "{used} bytes of heap at the end, tier at {budget}:\n{src}");
@@ -136,7 +136,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
         // fail on something the VM doesn't have yet.
         match vm.run(&module) {
             Ok(v) => {
-                assert_eq!(display(v), expect, "{name}");
+                assert_eq!(display(v, &vm), expect, "{name}");
                 ran.push(number(name).to_string());
             }
             Err(e) => {
@@ -177,7 +177,7 @@ fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
             let mut vm = Vm::new();
             vm.set_tier_back_edges(budget);
             let v = vm.run(&module).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(display(v), expect, "{name} (tier at {budget})");
+            assert_eq!(display(v, &vm), expect, "{name} (tier at {budget})");
         }
     }
 }
@@ -200,7 +200,7 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
             vm.set_warm_tier(true);
             vm.set_tier_back_edges(budget);
             let v = vm.run(&module).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(display(v), expect, "{name} (warm, tier at {budget})");
+            assert_eq!(display(v, &vm), expect, "{name} (warm, tier at {budget})");
         }
     }
 }
@@ -222,7 +222,7 @@ p.then(() => { globalThis.out = log.join(" "); });
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap()), "0 s1 caught 1 2 3 T 4 5 end 6 7");
+    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "0 s1 caught 1 2 3 T 4 5 end 6 7");
 }
 
 /// `globalThis.out` once `src` and its jobs have run.
@@ -232,7 +232,7 @@ fn out_after_jobs(src: &str) -> String {
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    display(vm.get(g, a).unwrap())
+    display(vm.get(g, a).unwrap(), &vm)
 }
 
 /// A `for await` left early awaits what `return()` gives, which must be
@@ -797,7 +797,7 @@ fn generate_lazy_takes_text() {
         // SAFETY: the front end's code, as `js::compile`'s.
         let r = vm.run(&unsafe { cloison::asm::Checked::new_unchecked(m) }).unwrap();
         let c = ch as u32;
-        assert_eq!(display(r), format!("{c},{c},{c},{c} true {c}"));
+        assert_eq!(display(r, &vm), format!("{c},{c},{c},{c} true {c}"));
     }
 }
 
@@ -820,7 +820,7 @@ t + " " + JSON.stringify(h(7, 3));
         vm.set_warm_tier(true);
         vm.set_tier_back_edges(budget);
         let v = vm.run(&module).unwrap();
-        assert_eq!(display(v), "59851 [7,3,[7,7]]", "tier at {budget}");
+        assert_eq!(display(v, &vm), "59851 [7,3,[7,7]]", "tier at {budget}");
     }
 }
 
@@ -2803,7 +2803,7 @@ var log = [];
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap()), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
+    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
 }
 
 /// A function with more variables than registers whose loops declare
@@ -3050,7 +3050,7 @@ Promise.all([g(), new C().m({ s: 1 })]).then(async v => { for await (const x of 
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap()), "5 2 7 function,function");
+    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "5 2 7 function,function");
 }
 
 /// `Intl.Collator` (the `intl` feature): ICU4X's root collation for
@@ -3599,7 +3599,7 @@ t;";
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(20);
-    assert_eq!(display(vm.run(&m).unwrap()), "367800");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "367800");
     let st = vm.jit_stats("block").expect("block compiled");
     // (11 for 288 exits here; one per exit before.)
     assert!(st.lowers <= 16 && st.exits > 100, "{st:?}");
@@ -3624,7 +3624,7 @@ t;";
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(20);
-    assert_eq!(display(vm.run(&m).unwrap()), "1515000");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "1515000");
     let st = vm.jit_stats("f").expect("f compiled");
     // (1 here; 20 when the exit at the call left it uncompiled.)
     assert!(st.exits <= 5, "{st:?}");
@@ -3644,7 +3644,7 @@ s + q;";
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(1000);
-    assert_eq!(display(vm.run(&m).unwrap()), "5000050002");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "5000050002");
     let st = vm.jit_stats("<script>").expect("the script compiled");
     assert!(st.compiles >= 1, "{st:?}");
 }
@@ -3663,7 +3663,7 @@ fn cold_interpreter_opcode_does_not_prevent_function_entry() {
     assert!(cloison::asm::disassemble(&m).contains("Intrinsic"), "{src}");
     let mut vm = Vm::new();
     vm.set_tier_back_edges(2);
-    assert_eq!(display(vm.run(&m).unwrap()), (200 * 190).to_string());
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), (200 * 190).to_string());
     let st = vm.jit_stats("f").expect("f entered compiled code");
     assert!(st.compiles >= 1 && st.exits == 0, "{st:?}");
 }
@@ -3702,7 +3702,7 @@ for (var run = 0; run < 20; run++) total += hot(30);
     }
     let mut vm = Vm::new();
     vm.set_tier_back_edges(2);
-    assert_eq!(display(vm.run(&m).unwrap()), "-18,-20,true,true,705900");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "-18,-20,true,true,705900");
     assert!(vm.jit_stats("hot").is_some(), "hot did not compile");
     // (Each runs interpreted: see `mapped_arguments_see_parameters_…` and
     // `prologue_exits_keep_functions_interpreted`.)
@@ -3723,7 +3723,7 @@ t;";
     // (Its loop's 400 turns in all, short of tiering up; calls would
     // enter after 10.)
     vm.set_tier_back_edges(1000);
-    assert_eq!(display(vm.run(&m).unwrap()), "400");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "400");
     assert!(vm.jit_stats("each").is_none(), "{:?}", vm.jit_stats("each"));
 }
 
@@ -3742,7 +3742,7 @@ t;";
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(2);
-    assert_eq!(display(vm.run(&m).unwrap()), (2000 * 92).to_string());
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), (2000 * 92).to_string());
     for function in ["rest", "me", "C"] {
         assert!(vm.jit_stats(function).is_none(), "{function}: {:?}", vm.jit_stats(function));
     }
@@ -3773,7 +3773,7 @@ r.join(',');";
         let m = cloison::js::compile(src).unwrap();
         let mut vm = Vm::new();
         vm.set_tier_back_edges(tier);
-        assert_eq!(display(vm.run(&m).unwrap()), "305,44850,x1", "tier {tier}");
+        assert_eq!(display(vm.run(&m).unwrap(), &vm), "305,44850,x1", "tier {tier}");
     }
 }
 
@@ -3815,7 +3815,7 @@ for (var k = 0; k < 20; k++) { try { thrower(2000); } catch (e) { if (e instance
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(100);
-    let v = display(vm.run(&m).unwrap());
+    let v = display(vm.run(&m).unwrap(), &vm);
     assert_eq!(v, "15628061018-220,74990000,10000,20");
     assert!(vm.jit_stats("f").is_some_and(|s| s.compiles >= 1));
     assert!(vm.jit_stats("thrower").is_some_and(|s| s.compiles >= 1));
@@ -3827,7 +3827,7 @@ fn compiled(src: &str, function: &str) -> (String, Vec<String>) {
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(1000);
-    let v = display(vm.run(&m).unwrap());
+    let v = display(vm.run(&m).unwrap(), &vm);
     (v, vm.jit_stencils(function).unwrap_or_default())
 }
 
@@ -4206,7 +4206,7 @@ a2().then(v => r.push(v));
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.run(&first).unwrap();
-        let r = vm.run(&second).map(display).unwrap();
+        let r = vm.run(&second).map(|v| display(v, &vm)).unwrap();
         assert_eq!(r, "12,012", "tier at {budget}");
     }
 }
@@ -4537,7 +4537,7 @@ log.push("sync");
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.run(&first).unwrap();
-        let r = vm.run(&second).map(display).unwrap();
+        let r = vm.run(&second).map(|v| display(v, &vm)).unwrap();
         vm.verify_heap();
         assert_eq!(
             r,
@@ -4577,7 +4577,7 @@ sum;
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.set_code_room(64 << 10);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r, Ok("13626000".to_string()), "tier at {budget}");
         vm.verify_heap();
         if budget == i64::MAX {
@@ -4618,7 +4618,7 @@ sum;
         vm.set_code_room(64 << 10);
         vm.set_gc_evacuate_all();
         vm.set_gc_verify(64 << 10);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r, Ok("48548700".to_string()), "tier at {budget}");
         vm.verify_heap();
     }
@@ -4650,7 +4650,7 @@ ok;
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.set_gc_verify(64 << 10);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r, Ok("47616".to_string()), "tier at {budget}");
         vm.verify_heap();
     }
@@ -4731,7 +4731,7 @@ async function* plain() { yield* (async function* () { yield 10; yield 20; })();
             let mut vm = Vm::new();
             vm.set_tier_back_edges(budget);
             vm.run(&first).unwrap();
-            let r = vm.run(&second).map(display).unwrap();
+            let r = vm.run(&second).map(|v| display(v, &vm)).unwrap();
             assert_eq!(r, expected, "tier at {budget}");
         }
     }
@@ -4789,7 +4789,7 @@ out;
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(20);
-    assert_eq!(display(vm.run(&m).unwrap()), "495000");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "495000");
     let st = vm.jit_stats("<script>").expect("script compiled");
     let stencils = vm.jit_stencils("<script>").unwrap();
     assert!(stencils.iter().any(|s| s.starts_with("set_keyed_")), "{stencils:?}");
@@ -4832,7 +4832,7 @@ out.join("\n");
 "#;
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
-    let got = display(vm.run(&m).unwrap());
+    let got = display(vm.run(&m).unwrap(), &vm);
     let tail = "1000,1000,38,1000,1000,1000,1000,1000,2";
     assert_eq!(
         got,
@@ -4860,7 +4860,7 @@ t;
 "#;
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
-    assert_eq!(display(vm.run(&m).unwrap()), "1824000");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "1824000");
     let stencils = vm.jit_stencils("fksum").expect("fksum compiled");
     assert!(stencils.iter().any(|s| s.starts_with("tget_i16_fk")), "{stencils:?}");
     assert!(!stencils.iter().any(|s| s.starts_with("get_keyed_rt")), "{stencils:?}");
@@ -4914,7 +4914,7 @@ out.join("\n");
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     assert_eq!(
-        display(vm.run(&m).unwrap()),
+        display(vm.run(&m).unwrap(), &vm),
         "Int8Array 148,51,8000,3000,,0,148\n\
          Uint8Array 148,51,8000,3000,,0,148\n\
          Uint8ClampedArray 148,51,8000,3000,,0,148\n\
@@ -4939,7 +4939,7 @@ s + " " + rdu(a, 8);
 "#;
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
-    assert_eq!(display(vm.run(&m).unwrap()), "84000 8000");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "84000 8000");
     for f in ["rdu", "wru"] {
         let stencils = vm.jit_stencils(f).expect("compiled");
         assert!(
@@ -4963,7 +4963,7 @@ rb.resize(6);
 "#;
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
-    assert_eq!(display(vm.run(&m).unwrap()), "250000,0,0,20,60,0");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "250000,0,0,20,60,0");
     let stencils = vm.jit_stencils("len").expect("len compiled");
     assert!(stencils.iter().any(|s| s.starts_with("get_length_td")), "{stencils:?}");
 }
@@ -5036,7 +5036,7 @@ k().catch(e => out.push("destructure " + e.name));
     let mut vm = Vm::new();
     vm.run(&first).unwrap();
     assert_eq!(
-        vm.run(&second).map(display).unwrap(),
+        vm.run(&second).map(|v| display(v, &vm)).unwrap(),
         "promise | sync gen | rejected param | g 3 | destructure TypeError"
     );
 }
@@ -5065,7 +5065,7 @@ ok + ":" + steps;
 "#;
     let module = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r, Ok("true:49".to_string()));
     vm.verify_heap();
     assert!(vm.weak_entry_count() < 100000, "{} weak entries", vm.weak_entry_count());
@@ -5099,7 +5099,7 @@ outer.get(key).get(k2).payload + " " + bad;
 "#;
     let module = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r, Ok("mine 0".to_string()));
     vm.verify_heap();
 }
@@ -5135,7 +5135,7 @@ Promise.resolve().then(() => {
     let mut vm = Vm::new();
     vm.run(&first).unwrap();
     assert_eq!(
-        vm.run(&second).map(display).unwrap(),
+        vm.run(&second).map(|v| display(v, &vm)).unwrap(),
         "tag=[object WeakRef] noNew=!TypeError prim=!TypeError regSym=!TypeError sym=symbol brand=!TypeError \
          wsBrand=!TypeError sameJob=0 later=true kept=true"
     );
@@ -5193,7 +5193,7 @@ Promise.resolve().then(() => {
     let second = cloison::js::compile("out.join(' ')").unwrap();
     let mut vm = Vm::new();
     vm.run(&first).unwrap();
-    assert_eq!(vm.run(&second).map(display).unwrap(), "219990000 182280000 true 39 40 true");
+    assert_eq!(vm.run(&second).map(|v| display(v, &vm)).unwrap(), "219990000 182280000 true 39 40 true");
 }
 
 /// A function the JIT took (compiled, its enclosing one pinned to fold
@@ -5225,7 +5225,7 @@ Promise.resolve().then(() => {
     let second = cloison::js::compile("out.join(' ')").unwrap();
     let mut vm = Vm::new();
     vm.run(&first).unwrap();
-    assert_eq!(vm.run(&second).map(display).unwrap(), "3500115 true");
+    assert_eq!(vm.run(&second).map(|v| display(v, &vm)).unwrap(), "3500115 true");
 }
 
 /// Lengths of 2^31 (a byte view of a whole 2 GiB buffer, its bytes never
@@ -5294,7 +5294,7 @@ function C() {}
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap()), "1,2 10,21 a,b true 1 SyntaxError 1 TypeError");
+    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "1,2 10,21 a,b true 1 SyntaxError 1 TypeError");
 }
 
 /// An async arrow (or generator) in an async function (or generator)
@@ -5317,7 +5317,7 @@ out.push([...g()].join("/"));
     vm.run(&module).unwrap();
     let a = vm.intern("result");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap()), "5/6,2,2");
+    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "5/6,2,2");
 }
 
 /// `DisposableStack`, `AsyncDisposableStack` and `SuppressedError`:
@@ -5355,7 +5355,7 @@ log.push(e.error, e.suppressed, e.message, e instanceof Error);
     let a = vm.intern("result");
     let g = vm.global_object();
     assert_eq!(
-        display(vm.get(g, a).unwrap()),
+        display(vm.get(g, a).unwrap(), &vm),
         "true,false,defer,adopt 7,use,true,SuppressedError,TypeError,RangeError,0,TypeError,ReferenceError,async,1,2,m,true,sync in async,true"
     );
 }
@@ -5394,7 +5394,7 @@ log.push(eval("4; { using c = null; }"));
     let a = vm.intern("result");
     let g = vm.global_object();
     assert_eq!(
-        display(vm.get(g, a).unwrap()),
+        display(vm.get(g, a).unwrap(), &vm),
         "body | dispose b | dispose a | dispose x | ret | dispose y | SuppressedError:y/TypeError | iter | dispose z1 | \
          iter | dispose z2 | loop | dispose w | ident 1 | SyntaxError | SyntaxError | ReferenceError | 4 | async body | \
          async dispose | after"
@@ -5421,7 +5421,7 @@ fn run_module(dir: &Path, main: &str) -> Result<String, String> {
         Ok(()) => {
             let a = vm.intern("result");
             let g = vm.global_object();
-            Ok(display(vm.get(g, a).unwrap()))
+            Ok(display(vm.get(g, a).unwrap(), &vm))
         }
         Err(cloison::vm::ModuleError::Early(m)) => Err(format!("early: {m}")),
         Err(cloison::vm::ModuleError::Thrown(e)) => Err(vm.uncaught_message(&e)),
@@ -5544,7 +5544,7 @@ fn modules_eval_in_arrows() {
         vm.run_module(dir.join("main.mjs").to_str().unwrap()).unwrap_or_else(|_| panic!("at {budget}"));
         vm.verify_heap();
         let (a, g) = (vm.intern("result"), vm.global_object());
-        assert_eq!(display(vm.get(g, a).unwrap()), want, "tier at {budget}");
+        assert_eq!(display(vm.get(g, a).unwrap(), &vm), want, "tier at {budget}");
     }
     // (With an `eval` of its own too.)
     assert_eq!(run_module(&dir, "top.mjs").unwrap(), "SyntaxError");
@@ -5569,7 +5569,7 @@ fn modules_eval_sees_many_top_level_bindings() {
         vm.run_module(dir.join("main.mjs").to_str().unwrap()).unwrap_or_else(|_| panic!("at {budget}"));
         vm.verify_heap();
         let (a, g) = (vm.intern("result"), vm.global_object());
-        assert_eq!(display(vm.get(g, a).unwrap()), "304,1,2,7,307,3", "tier at {budget}");
+        assert_eq!(display(vm.get(g, a).unwrap(), &vm), "304,1,2,7,307,3", "tier at {budget}");
     }
 }
 
@@ -5720,7 +5720,7 @@ fn modules_import_many_names() {
             let a = vm.intern("result");
             let g = vm.global_object();
             assert_eq!(
-                display(vm.get(g, a).unwrap()),
+                display(vm.get(g, a).unwrap(), &vm),
                 "2,7,1,1,1,2,4,2,2,2,TypeError,12000,2,4,3,6,4,ReferenceError,ReferenceError",
                 "{n} imports, tier at {budget}"
             );
@@ -5788,7 +5788,7 @@ fn shared_buffers_and_atomics() {
         let module = cloison::js::compile(src).unwrap();
         vm.run(&module).unwrap();
         let module = cloison::js::compile("out.join()").unwrap();
-        let r = vm.run(&module).map(display).unwrap();
+        let r = vm.run(&module).map(|v| display(v, &vm)).unwrap();
         assert_eq!(
             r,
             "[object SharedArrayBuffer],true,2,5,8,1,2,4,12,not-equal,timed-out,0,0,-5,TypeError,TypeError,true,not-equal,1,2 ok,1 timed-out"
@@ -5849,7 +5849,7 @@ fn notify_on_a_new_buffer_wakes_no_dead_buffers_waiter() {
     "#;
     let mut vm = Vm::new();
     vm.run(&cloison::js::compile(src).unwrap()).unwrap();
-    let r = vm.run(&cloison::js::compile("out.join()").unwrap()).map(display).unwrap();
+    let r = vm.run(&cloison::js::compile("out.join()").unwrap()).map(|v| display(v, &vm)).unwrap();
     assert_eq!(r, format!("0{}", ",timed-out".repeat(10)));
 }
 
@@ -5914,7 +5914,7 @@ fn views_see_a_grow_through_a_critical_section() {
         );
         let mut vm = Vm::new();
         vm.run(&cloison::js::compile(&src).unwrap()).unwrap();
-        let r = vm.run(&cloison::js::compile("out").unwrap()).map(display).unwrap();
+        let r = vm.run(&cloison::js::compile("out").unwrap()).map(|v| display(v, &vm)).unwrap();
         let outcome = if i == 2 { "0" } else { "timed-out" };
         assert_eq!(r, format!("{outcome},16,7"), "{what}");
     }
@@ -6022,7 +6022,7 @@ fn promise_keyed_combinators() {
     "#;
     let mut vm = Vm::new();
     vm.run(&cloison::js::compile(src).unwrap()).unwrap();
-    let r = vm.run(&cloison::js::compile("out.join()").unwrap()).map(display).unwrap();
+    let r = vm.run(&cloison::js::compile("out.join()").unwrap()).map(|v| display(v, &vm)).unwrap();
     assert_eq!(r, "TypeError,,3,1,2,rejected,4");
 }
 
@@ -6226,7 +6226,7 @@ fn agents_end_with_their_vm() {
     b.run(&cloison::js::compile("$262.agent.broadcast(new SharedArrayBuffer(8)); 1").unwrap()).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let none = cloison::js::compile("$262.agent.getReport()").unwrap();
-    assert_eq!(cloison::vm::display(a.run(&none).unwrap()), "null");
+    assert_eq!(cloison::vm::display(a.run(&none).unwrap(), &a), "null");
     let src = r#"
         var n = 0, r;
         try { for (;;) { $262.agent.start('$262.agent.receiveBroadcast(function () {})'); n++; } }
@@ -6282,7 +6282,7 @@ for (const a of [a1, a2, a3]) a().then((v) => r.push(v), () => r.push("escaped")
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.run(&first).unwrap();
-        let r = vm.run(&second).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&second).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("c c c2"), "tier at {budget}");
     }
 }
@@ -6383,7 +6383,7 @@ s
 "#;
     assert_eq!(value(src), "7201530018");
     let mut vm = Vm::new();
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("7201530018"));
     let zombies = vm.memory_stats()[5];
     assert!(zombies < 1000, "{zombies} zombie shapes kept");
@@ -6411,7 +6411,7 @@ s + " " + Object.keys(o).join(",") + " " + Object.values(o).reduce(function (a, 
     let want = "98 p7,p10,p13,p14,p17,p20,p21,p23,p24,p26,p27,p28,p29,p30,p31 1499840";
     assert_eq!(value(src), want);
     let mut vm = Vm::new();
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(want));
     let [shapes, shape_bytes, ..] = vm.memory_stats();
     assert!(shapes < 5000 && shape_bytes < 10 << 20, "{shapes} shapes kept, {shape_bytes} bytes");
@@ -6549,7 +6549,7 @@ out.join(" ")
     let mut vm = Vm::new();
     let src =
         r#"function f() { let l = 3; return eval("l * 2"); } var s = 0; for (var i = 0; i < 5000; i++) s += f(); s"#;
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("30000"));
     let shapes = vm.memory_stats()[0];
     assert!(shapes < 2000, "{shapes} shapes");
@@ -6583,7 +6583,7 @@ s
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.set_gc_verify(1 << 10);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("181200"), "tier at {budget}");
         vm.verify_heap();
     }
@@ -6608,7 +6608,7 @@ s
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.set_gc_verify(1 << 10);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("4501500"), "tier at {budget}");
         vm.verify_heap();
     }
@@ -6657,7 +6657,7 @@ out.join(" ")
     let mut vm = Vm::new();
     let src = r#"function g(x) { return x[0]; } function f(a, b) { return g(arguments) + b; }
 var s = 0; for (var i = 0; i < 5000; i++) s += f(i, 1); s"#;
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("12502500"));
     let shapes = vm.memory_stats()[0];
     assert!(shapes < 2000, "{shapes} shapes");
@@ -6698,7 +6698,7 @@ for (var i = 0; i < 100000; i++) { o["p" + (i & 31)] = i; delete o["p" + ((i * 7
 Object.keys(o).length + " " + o.p31
 "#;
     let mut vm = Vm::new();
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("15 99999"));
     let shapes = vm.memory_stats()[0];
     assert!(shapes < 2000, "{shapes} shapes");
@@ -6723,7 +6723,7 @@ n
 "#;
     let mut vm = Vm::new();
     let before = vm.memory_stats()[0];
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("199980"));
     let shapes = vm.memory_stats()[0] - before;
     assert!(shapes < 4000, "{shapes} shapes");
@@ -6750,7 +6750,7 @@ var e = {...a, last: 1};
 "#;
     let mut vm = Vm::new();
     let before = vm.memory_stats()[0];
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("6666,10000,10000,10000,6667 9998,9999,k9999,9999,9998,,1,false,85192"));
     let shapes = vm.memory_stats()[0] - before;
     assert!(shapes < 2000, "{shapes} shapes");
@@ -6796,7 +6796,7 @@ af().then(v => { out.push(v); globalThis.result = out.join("|"); });
 "#;
     let mut vm = Vm::new();
     vm.run(&cloison::js::compile(src).unwrap()).unwrap();
-    let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile("result").unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(
         r.as_deref(),
         Ok(
@@ -6837,7 +6837,7 @@ Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then
 "#;
     let mut vm = Vm::new();
     vm.run(&cloison::js::compile(src).unwrap()).unwrap();
-    let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&cloison::js::compile("result").unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(
         r.as_deref(),
         Ok(
@@ -6910,7 +6910,7 @@ out.join(" ");
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.set_gc_verify(64 << 10);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
         vm.verify_heap();
     }
@@ -6954,7 +6954,7 @@ errors.length + " " + errors[0];
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("0 undefined"), "tier at {budget}");
     }
 }
@@ -6998,7 +6998,7 @@ out.join("");
     for budget in [i64::MAX, 1, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("1111111111"), "tier at {budget}");
     }
 }
@@ -7057,7 +7057,7 @@ g0 + " " + a2.length;
     for budget in [i64::MAX, 1, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("0 1"), "tier at {budget}");
     }
 }
@@ -7099,7 +7099,7 @@ folded + " | " + s + " " + r.join(",");
     for budget in [i64::MAX, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("3500000 10000 100000000 | 2800000 7,7,7,7,7,34"), "tier at {budget}");
     }
 }
@@ -7147,7 +7147,7 @@ sum + " " + n;
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.set_gc_evacuate_cycles();
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("3599910000 9446"), "tier at {budget}");
         assert!(cloison::gc::EVACUATED.load(std::sync::atomic::Ordering::Relaxed) > before, "nothing moved");
     }
@@ -7184,7 +7184,7 @@ sum;
     let module = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_gc_evacuate_cycles();
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("472625600"));
 }
 
@@ -7254,7 +7254,7 @@ run();
     let mut vm = Vm::new();
     vm.set_gc_evacuate_cycles();
     vm.set_gc_verify(4 << 20);
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("149106224"));
 }
 
@@ -7307,7 +7307,7 @@ r.join(" | ");
     let mut vm = Vm::new();
     vm.set_gc_evacuate_all();
     vm.set_gc_verify(256 << 10);
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("11 two! 3,4 | 11 two! 3,4 | 11 two! 3,4"));
 }
 
@@ -7350,7 +7350,7 @@ var a = new Array(5000).fill(-1);
     let mut vm = Vm::new();
     vm.set_gc_evacuate_all();
     vm.set_gc_verify(1 << 10);
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("7 8 8"));
 }
 
@@ -7380,7 +7380,7 @@ n;
     let mut vm = Vm::new();
     vm.set_gc_evacuate_all();
     vm.set_gc_verify(256 << 10);
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("40000"));
 }
 
@@ -7412,7 +7412,7 @@ var m = keep[0].exec("xabbbc");
     for budget in [i64::MAX, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("40087 bbb 6 true 77 ppp true"), "tier at {budget}");
         assert!(vm.regexp_count() < 100, "{} regexps kept", vm.regexp_count());
     }
@@ -7446,7 +7446,7 @@ out.join(" | ");
     for budget in [i64::MAX, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("abc,b | <1>a<2>b<3> | ky,y"), "tier at {budget}");
     }
 }
@@ -7529,7 +7529,7 @@ g2 + " " + a1.length;
     for budget in [i64::MAX, 1, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("0 1"), "tier at {budget}");
     }
 }
@@ -7574,7 +7574,7 @@ out.join(" | ");
     for budget in [i64::MAX, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(
             r.as_deref(),
             Ok(
@@ -7630,7 +7630,7 @@ main();
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.run(&module).unwrap();
-        let r = vm.run(&report).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&report).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("38160000 30835860 true"), "tier at {budget}");
         vm.verify_heap();
         let kept = vm.code_count() - natives;
@@ -7677,7 +7677,7 @@ main();
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.run(&module).unwrap();
-        let r = vm.run(&report).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&report).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("true true true"), "tier at {budget}");
         vm.verify_heap();
     }
@@ -7711,7 +7711,7 @@ total;
     for budget in [2, 1000, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("2516160"), "tier at {budget}");
     }
 }
@@ -7749,7 +7749,7 @@ total + " " + obj.x;
     for budget in [i64::MAX, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("8370000 s"), "tier at {budget}");
         assert_eq!(vm.codes_named_but_not_live(), 0, "tier at {budget}");
     }
@@ -7764,7 +7764,7 @@ total + " " + obj.x;
 #[inline(never)]
 fn below(vm: &mut Vm, src: &str) -> String {
     let pad = std::hint::black_box([0usize; 1 << 16]);
-    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).unwrap();
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(|v| display(v, vm)).unwrap();
     std::hint::black_box(&pad);
     r
 }
@@ -7964,7 +7964,7 @@ total;
     for budget in [2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("516348"), "tier at {budget}");
         assert!(cloison::jit::alive().1 > 0, "tier at {budget}: compiled");
         drop(vm);
@@ -8015,7 +8015,7 @@ var syms = Object.getOwnPropertySymbols(keep).map(function (s) { return s.toStri
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         vm.set_atoms_poison(poison);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(
             r.as_deref(),
             Ok("56700 a Symbol(kept)=2,Symbol(named)=3 5 5 3"),
@@ -8056,7 +8056,7 @@ var h = wm.get(s);
     for budget in [i64::MAX, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("Symbol(s) true 2 deep"), "tier at {budget}");
     }
 }
@@ -8099,7 +8099,7 @@ out.join(" | ");
     for poison in [false, true] {
         let mut vm = Vm::new();
         vm.set_atoms_poison(poison);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("1 fresh1000007 7 | a,zq1000008,"), "poison {poison}");
     }
 }
@@ -8148,7 +8148,7 @@ out.join(" | ");
         let mut vm = Vm::new();
         vm.set_atoms_poison(poison);
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(
             r.as_deref(),
             Ok("a | jk1000002 | b |  | inner1000003=3 | outer1000001=1"),
@@ -8182,7 +8182,11 @@ for (var r = 0; r < 4; r++) {
         assert_eq!(vm.atom_name(a), "held_outside_the_vm", "poison {poison}");
         let g = vm.global_object();
         vm.set(g, a, cloison::value::Value::from_i32(7)).unwrap();
-        assert_eq!(vm.run(&read).map(display).map_err(|e| e.to_string()).as_deref(), Ok("7"), "poison {poison}");
+        assert_eq!(
+            vm.run(&read).map(|v| display(v, &vm)).map_err(|e| e.to_string()).as_deref(),
+            Ok("7"),
+            "poison {poison}"
+        );
     }
 }
 
@@ -8224,10 +8228,11 @@ out.join(" | ");
     for budget in [i64::MAX, 1, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
     }
-    let r = Vm::new().run(&module).map(display).map_err(|e| e.to_string());
+    let mut vm = Vm::new();
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(want), "tier by default");
 }
 
@@ -8283,10 +8288,11 @@ out.join(" | ");
     for budget in [i64::MAX, 1, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
     }
-    let r = Vm::new().run(&module).map(display).map_err(|e| e.to_string());
+    let mut vm = Vm::new();
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(want), "tier by default");
 }
 
@@ -8317,7 +8323,7 @@ fn tagged_templates_shared_by_a_module_run_again_stay() {
     vm.run(&gc).unwrap();
     vm.run(&gc).unwrap();
     assert!(vm.code_count() < codes, "the first run's codes freed ({codes} before)");
-    let r = vm.run(&check).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&check).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("true true"));
 }
 
@@ -8346,7 +8352,7 @@ fn tagged_templates_held_outlive_their_codes() {
     vm.run(&gc).unwrap();
     assert!(vm.code_count() < codes, "the first run's codes freed ({codes} before)");
     vm.run(&module).unwrap();
-    let r = vm.run(&check).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&check).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("true"));
 }
 
@@ -8406,7 +8412,7 @@ out.join(" ; ");
     for budget in [i64::MAX, 1, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
     }
 }
@@ -8468,7 +8474,7 @@ out.join(" ; ");
     for budget in [i64::MAX, 1, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
     }
 }
@@ -8634,21 +8640,21 @@ fn values_outlive_another_vm_run() {
         let mut a = Vm::new();
         a.run(&cloison::js::compile("0").unwrap()).unwrap();
     }
-    assert_eq!(display(s).len(), 200);
+    assert_eq!(display(s, &b).len(), 200);
     let mut a = Vm::new();
     a.run(&cloison::js::compile("0").unwrap()).unwrap();
     let m = cloison::js::compile("s.slice(99, 101) + s.length").unwrap();
-    assert_eq!(display(b.run(&m).unwrap()), "xy200");
+    assert_eq!(display(b.run(&m).unwrap(), &b), "xy200");
     drop(a);
-    assert_eq!(display(b.run(&m).unwrap()), "xy200");
-    assert_eq!(display(s), "x".repeat(100) + &"y".repeat(100));
+    assert_eq!(display(b.run(&m).unwrap(), &b), "xy200");
+    assert_eq!(display(s, &b), "x".repeat(100) + &"y".repeat(100));
     // The message of what a run threw is made after it, as one.
     let e = b.run(&cloison::js::compile("throw new Error('m' + s)").unwrap()).unwrap_err();
-    assert_eq!(b.uncaught_message(&e), format!("Error: m{}", display(s)));
+    assert_eq!(b.uncaught_message(&e), format!("Error: m{}", display(s, &b)));
     // A host's property access between runs makes a cons string key flat.
     let o = b.run(&cloison::js::compile("var o = {}; o[s + 'z'] = 7; o").unwrap()).unwrap();
     let k = b.run(&cloison::js::compile("s + 'z'").unwrap()).unwrap();
-    assert_eq!(display(b.get_keyed(o, k).unwrap()), "7");
+    assert_eq!(display(b.get_keyed(o, k).unwrap(), &b), "7");
 }
 
 /// A host's operations between runs enter the VM as a run does (#70): a
@@ -8676,21 +8682,21 @@ var C = function () {}; Object.defineProperty(C, Symbol.hasInstance, { value: v 
     };
     let o = get(&mut vm, "o");
     let gname = vm.intern("g");
-    assert_eq!(display(vm.get(o, gname).unwrap()), "G1");
+    assert_eq!(display(vm.get(o, gname).unwrap(), &vm), "G1");
     let sname = vm.intern("s");
     vm.set(o, sname, cloison::value::Value::from_i32(3)).unwrap();
     let key = get(&mut vm, "key");
-    assert_eq!(display(vm.get_keyed(o, key).unwrap()), "5");
+    assert_eq!(display(vm.get_keyed(o, key).unwrap(), &vm), "5");
     let bad = get(&mut vm, "bad");
     let e = vm.get_keyed(o, bad).unwrap_err();
     assert_eq!(vm.uncaught_message(&e), "Error: boom");
     let e = vm.set_keyed(o, bad, cloison::value::Value::from_i32(1)).unwrap_err();
     assert_eq!(vm.uncaught_message(&e), "Error: boom");
     // Nothing left pending: the next conversion runs.
-    assert_eq!(display(vm.get_keyed(o, key).unwrap()), "5");
+    assert_eq!(display(vm.get_keyed(o, key).unwrap(), &vm), "5");
     let p = get(&mut vm, "p");
     let x = vm.intern("x");
-    assert_eq!(display(vm.get(p, x).unwrap()), "Px");
+    assert_eq!(display(vm.get(p, x).unwrap(), &vm), "Px");
     let yes = vm.new_string(&"yes".encode_utf16().collect::<Vec<u16>>());
     assert!(vm.has_property(p, yes).unwrap());
     let e = vm.for_in_keys(p).unwrap_err();
@@ -8699,12 +8705,12 @@ var C = function () {}; Object.defineProperty(C, Symbol.hasInstance, { value: v 
     let r = vm.call_other(map, xs, &[twice]).unwrap();
     let join = vm.intern("join");
     let join = vm.get(r, join).unwrap();
-    assert_eq!(display(vm.call_other(join, r, &[]).unwrap()), "2,4,6");
+    assert_eq!(display(vm.call_other(join, r, &[]).unwrap(), &vm), "2,4,6");
     let c = get(&mut vm, "C");
     assert!(vm.instance_of(cloison::value::Value::from_i32(7), c).unwrap());
     assert!(!vm.instance_of(cloison::value::Value::from_i32(8), c).unwrap());
     let r = vm.run(&cloison::js::compile("log.join()").unwrap()).unwrap();
-    assert_eq!(display(r), "set 3");
+    assert_eq!(display(r, &vm), "set 3");
 }
 
 /// A value of one VM given to another's operation (#70): a cons string key
@@ -8719,10 +8725,10 @@ fn another_vms_cons_key_panics_cleanly() {
     let k = b.run(&cloison::js::compile(&format!("{xy} xy")).unwrap()).unwrap();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.get_keyed(o, k)));
     assert!(r.is_err());
-    assert_eq!(display(b.get_keyed(b.global_object(), k).unwrap()), "undefined");
+    assert_eq!(display(b.get_keyed(b.global_object(), k).unwrap(), &b), "undefined");
     let ka = a.run(&cloison::js::compile("'x'.repeat(40) + 'y'.repeat(40)").unwrap()).unwrap();
-    assert_eq!(display(a.get_keyed(o, ka).unwrap()), "1");
-    assert_eq!(display(b.run(&cloison::js::compile("xy.length").unwrap()).unwrap()), "80");
+    assert_eq!(display(a.get_keyed(o, ka).unwrap(), &a), "1");
+    assert_eq!(display(b.run(&cloison::js::compile("xy.length").unwrap()).unwrap(), &b), "80");
 }
 
 /// `Global`s made, cloned and dropped over many runs (the review of
@@ -8773,8 +8779,8 @@ fn globals_survive_clones_drops_and_moving_collections() {
             run(&mut vm, &format!("for (var i = 0; i < 3e4; i++) var x = {{i: [i]}}; {full}"));
             for (g, id) in &held {
                 let o = g.get(&vm);
-                assert_eq!(display(vm.get(o, n).unwrap()), id.to_string(), "config {config}, round {round}");
-                assert_eq!(display(vm.get(o, s).unwrap()), format!("v{}", id % 100));
+                assert_eq!(display(vm.get(o, n).unwrap(), &vm), id.to_string(), "config {config}, round {round}");
+                assert_eq!(display(vm.get(o, s).unwrap(), &vm), format!("v{}", id % 100));
             }
         }
         vm.verify_heap();
@@ -8810,7 +8816,7 @@ fn globals_keep_host_values_across_runs() {
         run(&mut vm, "for (var i = 0; i < 2e5; i++) var x = {i: [i]}; $262.gc(); $262.gc();");
     }
     let k = vm.intern("k");
-    assert_eq!(display(vm.get(o.get(&vm), k).unwrap()), "vvv");
+    assert_eq!(display(vm.get(o.get(&vm), k).unwrap(), &vm), "vvv");
     assert_eq!(o.get(&vm), copy.get(&vm));
     assert_ne!(o.get(&vm).to_bits(), at, "evacuation moved it, and its Global with it");
     let other = Vm::new();
@@ -8819,6 +8825,26 @@ fn globals_keep_host_values_across_runs() {
     assert!(r.is_err());
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Global::new(&other, o.get(&vm))));
     assert!(r.is_err());
+}
+
+/// #339: `display` takes the VM its value is of, and checks it: another
+/// VM's cell is refused, and one of a VM dropped (whose heap a new VM may
+/// have taken) is refused or a cell of the new VM's heap, never freed
+/// memory.
+#[test]
+fn display_checks_the_value_against_its_vm() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut a = Vm::new();
+    let s = a.run(&cloison::js::compile("'abc'.repeat(4)").unwrap()).unwrap();
+    assert_eq!(display(s, &a), "abcabcabcabc");
+    let b = Vm::new();
+    assert!(catch_unwind(AssertUnwindSafe(|| display(s, &b))).is_err());
+    drop(b);
+    drop(a);
+    let c = Vm::new();
+    let _ = catch_unwind(AssertUnwindSafe(|| display(s, &c)));
+    let mut c = c;
+    assert_eq!(display(c.run(&cloison::js::compile("'ok'").unwrap()).unwrap(), &c), "ok");
 }
 
 /// #163's records (an index mapped after the return, to an upvalue's cell
@@ -8855,7 +8881,7 @@ bad + " " + keep.length
     let mut vm = Vm::new();
     vm.set_gc_evacuate_all();
     vm.set_gc_verify(256 << 10);
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("0 600"));
     vm.verify_heap();
 }
@@ -9225,7 +9251,7 @@ function hfn(n) {{
     for budget in [i64::MAX, 100] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        assert_eq!(display(vm.run(&m).unwrap()), want, "tier at {budget}");
+        assert_eq!(display(vm.run(&m).unwrap(), &vm), want, "tier at {budget}");
         if budget == 100 {
             for f in ["hic", "hconst", "hfn"] {
                 let st = vm.jit_stats(f).unwrap_or_else(|| panic!("{f} not compiled"));
@@ -9386,9 +9412,9 @@ fn a_module_run_once_is_loaded_as_it_is() {
     let src = format!("{fns}var s = 0; for (var i = 0; i < 1500; i++) s += globalThis['f' + i](1);\ns + f7.toString()");
     let want = format!("{}function f7(x) {{ return x + 7; }}", 1500 + 1499 * 1500 / 2);
     let mut vm = Vm::new();
-    let r = vm.run_owned(cloison::js::compile(&src).unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run_owned(cloison::js::compile(&src).unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(want.as_str()));
-    let r = vm.run_owned(cloison::js::compile("f1499(s)").unwrap()).map(display).map_err(|e| e.to_string());
+    let r = vm.run_owned(cloison::js::compile("f1499(s)").unwrap()).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("1127249"));
     assert_eq!(run(&src).as_deref(), Ok(want.as_str()));
 }
@@ -9467,7 +9493,7 @@ once_a,once_b g2999,once_a [["g2999",1],["once_a",2]]"#;
     for budget in [i64::MAX, 2] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok(expected), "tier at {budget}");
     }
 }
@@ -9631,7 +9657,7 @@ true
 {"length":1,"name":2,"constructor":3,"toString":4,"valueOf":5}"#;
     let module = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(expected));
 }
 
@@ -10074,7 +10100,7 @@ fn run_moving(src: &str) -> Result<String, String> {
     let mut vm = Vm::new();
     vm.set_gc_evacuate_all();
     vm.set_gc_verify(64 << 10);
-    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
     vm.verify_heap();
     r
 }
@@ -10247,7 +10273,7 @@ fn a_vm_moved_between_runs_runs_again() {
         if evacuate {
             vm.set_gc_evacuate_all();
         }
-        assert_eq!(vm.run(&warm).map(display).as_deref(), Ok("100110000"));
+        assert_eq!(vm.run(&warm).map(|v| display(v, &vm)).as_deref(), Ok("100110000"));
         vm
     };
     // Memory freed reused: what a VM's old place holds then.
@@ -10256,14 +10282,14 @@ fn a_vm_moved_between_runs_runs_again() {
         let mut vm = *warmed(evacuate);
         assert_eq!(vm.jit_rehomes(), 0);
         let j = junk();
-        assert_eq!(vm.run(&again).map(display).as_deref(), Ok("25027500"));
+        assert_eq!(vm.run(&again).map(|v| display(v, &vm)).as_deref(), Ok("25027500"));
         assert_eq!(vm.jit_rehomes(), 1);
         vm.verify_heap();
         drop(j);
         let (mut a, mut b) = (warmed(evacuate), warmed(evacuate));
         std::mem::swap(&mut *a, &mut *b);
         for vm in [&mut a, &mut b] {
-            assert_eq!(vm.run(&again).map(display).as_deref(), Ok("25027500"));
+            assert_eq!(vm.run(&again).map(|v| display(v, vm)).as_deref(), Ok("25027500"));
             vm.verify_heap();
         }
         let mut moved = vec![*a];
@@ -10271,7 +10297,7 @@ fn a_vm_moved_between_runs_runs_again() {
         let j = junk();
         moved.reserve(64);
         for vm in &mut moved {
-            assert_eq!(vm.run(&again).map(display).as_deref(), Ok("25027500"));
+            assert_eq!(vm.run(&again).map(|v| display(v, vm)).as_deref(), Ok("25027500"));
             vm.verify_heap();
         }
         drop(j);

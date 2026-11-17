@@ -34,7 +34,7 @@ fn run(name: &str, src: &str) -> Result<String, String> {
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(|v| display(v, &vm)).map_err(|e| e.to_string());
         vm.verify_heap();
         match &result {
             None => result = Some(r),

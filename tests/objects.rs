@@ -8,14 +8,15 @@ use cloison::vm::{Error, Vm, display};
 /// Run `src` in the interpreter only, then tiering up after 1 and 2 loop
 /// back edges (so loops compile mid-run, and re-enter compiled code right
 /// after exits), then with the default tiering; the results must agree.
-fn run(src: &str) -> Result<Value, Error> {
+/// The value (a cell's only for its tag: its VM is gone) and as shown.
+fn run_shown(src: &str) -> Result<(Value, String), Error> {
     let m = cloison::asm::parse(src).unwrap_or_else(|e| panic!("{e}"));
     let mut results = Vec::new();
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&m);
-        results.push(r.as_ref().map(|&v| display(v)).map_err(Clone::clone));
+        let r = vm.run(&m).map(|v| (v, display(v, &vm)));
+        results.push(r.as_ref().map(|v| v.1.clone()).map_err(Clone::clone));
         if budget == 1000 {
             assert!(results.windows(2).all(|w| w[0] == w[1]), "interpreter, tier at 1, 2, 1000: {results:?}");
             return r;
@@ -24,8 +25,12 @@ fn run(src: &str) -> Result<Value, Error> {
     unreachable!()
 }
 
+fn run(src: &str) -> Result<Value, Error> {
+    run_shown(src).map(|r| r.0)
+}
+
 fn ok(src: &str) -> String {
-    display(run(src).unwrap_or_else(|e| panic!("{e}")))
+    run_shown(src).unwrap_or_else(|e| panic!("{e}")).1
 }
 
 /// `script` defining global function `f` (defined in `rest`) and calling
@@ -346,7 +351,7 @@ fn loose_equality_and_truthiness() {
 fn modulo_and_bitwise_edge_cases() {
     let one = |body: &str| ok(&format!("script\n{body}\n Return\nend\n"));
     assert_eq!(one(" LdaSmi -7\n ModSmi 3"), "-1");
-    assert_eq!(display(run("script\n LdaSmi -6\n ModSmi 3\n Return\nend\n").unwrap()), "0");
+    assert_eq!(ok("script\n LdaSmi -6\n ModSmi 3\n Return\nend\n"), "0");
     let v = run("script\n LdaSmi -6\n ModSmi 3\n Return\nend\n").unwrap();
     assert!(v.is_double() && v.as_f64_unchecked().is_sign_negative(), "-6 % 3 is -0");
     assert_eq!(one(" LdaSmi 7\n ModSmi 0"), "NaN");
@@ -470,7 +475,7 @@ fn jit(src: &str) -> (String, Vec<String>) {
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
-    let v = display(vm.run(&m).unwrap());
+    let v = display(vm.run(&m).unwrap(), &vm);
     assert_eq!(v, expected);
     (v, vm.jit_stencils("main").unwrap_or_default())
 }
@@ -1630,7 +1635,7 @@ end
     let m = cloison::asm::parse(src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
-    let v = display(vm.run(&m).unwrap());
+    let v = display(vm.run(&m).unwrap(), &vm);
     // Σ (i + 45) for i < 50 except 40, plus 2147483600 + 45.
     let expected: u64 = (0..50u64).filter(|&i| i != 40).map(|i| i + 45).sum::<u64>() + 2147483645;
     assert_eq!(v, expected.to_string());
@@ -1993,7 +1998,7 @@ fn jit_function(src: &str, function: &str) -> (String, Vec<String>) {
     let m = cloison::asm::parse(src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
-    let v = display(vm.run(&m).unwrap());
+    let v = display(vm.run(&m).unwrap(), &vm);
     assert_eq!(v, expected);
     (v, vm.jit_stencils(function).unwrap_or_default())
 }
@@ -2578,7 +2583,7 @@ end
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
-    assert_eq!(display(vm.run(&m).unwrap()), "700");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "700");
     let s = vm.jit_stencils("F").unwrap_or_default();
     assert!(s.iter().any(|n| n.starts_with("star_") || n.starts_with("spill_")), "{s:?}");
     assert!(!s.iter().any(|n| n == "bail"), "{s:?}");
@@ -2772,7 +2777,7 @@ end
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
-    assert_eq!(display(vm.run(&m).unwrap()), expected.to_string());
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), expected.to_string());
     assert_eq!(ok(&src), expected.to_string());
     assert_eq!(vm.jit_bound_direct_calls("main"), 1);
 }
@@ -2824,7 +2829,7 @@ fn deep_self_tail_recursion() {
     let m = cloison::asm::parse(&tail_sum_program(1_000_000)).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
-    assert_eq!(display(vm.run(&m).unwrap()), "500000500000");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "500000500000");
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(i64::MAX);
@@ -2969,7 +2974,7 @@ fn mutual_recursion_direct() {
     let m = cloison::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
-    assert_eq!(display(vm.run(&m).unwrap()), expected);
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), expected);
     assert_eq!(expected, "6765");
     for name in ["f", "g"] {
         let s = vm.jit_stencils(name).unwrap_or_default();
@@ -3039,7 +3044,7 @@ s;";
     let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(i64::MAX);
-    assert_eq!(display(vm.run(&m).unwrap()), "1000");
+    assert_eq!(display(vm.run(&m).unwrap(), &vm), "1000");
     assert_eq!(vm.ic_misses("get"), 2);
 }
 
@@ -3060,13 +3065,13 @@ fn own_cells_pass_the_api() {
     let (mut a, mut b, o) = two_vms();
     let x = a.intern("x");
     a.set(o, x, Value::from_i32(2)).unwrap();
-    assert_eq!(display(a.get(o, x).unwrap()), "2");
+    assert_eq!(display(a.get(o, x).unwrap(), &a), "2");
     let p = a.new_array();
     a.set_keyed(p, Value::from_i32(0), o).unwrap();
     let g = b.global_object();
     let y = b.intern("y");
     b.set(g, y, Value::from_i32(3)).unwrap();
-    assert_eq!(display(b.get(g, y).unwrap()), "3");
+    assert_eq!(display(b.get(g, y).unwrap(), &b), "3");
 }
 
 #[test]

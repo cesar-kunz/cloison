@@ -4262,7 +4262,7 @@ pub(crate) fn to_string_units(v: Value) -> Vec<u16> {
     if v.is_cell() {
         return to_string_units(to_primitive_hint(v, STRING));
     }
-    crate::vm::display(v).encode_utf16().collect()
+    crate::vm::display_raw(v).encode_utf16().collect()
 }
 
 /// ToNumber: a string is parsed (StringToNumber), an object goes through

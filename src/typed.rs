@@ -1326,7 +1326,7 @@ pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
         }
         let v = get(o, i);
         if !v.is_undefined() {
-            out.extend(crate::vm::display(v).encode_utf16());
+            out.extend(crate::vm::display_raw(v).encode_utf16());
         }
         crate::vm::check_string_len(out.len())?;
     }

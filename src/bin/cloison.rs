@@ -145,19 +145,21 @@ fn main() -> ExitCode {
     // (What the heap holds at the end counts for its peak too.)
     cloison::gc::HEAP_PEAK.fetch_max(vm.heap_allocated() as u64, std::sync::atomic::Ordering::Relaxed);
     // The process exits next: freeing the VM's shapes and code one by one
-    // would only cost time (about 100k instructions).
+    // would only cost time (about 100k instructions). (The result shown
+    // first: `display` needs the VM.)
+    let shown = result.as_ref().ok().map(|&v| cloison::vm::display(v, &vm));
     std::mem::forget(vm);
     // `CLOISON_EXITS`: exits from compiled code to the interpreter, and entries.
     if std::env::var_os("CLOISON_EXITS").is_some() {
         eprint!("{}", cloison::jit::exits_report());
     }
     match result {
-        Ok(v) => {
+        Ok(_) => {
             if std::env::var_os("CLOISON_TIME").is_some() {
                 eprintln!("time {:.3}", start.elapsed().as_secs_f64() * 1e3);
             }
             // (Not `println!`: it panics if standard output fails.)
-            let _ = writeln!(std::io::stdout(), "{}", cloison::vm::display(v));
+            let _ = writeln!(std::io::stdout(), "{}", shown.unwrap_or_default());
             // `CLOISON_JIT_TIME`: the JIT's lowering and compiling time.
             if std::env::var_os("CLOISON_JIT_TIME").is_some() {
                 let ms = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;

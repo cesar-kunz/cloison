@@ -12,6 +12,6 @@ fn host_length_lookup_respects_virtual_ancestors() {
     .unwrap();
     let ta = vm.run(&setup).unwrap();
     let length = vm.intern("length");
-    assert_eq!(display(vm.get(ta, length).unwrap()), "2");
+    assert_eq!(display(vm.get(ta, length).unwrap(), &vm), "2");
     vm.verify_heap();
 }

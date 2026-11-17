@@ -3532,6 +3532,22 @@ impl Vm {
         }
     }
 
+    /// Panics, as [`Vm::check_own`], if `v` is a cell of another VM's
+    /// heap, and if it is no cell of this one's but one a collection freed
+    /// or moved since (`Heap::holds_object`): a raw `Value` the host kept
+    /// past its run, or past its VM (#323, #339). For values from outside
+    /// the VM: those of its public operations not run through
+    /// [`Vm::host`], and the roots of those that are. (A cell of this
+    /// heap's that a stale value points at again, another object made
+    /// there since, is still safe to read.)
+    #[inline]
+    fn check_value(&self, v: Value, what: &str) {
+        self.check_own(v, what);
+        if v.is_cell() && !self.heap.holds_object(v.to_bits() as usize, self.heap.gc.marking) {
+            stale_cell(what)
+        }
+    }
+
     /// `f` run from the host between runs, with this VM entered as a run
     /// enters it: the one running (the public operations reach it through
     /// `interp::current_vm` too: a cons string key made flat, a native
@@ -3844,7 +3860,7 @@ impl Vm {
         if let Some(v) = e.1
             && !crate::props::is_object(v)
         {
-            return display(v);
+            return display_raw(v);
         }
         e.0.clone()
     }
@@ -8767,10 +8783,27 @@ fn foreign_cell(what: &str) -> ! {
     panic!("{what}: a value not of this VM's heap")
 }
 
-/// `String(v)` for the values that exist so far. A cell's must be of a
-/// VM alive, with no run of it on another thread, and not freed since:
-/// there is no VM here to check it against.
-pub fn display(v: Value) -> String {
+/// [`Vm::check_value`]'s panic.
+#[cold]
+#[inline(never)]
+fn stale_cell(what: &str) -> ! {
+    panic!("{what}: a value a collection freed or moved (a raw Value is valid until the next run: keep it as a Global)")
+}
+
+/// `String(v)` for the values that exist so far, of `vm`'s, without
+/// running any JavaScript (an object is `[object Object]`). Panics if `v`
+/// is a cell not of `vm`'s heap, or one a collection freed or moved (#339:
+/// a value kept past its run, or past its VM, which no longer compiles).
+/// (The value first, so that `display(vm.run(m)?, &vm)` borrows `vm` after
+/// the run.)
+pub fn display(v: Value, vm: &Vm) -> String {
+    vm.check_value(v, "display");
+    display_raw(v)
+}
+
+/// [`display`] unchecked, for the VM's own values: a cell's must be of a
+/// VM alive, with no run of it on another thread, and not freed since.
+pub(crate) fn display_raw(v: Value) -> String {
     if v.is_int32() {
         return v.as_i32_unchecked().to_string();
     }
@@ -8802,7 +8835,7 @@ pub fn display(v: Value) -> String {
 /// an error message shows (see [`shown`]).
 pub(crate) const SHOWN_UNITS: usize = 1000;
 
-/// [`display`] for an error message: a string, or a symbol's description,
+/// [`display_raw`] for an error message: a string, or a symbol's description,
 /// past [`SHOWN_UNITS`] code units cut there and `...` after (its units
 /// read without flattening it). So a message stays short (V8 shows a long
 /// string whole, and one past its longest as `<error>`).
@@ -8821,7 +8854,7 @@ pub(crate) fn shown(v: Value) -> String {
             return format!("Symbol({})", cut(d));
         }
     }
-    display(v)
+    display_raw(v)
 }
 
 /// String `v`'s first `n` code units (all of them if it has fewer), read
@@ -9185,7 +9218,7 @@ pub(crate) struct Globals {
 /// let o = Global::new(&vm, o);
 /// vm.run(&cloison::js::compile("for (var i = 0; i < 1e6; i++) var x = {i: [i]};").unwrap()).unwrap();
 /// let k = vm.intern("k");
-/// assert_eq!(display(vm.get(o.get(&vm), k).unwrap()), "vvv");
+/// assert_eq!(display(vm.get(o.get(&vm), k).unwrap(), &vm), "vvv");
 /// ```
 pub struct Global {
     globals: std::rc::Rc<Globals>,
@@ -9395,12 +9428,12 @@ try { [1].map(tooLong); out.push("none"); } catch (e) { out.push(e.name); }
 out.push("after");
 out.join();"#;
         let m = crate::js::compile(src).unwrap();
-        let r = vm.run(&m).map(display);
+        let r = vm.run(&m).map(display_raw);
         assert_eq!(r.as_deref(), Ok("RangeError,RangeError,after"));
         assert!(!vm.conv_failed());
         let r = vm.try_new_string_with(MAX_STRING_LEN + 1, |_| unreachable!());
-        assert_eq!(r.map(display).map_err(|e| e.0), Err("RangeError: Invalid string length".to_string()));
-        assert_eq!(vm.try_new_string(&[b'x' as u16]).map(display).ok().as_deref(), Some("x"));
+        assert_eq!(r.map(display_raw).map_err(|e| e.0), Err("RangeError: Invalid string length".to_string()));
+        assert_eq!(vm.try_new_string(&[b'x' as u16]).map(display_raw).ok().as_deref(), Some("x"));
     }
 
     /// Outside a run nothing would throw what the backstop leaves: a
@@ -9503,7 +9536,7 @@ out.join();"#;
               for (var j = 0; j < os.length; j++) moved = moved || addr(os[j]) != at[j];
             }
             [count() > 1000, moved, os[199].k].join()"#;
-        let r = vm.run(&crate::js::compile(src).unwrap()).map(display);
+        let r = vm.run(&crate::js::compile(src).unwrap()).map(display_raw);
         assert_eq!(r.as_deref(), Ok("true,true,vvv"));
         assert_eq!((vm.heap.gc.stack_base, vm.unmovable), (0, 0));
     }
@@ -9576,7 +9609,7 @@ out.join();"#;
                     assert!(vm.run(&again).is_err_and(|e| e.0.contains("poisoned")), "{evacuate} {src}");
                     continue;
                 }
-                assert_eq!(vm.run(&again).map(display).as_deref(), Ok("4999950000"), "{evacuate} {src}");
+                assert_eq!(vm.run(&again).map(|v| display(v, &vm)).as_deref(), Ok("4999950000"), "{evacuate} {src}");
                 vm.verify_heap();
             }
         }
@@ -9668,7 +9701,7 @@ out.join();"#;
         let mut reference = fresh();
         reference.run(&setup(false)).unwrap();
         reference.set_gc_evacuate_all();
-        let expected = reference.run(&observe).map(display).unwrap();
+        let expected = reference.run(&observe).map(display_raw).unwrap();
         // (After the frames returned: the variables' last values, and
         // `arguments` still aliasing those the closures captured, #163;
         // SpiderMonkey's and JSC's.)
@@ -9678,7 +9711,7 @@ out.join();"#;
         assert!(catch_unwind(AssertUnwindSafe(|| vm.run(&setup(true)))).is_err());
         between(&vm);
         vm.set_gc_evacuate_all();
-        assert_eq!(vm.run(&observe).map(display).as_deref(), Ok(&*expected));
+        assert_eq!(vm.run(&observe).map(display_raw).as_deref(), Ok(&*expected));
         vm.verify_heap();
 
         let mut vm = fresh();
@@ -9689,7 +9722,7 @@ out.join();"#;
             vm.set_gc_evacuate_all();
             vm.run(&observe)
         });
-        assert_eq!(r.map(display).as_deref(), Ok(&*expected));
+        assert_eq!(r.map(display_raw).as_deref(), Ok(&*expected));
         between(&vm);
         assert_eq!(vm.heap.gc.stack_base, 0);
         vm.verify_heap();
@@ -9790,7 +9823,7 @@ sum;
         heap.gc.verify = 64 << 10;
         heap.budget = heap.gc.budget();
         let mut vm = Vm::with_heap(heap);
-        assert_eq!(vm.run(&module).map(display).as_deref(), Ok("71410696"));
+        assert_eq!(vm.run(&module).map(|v| display(v, &vm)).as_deref(), Ok("71410696"));
     }
 
     /// `known(ta, p)`: what `Vm::typed_lengths` gives for typed array
@@ -9838,6 +9871,6 @@ before + "," + known(ta, P);
         let g = vm.global_obj();
         vm.define_native(g, "known", known, 2, crate::jit::Ty::Any, false);
         vm.define_native(g, "forget", forget, 0, crate::jit::Ty::Any, false);
-        assert_eq!(vm.run(&module).map(display).as_deref(), Ok("1,0"));
+        assert_eq!(vm.run(&module).map(|v| display(v, &vm)).as_deref(), Ok("1,0"));
     }
 }

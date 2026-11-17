@@ -12,7 +12,7 @@
 11 src/far.rs
 236 src/gc.rs
 15 src/generator.rs
-49 src/heap.rs
+50 src/heap.rs
 123 src/interp.rs
 2 src/intl/mod.rs
 13 src/intrinsics.rs

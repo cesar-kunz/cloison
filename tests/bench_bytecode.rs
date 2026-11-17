@@ -32,7 +32,7 @@ fn listings_match_their_benchmarks() {
             vm.set_warm_tier(false);
             vm.set_tier_back_edges(budget);
             let v = vm.run(&module).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
-            assert_eq!(display(v), expect.trim(), "{} (tier at {budget})", f.display());
+            assert_eq!(display(v, &vm), expect.trim(), "{} (tier at {budget})", f.display());
         }
     }
 }

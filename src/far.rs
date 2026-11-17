@@ -625,6 +625,6 @@ mod tests {
         let mut vm = Vm::new();
         let g = vm.global_obj();
         vm.define_native(g, "fake", fake, 2, crate::jit::Ty::Any, false);
-        assert_eq!(vm.run(&module).map(crate::vm::display).as_deref(), Ok("0,2"));
+        assert_eq!(vm.run(&module).map(|v| crate::vm::display(v, &vm)).as_deref(), Ok("0,2"));
     }
 }

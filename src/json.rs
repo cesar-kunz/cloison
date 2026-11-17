@@ -261,7 +261,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
     }
     if let Some(d) = v.as_number() {
         if v.is_int32() {
-            push_ascii(out, &crate::vm::display(v));
+            push_ascii(out, &crate::vm::display_raw(v));
         } else if d.is_finite() {
             push_ascii(out, crate::vm::number_ascii(d).as_str());
         } else {
@@ -376,7 +376,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
                 PKey::Str(s) => quote(string_units(s).unwrap(), out)?,
                 PKey::Num(i) => {
                     out.push(b'"' as u16);
-                    push_ascii(out, &crate::vm::display(Value::number(i)));
+                    push_ascii(out, &crate::vm::display_raw(Value::number(i)));
                     out.push(b'"' as u16);
                 }
                 PKey::Name(a) => {

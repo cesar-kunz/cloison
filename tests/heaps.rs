@@ -60,7 +60,7 @@ fn heaps_run_out_without_aborting() {
         r == null ? "timed out" : r
     "#;
     let mut vm = Vm::new();
-    let r = display(vm.run(&cloison::js::compile(src).unwrap()).unwrap());
+    let r = display(vm.run(&cloison::js::compile(src).unwrap()).unwrap(), &vm);
     let error = format!("TypeError: $262.agent.start: more than {} heaps alive at once", cloison::heap::HEAPS);
     assert!(r.split('|').all(|e| e == error), "{r}");
 }

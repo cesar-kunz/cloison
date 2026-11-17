@@ -974,7 +974,7 @@ pub(crate) fn policy() -> &'static Policy {
 
 /// A moved cell's first granule's metadata while it is evacuated: its new
 /// address in its second word (`Vm::evacuate`).
-const FORWARDED: u8 = 0x40;
+pub(crate) const FORWARDED: u8 = 0x40;
 /// A candidate's cell's first granule's metadata while it is evacuated: it
 /// stays (`Vm::evacuate`).
 const PINNED: u8 = 0x10;
@@ -5451,7 +5451,7 @@ mod tests {
         vm.define_native(g, "verify", verify_now, 0, crate::jit::Ty::Any, false);
         vm.define_native(g, "marking", marking, 0, crate::jit::Ty::Any, false);
         vm.define_native(g, "stop_cycles", stop_cycles, 0, crate::jit::Ty::Any, false);
-        assert_eq!(vm.run(&module).map(crate::vm::display).as_deref(), Ok("true,false"));
+        assert_eq!(vm.run(&module).map(crate::vm::display_raw).as_deref(), Ok("true,false"));
     }
 
     use std::time::{Duration, Instant};
@@ -5569,7 +5569,7 @@ mod tests {
             g,
             &[("stop_after_final", stop_after_final as crate::vm::NativeFn, 0), ("int32s", int32s, 1)],
         );
-        let r = vm.run(&module).map(crate::vm::display).map_err(|e| e.to_string());
+        let r = vm.run(&module).map(crate::vm::display_raw).map_err(|e| e.to_string());
         assert_eq!(r, Ok("true,0".to_string()));
     }
 }

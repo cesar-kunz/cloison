@@ -408,6 +408,9 @@ handlers! {
         {
             next_int!(Op::Add.size(), sum)
         }
+        if let Some((a, b)) = both_numbers(acc, rhs) {
+            next!(any, Op::Add.size(), Value::from_f64_arith(a + b))
+        }
         tail!(slow_add, acc)
     }
 
@@ -2661,6 +2664,9 @@ macro_rules! arith_reg {
                 {
                     next_int!(Op::$op.size(), v)
                 }
+                if let Some((x, y)) = both_numbers(lhs, acc) {
+                    next!(any, Op::$op.size(), Value::from_f64_arith(arith_f64(Op::$op, x, y)))
+                }
                 tail!($slow, acc)
             }
 
@@ -2814,6 +2820,9 @@ macro_rules! arith_reg_star {
                 {
                     star_int!(Op::$op.size(), v)
                 }
+                if let Some((x, y)) = both_numbers(lhs, acc) {
+                    star!(Op::$op.size(), Value::from_f64_arith(arith_f64(Op::$op, x, y)))
+                }
                 tail!($slow, acc)
             }
 
@@ -2872,8 +2881,31 @@ macro_rules! ldar_then {
 
 ldar_then!(op_ldar_get_keyed, op_get_keyed);
 ldar_then!(op_ldar_set_named, op_set_named);
-ldar_then!(op_ldar_add, op_add);
-ldar_then!(op_ldar_mul, op_mul);
+/// `Ldar r; Op s` for arithmetic `$op`: its number paths here (`$int(s,
+/// r)` and `s $f r`), as LLVM no longer inlines `$op`'s handler, which
+/// computes doubles too; the rest in `$slow`.
+macro_rules! ldar_arith {
+    ($name:ident, $op:ident, $slow:ident, $int:path, $f:tt) => {
+        handlers! {
+            fn $name(pc, acc, regs, tag) {
+                acc = *reg(pc, 1, regs);
+                let other = *reg(pc, Op::Ldar.size() + 1, regs);
+                if tag.both_int32(other, acc)
+                    && let Some(v) = $int(other.as_i32_unchecked(), acc.as_i32_unchecked())
+                {
+                    next_int!(Op::Ldar.size() + Op::$op.size(), v)
+                }
+                if let Some((x, y)) = both_numbers(other, acc) {
+                    next!(any, Op::Ldar.size() + Op::$op.size(), Value::from_f64_arith(x $f y))
+                }
+                then!($slow, Op::Ldar.size(), acc)
+            }
+        }
+    };
+}
+
+ldar_arith!(op_ldar_add, Add, slow_add, i32::checked_add, +);
+ldar_arith!(op_ldar_mul, Mul, slow_mul, int_mul, *);
 ldar_then!(op_ldar_add_smi, op_add_smi);
 ldar_then!(op_ldar_sar_smi, op_sar_smi);
 ldar_then!(op_ldar_return, op_return);
@@ -2889,6 +2921,9 @@ handlers! {
             && let Some(sum) = acc.as_i32_unchecked().checked_add(rhs.as_i32_unchecked())
         {
             star_int!(Op::Add.size(), sum)
+        }
+        if let Some((a, b)) = both_numbers(acc, rhs) {
+            star!(Op::Add.size(), Value::from_f64_arith(a + b))
         }
         tail!(slow_add, acc)
     }

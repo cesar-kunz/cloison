@@ -2874,6 +2874,7 @@ impl Vm {
 
     /// A plain object with prototype `proto`.
     pub fn new_object(&mut self, proto: Value) -> *mut Object {
+        self.check_value(proto, "Vm::new_object");
         self.new_plain(proto).ptr()
     }
 
@@ -3524,7 +3525,8 @@ impl Vm {
     /// A tag test alone for a value not a cell. (Only another live heap's:
     /// a raw `Value` kept past its VM, or past a collection that freed its
     /// cell, is dangling, and the heap a later VM takes may be where it
-    /// pointed: [`Global`] is the handle that keeps one alive.)
+    /// pointed. [`Vm::check_value`], at the host's entries, refuses those;
+    /// [`Global`] is the handle that keeps one alive.)
     #[inline(always)]
     fn check_own(&self, v: Value, what: &str) {
         if v.is_cell() && !self.heap.contains(v.to_bits() as usize) {
@@ -3553,14 +3555,16 @@ impl Vm {
     /// `interp::current_vm` too: a cons string key made flat, a native
     /// getter), its native stack's limit from here, the VM stack free from
     /// its base for the JS functions it calls (getters, traps, a key's
-    /// `toString`), and the values pushed to `handles` rooted. What a
-    /// conversion threw is `f`'s error, none left pending for the next
-    /// operation. (No collection runs: the host's values aren't on the
-    /// stack the collector scans, which starts at a run's frame.)
+    /// `toString`), and `roots`, the host's values it operates on, checked
+    /// (`check_value`, for operation `what`). What a conversion threw is
+    /// `f`'s error, none left pending for the next operation. (No
+    /// collection runs: the host's values aren't on the stack the collector
+    /// scans, which starts at a run's frame.)
     #[cold]
     #[inline(never)]
-    fn host<R>(&mut self, f: impl FnOnce(&mut Vm) -> Result<R>) -> Result<R> {
+    fn host<R>(&mut self, what: &str, roots: &[Value], f: impl FnOnce(&mut Vm) -> Result<R>) -> Result<R> {
         self.usable()?;
+        roots.iter().for_each(|&v| self.check_value(v, what));
         /// What `host` changed, back on return or unwinding.
         struct Entered {
             vm: *mut Vm,
@@ -3604,7 +3608,7 @@ impl Vm {
     /// `obj[name]`.
     pub fn get(&mut self, obj: Value, name: Atom) -> Result<Value> {
         if !self.running() {
-            return self.host(|vm| vm.get(obj, name));
+            return self.host("Vm::get", &[obj], |vm| vm.get(obj, name));
         }
         self.check_own(obj, "Vm::get");
         if !obj.is_cell() {
@@ -3852,7 +3856,7 @@ impl Vm {
         {
             // The run is over: its `toString` runs as a host's operation
             // (a throwing one leaves the error's own message).
-            if let Ok(s) = self.host(|_| Ok(crate::interp::to_string_units(v))) {
+            if let Ok(s) = self.host("Vm::uncaught_message", &[v], |_| Ok(crate::interp::to_string_units(v))) {
                 return String::from_utf16_lossy(&s);
             }
         }
@@ -4017,7 +4021,7 @@ impl Vm {
     /// `obj[name] = value`.
     pub fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
         if !self.running() {
-            return self.host(|vm| vm.set(obj, name, value));
+            return self.host("Vm::set", &[obj, value], |vm| vm.set(obj, name, value));
         }
         self.check_own(obj, "Vm::set");
         self.check_own(value, "Vm::set");
@@ -4582,7 +4586,7 @@ impl Vm {
     /// `typeof v`, a string constant (each made once: EarleyBoyer's
     /// `sc_isNumber` and others spent 3% encoding and looking them up).
     pub fn type_of(&mut self, v: Value) -> Value {
-        self.check_own(v, "Vm::type_of");
+        self.check_value(v, "Vm::type_of");
         self.type_of_own(v)
     }
 
@@ -4695,7 +4699,7 @@ impl Vm {
     /// became a prototype), OrdinaryHasInstance.
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
         if !self.running() {
-            return self.host(|vm| vm.instance_of(v, f));
+            return self.host("Vm::instance_of", &[v, f], |vm| vm.instance_of(v, f));
         }
         self.check_own(v, "Vm::instance_of");
         self.check_own(f, "Vm::instance_of");
@@ -4820,7 +4824,7 @@ impl Vm {
     /// element `key`.
     pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
         if !self.running() {
-            return self.host(|vm| vm.has_property(obj, key));
+            return self.host("Vm::has_property", &[obj, key], |vm| vm.has_property(obj, key));
         }
         self.check_own(obj, "Vm::has_property");
         self.check_own(key, "Vm::has_property");
@@ -4861,7 +4865,7 @@ impl Vm {
     /// [`Vm::delete_named`]). False for what can't be deleted.
     pub fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
         if !self.running() {
-            return self.host(|vm| vm.delete_property(obj, key));
+            return self.host("Vm::delete_property", &[obj, key], |vm| vm.delete_property(obj, key));
         }
         self.check_own(obj, "Vm::delete_property");
         self.check_own(key, "Vm::delete_property");
@@ -5263,7 +5267,7 @@ impl Vm {
     /// `obj[key]`.
     pub fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
         if !self.running() {
-            return self.host(|vm| vm.get_keyed(obj, key));
+            return self.host("Vm::get_keyed", &[obj, key], |vm| vm.get_keyed(obj, key));
         }
         self.check_own(obj, "Vm::get_keyed");
         self.check_own(key, "Vm::get_keyed");
@@ -5438,7 +5442,7 @@ impl Vm {
 
     pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
         if !self.running() {
-            return self.host(|vm| vm.set_keyed(obj, key, value));
+            return self.host("Vm::set_keyed", &[obj, key, value], |vm| vm.set_keyed(obj, key, value));
         }
         self.check_own(obj, "Vm::set_keyed");
         self.check_own(key, "Vm::set_keyed");
@@ -5766,7 +5770,7 @@ impl Vm {
     /// further up. Null and undefined have none.
     pub fn for_in_keys(&mut self, v: Value) -> Result<Value> {
         if !self.running() {
-            return self.host(|vm| Ok(vm.for_in_key_array(v)));
+            return self.host("Vm::for_in_keys", &[v], |vm| Ok(vm.for_in_key_array(v)));
         }
         self.check_own(v, "Vm::for_in_keys");
         let keys = self.for_in_key_array(v);
@@ -5900,7 +5904,7 @@ impl Vm {
     /// ```
     pub fn string_units(&self, v: Value) -> Option<std::borrow::Cow<'_, [u16]>> {
         // (The borrow is this VM's: another's string could be freed under it.)
-        self.check_own(v, "Vm::string_units");
+        self.check_value(v, "Vm::string_units");
         units_in_place(v)
     }
 
@@ -6917,7 +6921,7 @@ impl Vm {
     #[inline]
     pub fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
         if !self.running() {
-            return self.host(|vm| vm.call_other(f, this, args));
+            return self.host("Vm::call_other", &[&[f, this][..], args].concat(), |vm| vm.call_other(f, this, args));
         }
         self.call_own(f, this, args)
     }
@@ -6955,7 +6959,7 @@ impl Vm {
     /// constructs (`Array`, `Object`) makes its object.
     pub fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
         if !self.running() {
-            return self.host(|vm| vm.construct_other(f, args));
+            return self.host("Vm::construct_other", &[&[f][..], args].concat(), |vm| vm.construct_other(f, args));
         }
         self.check_own(f, "Vm::construct_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::construct_other"));
@@ -7440,7 +7444,9 @@ impl Vm {
     /// one in a run frees the cells nothing in the VM refers to and moves
     /// others, the host's copies left pointing at memory reused. A value
     /// kept past it is held as a [`Global`], which the collector keeps and
-    /// updates.
+    /// updates. The VM's operations, [`display`] and [`Global::new`] refuse
+    /// (panic on) one a collection freed or moved (#323); one pointing at a
+    /// cell made there since reads that cell.
     ///
     /// A panic unwinding out of the run (the heap limit's, `CLOISON_HEAP_
     /// LIMIT`, under an embedder's `catch_unwind`) leaves the VM as between
@@ -8043,7 +8049,7 @@ impl Vm {
 
     /// Words of in-object storage in `o` (for tests).
     pub fn inline_capacity(&self, o: Value) -> u32 {
-        self.check_own(o, "Vm::inline_capacity");
+        self.check_value(o, "Vm::inline_capacity");
         unsafe { (*Obj::of(o).shape()).capacity.get() }
     }
 }
@@ -9230,7 +9236,7 @@ impl Global {
     /// operation of `vm`'s, or from within one of its runs (a native's).
     /// Panics if `v` is a cell of another VM's heap.
     pub fn new(vm: &Vm, v: Value) -> Global {
-        vm.check_own(v, "Global::new");
+        vm.check_value(v, "Global::new");
         Global::hold(&vm.globals, v)
     }
 
@@ -9469,7 +9475,7 @@ out.join();"#;
             let r = catch_unwind(AssertUnwindSafe(|| b.enter(|_| panic!("unwinding"))));
             assert!(r.is_err());
             assert!(std::ptr::eq(crate::interp::current_vm(), pa));
-            let r = catch_unwind(AssertUnwindSafe(|| b.host(|_| -> Result<()> { panic!("unwinding") })));
+            let r = catch_unwind(AssertUnwindSafe(|| b.host("test", &[], |_| -> Result<()> { panic!("unwinding") })));
             assert!(r.is_err());
             assert!(std::ptr::eq(crate::interp::current_vm(), pa));
             assert!(std::ptr::eq(crate::heap::owner(a.global as usize), pa));
@@ -9483,7 +9489,7 @@ out.join();"#;
         // And what `host` entered.
         let mut c = Vm::new();
         let r = catch_unwind(AssertUnwindSafe(|| {
-            c.host(|c| -> Result<()> {
+            c.host("test", &[], |c| -> Result<()> {
                 c.conv_thrown = true;
                 panic!("unwinding")
             })

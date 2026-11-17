@@ -8827,6 +8827,40 @@ fn globals_keep_host_values_across_runs() {
     assert!(r.is_err());
 }
 
+/// #323: a raw `Value` kept past a collection that freed its cell is
+/// refused by the VM's operations (they panic) rather than read. Of the
+/// objects the host had, the script dropped and collected, a stale word
+/// may keep a few (the native stack is scanned conservatively): those
+/// still read as they were.
+#[test]
+fn stale_raw_values_are_refused() {
+    use cloison::value::Value;
+    use cloison::vm::Global;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut vm = Vm::new();
+    let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let a = run(&mut vm, "var a = []; for (var i = 0; i < 200; i++) a.push({k: 'v'.repeat(i % 7) + i}); a");
+    let objs: Vec<Value> = (0..200).map(|i| vm.get_keyed(a, Value::from_i32(i)).unwrap()).collect();
+    run(&mut vm, "a = null; $262.gc(); $262.gc();");
+    let k = vm.intern("k");
+    let mut refused = 0;
+    for (i, &o) in objs.iter().enumerate() {
+        match catch_unwind(AssertUnwindSafe(|| vm.get(o, k))) {
+            Err(_) => refused += 1,
+            Ok(r) => assert_eq!(display(r.unwrap(), &vm), "v".repeat(i % 7) + &i.to_string()),
+        }
+    }
+    assert!(refused >= 150, "{refused} of 200 refused");
+    // Nor displayed, kept or called.
+    let dead = objs.iter().copied().find(|&o| catch_unwind(AssertUnwindSafe(|| display(o, &vm))).is_err()).unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| Global::new(&vm, dead))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| vm.type_of(dead))).is_err());
+    let f = run(&mut vm, "(function (x) { return x; })");
+    assert!(catch_unwind(AssertUnwindSafe(|| vm.call_other(f, Value::UNDEFINED, &[dead]))).is_err());
+    // The VM goes on.
+    assert_eq!(display(run(&mut vm, "1 + 1"), &vm), "2");
+}
+
 /// #339: `display` takes the VM its value is of, and checks it: another
 /// VM's cell is refused, and one of a VM dropped (whose heap a new VM may
 /// have taken) is refused or a cell of the new VM's heap, never freed

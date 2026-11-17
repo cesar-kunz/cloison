@@ -4590,6 +4590,19 @@ impl Vm {
         self.type_of_own(v)
     }
 
+    /// ECMAScript ToNumber of `v`: a string parsed, an object through its
+    /// `@@toPrimitive`, `valueOf` or `toString` (run as a host operation
+    /// between runs), a Symbol's or a BigInt's TypeError the error.
+    /// (`Value::to_number`, the primitives' alone, is the VM's: #343.)
+    pub fn to_number(&mut self, v: Value) -> Result<f64> {
+        if !self.running() {
+            return self.host("Vm::to_number", &[v], |vm| vm.to_number(v));
+        }
+        self.check_own(v, "Vm::to_number");
+        let d = crate::interp::to_number(v);
+        if self.conv_failed() { Err(self.take_conv_error()) } else { Ok(d) }
+    }
+
     /// [`Vm::type_of`] of a value known to be this VM's (`typeof`'s).
     pub(crate) fn type_of_own(&mut self, v: Value) -> Value {
         const NAMES: [&str; 8] = ["number", "undefined", "boolean", "string", "function", "object", "symbol", "bigint"];

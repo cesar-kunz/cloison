@@ -1030,16 +1030,21 @@ fn zip_keyed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// A zip's open iterators, closed with completion `c` (IteratorCloseAll).
+/// (In a handle scope: each `close` runs user code, and `its` must not
+/// move under it.)
 fn close_all(vm: &mut Vm, state: Value, c: Result<()>) -> Result<()> {
-    let (iters, open) = (get(vm, state, ITER)?, get(vm, state, INNER_NEXT)?);
-    let n = vm.length_of(iters)? as usize;
-    let mut its = Vec::new();
-    for i in 0..n {
-        if vm.get_keyed(open, Value::from_i32(i as i32))? == Value::TRUE {
-            its.push(vm.get_keyed(iters, Value::from_i32(i as i32))?);
+    vm.handle_scope(|vm| {
+        let (iters, open) = (get(vm, state, ITER)?, get(vm, state, INNER_NEXT)?);
+        let n = vm.length_of(iters)? as usize;
+        let mut its = Vec::new();
+        for i in 0..n {
+            if vm.get_keyed(open, Value::from_i32(i as i32))? == Value::TRUE {
+                its.push(vm.get_keyed(iters, Value::from_i32(i as i32))?);
+            }
         }
-    }
-    close_list(vm, &its, c)
+        vm.handles.extend(its.iter().copied());
+        close_list(vm, &its, c)
+    })
 }
 
 /// A zip's next results (IteratorZip's closure, to its `yield`).

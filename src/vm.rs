@@ -272,6 +272,9 @@ fn settle(code: &Code) {
 /// prototype before their capacity settles (see [`CtorProto`]).
 const SLACK_OBJECTS: u32 = 8;
 
+/// Entries of [`Vm::ctor_cache`] (a power of two).
+const CTOR_CACHE: usize = 64;
+
 /// Slack tracking for the objects a shared constructor makes with one
 /// prototype: as `Code`'s (see [`settle`]), but settled once
 /// [`SLACK_OBJECTS`] have been made, so it counts the properties they got
@@ -1384,6 +1387,11 @@ pub struct Vm {
     /// The slack tracking of `new` for each prototype, for constructors
     /// that have made objects with several (see `Code::ctor_shared`).
     ctor_protos: HashMap<u64, Box<CtorProto>>,
+    /// The entries of `ctor_protos` found last, by their prototype's
+    /// address: each `new` of a shared constructor (Prototype's
+    /// `Class.create`) looks its own up twice, which the map made 100
+    /// instructions. Cleared when entries go.
+    ctor_cache: Box<[(u64, *const CtorProto); CTOR_CACHE]>,
     pub(crate) a_prototype: Atom,
     pub(crate) a_constructor: Atom,
     pub(crate) a_length: Atom,
@@ -1654,6 +1662,7 @@ impl Vm {
             math_max_fn: std::ptr::null_mut(),
             math_min_fn: std::ptr::null_mut(),
             ctor_protos: HashMap::default(),
+            ctor_cache: Box::new([(0, std::ptr::null()); CTOR_CACHE]),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
@@ -2145,6 +2154,7 @@ impl Vm {
     /// root shapes are live.
     pub(crate) fn sweep_ctor_protos(&mut self, live: impl Fn(usize) -> bool) {
         let epoch = crate::gc::code_epoch();
+        self.ctor_cache.fill((0, std::ptr::null()));
         self.ctor_protos.retain(|&p, e| {
             if !live(p as usize) {
                 return false;
@@ -6747,6 +6757,10 @@ impl Vm {
         if !code.ctor_shared.get() {
             return None;
         }
+        let k = (p >> 4) as usize % CTOR_CACHE;
+        if self.ctor_cache[k].0 == p {
+            return Some(self.ctor_cache[k].1);
+        }
         let e = self.ctor_protos.entry(p).or_insert_with(|| {
             // (The first prototype's tracking was the code's: settled, if
             // a `new` returned.)
@@ -6762,7 +6776,9 @@ impl Vm {
                 made: Cell::new(if first { SLACK_OBJECTS } else { 0 }),
             })
         });
-        Some(&**e)
+        let e: *const CtorProto = &**e;
+        self.ctor_cache[k] = (p, e);
+        Some(e)
     }
 
     /// After `new` returned `this`: grow the in-object capacity for the next

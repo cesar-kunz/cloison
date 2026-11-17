@@ -297,6 +297,12 @@ fn hold_entries(o: Obj, e: Value) {
 
 /// Element `i` of entries array `e` (within its length).
 fn slot(e: Obj, i: usize) -> Value {
+    if i < e.elems_len() as usize && e.class() == Class::Array {
+        // SAFETY: an array's elements are values, `i` below their length.
+        // (Not `elem`, whose checks on each entry a lookup reads cost
+        // 0.4% instructions on sass, whose maps are these.)
+        return unsafe { *e.elems().add(i) };
+    }
     e.elem(i)
 }
 

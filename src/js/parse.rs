@@ -1433,9 +1433,11 @@ impl<'a> Parser<'_, 'a, '_> {
         self.classes += 1;
         let h: Name = format!("%forin{k}").into();
         self.hidden_var(h.clone());
+        // (Taken before the object, which may have loops of its own.)
+        let vars = std::mem::take(&mut self.head_vars);
         let object = self.expression(false)?;
         self.expect(")")?;
-        let body = self.loop_body()?;
+        let body = self.loop_body(vars)?;
         let key = expr(self.arena, Expr { kind: ExprKind::Ident(h.clone()), pos });
         let first = match target {
             ForInTarget::Expr(t) => {
@@ -1490,13 +1492,15 @@ impl<'a> Parser<'_, 'a, '_> {
     fn for_of_rest(&mut self, kind: u8, target: ExprKind<'a>) -> R<StmtKind<'a>> {
         let pos = self.pos();
         self.advance();
+        // (Taken before the iterable, which may have loops of its own.)
+        let vars = std::mem::take(&mut self.head_vars);
         let iterable = self.assignment(false)?;
         match &target {
             ExprKind::Ident(n) => self.head_tdz(std::slice::from_ref(n)),
             _ => self.head_tdz(&[]),
         }
         self.expect(")")?;
-        let body = stmt(self.arena, self.loop_body()?);
+        let body = stmt(self.arena, self.loop_body(vars)?);
         Ok(StmtKind::ForOf {
             kind,
             target: expr(self.arena, Expr { kind: target, pos }),
@@ -1719,9 +1723,9 @@ impl<'a> Parser<'_, 'a, '_> {
         })
     }
 
-    /// A `for` loop's body, declaring `head_vars` first.
-    fn loop_body(&mut self) -> R<Stmt<'a>> {
-        let vars = std::mem::take(&mut self.head_vars);
+    /// A `for` loop's body, declaring `vars` (its head's `head_vars`)
+    /// first.
+    fn loop_body(&mut self, vars: Vec<Name>) -> R<Stmt<'a>> {
         let pos = self.pos();
         let body = self.sub_statement()?;
         if vars.is_empty() {
@@ -1732,9 +1736,11 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     fn for_in_rest(&mut self, var: bool, name: Name) -> R<StmtKind<'a>> {
+        // (Taken before the object, which may have loops of its own.)
+        let vars = std::mem::take(&mut self.head_vars);
         let object = self.expression(false)?;
         self.expect(")")?;
-        let body = stmt(self.arena, self.loop_body()?);
+        let body = stmt(self.arena, self.loop_body(vars)?);
         Ok(StmtKind::ForIn { var, fresh: false, name, object: expr(self.arena, object), body })
     }
 

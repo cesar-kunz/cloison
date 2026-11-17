@@ -10091,3 +10091,23 @@ re[Symbol.replace]("abc", function (m, c) { return c; })
     let want: String = (1..=20).map(|i| format!("c{i}")).collect();
     assert_eq!(run_moving(src), Ok(format!("{want}abc")));
 }
+
+/// A String method given a RegExp without its `Symbol.*` method takes
+/// the pattern as a string (#328): the pattern's string, and the other
+/// arguments, are still there after the receiver's `toString` collected.
+/// (They were in a Rust `Vec`, the string only there.) What V8 gives.
+#[test]
+fn string_methods_hold_a_regexps_pattern_string_across_tostring() {
+    let src = r#"
+var junk, out = [];
+var recv = () => ({ toString() { $262.gc(); junk = []; for (var i = 0; i < 2e4; i++) junk.push({ i }); $262.gc(); return "a/b/c"; } });
+var re = /b/; re[Symbol.replace] = undefined; re[Symbol.split] = undefined;
+re[Symbol.search] = undefined; re[Symbol.match] = undefined;
+out.push(String.prototype.replace.call(recv(), re, { toString() { return "X"; } }));
+out.push(String.prototype.split.call(recv(), re, { valueOf() { $262.gc(); return 5; } }).join("|"));
+out.push(String.prototype.search.call(recv(), re));
+out.push(String.prototype.match.call(recv(), re)[0]);
+out.join(" ")
+"#;
+    assert_eq!(run_moving(src).as_deref(), Ok("aXc a|c 1 /b/"));
+}

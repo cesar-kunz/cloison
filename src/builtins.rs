@@ -3152,16 +3152,18 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     // `this`'s `Symbol.<K>`, which may not be this one.)
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
-    match K {
-        0 => match_fast(vm, s, &args),
+    // (On the VM stack: the String methods read them after user code, a
+    // replacer's or a limit's conversion, and a `Vec` is no root.)
+    crate::interp::with_args_on_stack(vm, &args, |vm, args| match K {
+        0 => match_fast(vm, s, args),
         1 => {
             let u = this_units(s)?;
             match_all(vm, s, &u, this)
         }
-        2 => replace(vm, s, &args, false),
-        3 => search_fast(vm, s, &args),
-        _ => split_fast(vm, s, &args),
-    }
+        2 => replace(vm, s, args, false),
+        3 => search_fast(vm, s, args),
+        _ => split_fast(vm, s, args),
+    })
 }
 
 /// A String method's pattern `a[0]`, if an object (not a RegExp) with a
@@ -3194,7 +3196,9 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
         }
         let mut args = vec![vm.new_string(&u)];
         args.extend_from_slice(a.get(1..).unwrap_or(&[]));
-        return f(vm, this, &args).map(Some);
+        // (On the VM stack: `f` runs `this`'s `toString` before it reads
+        // them, and a `Vec` is no root.)
+        return crate::interp::with_args_on_stack(vm, &args, |vm, args| f(vm, this, args)).map(Some);
     }
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));

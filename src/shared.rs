@@ -842,7 +842,9 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
     let b = crate::typed::buffer_of(o);
     let block = block_of(b);
     let index = i * k.size() + crate::typed::offset_of(o);
-    let deadline = (t.is_finite()).then(|| Instant::now() + Duration::from_secs_f64(t / 1000.0));
+    // (Any finite `t` is a timeout, 25.4.3.14; one past what an `Instant`
+    // holds, about 9e21 ms, is none: it would end long after the machine.)
+    let deadline = Duration::try_from_secs_f64(t / 1000.0).ok().and_then(|d| Instant::now().checked_add(d));
     let mut list = waiters();
     let w = apply(o, k, i, Op::Load, 0);
     let mask = if k.size() == 8 { u64::MAX } else { u32::MAX as u64 };

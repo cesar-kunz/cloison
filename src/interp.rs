@@ -1192,7 +1192,7 @@ handlers! {
 
     fn op_initial_yield(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
-        match with_top(regs, None, |vm| crate::generator::create(vm, f)) {
+        match with_top(regs, None, |vm| crate::generator::create(vm, unsafe { Obj::from_ptr(f) })) {
             Ok(g) => {
                 *reg(pc, 1, regs) = g;
                 let code = frame_code(regs);
@@ -1210,7 +1210,7 @@ handlers! {
     fn op_async_start(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
         let r = with_top(regs, None, |vm| {
-            let g = crate::generator::create(vm, f)?;
+            let g = crate::generator::create(vm, unsafe { Obj::from_ptr(f) })?;
             *reg(pc, 1, regs) = g;
             let code = frame_code(regs);
             let at = pc.add(Op::AsyncStart.size()).offset_from(code.live().bytecode.as_ptr()) as usize;
@@ -3923,7 +3923,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
         if vm.conv_failed() {
             return Value::UNDEFINED;
         }
-        if vm.to_primitive_defined || vm.proxies_exist && crate::proxy::is_proxy(vm, as_object(v)) {
+        if vm.to_primitive_defined || vm.proxies_exist && crate::proxy::is_proxy(vm, Obj::from_ptr(as_object(v))) {
             let fail = |vm: &mut Vm, e: Error| {
                 vm.conv_error.get_or_insert(e);
                 vm.conv_thrown = true;

@@ -766,8 +766,8 @@ impl Vm {
     /// `Object.defineProperty`: whether it could be (ValidateAndApply-
     /// PropertyDescriptor; a `RangeError` for an array's bad `length`).
     pub(crate) fn define_own_property(&mut self, o: Obj, key: Key, d: &Desc) -> Result<bool> {
-        if self.proxies_exist && crate::proxy::is_proxy(self, o.ptr()) {
-            return crate::proxy::proxy_define(self, o.ptr(), key, d);
+        if self.proxies_exist && crate::proxy::is_proxy(self, o) {
+            return crate::proxy::proxy_define(self, o, key, d);
         }
         // A mapped `arguments` element: its parameter set too, and unmapped
         // by an accessor or a non-writable value.
@@ -1369,7 +1369,7 @@ impl Vm {
     /// where the store couldn't happen): the spec's `Set` with `Throw`
     /// true, as the builtins use it.
     pub(crate) fn put_key(&mut self, o: Value, key: Key, v: Value) -> Result<()> {
-        if is_object(o) && crate::proxy::chain_has_proxy(self, as_object(o)) {
+        if is_object(o) && crate::proxy::chain_has_proxy(self, Obj::of(o)) {
             if !crate::proxy::generic_set(self, o, key, v, o)? {
                 let k = self.key_string(key);
                 return Err(Error::type_error(format!(
@@ -1463,7 +1463,7 @@ impl Vm {
 
     /// `delete o[key]` where failure is a `TypeError` (the builtins').
     pub(crate) fn delete_key(&mut self, o: Value, key: Key) -> Result<()> {
-        if is_object(o) && !crate::proxy::delete(self, as_object(o), key)? {
+        if is_object(o) && !crate::proxy::delete(self, Obj::of(o), key)? {
             let k = self.key_string(key);
             return Err(Error::type_error(format!("Cannot delete property '{}' of object", crate::vm::shown(k))));
         }
@@ -1614,9 +1614,9 @@ fn descriptors(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
     let mut out = Vec::new();
     vm.handle_scope(|vm| {
         // (A proxy's through its traps; symbols too.)
-        for key in crate::proxy::own_keys(vm, po.ptr())? {
+        for key in crate::proxy::own_keys(vm, po)? {
             // (Enumerability as of now: a getter may have changed it.)
-            let Some(d) = crate::proxy::get_own_property(vm, po.ptr(), key)? else { continue };
+            let Some(d) = crate::proxy::get_own_property(vm, po, key)? else { continue };
             if d.enumerable != Some(true) {
                 continue;
             }
@@ -1686,7 +1686,7 @@ fn object_create(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn object_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = vm.to_object(arg(a, 0))?;
     let key = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
-    Ok(match crate::proxy::get_own_property(vm, o.ptr(), key)? {
+    Ok(match crate::proxy::get_own_property(vm, o, key)? {
         Some(d) => vm.from_descriptor(&d),
         None => Value::UNDEFINED,
     })
@@ -1695,12 +1695,12 @@ fn object_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Res
 /// An array of `o`'s own keys (`all`: including the non-enumerable).
 fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
     // (A proxy's through its traps.)
-    if vm.proxies_exist && crate::proxy::is_proxy(vm, o.ptr()) {
+    if vm.proxies_exist && crate::proxy::is_proxy(vm, o) {
         let keys = if all {
-            let ks = crate::proxy::own_keys(vm, o.ptr())?;
+            let ks = crate::proxy::own_keys(vm, o)?;
             ks.into_iter().filter(|k| !matches!(k, Key::Name(a) if crate::symbol::is_symbol_atom(vm, *a))).collect()
         } else {
-            crate::proxy::enumerable_own_keys(vm, o.ptr())?
+            crate::proxy::enumerable_own_keys(vm, o)?
         };
         let values: Vec<Value> = keys.into_iter().map(|k| vm.key_string(k)).collect();
         return crate::array::new_array_of(vm, &values);
@@ -1744,7 +1744,7 @@ fn object_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `Object.getPrototypeOf(o)`.
 fn object_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = vm.to_object(arg(a, 0))?;
-    crate::proxy::get_prototype_of(vm, o.ptr())
+    crate::proxy::get_prototype_of(vm, o)
 }
 
 /// `Object.setPrototypeOf(o, proto)`.
@@ -1756,7 +1756,7 @@ fn object_set_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> 
     if !(proto.is_null() || is_object(proto)) {
         return Err(Error::type_error("Object prototype may only be an Object or null"));
     }
-    if is_object(o) && !crate::proxy::set_prototype_of(vm, as_object(o), proto)? {
+    if is_object(o) && !crate::proxy::set_prototype_of(vm, Obj::of(o), proto)? {
         return Err(Error::type_error("Cannot set prototype"));
     }
     Ok(o)
@@ -1764,7 +1764,7 @@ fn object_set_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> 
 
 fn object_prevent_extensions(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = arg(a, 0);
-    if is_object(o) && !crate::proxy::prevent_extensions(vm, as_object(o))? {
+    if is_object(o) && !crate::proxy::prevent_extensions(vm, Obj::of(o))? {
         return Err(Error::type_error("Cannot prevent extensions"));
     }
     Ok(o)
@@ -1772,12 +1772,12 @@ fn object_prevent_extensions(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value
 
 fn object_is_extensible(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = arg(a, 0);
-    Ok(Value::from_bool(is_object(o) && crate::proxy::is_extensible(vm, as_object(o))?))
+    Ok(Value::from_bool(is_object(o) && crate::proxy::is_extensible(vm, Obj::of(o))?))
 }
 
 fn object_seal(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = arg(a, 0);
-    if is_object(o) && crate::proxy::is_proxy(vm, as_object(o)) {
+    if is_object(o) && crate::proxy::is_proxy(vm, Obj::of(o)) {
         integrity(vm, Obj::of(o), false)?;
         return Ok(o);
     }
@@ -1789,7 +1789,7 @@ fn object_seal(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn object_freeze(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = arg(a, 0);
-    if is_object(o) && crate::proxy::is_proxy(vm, as_object(o)) {
+    if is_object(o) && crate::proxy::is_proxy(vm, Obj::of(o)) {
         integrity(vm, Obj::of(o), true)?;
         return Ok(o);
     }
@@ -1805,7 +1805,7 @@ fn object_freeze(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn object_is_sealed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = arg(a, 0);
-    if is_object(o) && crate::proxy::is_proxy(vm, as_object(o)) {
+    if is_object(o) && crate::proxy::is_proxy(vm, Obj::of(o)) {
         return test_integrity(vm, Obj::of(o), false).map(Value::from_bool);
     }
     Ok(Value::from_bool(!is_object(o) || vm.is_sealed(Obj::of(o), false)))
@@ -1813,7 +1813,7 @@ fn object_is_sealed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn object_is_frozen(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = arg(a, 0);
-    if is_object(o) && crate::proxy::is_proxy(vm, as_object(o)) {
+    if is_object(o) && crate::proxy::is_proxy(vm, Obj::of(o)) {
         return test_integrity(vm, Obj::of(o), true).map(Value::from_bool);
     }
     Ok(Value::from_bool(!is_object(o) || vm.is_sealed(Obj::of(o), true)))
@@ -1822,11 +1822,11 @@ fn object_is_frozen(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// TestIntegrityLevel of proxy `o` (`frozen` or sealed), through its
 /// traps.
 fn test_integrity(vm: &mut Vm, o: Obj, frozen: bool) -> Result<bool> {
-    if crate::proxy::is_extensible(vm, o.ptr())? {
+    if crate::proxy::is_extensible(vm, o)? {
         return Ok(false);
     }
-    for key in crate::proxy::own_keys(vm, o.ptr())? {
-        if let Some(d) = crate::proxy::get_own_property(vm, o.ptr(), key)?
+    for key in crate::proxy::own_keys(vm, o)? {
+        if let Some(d) = crate::proxy::get_own_property(vm, o, key)?
             && (d.configurable == Some(true) || frozen && d.writable == Some(true))
         {
             return Ok(false);
@@ -1878,7 +1878,7 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
                 } else if attrs & ACCESSOR == 0 {
                     so.slot_value(cur.location(k))
                 } else {
-                    match crate::proxy::get_own_property(vm, so.ptr(), key)? {
+                    match crate::proxy::get_own_property(vm, so, key)? {
                         Some(d) if d.enumerable == Some(true) => vm.get_key(s, key)?,
                         _ => continue,
                     }
@@ -1888,9 +1888,9 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             continue;
         }
         // (String keys, then symbols.)
-        let keys = crate::proxy::own_keys(vm, so.ptr())?;
+        let keys = crate::proxy::own_keys(vm, so)?;
         for key in keys {
-            let Some(d) = crate::proxy::get_own_property(vm, so.ptr(), key)? else { continue };
+            let Some(d) = crate::proxy::get_own_property(vm, so, key)? else { continue };
             if d.enumerable != Some(true) {
                 continue;
             }
@@ -1924,12 +1924,12 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
     }
     let out = vm.new_array();
     let mut n = 0;
-    for key in crate::proxy::own_keys(vm, o.ptr())? {
+    for key in crate::proxy::own_keys(vm, o)? {
         if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) {
             continue;
         }
         // (Enumerability as of now.)
-        let Some(d) = crate::proxy::get_own_property(vm, o.ptr(), key)? else { continue };
+        let Some(d) = crate::proxy::get_own_property(vm, o, key)? else { continue };
         if d.enumerable != Some(true) {
             continue;
         }
@@ -1961,8 +1961,8 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: &[Value]) -> Re
     let o = vm.to_object(arg(a, 0))?;
     let op = object_value(vm.object_prototype);
     let out = object_value(vm.new_plain(op).ptr());
-    for key in crate::proxy::own_keys(vm, o.ptr())? {
-        if let Some(d) = crate::proxy::get_own_property(vm, o.ptr(), key)? {
+    for key in crate::proxy::own_keys(vm, o)? {
+        if let Some(d) = crate::proxy::get_own_property(vm, o, key)? {
             let dv = vm.from_descriptor(&d);
             vm.create_data_property(out, key, dv)?;
         }
@@ -1998,7 +1998,7 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn object_has_own(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = vm.to_object(arg(a, 0))?;
     let key = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
-    Ok(Value::from_bool(crate::proxy::get_own_property(vm, o.ptr(), key)?.is_some()))
+    Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some()))
 }
 
 /// GroupBy(items, callback): each item with the key the callback gives it
@@ -2047,22 +2047,22 @@ fn object_has_own_property(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Valu
     let key = vm.to_key(arg(a, 0));
     let o = vm.to_object(this)?;
     if vm.proxies_exist {
-        return Ok(Value::from_bool(crate::proxy::get_own_property(vm, o.ptr(), key)?.is_some()));
+        return Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some()));
     }
     Ok(Value::from_bool(vm.own_property(o, key).is_some()))
 }
 
 /// SetIntegrityLevel of proxy `o` (`frozen` or sealed), through its traps.
 fn integrity(vm: &mut Vm, o: Obj, frozen: bool) -> Result<()> {
-    if !crate::proxy::prevent_extensions(vm, o.ptr())? {
+    if !crate::proxy::prevent_extensions(vm, o)? {
         return Err(Error::type_error("Cannot prevent extensions"));
     }
-    for key in crate::proxy::own_keys(vm, o.ptr())? {
+    for key in crate::proxy::own_keys(vm, o)? {
         let mut d = Desc { configurable: Some(false), ..Desc::default() };
-        if frozen && crate::proxy::get_own_property(vm, o.ptr(), key)?.is_some_and(|c| c.is_data()) {
+        if frozen && crate::proxy::get_own_property(vm, o, key)?.is_some_and(|c| c.is_data()) {
             d.writable = Some(false);
         }
-        if !crate::proxy::define_property(vm, o.ptr(), key, &d)? {
+        if !crate::proxy::define_property(vm, o, key, &d)? {
             return Err(Error::type_error("Cannot redefine property"));
         }
     }
@@ -2090,7 +2090,7 @@ fn object_is_prototype_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
 fn object_property_is_enumerable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let key = crate::intrinsics::to_property_key(vm, arg(a, 0))?;
     let o = vm.to_object(this)?;
-    Ok(Value::from_bool(crate::proxy::get_own_property(vm, o.ptr(), key)?.is_some_and(|d| d.enumerable == Some(true))))
+    Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true))))
 }
 
 /// `Object.prototype.toLocaleString()`: `this.toString()`.
@@ -2105,7 +2105,7 @@ fn object_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Valu
 /// `Object.prototype.__proto__`'s getter.
 fn object_get_proto(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = vm.to_object(this)?;
-    crate::proxy::get_prototype_of(vm, o.ptr())
+    crate::proxy::get_prototype_of(vm, o)
 }
 
 /// `Object.prototype.__proto__`'s setter.
@@ -2117,7 +2117,7 @@ fn object_set_proto(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !(proto.is_null() || is_object(proto)) || !is_object(this) {
         return Ok(Value::UNDEFINED);
     }
-    if !crate::proxy::set_prototype_of(vm, as_object(this), proto)? {
+    if !crate::proxy::set_prototype_of(vm, Obj::of(this), proto)? {
         return Err(Error::type_error("Cannot set prototype"));
     }
     Ok(Value::UNDEFINED)
@@ -2157,7 +2157,7 @@ fn lookup_accessor_half(vm: &mut Vm, this: Value, a: &[Value], setter: bool) -> 
     let mut p = object_value(o.ptr());
     // (A proxy's through its traps.)
     while p.is_cell() {
-        let po = as_object(p);
+        let po = Obj::of(p);
         if let Some(d) = crate::proxy::get_own_property(vm, po, key)? {
             return Ok(if d.is_accessor() {
                 if setter { d.set.unwrap() } else { d.get.unwrap() }

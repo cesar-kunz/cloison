@@ -25,7 +25,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::builtins::{getter, is_class};
-use crate::object::{Class, Obj, Object, TypedKind, as_object, object_value};
+use crate::object::{Class, Obj, Object, TypedKind, object_value};
 use crate::props::is_object;
 use crate::typed::{
     MAX_BYTES, MAX_RESIZABLE, RESIZABLE, integer, is_resizable, kind_of, refresh_views, relative, species_constructor,
@@ -81,7 +81,7 @@ fn bytes_of(b: *mut Block) -> *mut u8 {
 }
 
 /// Shared buffer `o`'s block.
-pub(crate) fn block_of(o: *mut Object) -> *mut Block {
+pub(crate) fn block_of(o: Obj) -> *mut Block {
     unsafe { o.elems().cast::<u8>().sub(HEADER).cast() }
 }
 
@@ -208,7 +208,7 @@ fn prune(vm: &mut Vm) -> Result<()> {
     // one), the dead ones' released.
     let mut live: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &v in &values {
-        *live.entry(block_of(as_object(v)) as usize).or_default() += 1;
+        *live.entry(block_of(Obj::of(v)) as usize).or_default() += 1;
     }
     let mut freed = 0;
     s.blocks.retain(|&b| {
@@ -298,11 +298,11 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
 /// Shared buffer `o`'s length, as its block has it now (another agent
 /// may have grown it): its views brought up to date to it, not the other
 /// buffers' (see [`read_length`]).
-fn sync_length(o: *mut Object) -> usize {
+fn sync_length(o: Obj) -> usize {
     let n = unsafe { (*block_of(o)).len.load(SeqCst) };
     if n != o.elems_len() as usize {
-        unsafe { (*o).elems_len = n as u32 };
-        refresh_views(unsafe { Obj::from_ptr(o) });
+        unsafe { (*o.ptr()).elems_len = n as u32 };
+        refresh_views(o);
     }
     n
 }
@@ -312,7 +312,7 @@ fn sync_length(o: *mut Object) -> usize {
 /// to it, then the other buffers caught up, as the read may have
 /// synchronized with another agent's grow (#155, #219); another's as it
 /// is (0 if detached).
-pub(crate) fn read_length(vm: &mut Vm, o: *mut Object) -> usize {
+pub(crate) fn read_length(vm: &mut Vm, o: Obj) -> usize {
     if !is_shared(o) {
         return o.elems_len() as usize;
     }
@@ -440,22 +440,22 @@ pub(crate) fn catch_up(vm: &mut Vm) {
     // length changed: while a grow is in flight, every catch-up comes
     // here.)
     crate::collections::weak_set_each(unsafe { Obj::from_ptr(vm.shared.growing) }, |v| {
-        sync_length(as_object(v));
+        sync_length(Obj::of(v));
     });
     if settled {
         vm.shared.grows = n;
     }
 }
 
-pub(crate) fn is_shared(o: *mut Object) -> bool {
+pub(crate) fn is_shared(o: Obj) -> bool {
     o.class() == Class::SharedArrayBuffer
 }
 
 // ---- SharedArrayBuffer ----
 
-fn this_shared(this: Value, what: &str) -> Result<*mut Object> {
+fn this_shared(this: Value, what: &str) -> Result<Obj> {
     if is_class(this, Class::SharedArrayBuffer) {
-        Ok(as_object(this))
+        Ok(Obj::of(this))
     } else {
         Err(Error::type_error(format!("SharedArrayBuffer.prototype.{what} called on an incompatible receiver")))
     }
@@ -501,19 +501,19 @@ fn shared_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 fn shared_growable(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(is_resizable(unsafe { Obj::from_ptr(this_shared(this, "growable")?) })))
+    Ok(Value::from_bool(is_resizable(this_shared(this, "growable")?)))
 }
 
 fn shared_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_shared(this, "maxByteLength")?;
-    let n = if is_resizable(unsafe { Obj::from_ptr(o) }) { unsafe { (*block_of(o)).room } } else { sync_length(o) };
+    let n = if is_resizable(o) { unsafe { (*block_of(o)).room } } else { sync_length(o) };
     Ok(Value::number(n as f64))
 }
 
 /// `buffer.grow(newLength)`: never shorter.
 fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_shared(this, "grow")?;
-    if !is_resizable(unsafe { Obj::from_ptr(o) }) {
+    if !is_resizable(o) {
         return Err(Error::type_error("SharedArrayBuffer.prototype.grow: the buffer is not growable"));
     }
     let n = to_index(vm, arg(a, 0))?;
@@ -578,7 +578,7 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !is_class(out, Class::SharedArrayBuffer) {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the species made no SharedArrayBuffer"));
     }
-    let p = as_object(out);
+    let p = Obj::of(out);
     if p == o {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the species returned the same buffer"));
     }
@@ -596,13 +596,7 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// (of an integer kind; `waitable`: `Int32Array` or `BigInt64Array`) in
 /// bounds (`write`: of a mutable buffer), and `index` converted, an
 /// element's index in it.
-fn access(
-    vm: &mut Vm,
-    ta: Value,
-    index: Value,
-    waitable: bool,
-    write: bool,
-) -> Result<(*mut Object, TypedKind, usize)> {
+fn access(vm: &mut Vm, ta: Value, index: Value, waitable: bool, write: bool) -> Result<(Obj, TypedKind, usize)> {
     if !is_class(ta, Class::TypedArray) {
         return Err(Error::type_error("Atomics: the argument is not a typed array"));
     }
@@ -626,13 +620,13 @@ fn access(
     if i >= len {
         return Err(Error::range_error("Atomics: index out of range"));
     }
-    Ok((o.ptr(), k, i))
+    Ok((o, k, i))
 }
 
 /// RevalidateAtomicAccess: the conversions may have detached or shrunk
 /// the buffer.
-fn revalidate(o: *mut Object, i: usize) -> Result<()> {
-    match ta_length(unsafe { Obj::from_ptr(o) }) {
+fn revalidate(o: Obj, i: usize) -> Result<()> {
+    match ta_length(o) {
         None => Err(Error::type_error("Atomics: the typed array is detached or out of bounds")),
         Some(n) if i >= n => Err(Error::range_error("Atomics: index out of range")),
         _ => Ok(()),
@@ -667,7 +661,7 @@ enum Op {
 
 /// Operation `op` with bits `v` on element `i` of typed array `o`: the
 /// element's bits before.
-fn apply(o: *mut Object, k: TypedKind, i: usize, op: Op, v: u64) -> u64 {
+fn apply(o: Obj, k: TypedKind, i: usize, op: Op, v: u64) -> u64 {
     macro_rules! with {
         ($a:ty, $t:ty) => {{
             let a = unsafe { <$a>::from_ptr(o.elems().cast::<$t>().add(i)) };
@@ -845,9 +839,9 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
     if !async_ && !can_block(vm) {
         return Err(Error::type_error("Atomics.wait: this agent can't block"));
     }
-    let b = crate::typed::buffer_of(unsafe { Obj::from_ptr(o) });
-    let block = block_of(b.ptr());
-    let index = i * k.size() + crate::typed::offset_of(unsafe { Obj::from_ptr(o) });
+    let b = crate::typed::buffer_of(o);
+    let block = block_of(b);
+    let index = i * k.size() + crate::typed::offset_of(o);
     let deadline = (t.is_finite()).then(|| Instant::now() + Duration::from_secs_f64(t / 1000.0));
     let mut list = waiters();
     let w = apply(o, k, i, Op::Load, 0);
@@ -896,12 +890,12 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
 
 /// ValidateIntegerTypedArray (waitable), of a shared buffer, and
 /// ValidateAtomicAccess.
-fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(*mut Object, TypedKind, usize)> {
+fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(Obj, TypedKind, usize)> {
     if is_class(ta, Class::TypedArray) {
         let o = Obj::of(ta);
         if ta_length(o).is_some()
             && matches!(kind_of(o), TypedKind::I32 | TypedKind::I64)
-            && !is_shared(crate::typed::buffer_of(o).ptr())
+            && !is_shared(crate::typed::buffer_of(o))
         {
             return Err(Error::type_error("Atomics.wait: the typed array's buffer is not shared"));
         }
@@ -934,12 +928,12 @@ fn atomics_notify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), true, false)?;
     let count = arg(a, 2);
     let c = if count.is_undefined() { f64::INFINITY } else { integer(vm, count)?.max(0.0) };
-    let b = crate::typed::buffer_of(unsafe { Obj::from_ptr(o) });
-    if !is_shared(b.ptr()) {
+    let b = crate::typed::buffer_of(o);
+    if !is_shared(b) {
         return Ok(Value::from_i32(0));
     }
-    let block = block_of(b.ptr()) as usize;
-    let index = i * k.size() + crate::typed::offset_of(unsafe { Obj::from_ptr(o) });
+    let block = block_of(b) as usize;
+    let index = i * k.size() + crate::typed::offset_of(o);
     let mut list = waiters();
     let mut n = 0usize;
     list.retain(|w| {

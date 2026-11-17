@@ -961,7 +961,7 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }
     // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
-    let bytes = crate::shared::read_length(vm, b.ptr());
+    let bytes = crate::shared::read_length(vm, b);
     if offset > bytes {
         return Err(Error::range_error(format!("Start offset {offset} is outside the bounds of the buffer")));
     }
@@ -981,7 +981,7 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }
-    let bytes = crate::shared::read_length(vm, b.ptr());
+    let bytes = crate::shared::read_length(vm, b);
     if offset > bytes || len.is_some_and(|n| offset + n > bytes) {
         return Err(Error::range_error(format!("Invalid DataView length {}", len.unwrap_or(0))));
     }

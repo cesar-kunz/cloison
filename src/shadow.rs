@@ -24,8 +24,8 @@ enum Root {
     ImportFailed,
 }
 
-fn root(vm: &Vm, r: Root) -> *mut Object {
-    (vm.shadow_roots[r as usize]).ptr()
+fn root(vm: &Vm, r: Root) -> Obj {
+    vm.shadow_roots[r as usize]
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -57,7 +57,7 @@ fn shadow_realm_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Constructor ShadowRealm requires 'new'"));
     }
     let callee = vm.callee_obj();
-    let default = object_value(root(vm, Root::Prototype));
+    let default = object_value(root(vm, Root::Prototype).ptr());
     let proto = vm.take_new_target(callee, default)?;
     let o = vm.new_plain(proto);
     let r = crate::realm::create(vm);
@@ -144,7 +144,7 @@ fn wrap(vm: &mut Vm, v: Value) -> Result<Value> {
         return Err(Error::type_error("ShadowRealm values crossing must be primitives or callables"));
     }
     let template = root(vm, Root::Wrapped);
-    let f = native_closure(vm, unsafe { Obj::from_ptr(template) }, &[v]);
+    let f = native_closure(vm, template, &[v]);
     copy_name_and_length(vm, f, v)
         .map_err(|e| Error::type_error(format!("wrapping a function: {}", thrown_message(vm, &e))))?;
     Ok(f)
@@ -163,7 +163,7 @@ fn wrap_in(vm: &mut Vm, r: u32, v: Value) -> Result<Value> {
 fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
     let (a_length, a_name) = (vm.a_length, vm.a_name);
     let mut len = 0.0;
-    if crate::proxy::get_own_property(vm, as_object(target), Key::Name(a_length))?.is_some() {
+    if crate::proxy::get_own_property(vm, Obj::of(target), Key::Name(a_length))?.is_some() {
         let l = vm.get(target, a_length)?;
         if let Some(n) = l.as_number() {
             len = if n == f64::INFINITY {
@@ -226,12 +226,8 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let loaded = crate::realm::run_in(vm, r, |vm| crate::module::import_now(vm, spec));
     match loaded {
         Ok((m, done)) => {
-            let ok = native_closure(
-                vm,
-                unsafe { Obj::from_ptr(root(vm, Root::Imported)) },
-                &[Value::from_i32(m as i32), name, resolve, reject],
-            );
-            let bad = native_closure(vm, unsafe { Obj::from_ptr(root(vm, Root::ImportFailed)) }, &[reject]);
+            let ok = native_closure(vm, root(vm, Root::Imported), &[Value::from_i32(m as i32), name, resolve, reject]);
+            let bad = native_closure(vm, root(vm, Root::ImportFailed), &[reject]);
             crate::promise::await_then(vm, done, ok, bad)?;
         }
         Err(e) if e.0.starts_with("unsupported") => return Err(e),

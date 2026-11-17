@@ -16,7 +16,7 @@ mod segmenter;
 use crate::raw::Live;
 use std::collections::HashMap;
 
-use crate::object::{DONT_ENUM, Obj, Object, object_value};
+use crate::object::{DONT_ENUM, Obj, object_value};
 use crate::props::is_object;
 use crate::temporal::to_rust_string;
 use crate::value::Value;
@@ -56,8 +56,8 @@ enum Root {
     SegmentIteratorPrototype,
 }
 
-fn root(vm: &Vm, r: Root) -> *mut Object {
-    vm.intl_roots[r as usize]
+fn root(vm: &Vm, r: Root) -> Obj {
+    unsafe { Obj::from_ptr(vm.intl_roots[r as usize]) }
 }
 
 pub(crate) fn install(vm: &mut Vm) {
@@ -68,8 +68,8 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(g, a, object_value(intl.ptr()), DONT_ENUM);
     crate::symbol::to_string_tag(vm, intl, "Intl");
     vm.intl_roots = vec![std::ptr::null_mut(); 5];
-    collator::install(vm, intl.ptr());
-    segmenter::install(vm, intl.ptr());
+    collator::install(vm, intl);
+    segmenter::install(vm, intl);
 }
 
 fn data_error(e: String) -> Error {
@@ -103,18 +103,17 @@ fn create(vm: &mut Vm, proto: Value, kind: Kind, slots: &[Value]) -> Value {
 
 /// `v` as the `Intl` object of kind `kind` it is (RequireInternalSlot),
 /// or a `TypeError` naming `method`.
-fn require(v: Value, kind: Kind, method: &str) -> Result<*mut Object> {
-    if crate::builtins::is_class(v, crate::object::Class::Intl)
-        && slot(crate::object::as_object(v), 0).as_i32_unchecked() == kind as i32
+fn require(v: Value, kind: Kind, method: &str) -> Result<Obj> {
+    if crate::builtins::is_class(v, crate::object::Class::Intl) && slot(Obj::of(v), 0).as_i32_unchecked() == kind as i32
     {
-        return Ok(crate::object::as_object(v));
+        return Ok(Obj::of(v));
     }
     Err(Error::type_error(format!("Method {method} called on incompatible receiver {}", crate::vm::shown(v))))
 }
 
 /// Internal slot `i` of `Intl` object `o`.
-fn slot(o: *mut Object, i: usize) -> Value {
-    crate::promise::slot(unsafe { Obj::from_ptr(o) }, i)
+fn slot(o: Obj, i: usize) -> Value {
+    crate::promise::slot(o, i)
 }
 
 // ---- Locales ----

@@ -11,7 +11,7 @@ use super::{
     Kind, Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
-use crate::object::{Obj, Object, object_value};
+use crate::object::{Obj, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, string_units};
@@ -55,10 +55,10 @@ impl Flags {
     }
 }
 
-pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
+pub(super) fn install(vm: &mut Vm, intl: Obj) {
     let op = object_value(vm.object_prototype);
     let proto = vm.new_plain(op);
-    let c = vm.define_native(unsafe { Obj::from_ptr(intl) }, "Collator", collator_ctor, 0, crate::jit::Ty::Any, true);
+    let c = vm.define_native(intl, "Collator", collator_ctor, 0, crate::jit::Ty::Any, true);
     crate::builtins::link_constructor(vm, c, proto);
     vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
     crate::builtins::getter(vm, proto, "compare", compare_getter);
@@ -72,7 +72,7 @@ pub(super) fn install(vm: &mut Vm, intl: *mut Object) {
 fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let construct = vm.is_construct();
     let f = vm.callee_obj();
-    let default = object_value(root(vm, Root::CollatorPrototype));
+    let default = object_value(root(vm, Root::CollatorPrototype).ptr());
     let proto = if construct { vm.take_new_target(f, default)? } else { default };
     let (handle, locale, flags) = initialize(vm, arg(a, 0), arg(a, 1))?;
     let locale = crate::temporal::string(vm, &locale);
@@ -186,7 +186,7 @@ fn is_type(s: &str) -> bool {
     s.split('-').all(|t| (3..=8).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
-fn this_collator(this: Value, what: &str) -> Result<*mut Object> {
+fn this_collator(this: Value, what: &str) -> Result<Obj> {
     require(this, Kind::Collator, &format!("Intl.Collator.prototype.{what}"))
 }
 
@@ -199,15 +199,15 @@ fn compare_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         return Ok(f);
     }
     let template = root(vm, Root::Compare);
-    let f = crate::promise::native_closure(vm, unsafe { Obj::from_ptr(template) }, &[slot(o, HANDLE)]);
-    crate::promise::set_slot(unsafe { Obj::from_ptr(o) }, BOUND_COMPARE, f);
+    let f = crate::promise::native_closure(vm, template, &[slot(o, HANDLE)]);
+    crate::promise::set_slot(o, BOUND_COMPARE, f);
     Ok(f)
 }
 
 /// A collator's bound compare function (a closure of its handle):
 /// CompareStrings of its arguments as strings.
 fn bound_compare(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let h = slot(vm.callee, 0).as_i32_unchecked() as usize;
+    let h = slot(vm.callee_obj(), 0).as_i32_unchecked() as usize;
     let x = crate::intrinsics::to_string(vm, arg(a, 0))?;
     let y = crate::intrinsics::to_string(vm, arg(a, 1))?;
     let ord = vm.intl.collators[h].compare(string_units(x).unwrap_or(&[]), string_units(y).unwrap_or(&[]));

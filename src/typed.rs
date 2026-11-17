@@ -164,7 +164,7 @@ pub(crate) fn buffer_of(o: Obj) -> Obj {
 /// Whether view `o`'s bytes are a shared buffer's, which other agents may
 /// access meanwhile (see `racy`).
 pub(crate) fn shares(o: Obj) -> bool {
-    crate::shared::is_shared(buffer_of(o).ptr())
+    crate::shared::is_shared(buffer_of(o))
 }
 
 /// A new buffer of `n` zero bytes (resizable up to `max` bytes, if given).
@@ -319,7 +319,7 @@ pub(crate) fn make_view(
     // fixed-length, no resizable buffer being that long (`MAX_RESIZABLE`):
     // its length stays one compiled code can't box, or 0 once detached.)
     let long = class == Class::TypedArray && o.elems_len() > i32::MAX as u32;
-    if long || len.is_none() && is_resizable(b) && crate::shared::is_shared(b.ptr()) {
+    if long || len.is_none() && is_resizable(b) && crate::shared::is_shared(b) {
         unsafe { (*o.ptr()).flags |= RUNTIME_LENGTH };
         // (Compiled code that read a known typed array's length unchecked
         // dropped: see `jit`'s `Prop::Length`.)
@@ -343,7 +343,7 @@ fn read_view_length(vm: &mut Vm, o: Obj) {
     #[cold]
     #[inline(never)]
     fn read(vm: &mut Vm, o: Obj) {
-        crate::shared::read_length(vm, buffer_of(o).ptr());
+        crate::shared::read_length(vm, buffer_of(o));
     }
     if o.flags() & RUNTIME_LENGTH != 0 {
         read(vm, o);
@@ -962,7 +962,7 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, n: Option<usize>)
         return Err(Error::type_error("Cannot construct a typed array on a detached ArrayBuffer"));
     }
     // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
-    let bytes = crate::shared::read_length(vm, b.ptr());
+    let bytes = crate::shared::read_length(vm, b);
     let len = match n {
         None if is_resizable(b) => {
             if offset > bytes {

@@ -818,5 +818,5 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.temporal.protos[spec.kind as usize] = proto.ptr();
         vm.temporal.ctors[spec.kind as usize] = c.ptr();
     }
-    zoned::install_now(vm, temporal.ptr());
+    zoned::install_now(vm, temporal);
 }

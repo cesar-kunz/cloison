@@ -984,13 +984,15 @@ fn zip_keyed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Iterator.zipKeyed: iterables must be an object"));
     }
     let (mode, padding) = zip_options(vm, arg(a, 1))?;
-    let all = crate::proxy::own_keys(vm, as_object(iterables))?;
+    let all = crate::proxy::own_keys(vm, Obj::of(iterables))?;
     vm.handle_scope(|vm| {
         let mut keys = Vec::new();
         let mut iters: Vec<(Value, Value)> = Vec::new();
         for key in all {
             let r = (|| {
-                let Some(d) = crate::proxy::get_own_property(vm, as_object(iterables), key)? else { return Ok(None) };
+                let Some(d) = crate::proxy::get_own_property(vm, Obj::of(iterables), key)? else {
+                    return Ok(None);
+                };
                 if d.enumerable != Some(true) {
                     return Ok(None);
                 }

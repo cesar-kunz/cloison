@@ -8,7 +8,7 @@ use crate::js::ast::{
     EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_LIVE_THIS,
     EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS,
 };
-use crate::object::{Class, Obj, Object, as_object, object_value};
+use crate::object::{Class, Obj, as_object, object_value};
 use crate::props::Desc;
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -269,7 +269,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         return Err(Error::type_error(format!("{} is not a constructor", crate::vm::shown(f))));
     }
     // (A proxy's trampoline takes `new.target`.)
-    if vm.proxies_exist && crate::proxy::is_proxy(vm, as_object(f)) {
+    if vm.proxies_exist && crate::proxy::is_proxy(vm, Obj::of(f)) {
         vm.new_target = nt;
     }
     let derived = std::mem::replace(&mut vm.derived_construct, if nt != f { f } else { Value::UNDEFINED });
@@ -679,7 +679,7 @@ pub(crate) fn ordinary_set(vm: &mut Vm, start: Value, key: Key, v: Value, receiv
     }
     // (A proxy receiver's traps: `getOwnPropertyDescriptor`,
     // `defineProperty`.)
-    let r = as_object(receiver);
+    let r = Obj::of(receiver);
     match crate::proxy::get_own_property(vm, r, key)? {
         Some(d) if d.get.is_some() || d.set.is_some() || d.writable == Some(false) => Ok(false),
         Some(_) => {
@@ -769,7 +769,7 @@ fn iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// a primitive, whose keys stay) still has it, not deleted in the loop.
 fn for_in_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // (Nor through a proxy's traps.)
-    if !crate::props::is_object(a[0]) || crate::proxy::chain_has_proxy(vm, as_object(a[0])) {
+    if !crate::props::is_object(a[0]) || crate::proxy::chain_has_proxy(vm, Obj::of(a[0])) {
         return Ok(Value::TRUE);
     }
     vm.has_property(a[0], a[1]).map(Value::from_bool)
@@ -838,9 +838,9 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         out
     };
     let out = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
-    for key in crate::proxy::own_keys(vm, src.ptr())? {
+    for key in crate::proxy::own_keys(vm, src)? {
         if excluded.contains(&key)
-            || !crate::proxy::get_own_property(vm, src.ptr(), key)?.is_some_and(|d| d.enumerable == Some(true))
+            || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
         {
             continue;
         }
@@ -1517,8 +1517,8 @@ fn throw_super_delete(_: &mut Vm, _: &[Value]) -> Result<Value> {
 }
 
 #[allow(dead_code)]
-fn object(o: *mut Object) -> Value {
-    object_value(o)
+fn object(o: Obj) -> Value {
+    object_value(o.ptr())
 }
 
 /// `a ** b` (Number::exponentiate, as `Math.pow`).
@@ -1552,10 +1552,10 @@ fn copy_data_properties(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if crate::props::is_object(target) && vm.copy_plain_properties(Obj::of(target), src)? {
         return Ok(target);
     }
-    let keys = crate::proxy::own_keys(vm, src.ptr())?;
+    let keys = crate::proxy::own_keys(vm, src)?;
     for key in keys {
         // (Enumerable when reached: a getter may change that.)
-        if !crate::proxy::get_own_property(vm, src.ptr(), key)?.is_some_and(|d| d.enumerable == Some(true)) {
+        if !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
             continue;
         }
         let v = vm.get_key(object_value(src.ptr()), key)?;

@@ -235,8 +235,8 @@ fn symbol_description(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `Object.getOwnPropertySymbols(o)`.
 fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = vm.to_object(arg(a, 0))?;
-    let keys: Vec<Value> = if vm.proxies_exist && crate::proxy::is_proxy(vm, o.ptr()) {
-        let ks = crate::proxy::own_keys(vm, o.ptr())?;
+    let keys: Vec<Value> = if vm.proxies_exist && crate::proxy::is_proxy(vm, o) {
+        let ks = crate::proxy::own_keys(vm, o)?;
         ks.into_iter()
             .filter_map(|k| match k {
                 Key::Name(a) => atom_symbol(vm, a),
@@ -870,7 +870,7 @@ fn protector_again(vm: &mut Vm) -> u8 {
     for start in [vm.array_prototype, vm.string_prototype, mp.ptr(), sp.ptr(), tap].into_iter().chain(iterators) {
         let mut o = start;
         while !o.is_null() {
-            proxied |= crate::proxy::is_proxy(vm, o);
+            proxied |= crate::proxy::is_proxy(vm, unsafe { Obj::from_ptr(o) });
             vm.make_prototype(unsafe { Obj::from_ptr(o) });
             let p = o.shape().live().proto;
             o = if p.is_cell() { as_object(p) } else { std::ptr::null_mut() };

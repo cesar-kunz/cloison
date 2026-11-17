@@ -2,7 +2,7 @@
 
 use crate::interp::call_function;
 use crate::intrinsics::{construct_with, get_from, is_constructor, ordinary_set, to_property_key};
-use crate::object::{DONT_ENUM, Object, as_object, object_value};
+use crate::object::{DONT_ENUM, Obj, object_value};
 use crate::props::is_object;
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm};
@@ -12,12 +12,12 @@ fn arg(a: &[Value], i: usize) -> Value {
 }
 
 /// The target argument, which must be an object.
-fn target(a: &[Value], what: &str) -> Result<*mut Object> {
+fn target(a: &[Value], what: &str) -> Result<Obj> {
     let t = arg(a, 0);
     if !is_object(t) {
         return Err(Error::type_error(format!("Reflect.{what} called on non-object")));
     }
-    Ok(as_object(t))
+    Ok(Obj::of(t))
 }
 
 /// An arguments list (CreateListFromArrayLike), which must be an object.
@@ -96,11 +96,11 @@ pub(crate) fn reflect_delete_property(vm: &mut Vm, _: Value, a: &[Value]) -> Res
 pub(crate) fn reflect_get(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "get")?;
     let key = to_property_key(vm, arg(a, 1))?;
-    let receiver = if a.len() > 2 { a[2] } else { object_value(o) };
+    let receiver = if a.len() > 2 { a[2] } else { object_value(o.ptr()) };
     if crate::proxy::chain_has_proxy(vm, o) {
-        return crate::proxy::generic_get(vm, object_value(o), key, receiver);
+        return crate::proxy::generic_get(vm, object_value(o.ptr()), key, receiver);
     }
-    get_from(vm, object_value(o), key, receiver)
+    get_from(vm, object_value(o.ptr()), key, receiver)
 }
 
 pub(crate) fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -120,7 +120,7 @@ fn reflect_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
 pub(crate) fn reflect_has(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "has")?;
     let key = to_property_key(vm, arg(a, 1))?;
-    vm.has_key(object_value(o), key).map(Value::from_bool)
+    vm.has_key(object_value(o.ptr()), key).map(Value::from_bool)
 }
 
 fn reflect_is_extensible(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -152,12 +152,12 @@ fn reflect_prevent_extensions(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
 fn reflect_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "set")?;
     let key = to_property_key(vm, arg(a, 1))?;
-    let receiver = if a.len() > 3 { a[3] } else { object_value(o) };
+    let receiver = if a.len() > 3 { a[3] } else { object_value(o.ptr()) };
     let v = arg(a, 2);
     if crate::proxy::chain_has_proxy(vm, o) {
-        return crate::proxy::generic_set(vm, object_value(o), key, v, receiver).map(Value::from_bool);
+        return crate::proxy::generic_set(vm, object_value(o.ptr()), key, v, receiver).map(Value::from_bool);
     }
-    ordinary_set(vm, object_value(o), key, v, receiver).map(Value::from_bool)
+    ordinary_set(vm, object_value(o.ptr()), key, v, receiver).map(Value::from_bool)
 }
 
 fn reflect_set_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {

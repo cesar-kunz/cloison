@@ -180,7 +180,8 @@ pub struct Gc {
     full_at: usize,
     /// Every collection full (`CLOISON_GC_FULL`).
     always_full: bool,
-    /// Full collections marked in one pause (`CLOISON_GC_STW`).
+    /// Full collections marked in one pause (`CLOISON_GC_STW`, or the
+    /// marker thread couldn't be started: #341).
     stw: bool,
     /// Concurrent full collections back to back (`CLOISON_GC_CYCLES`).
     cycles: bool,
@@ -980,7 +981,8 @@ pub(crate) const FORWARDED: u8 = 0x40;
 const PINNED: u8 = 0x10;
 
 /// `f` of `items` in `threads` runs, each on its own thread but the first
-/// (on this one), in order: on this thread alone if fewer than `min`.
+/// (on this one), in order: on this thread alone if fewer than `min`. A
+/// run whose thread can't be started runs on this one (#341).
 fn in_parallel<I: Sync, T: Send>(threads: usize, items: &[I], min: usize, f: impl Fn(&[I]) -> T + Sync) -> Vec<T> {
     if threads < 2 || items.len() < min {
         return vec![f(items)];
@@ -988,11 +990,56 @@ fn in_parallel<I: Sync, T: Send>(threads: usize, items: &[I], min: usize, f: imp
     let per = items.len().div_ceil(threads);
     let f = &f;
     std::thread::scope(|sc| {
-        let rest: Vec<_> = items.chunks(per).skip(1).map(|c| sc.spawn(move || f(c))).collect();
+        let rest: Vec<_> = items
+            .chunks(per)
+            .skip(1)
+            .map(|c| {
+                if spawn_refused() {
+                    return Err(c);
+                }
+                std::thread::Builder::new().spawn_scoped(sc, move || f(c)).map_err(|_| c)
+            })
+            .collect();
         let mut r = vec![f(&items[..per])];
-        r.extend(rest.into_iter().map(|h| h.join().unwrap()));
+        r.extend(rest.into_iter().map(|h| match h {
+            Ok(h) => h.join().unwrap(),
+            Err(c) => f(c),
+        }));
         r
     })
+}
+
+/// A helper thread of a collection's pause, started in scope `sc`, if it
+/// can be (#341: under a limit of threads, the pause does with fewer).
+fn helper<'s, T: Send + 's>(
+    sc: &'s std::thread::Scope<'s, '_>,
+    f: impl FnOnce() -> T + Send + 's,
+) -> Option<std::thread::ScopedJoinHandle<'s, T>> {
+    if spawn_refused() {
+        return None;
+    }
+    std::thread::Builder::new().spawn_scoped(sc, f).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The collector's threads not to be started from this thread, as
+    /// under a limit of threads: `(every, attempts, refused)`, one
+    /// attempt in `every` refused, from the first (see the tests).
+    static REFUSE_THREADS: std::cell::Cell<Option<(usize, usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a thread of the collector's is not to be started (the tests'
+/// limit of threads, [`REFUSE_THREADS`]); never outside the tests.
+#[inline(always)]
+fn spawn_refused() -> bool {
+    #[cfg(test)]
+    if let Some((every, attempts, refused)) = REFUSE_THREADS.get() {
+        let refuse = attempts % every == 0;
+        REFUSE_THREADS.set(Some((every, attempts + 1, refused + usize::from(refuse))));
+        return refuse;
+    }
+    false
 }
 
 /// The cells marked with `color` in the small block at `start`, and their
@@ -1472,7 +1519,7 @@ impl Marking<'_> {
             state: std::sync::Mutex::new((Vec::new(), 0)),
             wake: std::sync::Condvar::new(),
             queued: std::sync::atomic::AtomicUsize::new(0),
-            threads,
+            threads: std::sync::atomic::AtomicUsize::new(threads),
         };
         let per = cells.len().div_ceil(threads).max(1);
         let mut deal: Vec<Vec<usize>> = cells.chunks(per).map(<[usize]>::to_vec).collect();
@@ -1482,15 +1529,30 @@ impl Marking<'_> {
         let results: Vec<(usize, usize, Vec<usize>, Vec<usize>)> = std::thread::scope(|sc| {
             let mut deal = deal.into_iter();
             let first = (deal.next().unwrap(), slices);
+            // (A helper that can't be started, #341: its stack goes to the
+            // queue, for the others, before it is counted out; until this
+            // thread takes from the queue, the others can't all be idle.)
             let helpers: Vec<_> = deal
-                .map(|stack| {
-                    sc.spawn(move || unsafe {
+                .filter_map(|stack| {
+                    let (tx, rx) = std::sync::mpsc::channel::<Vec<usize>>();
+                    let h = helper(sc, move || unsafe {
+                        let stack = rx.recv().unwrap_or_default();
                         if cand.map != 0 {
                             trace_shared::<true>(pool, mode, heap, cand, stack, Vec::new())
                         } else {
                             trace_shared::<false>(pool, mode, heap, cand, stack, Vec::new())
                         }
-                    })
+                    });
+                    match h {
+                        Some(h) => {
+                            let _ = tx.send(stack);
+                            Some(h)
+                        }
+                        None => {
+                            pool.leave(stack);
+                            None
+                        }
+                    }
                 })
                 .collect();
             let mut r = vec![unsafe {
@@ -1532,7 +1594,8 @@ struct TracePool {
     state: std::sync::Mutex<(Vec<Vec<usize>>, usize)>,
     wake: std::sync::Condvar,
     queued: std::sync::atomic::AtomicUsize,
-    threads: usize,
+    /// The threads sharing it (changed under the lock: [`TracePool::leave`]).
+    threads: std::sync::atomic::AtomicUsize,
 }
 
 impl TracePool {
@@ -1541,6 +1604,16 @@ impl TracePool {
         st.0.push(stack);
         self.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.wake.notify_one();
+    }
+
+    /// A thread that couldn't be started: its `stack` queued for the
+    /// others, and it counted out.
+    fn leave(&self, stack: Vec<usize>) {
+        let mut st = self.state.lock().unwrap();
+        st.0.push(stack);
+        self.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.threads.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.wake.notify_all();
     }
 
     /// A stack to trace from, waiting for one; `None` once every thread
@@ -1554,7 +1627,7 @@ impl TracePool {
                 self.queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(stack);
             }
-            if st.1 == self.threads {
+            if st.1 == self.threads.load(std::sync::atomic::Ordering::Relaxed) {
                 self.wake.notify_all();
                 return None;
             }
@@ -1996,7 +2069,16 @@ struct MarkerState {
 }
 
 impl Marker {
+    #[cfg(test)]
     fn start() -> Marker {
+        Self::try_start().expect("the marker thread")
+    }
+
+    /// The marker, its thread started; `None` if it can't be.
+    fn try_start() -> Option<Marker> {
+        if spawn_refused() {
+            return None;
+        }
         let shared = std::sync::Arc::new(Shared {
             state: Default::default(),
             wake: std::sync::Condvar::new(),
@@ -2005,11 +2087,8 @@ impl Marker {
             fail: Default::default(),
         });
         let s = shared.clone();
-        let thread = std::thread::Builder::new()
-            .name("cloison-marker".into())
-            .spawn(move || marker_loop(&s))
-            .expect("the marker thread");
-        Marker { shared, thread: Some(thread) }
+        let thread = std::thread::Builder::new().name("cloison-marker".into()).spawn(move || marker_loop(&s)).ok()?;
+        Some(Marker { shared, thread: Some(thread) })
     }
 
     /// Stop the marker and wait until it has: its work back in `work`.
@@ -2274,6 +2353,9 @@ impl Vm {
 
     /// A collection, the native stack's live part starting at `sp`.
     fn collect_from(&mut self, sp: usize, regs: *mut Value, kind: Collection) {
+        // (No marker thread to be had, under a limit of threads, say: this
+        // full collection and those after are stop-the-world, #341.)
+        let kind = if kind == Collection::Start && !self.heap.has_marker() { Collection::Full } else { kind };
         if let Some(m) = &self.heap.gc.marker {
             m.pause();
             // Its marking or sweep half done, none runs again (#224).
@@ -2585,10 +2667,8 @@ impl Vm {
         // Shaded cells are the marker's to trace.
         if self.heap.gc.marking {
             let request = &raw const self.heap.requested as usize;
-            if self.heap.gc.marker.is_none() {
-                self.heap.gc.marker = Some(Marker::start());
-            }
-            let mk = self.heap.gc.marker.as_ref().unwrap();
+            // (Started for the cycle's start: `collect_from`.)
+            let mk = self.heap.gc.marker.as_ref().expect("the marker thread");
             {
                 let mut st = mk.shared.state();
                 st.color = color;
@@ -4828,7 +4908,8 @@ impl Heap {
                     (cm.stack, cm.shade, cm.rec)
                 };
                 std::thread::scope(|sc| {
-                    let helpers: Vec<_> = (1..threads).map(|_| sc.spawn(work)).collect();
+                    // (Runs are taken in turn: fewer helpers take more.)
+                    let helpers: Vec<_> = (1..threads).map_while(|_| helper(sc, work)).collect();
                     let mut take = |(stack, shade, rec): (Vec<usize>, Vec<usize>, Vec<usize>)| {
                         m.stack.extend(stack);
                         m.shade.extend(shade);
@@ -5048,10 +5129,8 @@ impl Heap {
         // (Blocks swept before are swept again: their cells' colors are
         // stale now.)
         self.reset_blocks(&[], &[]);
-        if self.gc.marker.is_none() {
-            self.gc.marker = Some(Marker::start());
-        }
-        let mk = self.gc.marker.as_ref().unwrap();
+        // (A final pause's: the marker marked the cycle.)
+        let mk = self.gc.marker.as_ref().expect("the marker thread");
         let mut st = mk.shared.state();
         st.sweep = small;
         st.sweep_color = color;
@@ -5059,6 +5138,19 @@ impl Heap {
         drop(st);
         self.gc.sweeping = true;
         freed
+    }
+
+    /// Whether the marker thread runs, started now if not yet; if it can't
+    /// be (#341), full collections are stop-the-world from now on.
+    fn has_marker(&mut self) -> bool {
+        if self.gc.marker.is_none() {
+            self.gc.marker = Marker::try_start();
+            if self.gc.marker.is_none() {
+                self.gc.stw = true;
+                return false;
+            }
+        }
+        true
     }
 
     /// Take what the sweeper found: blocks with room to allocate in, empty
@@ -5377,6 +5469,40 @@ mod tests {
             assert_eq!(e, expected, "jit: {jit}");
             assert!(vm.poisoned());
             assert_eq!(vm.run(&crate::js::compile("1").unwrap()).unwrap_err().0, expected);
+        }
+    }
+
+    /// No thread of the collector's to be had, as under a limit of threads
+    /// (#341): full collections are stop-the-world, a pause's helpers'
+    /// work done by those started, here the mutator alone, and the run
+    /// computes what it should.
+    #[test]
+    fn collections_go_on_without_threads() {
+        let src = r#"
+            var keep = [];
+            for (var i = 0; i < 300000; i++) keep.push({i: i, a: [i]});
+            var s = 0;
+            for (var k = 0; k < 30; k++) {
+                var b = [];
+                for (var j = 0; j < 30000; j++) b.push({j: j});
+                s += b[29999].j;
+            }
+            for (var i = 0; i < keep.length; i += 1000) s += keep[i].a[0];
+            s
+        "#;
+        let module = crate::js::compile(src).unwrap();
+        // (Every thread refused, then one in two: the marker, the first,
+        // is, and some helpers start.)
+        for every in [1, 2] {
+            REFUSE_THREADS.set(Some((every, 0, 0)));
+            let mut vm = Vm::new();
+            vm.heap.gc.threads = 4;
+            let r = vm.run(&module).map(crate::vm::display);
+            vm.verify_heap();
+            let (_, attempts, refused) = REFUSE_THREADS.take().unwrap();
+            assert_eq!(r.map_err(|e| e.0), Ok("45749970".to_string()));
+            assert!(vm.heap.gc.marker.is_none());
+            assert!(refused >= 2 && (every == 1 || refused < attempts), "{refused} of {attempts} refused");
         }
     }
 

@@ -43,3 +43,5 @@
 43 src/typed.rs
 1 src/value.rs
 174 src/vm.rs
+187 stencils/stencils.rs
+156 (Obj::from_ptr bridges)

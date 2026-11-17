@@ -7618,6 +7618,33 @@ out.join(" ");
     );
 }
 
+/// A prototype cycle through a proxy without traps (which
+/// OrdinarySetPrototypeOf allows, 10.1.2.1 step 7.b.i) makes a lookup
+/// on it a RangeError, not a loop (issue #336): the forwards in the
+/// lookup's loop are bounded, as the stack bounds other engines'
+/// recursion. A long chain of such proxies still works.
+#[test]
+fn a_prototype_cycle_through_a_trapless_proxy_is_a_range_error() {
+    let src = r#"
+var out = [];
+var t = {}, p = new Proxy(t, {});
+Object.setPrototypeOf(t, p);
+for (var f of [() => "x" in p, () => p.x, () => { p.x = 1; }, () => t.x, () => Object.create(p).x])
+  try { f(); out.push("no error"); } catch (e) { out.push(e.constructor.name); }
+var q = { y: 1 };
+for (var i = 0; i < 10000; i++) q = new Proxy(q, {});
+out.push("y" in q, q.y, Object.create(q).y);
+q.z = 2;
+out.push(q.z);
+var log = [];
+var h = new Proxy({}, { get(_, k) { log.push(k); } });
+new Proxy({ a: 1 }, h).a;
+out.push(log.join());
+out.join(" ");
+"#;
+    assert_eq!(value(src), "RangeError RangeError RangeError RangeError RangeError true 1 1 2 get");
+}
+
 /// Code made at run time goes with its last closure, though the JIT took
 /// it (issue #35): a code the JIT compiled, inlined or bound a call to was
 /// kept for good, with its compiled code, the JIT's tables of it and what

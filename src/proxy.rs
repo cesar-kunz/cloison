@@ -235,82 +235,96 @@ fn trampoline(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
 
 // ---- The internal methods of proxies ----
 
-fn get(vm: &mut Vm, p: Obj, key: Key, receiver: Value) -> Result<Value> {
-    let (t, h) = parts(p)?;
-    match trap(vm, h, "get")? {
-        Some(f) => {
-            let k = trap_key(vm, key);
-            let v = call_function(vm, f, h, &[t, k, receiver])?;
-            if let Some(d) = get_own_property(vm, Obj::of(t), key)?
-                && d.configurable == Some(false)
-            {
-                if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
-                    return Err(broken("get", "reported a non-writable, non-configurable property's value otherwise"));
-                }
-                if d.is_accessor() && d.get.is_none_or(|g| g.is_undefined()) && !v.is_undefined() {
-                    return Err(broken("get", "reported a value for a non-configurable property without a getter"));
-                }
-            }
-            Ok(v)
+/// A proxy's `[[Get]]` by its handler `h`'s `get` trap `f`, its target
+/// `t` (one without the trap forwards in `generic_get`'s loop).
+fn get(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, receiver: Value) -> Result<Value> {
+    let k = trap_key(vm, key);
+    let v = call_function(vm, f, h, &[t, k, receiver])?;
+    if let Some(d) = get_own_property(vm, Obj::of(t), key)?
+        && d.configurable == Some(false)
+    {
+        if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
+            return Err(broken("get", "reported a non-writable, non-configurable property's value otherwise"));
         }
-        None => generic_get(vm, t, key, receiver),
+        if d.is_accessor() && d.get.is_none_or(|g| g.is_undefined()) && !v.is_undefined() {
+            return Err(broken("get", "reported a value for a non-configurable property without a getter"));
+        }
     }
+    Ok(v)
 }
 
-fn set(vm: &mut Vm, p: Obj, key: Key, v: Value, receiver: Value) -> Result<bool> {
-    let (t, h) = parts(p)?;
-    match trap(vm, h, "set")? {
-        Some(f) => {
-            let k = trap_key(vm, key);
-            if !to_boolean(call_function(vm, f, h, &[t, k, v, receiver])?) {
-                return Ok(false);
-            }
-            if let Some(d) = get_own_property(vm, Obj::of(t), key)?
-                && d.configurable == Some(false)
-            {
-                if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
-                    return Err(broken("set", "set a non-writable, non-configurable property otherwise"));
-                }
-                if d.is_accessor() && d.set.is_none_or(|s| s.is_undefined()) {
-                    return Err(broken("set", "set a non-configurable property without a setter"));
-                }
-            }
-            Ok(true)
-        }
-        None => generic_set(vm, t, key, v, receiver),
+/// A proxy's `[[Set]]` by its `set` trap `f` (see [`get`]).
+fn set(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
+    let k = trap_key(vm, key);
+    if !to_boolean(call_function(vm, f, h, &[t, k, v, receiver])?) {
+        return Ok(false);
     }
+    if let Some(d) = get_own_property(vm, Obj::of(t), key)?
+        && d.configurable == Some(false)
+    {
+        if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
+            return Err(broken("set", "set a non-writable, non-configurable property otherwise"));
+        }
+        if d.is_accessor() && d.set.is_none_or(|s| s.is_undefined()) {
+            return Err(broken("set", "set a non-configurable property without a setter"));
+        }
+    }
+    Ok(true)
 }
 
-fn has(vm: &mut Vm, p: Obj, key: Key) -> Result<bool> {
-    let (t, h) = parts(p)?;
-    match trap(vm, h, "has")? {
-        Some(f) => {
-            let k = trap_key(vm, key);
-            if to_boolean(call_function(vm, f, h, &[t, k])?) {
-                return Ok(true);
-            }
-            if let Some(d) = get_own_property(vm, Obj::of(t), key)? {
-                if d.configurable == Some(false) {
-                    return Err(broken("has", "hid a non-configurable property"));
-                }
-                if !is_extensible(vm, Obj::of(t))? {
-                    return Err(broken("has", "hid a property of a non-extensible target"));
-                }
-            }
-            Ok(false)
-        }
-        None => generic_has(vm, t, key),
+/// A proxy's `[[HasProperty]]` by its `has` trap `f` (see [`get`]).
+fn has(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key) -> Result<bool> {
+    let k = trap_key(vm, key);
+    if to_boolean(call_function(vm, f, h, &[t, k])?) {
+        return Ok(true);
     }
+    if let Some(d) = get_own_property(vm, Obj::of(t), key)? {
+        if d.configurable == Some(false) {
+            return Err(broken("has", "hid a non-configurable property"));
+        }
+        if !is_extensible(vm, Obj::of(t))? {
+            return Err(broken("has", "hid a property of a non-extensible target"));
+        }
+    }
+    Ok(false)
 }
 
 // ---- Proxy-aware internal methods of any object ----
 
+/// How many proxies without the trap a property lookup goes through
+/// before it gives up with a RangeError. A proxy without the trap
+/// forwards to its target in the lookup's loop, not by a call, so a
+/// cycle through one (OrdinarySetPrototypeOf stops its check at a proxy,
+/// 10.1.2.1 step 7.b.i) would loop forever, the stack never growing to
+/// its limit (issue #336). Other engines recurse and run out of stack:
+/// JavaScriptCore past 10^4 nested proxies, SpiderMonkey and QuickJS
+/// before.
+const MAX_FORWARDS: u32 = 100_000;
+
+/// A proxy `p`'s target and handler, and its trap `name` if it has one,
+/// a forward counted in `hops`.
+fn forward(vm: &mut Vm, p: Obj, name: &str, hops: &mut u32) -> Result<(Value, Value, Option<Value>)> {
+    *hops += 1;
+    if *hops > MAX_FORWARDS {
+        return Err(Error::range_error("Maximum call stack size exceeded"));
+    }
+    let (t, h) = parts(p)?;
+    Ok((t, h, trap(vm, h, name)?))
+}
+
 /// `o.[[Get]](key, receiver)`.
 pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> Result<Value> {
     let mut cur = Obj::of(o);
+    let mut hops = 0;
     loop {
         if is_proxy(vm, cur) {
-            return get(vm, cur, key, receiver);
+            match forward(vm, cur, "get", &mut hops)? {
+                (t, h, Some(f)) => return get(vm, t, h, f, key, receiver),
+                (t, _, None) => {
+                    cur = Obj::of(t);
+                    continue;
+                }
+            }
         }
         if let Some(d) = vm.own_property(cur, key) {
             if d.is_accessor() {
@@ -332,9 +346,16 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
 /// `o.[[Set]](key, v, receiver)`: whether it was set.
 pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
     let mut cur = Obj::of(o);
+    let mut hops = 0;
     let found = loop {
         if is_proxy(vm, cur) {
-            return set(vm, cur, key, v, receiver);
+            match forward(vm, cur, "set", &mut hops)? {
+                (t, h, Some(f)) => return set(vm, t, h, f, key, v, receiver),
+                (t, _, None) => {
+                    cur = Obj::of(t);
+                    continue;
+                }
+            }
         }
         if let Some(d) = vm.own_property(cur, key) {
             break Some(d);
@@ -371,9 +392,16 @@ pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: V
 /// `o.[[HasProperty]](key)`.
 pub(crate) fn generic_has(vm: &mut Vm, o: Value, key: Key) -> Result<bool> {
     let mut cur = Obj::of(o);
+    let mut hops = 0;
     loop {
         if is_proxy(vm, cur) {
-            return has(vm, cur, key);
+            match forward(vm, cur, "has", &mut hops)? {
+                (t, h, Some(f)) => return has(vm, t, h, f, key),
+                (t, _, None) => {
+                    cur = Obj::of(t);
+                    continue;
+                }
+            }
         }
         if vm.own_property(cur, key).is_some() {
             return Ok(true);

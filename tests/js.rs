@@ -10300,3 +10300,33 @@ fn a_constructors_first_new_allocates_one_receiver() {
     };
     assert_eq!(cells(false), cells(true));
 }
+
+/// A `var` in a catch block naming the catch parameter is the function's,
+/// but the stores through it go to the parameter (Annex B.3.4): a
+/// `for (var e of …)`, `for (var e in …)` or `var [e] = …` head as well as
+/// `var e = …`, when catch parameters are renamed apart (#344).
+#[test]
+fn a_var_head_in_a_catch_block_stores_to_the_catch_parameter() {
+    let src = r#"
+let q;
+var log = [];
+try { throw "c" } catch (e) { for (var e of [1]); log.push(e) }
+try { throw "c" } catch (e) { for (var e in {z: 1}); log.push(e) }
+log.push(typeof e);
+function a1() { try { throw "c" } catch (e) { for (var e of [1]); return (() => e)() } }
+function a2() { try { throw "c" } catch (e) { for (var e in {k: 1}); return (() => e)() } }
+function a3() { try { throw "c" } catch (e) { var [e] = [1]; return (() => e)() } }
+function a4() { try { throw "c" } catch (e) { var e = 1; return (() => e)() } }
+function a5() { try { throw "c" } catch (e) { for (var e of [1]); (() => e) } return e }
+function a6() { try { throw "c" } catch (e) { for (var [e] of [[1]]); return (() => e)() } }
+function a7() { try { throw "c" } catch (e) { for (var [e, f] in {ab: 1}); return [(() => e)(), f].join("") } }
+function a8() { try { throw "c" } catch (e) { var [e, f] = [1, 2]; (() => e); return [e, f].join("") } }
+function a9() {
+    var r = [];
+    try { throw "c" } catch (e) { l: for (var e of [1, 2, 3]) { r.push(e); continue l; } (() => e) }
+    return r.join("") + e;
+}
+log.push(a1(), a2(), a3(), a4(), a5(), a6(), a7(), a8(), a9());
+log.join(" ");"#;
+    assert_eq!(value(src), "1 z undefined 1 k 1 1  1 ab 12 123undefined");
+}

@@ -3023,6 +3023,12 @@ impl Vm {
     /// first if `value` doesn't fit it. Every store to a field that doesn't
     /// go through an inline cache whose check passed must use this.
     pub(crate) fn store_field(&mut self, o: Obj, slot: u32, value: Value) {
+        self.store_field_typed(o, slot, value, FieldType::of(value))
+    }
+
+    /// [`Vm::store_field`] given `value`'s type, `FieldType::of(value)`.
+    #[inline(always)]
+    fn store_field_typed(&mut self, o: Obj, slot: u32, value: Value, t: FieldType) {
         unsafe {
             let shape = o.shape().live();
             let cell = &*shape.fields()[slot as usize];
@@ -3031,7 +3037,7 @@ impl Vm {
             // The common case, calling nothing: the type holds, and the
             // field isn't constant or a prototype's, or keeps its value.
             let unchanged = *at == value;
-            if cell.get().join(FieldType::of(value)) == cell.get()
+            if cell.get().join(t) == cell.get()
                 && (unchanged || !cell.is_constant() || *at == Value::UNDEFINED)
                 && (unchanged || o.flags() & PROTOTYPE == 0)
             {
@@ -6155,9 +6161,10 @@ impl Vm {
             self.store_field(f, 0, object_value(p.ptr()));
             return object_value(f.ptr());
         }
-        let p = self.heap.alloc_object(self.proto_object_shape.live());
-        self.store_field(unsafe { Obj::from_ptr(p) }, 0, object_value(f.ptr()));
-        self.store_field(f, 0, object_value(p));
+        let p = self.heap.alloc_plain(self.proto_object_shape.live());
+        // (Neither shape is a dictionary's: their objects' type is theirs.)
+        self.store_field_typed(unsafe { Obj::from_ptr(p) }, 0, object_value(f.ptr()), FieldType::Obj(f.shape()));
+        self.store_field_typed(f, 0, object_value(p), FieldType::Obj(self.proto_object_shape));
         object_value(f.ptr())
     }
 

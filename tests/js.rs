@@ -10026,3 +10026,22 @@ log.join(" ")
 "#;
     assert_eq!(run_moving(src).as_deref(), Ok("it5:5 it4:4 it3:3 it2:2 it1:1 it0:0"));
 }
+
+/// `RegExp.prototype[Symbol.replace]` through a user `exec`, whose results
+/// only it holds, their `groups` getters collecting (#327): each result
+/// read after another's getter ran is still there. (Its list of them was
+/// out of the handle scope that held them.)
+#[test]
+fn regexp_replace_holds_exec_results_across_user_code() {
+    let src = r#"
+var n = 0, re = /x/g;
+re.exec = function () {
+  if (n++ >= 20) return null;
+  return { length: 2, 0: "", 1: "c" + n, index: 0,
+    get groups() { $262.gc(); var a = []; for (var i = 0; i < 2e4; i++) a.push({ i }); return undefined; } };
+};
+re[Symbol.replace]("abc", function (m, c) { return c; })
+"#;
+    let want: String = (1..=20).map(|i| format!("c{i}")).collect();
+    assert_eq!(run_moving(src), Ok(format!("{want}abc")));
+}

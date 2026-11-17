@@ -1569,13 +1569,22 @@ fn private_name(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(crate::symbol::new_private_symbol(vm, a[0]))
 }
 
-/// The own property of `o` private symbol `s` keys, if `o` has one.
+/// The object whose own properties keyed by private symbols are object
+/// `o`'s private elements: `o`, or a proxy's holder (made if `make`),
+/// which no trap sees (see `proxy::private_holder`).
+fn private_elements(vm: &mut Vm, o: Obj, make: bool) -> Option<Obj> {
+    if crate::proxy::is_proxy(vm, o) { crate::proxy::private_holder(vm, o, make) } else { Some(o) }
+}
+
+/// The private element of `o` private symbol `s` keys, if `o` has one
+/// (PrivateElementFind).
 fn private_property(vm: &mut Vm, o: Value, s: Value) -> Option<Desc> {
     if !crate::props::is_object(o) {
         return None;
     }
     let key = Key::Name(crate::symbol::symbol_atom(vm, s));
-    vm.own_property(Obj::of(o), key)
+    let e = private_elements(vm, Obj::of(o), false)?;
+    vm.own_property(e, key)
 }
 
 /// `o.#x`: `[o, symbol]`.
@@ -1626,7 +1635,8 @@ fn private_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         Some(_) => {
             let d = Desc { value: Some(v), ..Desc::default() };
-            vm.define_own_property(Obj::of(o), key, &d)?;
+            let e = private_elements(vm, Obj::of(o), false).unwrap();
+            vm.define_own_property(e, key, &d)?;
         }
         None => {
             return Err(Error::type_error(format!(
@@ -1638,8 +1648,22 @@ fn private_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(v)
 }
 
-/// Define private property `key` of `o` as `d`, unless `o` has it.
-fn private_add(vm: &mut Vm, o: Value, s: Value, d: &Desc) -> Result<()> {
+/// Define private property `key` of `o` as `d`, unless `o` has it
+/// (PrivateFieldAdd, PrivateMethodOrAccessorAdd: 7.3.27-28). On a proxy,
+/// in its holder: no trap runs but `isExtensible` if `check`, the check
+/// before (the stage 3 proposal nonextensible-applies-to-private's
+/// IsExtensible, which an ordinary object's define does here).
+fn private_add(vm: &mut Vm, o: Value, s: Value, d: &Desc, check: bool) -> Result<()> {
+    let non_extensible = || {
+        Error::type_error(format!(
+            "Cannot define private member {} on a non-extensible object",
+            crate::symbol::description_string(s)
+        ))
+    };
+    let proxy = crate::proxy::is_proxy(vm, Obj::of(o));
+    if proxy && check && !crate::proxy::is_extensible(vm, Obj::of(o))? {
+        return Err(non_extensible());
+    }
     if private_property(vm, o, s).is_some() {
         return Err(Error::type_error(format!(
             "Cannot initialize {} twice on the same object",
@@ -1647,18 +1671,16 @@ fn private_add(vm: &mut Vm, o: Value, s: Value, d: &Desc) -> Result<()> {
         )));
     }
     let key = Key::Name(crate::symbol::symbol_atom(vm, s));
-    if !vm.define_own_property(Obj::of(o), key, d)? {
-        return Err(Error::type_error(format!(
-            "Cannot define private member {} on a non-extensible object",
-            crate::symbol::description_string(s)
-        )));
+    let e = private_elements(vm, Obj::of(o), true).unwrap();
+    if !vm.define_own_property(e, key, d)? {
+        return Err(non_extensible());
     }
     Ok(())
 }
 
 /// A private field `#x = v` of a new instance: `[o, symbol, v]`.
 fn private_define(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    private_add(vm, a[0], a[1], &Desc::data(a[2], true, false, true))?;
+    private_add(vm, a[0], a[1], &Desc::data(a[2], true, false, true), true)?;
     Ok(a[2])
 }
 
@@ -1669,16 +1691,22 @@ fn private_method(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (o, s, f) = (a[0], a[1], a[2]);
     let kind = a[3].to_number() as u8;
     if kind == 0 {
-        private_add(vm, o, s, &Desc::data(f, false, false, true))?;
+        private_add(vm, o, s, &Desc::data(f, false, false, true), true)?;
         return Ok(o);
     }
     let (mut get, mut set) = (Value::UNDEFINED, Value::UNDEFINED);
-    if let Some(d) = private_property(vm, o, s) {
+    // (An accessor's second half completes the element its first added:
+    // on a proxy, `isExtensible` asked once for both. The proposal asks
+    // it once for all of an instance's methods.)
+    let existing = private_property(vm, o, s);
+    let first = existing.is_none();
+    if let Some(d) = existing {
         match (d.get, d.set) {
             (Some(g), Some(st)) if (kind == 1 && g.is_undefined()) || (kind == 2 && st.is_undefined()) => {
                 (get, set) = (g, st);
                 let key = Key::Name(crate::symbol::symbol_atom(vm, s));
-                vm.delete_key(o, key)?;
+                let e = private_elements(vm, Obj::of(o), false).unwrap();
+                vm.delete_key(object_value(e.ptr()), key)?;
             }
             _ => {
                 return Err(Error::type_error(format!(
@@ -1693,7 +1721,7 @@ fn private_method(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     } else {
         set = f;
     }
-    private_add(vm, o, s, &Desc::accessor(get, set, false, true))?;
+    private_add(vm, o, s, &Desc::accessor(get, set, false, true), first)?;
     Ok(o)
 }
 

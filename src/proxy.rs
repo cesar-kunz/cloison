@@ -152,7 +152,8 @@ pub(crate) fn create(vm: &mut Vm, target: Value, handler: Value) -> Result<Value
     vm.proxies_exist = true;
     let callable = is_callable(target);
     let class = if callable { Class::Native } else { Class::Proxy };
-    let full = vm.root_shape(class, Value::NULL, 2);
+    // (Its target, its handler and its private elements' holder.)
+    let full = vm.root_shape(class, Value::NULL, 3);
     let bare = vm.root_shape(class, Value::NULL, 0);
     let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(full.live())) };
     unsafe {
@@ -164,7 +165,25 @@ pub(crate) fn create(vm: &mut Vm, target: Value, handler: Value) -> Result<Value
     }
     set_slot(o, 0, target);
     set_slot(o, 1, handler);
+    set_slot(o, 2, Value::UNDEFINED);
     Ok(object_value(o.ptr()))
+}
+
+/// The object holding proxy `p`'s private elements (its
+/// [[PrivateElements]], 7.3.26-28), made if `make` and none yet. They are
+/// the proxy's own, its traps never see them (no internal method of the
+/// proxy runs for them), and they outlive a revoke.
+pub(crate) fn private_holder(vm: &mut Vm, p: Obj, make: bool) -> Option<Obj> {
+    let h = slot(p, 2);
+    if h.is_cell() {
+        return Some(Obj::of(h));
+    }
+    if !make {
+        return None;
+    }
+    let h = vm.new_plain(Value::NULL);
+    set_slot(p, 2, object_value(h.ptr()));
+    Some(h)
 }
 
 fn arg(a: &[Value], i: usize) -> Value {

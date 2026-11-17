@@ -5812,6 +5812,47 @@ out.join(" ");
     assert_eq!(value(src), "not-equal not-equal not-equal not-equal not-equal not-equal true 1");
 }
 
+/// Private elements added to a proxy (a base constructor returning one)
+/// are the proxy's own, its traps never given the private name (issue
+/// #338, PrivateFieldAdd and PrivateMethodOrAccessorAdd, 7.3.27-28): no
+/// `defineProperty` trap gets a key to read `#x` with, `#x in` finds it
+/// on the proxy, not its target, and it outlives a revoke. Only
+/// `isExtensible` runs, the stage 3 nonextensible-applies-to-private
+/// check. What V8, SpiderMonkey and JavaScriptCore give, but for that
+/// check.
+#[test]
+fn private_elements_of_a_proxy_bypass_its_traps() {
+    let src = r#"
+var out = [];
+var k, p = new Proxy({}, { defineProperty(t, key, d) { k = key; return Reflect.defineProperty(t, key, d); } });
+class B { constructor(o) { return o; } }
+class S extends B { #x = 42; static has(o) { return #x in o; } static get(o) { return o.#x; } static set(o, v) { o.#x = v; } }
+new S(p);
+var f = {}; f[k] = 0;
+out.push(typeof k, new S({})[k], S.has(f), S.has(p), S.get(p));
+S.set(p, 7);
+out.push(S.get(p));
+try { new S(p); } catch (e) { out.push(e.constructor.name); }
+var log = [], traps = {};
+for (var n of ["get", "set", "has", "defineProperty", "getOwnPropertyDescriptor", "isExtensible", "ownKeys", "deleteProperty"])
+  traps[n] = (function (n) { return function (...a) { log.push(n); return Reflect[n](...a); }; })(n);
+var q = new Proxy({}, traps);
+class M extends B { #m() { return 1; } get #g() { return 2; } set #g(v) {} static t(o) { return o.#m() + o.#g; } }
+new M(q);
+out.push(M.t(q), log.join("+"), Reflect.ownKeys(q).length);
+var fn = new Proxy(function () {}, {});
+new S(fn);
+out.push(S.get(fn));
+var r = Proxy.revocable({}, {});
+new S(r.proxy);
+r.revoke();
+out.push(S.has(r.proxy), S.get(r.proxy));
+try { new S(new Proxy(Object.preventExtensions({}), {})); } catch (e) { out.push(e.constructor.name); }
+out.join(" ");
+"#;
+    assert_eq!(value(src), "undefined  false true 42 7 TypeError 3 isExtensible+isExtensible 0 42 true 42 TypeError");
+}
+
 /// The tests starting agents, one at a time: agents are the process's,
 /// and a broadcast goes to every one (another test's, blocked in
 /// `Atomics.wait`, would never take it).

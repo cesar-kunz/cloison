@@ -638,10 +638,7 @@ language/statements/class/elements/private-static-method-visible-to-direct-eval.
 language/statements/class/elements/private-static-setter-visible-to-direct-eval.js
 language/statements/class/elements/private-ternary-init-err-contains-arguments.js
 language/statements/class/elements/private-typeof-init-err-contains-arguments.js
-language/statements/class/elements/privatefield-on-proxy.js
 language/statements/class/elements/privatefieldset-evaluation-order-1.js
-language/statements/class/elements/privategetter-on-proxy.js
-language/statements/class/elements/privatemethods-on-proxy.js
 language/statements/class/elements/static-comp-name-init-err-contains-arguments.js
 language/statements/class/elements/static-literal-init-err-contains-arguments.js
 language/statements/class/elements/static-private-init-err-contains-arguments.js

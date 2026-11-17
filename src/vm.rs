@@ -7720,12 +7720,12 @@ impl Vm {
         self.codes.iter().map(|c| &**c)
     }
 
-    /// Forget what the lookup and megamorphic tables hold: prototypes,
-    /// and their slots' addresses, which a collection moving cells may
-    /// have moved (`gc::Evacuation`). (Not by a new prototype epoch: that
-    /// drops every compiled version, the CPU time to compile them again
-    /// sass's 49% more.) The megamorphic table's first entry is the
-    /// prototype epoch's address, which compiled code reads.
+    /// Forget what the lookup, megamorphic and typed `length` tables
+    /// hold: prototypes, and their slots' addresses, which a collection
+    /// moving cells may have moved (`gc::Evacuation`). (Not by a new
+    /// prototype epoch: that drops every compiled version, the CPU time to
+    /// compile them again sass's 49% more.) The megamorphic table's first
+    /// entry is the prototype epoch's address, which compiled code reads.
     pub(crate) fn forget_lookups(&mut self) {
         for e in self.lookups.iter() {
             e.set(LookupEntry::EMPTY);
@@ -7733,6 +7733,8 @@ impl Vm {
         for e in self.megas[1..].iter_mut() {
             *e = MegaEntry::EMPTY;
         }
+        // (Their holders: prototypes, which may have moved, #329.)
+        self.typed_lengths = [TypedLength::EMPTY; TYPED_LENGTHS];
     }
 
     /// Cells the VM's tables key by address (the root shapes' prototypes,
@@ -9578,5 +9580,50 @@ out.join();"#;
         a.run(&gc).unwrap();
         a.run(&gc).unwrap();
         assert!(a.atoms[x.0 as usize].as_deref() != Some("usedSinceTheMarkingBefore"));
+    }
+
+    /// A typed array's `length` getter found in a prototype whose getter
+    /// slot is out of line (#329): `Vm::typed_lengths` kept the prototype's
+    /// address while collections moved it (only its props array was
+    /// pinned), and the next miss put the old copy in an inline cache,
+    /// which the JIT then read. (Collections from the VM's making on, as
+    /// `CLOISON_GC_VERIFY` has them: which ones move the prototype depends
+    /// on the schedule.) What V8, SpiderMonkey and JavaScriptCore give.
+    #[test]
+    fn typed_length_holders_moved_are_not_kept_by_address() {
+        let src = r#"
+const TAP = Object.getPrototypeOf(Uint8Array.prototype);
+const d = Object.getOwnPropertyDescriptor(TAP, 'length');
+const P = {};
+for (let i = 0; i < 20; i++) P['k' + i] = i;
+Object.defineProperty(P, 'length', d);
+Object.setPrototypeOf(P, TAP);
+const ta = new Uint8Array(7);
+Object.setPrototypeOf(ta, P);
+function f(t) { return t.length; }
+let sum = 0;
+for (let i = 0; i < 100; i++) sum += f(ta);
+let keep = [];
+for (let r = 0; r < 200; r++) {
+  let junk = [];
+  for (let i = 0; i < 2000; i++) junk.push({ a: i, b: [i] });
+  keep.push(junk[r]);
+}
+const g = new Function('t', 'let s = 0; for (let i = 0; i < 200000; i++) { s += t.length; if ((i & 1023) == 0) s += [i].length; } return s;');
+sum += g(ta);
+for (let r = 0; r < 50; r++) {
+  let junk = [];
+  for (let i = 0; i < 2000; i++) junk.push({ a: i, b: [i] });
+  sum += g(ta);
+}
+sum;
+"#;
+        let module = crate::js::compile(src).unwrap();
+        let mut heap = crate::heap::Heap::new();
+        heap.gc.set_evacuate_all();
+        heap.gc.verify = 64 << 10;
+        heap.budget = heap.gc.budget();
+        let mut vm = Vm::with_heap(heap);
+        assert_eq!(vm.run(&module).map(display).as_deref(), Ok("71410696"));
     }
 }

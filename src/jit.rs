@@ -3394,13 +3394,24 @@ pub enum Ty {
 
 impl Ty {
     /// The exact type of a runtime value. All cells are objects so far.
+    #[track_caller]
     pub fn of(v: Value) -> Ty {
         if v.is_int32() {
             Ty::I32
         } else if v.is_double() {
             Ty::F64
         } else if v.is_cell() {
-            // (Not a dictionary shape's object: its slots change in place.)
+            // (Its header is read: it must be a cell of this VM's heap. A
+            // debug build names the caller that handed another word.)
+            #[cfg(debug_assertions)]
+            unsafe {
+                let (vm, a) = (crate::interp::current_vm(), v.to_bits() as usize);
+                if !vm.is_null() && (*vm).heap.cell_containing(a) != Some(a) {
+                    let h = &(*vm).heap;
+                    let meta = if h.contains(a) { *crate::heap::meta(a) } else { 0 };
+                    panic!("Ty::of of {a:#x}, no cell's start: in heap {}, meta {meta:#x}", h.contains(a));
+                }
+            }
             let w = unsafe { *(v.to_bits() as *const u64) };
             if w & 1 == 0 && unsafe { (*(w as *const Shape)).dictionary } { Ty::Any } else { Ty::Obj(w) }
         } else {
@@ -14896,6 +14907,10 @@ impl Lowering<'_> {
             && v.root_func.is_null()
         {
             v.root_func = fo;
+            // (Kept by no collection: a young one, through the next minor
+            // collection, which doesn't visit this state; a full one
+            // forgets it once dead, `forget_dead_root_funcs`.)
+            unsafe { (*self.state.vm).heap.note(crate::object::object_value(fo)) };
         }
         // A constructor's `this` is allocated by the call
         // (`cloison_rt_construct`), with the shape its root has now.
@@ -15690,6 +15705,13 @@ impl Lowering<'_> {
         } else {
             return None;
         };
+        // (Read through: it must be a live cell, see `forget_dead_root_funcs`.)
+        #[cfg(debug_assertions)]
+        if !func.is_null() {
+            let a = func as usize;
+            let cell = unsafe { (*self.state.vm).heap.cell_containing(a) };
+            assert!(cell == Some(a), "constant_upvalue: func {a:#x} is no cell's start");
+        }
         // (A script's or an eval's frame may hold another object than a
         // function there, with no code word.)
         if func.is_null()
@@ -16725,6 +16747,8 @@ impl JitFunction {
                 let f = unsafe { *(regs.byte_sub(interp::FUNC_OFF) as *const *mut Object) };
                 if n > 0 && !f.is_null() {
                     vm.root_func = f;
+                    // (As at a direct call's lowering: see `forget_dead_root_funcs`.)
+                    unsafe { (*crate::interp::current_vm()).heap.note(crate::object::object_value(f)) };
                     vm.int_upvalues = (0..n)
                         .map(|k| unsafe {
                             let cell = *crate::vm::Vm::upvalues(Obj::from_ptr(f)).add(k);
@@ -18506,6 +18530,25 @@ pub fn census(vm: &crate::vm::Vm) -> (Vec<(&'static str, usize)>, Vec<(&'static 
         ("caches", other),
     ];
     (counts, bytes)
+}
+
+/// After a full marking: forget each function's `VmState::root_func`
+/// that the marking didn't find live (`live`). Read by address and kept
+/// by no collection (a young one is noted when recorded, `Heap::note`, so
+/// that the next minor collection keeps it, old after it), it would be
+/// read from freed memory (`Lowering::constant_upvalue` folds its
+/// upvalues): a constant taken from a dead cell, or a crash.
+pub(crate) fn forget_dead_root_funcs(vm: &crate::vm::Vm, live: &dyn Fn(usize) -> bool) {
+    for code in vm.codes.iter().chain(&vm.condemned) {
+        // (Borrowed: being compiled, which no collection interrupts.)
+        let Ok(mut jit) = code.jit.try_borrow_mut() else { continue };
+        if let Some(v) = jit.as_mut().and_then(|f| f.vm.as_mut())
+            && !v.root_func.is_null()
+            && !live(v.root_func as usize)
+        {
+            v.root_func = std::ptr::null_mut();
+        }
+    }
 }
 
 /// Every word the JIT keeps that may be a shape's address, to `out` (see

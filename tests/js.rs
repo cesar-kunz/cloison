@@ -10065,3 +10065,35 @@ out.join(" ")
 "#;
     assert_eq!(run_moving(src).as_deref(), Ok("aXc a|c 1 /b/"));
 }
+
+/// Object spread and rest copy the keys `[[OwnPropertyKeys]]` gave, not
+/// properties added meanwhile (#331; ECMA-262 CopyDataProperties): a
+/// getter deleting the rest and collecting can't have their names' atoms
+/// freed and given to new ones. What SpiderMonkey and JavaScriptCore give.
+#[test]
+fn object_spread_and_rest_hold_their_keys_across_getters() {
+    let src = r#"
+function mk(evil) {
+  var names = [], src = {};
+  Object.defineProperty(src, "a", { enumerable: true, configurable: true, get: function () {
+    if (!evil) return 1;
+    for (var k of names) delete src[k];
+    names = null;
+    for (var j = 0; j < 4; j++) $262.gc();
+    for (var j = 0; j < 200; j++) src["late_" + j + "_" + Math.random()] = j;
+    return 1;
+  }});
+  for (var i = 0; i < 50; i++) { var n = "victim_" + i + "_" + Math.random(); names.push(n); src[n] = i; }
+  return src;
+}
+function spread(s) { return { ...s }; }
+function rest(s) { var { b, ...r } = s; return r; }
+function proxied(s) { return { ...new Proxy(s, {}) }; }
+for (var i = 0; i < 50; i++) { spread(mk(false)); rest(mk(false)); }
+[spread, rest, proxied].map(function (f) {
+  var r = f(mk(true));
+  return Object.keys(r).filter(function (k) { return k.startsWith("late_"); }).length + ":" + Object.keys(r).length;
+}).join(" ")
+"#;
+    assert_eq!(value(src), "0:1 0:1 0:1");
+}

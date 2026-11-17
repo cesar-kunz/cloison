@@ -7354,6 +7354,30 @@ var a = new Array(5000).fill(-1);
     assert_eq!(r.as_deref(), Ok("7 8 8"));
 }
 
+/// A constructor called directly from compiled code, which allocates
+/// `this` in the runtime (`cloison_rt_construct`), with every collection
+/// full (issue #321): the collection at the allocation could find the
+/// constructor's code idle (direct calls enter it unseen) and unbind the
+/// site, which then entered its code at address 0. What V8, SpiderMonkey
+/// and JavaScriptCore give.
+#[test]
+fn constructs_whose_site_a_collection_unbinds_go_through_the_runtime() {
+    let src = r#"
+var n = 0;
+for (var round = 0; round < 2; round++) {
+  var C = function () { n++; };
+  for (var i = 0; i < 20000; i++) new C();
+}
+n;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_gc_evacuate_all();
+    vm.set_gc_verify(256 << 10);
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("40000"));
+}
+
 /// A regular expression's compiled pattern goes with the last `RegExp`
 /// using it (issue #34): `Vm::regexps` kept the pattern of every new
 /// source for good, 10 KiB each. Regexps of 20,000 sources made, run and

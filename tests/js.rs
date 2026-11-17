@@ -5796,6 +5796,24 @@ fn shared_buffers_and_atomics() {
     }
 }
 
+/// A finite timeout too large for a deadline (issue #337) is a wait with
+/// none, not a panic: DoWait (25.4.3.14) takes any finite timeout, and
+/// one whose value differs returns "not-equal" at once. What V8,
+/// SpiderMonkey and JavaScriptCore give.
+#[test]
+fn atomics_waits_with_huge_timeouts() {
+    let src = r#"
+var ia = new Int32Array(new SharedArrayBuffer(8));
+var out = [];
+for (var t of [1e22, 1e30, Number.MAX_VALUE])
+  out.push(Atomics.wait(ia, 0, 1, t), Atomics.waitAsync(ia, 0, 1, t).value);
+var r = Atomics.waitAsync(ia, 0, 0, 1e30);
+out.push(r.async, Atomics.notify(ia, 0));
+out.join(" ");
+"#;
+    assert_eq!(value(src), "not-equal not-equal not-equal not-equal not-equal not-equal true 1");
+}
+
 /// The tests starting agents, one at a time: agents are the process's,
 /// and a broadcast goes to every one (another test's, blocked in
 /// `Atomics.wait`, would never take it).

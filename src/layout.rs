@@ -130,6 +130,9 @@ pub enum Class {
     /// in-object slots, beyond its shape's capacity, as a native closure's
     /// data (see `promise::native_closure`, and `intl`).
     Intl,
+    /// A RegExp String Iterator (`matchAll`'s): `code`'s bits are its
+    /// state, a hidden array (see `builtins::regexp_string_iterator`).
+    RegExpStringIterator,
 }
 
 /// [`Class`] numbers as a header's byte holds them, for patterns.
@@ -305,7 +308,7 @@ pub const EXTRA_WORDS: [u8; 32] = {
     t[Class::BigInt as usize] = 2;
     t
 };
-const _: () = assert!((Class::Intl as usize) < 32);
+const _: () = assert!((Class::RegExpStringIterator as usize) < 32);
 
 /// [`EXTRA_WORDS`] of `class`.
 #[inline(always)]

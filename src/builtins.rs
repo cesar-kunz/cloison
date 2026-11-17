@@ -3232,29 +3232,8 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// pristine RegExp `rv` (no IsRegExp or "g" check: those are
 /// `matchAll`'s).
 fn match_all(vm: &mut Vm, this: Value, s: &[u16], rv: Value) -> Result<Value> {
-    let re = regexp_of(rv).unwrap();
     let input = this_string(vm, this, s);
-    // (Not global: one match, as `exec` finds it.)
-    if !re.global {
-        return rx_match_all(vm, rv, input);
-    }
-    let a_last = vm.a_last_index;
-    let li = vm.get(rv, a_last)?;
-    let li = to_number(li);
-    if vm.conv_failed() {
-        return Err(vm.take_conv_error());
-    }
-    let out = vm.new_array();
-    let mut at = if li.is_nan() || li < 0.0 { 0 } else { li.min(s.len() as f64 + 1.0) as usize };
-    let mut caps = Vec::new();
-    while at <= s.len() && re.exec_into(s, at, &mut caps) {
-        let (x, y) = caps[0].unwrap();
-        at = if y == x { advance(s, y as f64, re.unicode) as usize } else { y };
-        note_legacy(vm, rv, input, &caps);
-        let m = match_array(vm, re, &caps, s, input)?;
-        crate::vm::array_push(vm, out, &[m])?;
-    }
-    crate::symbol::array_values(vm, out, &[])
+    rx_match_all(vm, rv, input)
 }
 
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
@@ -4456,8 +4435,9 @@ fn rx_split(vm: &mut Vm, r: Value, s: Value, limit: Value) -> Result<Value> {
     Ok(out)
 }
 
-/// `RegExp.prototype[Symbol.matchAll]` generically: a copy (of the
-/// species constructor) from `lastIndex`, its matches found at once.
+/// `RegExp.prototype[Symbol.matchAll]` (22.2.6.9): a copy (of the
+/// species constructor) from `lastIndex`, and a RegExp String Iterator
+/// over its matches, which finds them one per `next()`.
 #[cold]
 #[inline(never)]
 fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
@@ -4469,24 +4449,55 @@ fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     set_last_index(vm, matcher, li)?;
     let global = flags_have(&flags, b'g');
     let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
-    let su = string_units(s).unwrap_or(&[]).to_vec();
-    let out = vm.new_array();
-    loop {
-        let res = rx_exec(vm, matcher, s)?;
-        if res.is_null() {
-            break;
-        }
-        crate::vm::array_push(vm, out, &[res])?;
-        if !global {
-            break;
-        }
-        let m = get_units(vm, res, "0")?;
-        if m.is_empty() {
-            let i = get_length(vm, matcher, "lastIndex")?;
-            set_last_index(vm, matcher, advance(&su, i, unicode))?;
-        }
+    regexp_string_iterator(vm, matcher, s, global, unicode)
+}
+
+// A RegExp String Iterator's state's cells: the matcher (`undefined` once
+// done: its [[Done]]), the string, [[Global]] and [[Unicode]].
+const RSI_MATCHER: i32 = 0;
+const RSI_STRING: i32 = 1;
+const RSI_GLOBAL: i32 = 2;
+const RSI_UNICODE: i32 = 3;
+
+/// CreateRegExpStringIterator(R, S, global, fullUnicode) (22.2.9.1).
+fn regexp_string_iterator(vm: &mut Vm, matcher: Value, s: Value, global: bool, unicode: bool) -> Result<Value> {
+    let state = crate::array::new_array_of(vm, &[matcher, s, Value::from_bool(global), Value::from_bool(unicode)])?;
+    let proto = crate::symbol::Root::RegExpStringIteratorPrototype;
+    Ok(crate::symbol::iterator_with_state(vm, Class::RegExpStringIterator, proto, state))
+}
+
+/// `%RegExpStringIteratorPrototype%.next()` (22.2.9.2.1): one RegExpExec
+/// of the matcher; past an empty match of a global one, `lastIndex`
+/// advanced.
+pub(crate) fn regexp_string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    if !is_class(this, Class::RegExpStringIterator) {
+        return Err(Error::type_error("%RegExpStringIteratorPrototype%.next called on an incompatible receiver"));
     }
-    crate::symbol::array_values(vm, out, &[])
+    let state = Value::from_bits(Obj::of(this).code() as u64);
+    let cell = |i: i32| Value::from_i32(i);
+    let matcher = vm.get_keyed(state, cell(RSI_MATCHER))?;
+    if matcher.is_undefined() {
+        return crate::symbol::iter_result(vm, Value::UNDEFINED, true);
+    }
+    let s = vm.get_keyed(state, cell(RSI_STRING))?;
+    let global = vm.get_keyed(state, cell(RSI_GLOBAL))? == Value::TRUE;
+    let unicode = vm.get_keyed(state, cell(RSI_UNICODE))? == Value::TRUE;
+    let res = rx_exec(vm, matcher, s)?;
+    if res.is_null() {
+        vm.set_keyed(state, cell(RSI_MATCHER), Value::UNDEFINED)?;
+        return crate::symbol::iter_result(vm, Value::UNDEFINED, true);
+    }
+    if !global {
+        vm.set_keyed(state, cell(RSI_MATCHER), Value::UNDEFINED)?;
+        return crate::symbol::iter_result(vm, res, false);
+    }
+    if get_units(vm, res, "0")?.is_empty() {
+        let i = get_length(vm, matcher, "lastIndex")?;
+        let su = string_units(s).unwrap_or(&[]);
+        let next = advance(su, i, unicode);
+        set_last_index(vm, matcher, next)?;
+    }
+    crate::symbol::iter_result(vm, res, false)
 }
 
 /// `get RegExp.prototype.flags`: each flag's getter asked.

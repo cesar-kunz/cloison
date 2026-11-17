@@ -47,6 +47,8 @@ pub(crate) enum Root {
     IteratorPrototype,
     ArrayIteratorPrototype,
     StringIteratorPrototype,
+    /// `%RegExpStringIteratorPrototype%`.
+    RegExpStringIteratorPrototype,
     ArrayValues,
     GeneratorPrototype,
     AsyncGeneratorPrototype,
@@ -403,6 +405,10 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.symbol_roots.push(sip);
     vm.define_natives(sip, &[("next", string_iterator_next as NativeFn, 0)]);
     to_string_tag(vm, sip, "String Iterator");
+    let rsip = vm.new_plain(object_value(ip.ptr()));
+    vm.symbol_roots.push(rsip);
+    vm.define_natives(rsip, &[("next", crate::builtins::regexp_string_iterator_next as NativeFn, 0)]);
+    to_string_tag(vm, rsip, "RegExp String Iterator");
 
     let ap = vm.array_prototype_obj();
     vm.define_natives(ap, &[("keys", array_keys as NativeFn, 0), ("entries", array_entries, 0)]);
@@ -472,10 +478,16 @@ pub(crate) fn return_this(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value>
 /// index, kind]` in `code`.
 fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Value> {
     let state = crate::array::new_array_of(vm, &[target, Value::from_i32(0), Value::from_i32(kind)])?;
+    Ok(iterator_with_state(vm, Class::ArrayIterator, proto, state))
+}
+
+/// An object of `class` (one whose `code` bits the collector traces as a
+/// value) inheriting from `proto`, its state the hidden array `state`.
+pub(crate) fn iterator_with_state(vm: &mut Vm, class: Class, proto: Root, state: Value) -> Value {
     let p = object_value(root(vm, proto).ptr());
-    let it = vm.new_object_with(Class::ArrayIterator, p, 0);
+    let it = vm.new_object_with(class, p, 0);
     unsafe { (*it.ptr()).code = state.to_bits() as *const crate::vm::Code };
-    Ok(object_value(it.ptr()))
+    object_value(it.ptr())
 }
 
 fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {

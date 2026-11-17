@@ -75,6 +75,7 @@ impl Class {
                 | Class::Symbol
                 | Class::BigInt
                 | Class::ArrayIterator
+                | Class::RegExpStringIterator
                 | Class::IteratorHelper
                 | Class::DisposableStack
                 | Class::Generator

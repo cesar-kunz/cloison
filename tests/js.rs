@@ -7583,6 +7583,39 @@ out.join(" | ");
     }
 }
 
+/// `matchAll` returns a lazy RegExp String Iterator (issue #334,
+/// 22.2.6.9 and 22.2.9): `exec` runs once per `next()`, so the legacy
+/// statics change only then, and an `exec` that never returns null
+/// doesn't hang the call. What SpiderMonkey and JavaScriptCore give.
+#[test]
+fn match_all_execs_once_per_next() {
+    let src = r#"
+var out = [];
+/b/.exec("b");
+var it = "a".matchAll(/a/g);
+out.push(RegExp.lastMatch);
+var calls = 0;
+class R extends RegExp { exec(s) { calls++; return ["a"]; } }
+var it2 = new R("x", "g")[Symbol.matchAll]("x");
+out.push(calls);
+out.push(JSON.stringify(it2.next()), calls);
+it2.next();
+out.push(calls);
+for (var m of it) out.push(m[0] + RegExp.lastMatch);
+out.push(JSON.stringify(it.next()));
+out.push([..."a1b22c333".matchAll(/\d+/g)].map(m => m[0] + "@" + m.index).join());
+out.push([..."".matchAll(/x*/g)].length, [..."\u{1F600}".matchAll(/(?:)/gu)].length);
+out.push([.../a/[Symbol.matchAll]("aaa")].length);
+out.push(Object.prototype.toString.call(it));
+try { Object.getPrototypeOf(it).next.call([].values()); } catch (e) { out.push(e.constructor.name); }
+out.join(" ");
+"#;
+    assert_eq!(
+        value(src),
+        r#"b 0 {"value":["a"],"done":false} 1 2 aa {"done":true} 1@1,22@3,333@6 1 2 1 [object RegExp String Iterator] TypeError"#
+    );
+}
+
 /// Code made at run time goes with its last closure, though the JIT took
 /// it (issue #35): a code the JIT compiled, inlined or bound a call to was
 /// kept for good, with its compiled code, the JIT's tables of it and what

@@ -13,7 +13,7 @@
 //! `[state, registers, pc, function, mode]`.
 
 use crate::interp::{native_stack_low, write_frame_header};
-use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, Object, as_object, object_value};
+use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, object_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
@@ -75,18 +75,18 @@ fn regs_at(st: *mut Value, code: *const Code) -> *mut Value {
 }
 
 /// The function of state `st`'s generator (its `FUNCTION` cell).
-fn function_of(st: *mut Value) -> *mut Object {
-    as_object(unsafe { *st.add(FUNCTION as usize) })
+fn function_of(st: *mut Value) -> Obj {
+    Obj::of(unsafe { *st.add(FUNCTION as usize) })
 }
 
 /// Whether state `st` is an async generator's (its function's kind).
 fn is_async_generator(st: *mut Value) -> bool {
-    unsafe { (*(*function_of(st)).code).kind == 6 }
+    unsafe { (*(*function_of(st).ptr()).code).kind == 6 }
 }
 
 /// Cell `k` of state `st` (undefined past its cells: its registers follow).
 fn get(_: &mut Vm, st: *mut Value, k: i32) -> Value {
-    let cells = cells_for(unsafe { (*(*function_of(st)).code).kind });
+    let cells = cells_for(unsafe { (*(*function_of(st).ptr()).code).kind });
     if (k as usize) < cells { unsafe { *st.add(k as usize) } } else { Value::UNDEFINED }
 }
 
@@ -112,9 +112,9 @@ fn clear_regs(st: *mut Value, code: *const Code) {
 
 /// A new generator object for function `f`: its prototype `f.prototype`
 /// (or `%GeneratorPrototype%`).
-pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
+pub(crate) fn create(vm: &mut Vm, f: Obj) -> Result<Value> {
     let a_prototype = vm.a_prototype;
-    let p = vm.get(object_value(f), a_prototype)?;
+    let p = vm.get(object_value(f.ptr()), a_prototype)?;
     // (An async generator function's: kind 6, see `vm::Code::kind`.)
     let is_async = f.code().live().kind == 6;
     let root =
@@ -129,7 +129,7 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
         Value::from_i32(SUSPENDED_START),
         Value::UNDEFINED,
         Value::from_i32(0),
-        object_value(f),
+        object_value(f.ptr()),
         Value::from_i32(NEXT),
     ];
     if is_async {
@@ -194,7 +194,7 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     set(vm, st, MODE, Value::from_i32(mode));
     let f = get(vm, st, FUNCTION);
     let pc = get(vm, st, PC).as_i32_unchecked() as usize;
-    let r = unsafe { run(vm, as_object(f), regs_at(st, Obj::of(f).code()), pc, v) };
+    let r = unsafe { run(vm, Obj::of(f), regs_at(st, Obj::of(f).code()), pc, v) };
     match r {
         Ok(out) => {
             let yielded = get(vm, st, STATE).as_i32_unchecked() == SUSPENDED_YIELD;
@@ -219,7 +219,7 @@ pub(crate) fn run_module(vm: &mut Vm, g: Value) -> Result<()> {
 
 /// Run function `f`'s code from offset `pc` in a frame of registers
 /// `saved` (a generator state's), `acc` `v`: what it returns or yields.
-unsafe fn run(vm: &mut Vm, f: *mut Object, saved: *mut Value, pc: usize, v: Value) -> Result<Value> {
+unsafe fn run(vm: &mut Vm, f: Obj, saved: *mut Value, pc: usize, v: Value) -> Result<Value> {
     unsafe {
         let top = vm.native_top;
         if top.is_null() {
@@ -233,7 +233,7 @@ unsafe fn run(vm: &mut Vm, f: *mut Object, saved: *mut Value, pc: usize, v: Valu
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         write_frame_header(vm, new, code, std::ptr::null(), std::ptr::null_mut(), 0);
-        crate::interp::set_frame_function(new, f);
+        crate::interp::set_frame_function(new, f.ptr());
         for i in 0..n {
             let r = *saved.add(i);
             *new.add(i) = if r == Value::EMPTY { Value::UNDEFINED } else { r };

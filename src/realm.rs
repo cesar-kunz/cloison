@@ -13,7 +13,7 @@
 //! through `interp::enter_compiled` (all codes' `calls_left` kept at 0),
 //! which compares realms, and the JIT is off.
 
-use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, as_object, object_value};
+use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, object_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
@@ -382,7 +382,7 @@ pub(crate) fn function_realm(vm: &mut Vm, f: Value) -> Result<u32> {
     if vm.realms.is_empty() || !f.is_cell() {
         return Ok(vm.realm);
     }
-    let o = as_object(f);
+    let o = Obj::of(f);
     match o.class() {
         Class::Function | Class::Native => {
             if crate::proxy::is_proxy(vm, o) {

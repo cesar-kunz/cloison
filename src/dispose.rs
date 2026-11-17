@@ -16,7 +16,7 @@
 
 use crate::builtins::{getter, link_constructor};
 use crate::interp::{call_function, to_string_units};
-use crate::object::{Class, DONT_ENUM, Obj, Object, as_object, object_value};
+use crate::object::{Class, DONT_ENUM, Obj, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -112,7 +112,7 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     vm.add_property_with(ip, a_dispose, object_value(f.ptr()), DONT_ENUM);
     let aip = async_iterator_prototype(vm);
     let f = vm.native_function("[Symbol.asyncDispose]", async_iterator_dispose, 0, any, false);
-    vm.add_property_with(unsafe { Obj::from_ptr(aip) }, a_async_dispose, object_value(f.ptr()), DONT_ENUM);
+    vm.add_property_with(aip, a_async_dispose, object_value(f.ptr()), DONT_ENUM);
 
     vm.dispose_roots =
         vec![object_value(dsp.ptr()), object_value(adsp.ptr()), object_value(sep.ptr()), Value::UNDEFINED];
@@ -120,9 +120,9 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
 }
 
 /// `%AsyncIteratorPrototype%`: `%AsyncGeneratorPrototype%`'s prototype.
-fn async_iterator_prototype(vm: &mut Vm) -> *mut Object {
+fn async_iterator_prototype(vm: &mut Vm) -> Obj {
     let agp = vm.symbol_roots[crate::symbol::Root::AsyncGeneratorPrototype as usize];
-    as_object(agp.shape().live().proto)
+    Obj::of(agp.shape().live().proto)
 }
 
 fn arg(a: &[Value], i: usize) -> Value {

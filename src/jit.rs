@@ -805,7 +805,7 @@ extern "C" fn cloison_rt_less_than(a: Value, b: Value) -> u64 {
 extern "C" fn cloison_rt_for_in_keys(vm: Value, v: Value) -> u64 {
     unsafe {
         let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
-        if v.is_cell() && crate::proxy::chain_has_proxy(vm, crate::object::as_object(v)) {
+        if v.is_cell() && crate::proxy::chain_has_proxy(vm, Obj::from_ptr(crate::object::as_object(v))) {
             return 0;
         }
         vm.safepoint(std::ptr::null_mut());
@@ -4187,7 +4187,7 @@ fn typed_lengths_standard() -> bool {
     let name = vm.a_length;
     let sp = vm.typed_array_prototype;
     unsafe {
-        if sp.is_null() || sp.flags() & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, sp) {
+        if sp.is_null() || sp.flags() & PROTOTYPE == 0 || crate::proxy::is_proxy(vm, Obj::from_ptr(sp)) {
             return false;
         }
         let ss = sp.shape().live();
@@ -4207,7 +4207,7 @@ fn typed_lengths_standard() -> bool {
             if s.dictionary
                 || s.lookup(name).is_some()
                 || s.proto != crate::object::object_value(sp)
-                || crate::proxy::is_proxy(vm, p.ptr())
+                || crate::proxy::is_proxy(vm, p)
             {
                 return false;
             }
@@ -4244,7 +4244,7 @@ fn typed_length_known(t: Ty) -> bool {
         let o = as_object(p);
         unsafe {
             if o.flags() & PROTOTYPE == 0
-                || crate::proxy::is_proxy(vm, o)
+                || crate::proxy::is_proxy(vm, Obj::from_ptr(o))
                 || vm.virtual_own(Obj::from_ptr(o), name).is_some()
             {
                 return false;

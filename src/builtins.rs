@@ -247,8 +247,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("createRealm", crate::realm::host_create_realm, 0),
         ],
     );
-    crate::agent::install(vm, host.ptr());
-    crate::module::install(vm, host.ptr());
+    crate::agent::install(vm, host);
+    crate::module::install(vm, host);
     crate::typed::install(vm);
     crate::collections::install(vm);
     install_regexps(vm);
@@ -1285,7 +1285,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let target = Obj::of(this);
     let args = a.get(1..).unwrap_or(&[]);
     let proto =
-        if vm.proxies_exist { crate::proxy::get_prototype_of(vm, target.ptr())? } else { target.shape().live().proto };
+        if vm.proxies_exist { crate::proxy::get_prototype_of(vm, target)? } else { target.shape().live().proto };
     // Its `length` (what the target's leaves) and `name` ("bound …"): the
     // target's code's, where it has neither as a property of its own
     // making (nor deleted them); as read otherwise.
@@ -1295,7 +1295,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         target.flags() & (crate::object::FN_LENGTH_DELETED | crate::object::FN_NAME_DELETED) == 0
             && s.lookup(a_length).is_none()
             && s.lookup(a_name).is_none()
-            && !(vm.proxies_exist && crate::proxy::is_proxy(vm, target.ptr()))
+            && !(vm.proxies_exist && crate::proxy::is_proxy(vm, target))
     };
     let mut units: Vec<u16> = Vec::with_capacity(32);
     units.extend(b"bound ".iter().map(|&c| c as u16));
@@ -3707,8 +3707,8 @@ fn error_stack_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !is_string(v) {
         return Err(Error::type_error("Error.prototype.stack must be set to a string"));
     }
-    let o = as_object(this);
-    if o == (vm.error_prototypes[0]).ptr() {
+    let o = Obj::of(this);
+    if o == (vm.error_prototypes[0]) {
         return Err(Error::type_error("Cannot set Error.prototype.stack"));
     }
     let key = crate::vm::Key::Name(vm.intern_name("stack"));
@@ -3912,7 +3912,7 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     // (Without calling a getter: the generic algorithms will. Not through
     // a proxy, whose traps they call.)
     let o = Obj::of(rx);
-    if crate::proxy::chain_has_proxy(vm, o.ptr()) {
+    if crate::proxy::chain_has_proxy(vm, o) {
         return Ok(false);
     }
     // Whether slot `slot` of `h` holds `regexp_fns[i]` (a getter's from 6
@@ -4331,21 +4331,21 @@ fn builtin_species(g: Value) -> bool {
 #[cold]
 #[inline(never)]
 fn species_pristine_slow(vm: &mut Vm, r: Value) -> bool {
-    let o = as_object(r);
+    let o = Obj::of(r);
     if crate::proxy::chain_has_proxy(vm, o) {
         return false;
     }
     let a_c = vm.a_constructor;
     let mut p = o;
     let d = loop {
-        if let Some(d) = vm.own_property(unsafe { Obj::from_ptr(p) }, crate::vm::Key::Name(a_c)) {
+        if let Some(d) = vm.own_property(p, crate::vm::Key::Name(a_c)) {
             break d;
         }
         let proto = p.shape().live().proto;
         if !proto.is_cell() {
             return false;
         }
-        p = as_object(proto);
+        p = Obj::of(proto);
     };
     if d.is_accessor() || d.value != Some(object_value(vm.regexp_constructor)) {
         return false;

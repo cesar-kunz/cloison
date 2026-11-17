@@ -2693,7 +2693,7 @@ impl Vm {
         unsafe { o.set_flags(o.flags() | PROTOTYPE) };
         // (A proxy's traps may take any new element's store, and give
         // any symbol's method.)
-        if self.proxies_exist && crate::proxy::is_proxy(self, o.ptr()) {
+        if self.proxies_exist && crate::proxy::is_proxy(self, o) {
             self.protect_indices();
             self.to_primitive_defined = true;
             self.has_instance_defined = true;
@@ -3555,7 +3555,7 @@ impl Vm {
         {
             return self.get_through(p, name, obj);
         }
-        if crate::proxy::chain_has_proxy(self, o.ptr()) {
+        if crate::proxy::chain_has_proxy(self, o) {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
         if name == self.a_length && matches!(o.class(), Class::Array | Class::String) {
@@ -3886,7 +3886,7 @@ impl Vm {
 
     /// `p.[[Get]](name, receiver)`.
     fn get_through(&mut self, p: Obj, name: Atom, receiver: Value) -> Result<Value> {
-        if crate::proxy::chain_has_proxy(self, p.ptr()) {
+        if crate::proxy::chain_has_proxy(self, p) {
             return crate::proxy::generic_get(self, object_value(p.ptr()), Key::Name(name), receiver);
         }
         let found = self.lookup(p, name);
@@ -3909,7 +3909,7 @@ impl Vm {
     /// `p.[[Set]](name, value, receiver)` for a primitive `receiver`:
     /// an inherited setter's call (or a proxy's trap), or nothing.
     fn set_through(&mut self, p: Obj, name: Atom, value: Value, receiver: Value) -> Result<()> {
-        if crate::proxy::chain_has_proxy(self, p.ptr()) {
+        if crate::proxy::chain_has_proxy(self, p) {
             if !crate::proxy::generic_set(self, object_value(p.ptr()), Key::Name(name), value, receiver)? {
                 self.store_failed = true;
             }
@@ -3969,7 +3969,7 @@ impl Vm {
         {
             return self.set_through(p, name, value, obj);
         }
-        if crate::proxy::chain_has_proxy(self, o.ptr()) {
+        if crate::proxy::chain_has_proxy(self, o) {
             if !crate::proxy::generic_set(self, obj, Key::Name(name), value, obj)? {
                 self.store_failed = true;
             }
@@ -4052,7 +4052,7 @@ impl Vm {
             return self.get_through(p, name, obj);
         }
         // (Never cached through a proxy.)
-        if crate::proxy::chain_has_proxy(self, o.ptr()) {
+        if crate::proxy::chain_has_proxy(self, o) {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
         unsafe {
@@ -4186,7 +4186,7 @@ impl Vm {
         let o = Obj::of(obj);
         // An object literal's property past a proxy or another realm's
         // prototype: defined, not that prototype's [[Set]].
-        if (!self.realms.is_empty() || crate::proxy::chain_has_proxy(self, o.ptr())) && code.define_ics.contains(&k) {
+        if (!self.realms.is_empty() || crate::proxy::chain_has_proxy(self, o)) && code.define_ics.contains(&k) {
             return self.create_data_property(obj, Key::Name(name), value);
         }
         if !self.realms.is_empty()
@@ -4195,7 +4195,7 @@ impl Vm {
         {
             return self.set_through(p, name, value, obj);
         }
-        if crate::proxy::chain_has_proxy(self, o.ptr()) {
+        if crate::proxy::chain_has_proxy(self, o) {
             if !crate::proxy::generic_set(self, obj, Key::Name(name), value, obj)? {
                 self.store_failed = true;
             }
@@ -4456,7 +4456,7 @@ impl Vm {
     /// its prototypes, a proxy among them asked (its `has` trap).
     fn has_global(&mut self, name: Atom) -> Result<bool> {
         let g = self.global_obj();
-        if crate::proxy::chain_has_proxy(self, g.ptr()) {
+        if crate::proxy::chain_has_proxy(self, g) {
             return crate::proxy::generic_has(self, object_value(g.ptr()), Key::Name(name));
         }
         Ok(self.lookup(g, name).is_some())
@@ -4562,7 +4562,7 @@ impl Vm {
         // Not the global's own, past a proxy on its prototype chain: the
         // proxy's `has` says if it exists, the store is [[Set]] on the global
         // (its `set` trap).
-        if g.shape().live().lookup(name).is_none() && crate::proxy::chain_has_proxy(self, g.ptr()) {
+        if g.shape().live().lookup(name).is_none() && crate::proxy::chain_has_proxy(self, g) {
             if code.strict && !self.has_global(name)? {
                 return Err(Error::reference_error(format!("{} is not defined", self.atom_name(name))));
             }
@@ -4638,7 +4638,7 @@ impl Vm {
         let function = f.is_cell() && matches!(Obj::of(f).class(), Class::Function | Class::Native);
         if !function
             || Obj::of(f).shape() != self.function_shape
-                && (self.has_instance_defined || self.proxies_exist && crate::proxy::is_proxy(self, as_object(f)))
+                && (self.has_instance_defined || self.proxies_exist && crate::proxy::is_proxy(self, Obj::of(f)))
         {
             return self.instance_of_generic(v, f);
         }
@@ -4689,8 +4689,11 @@ impl Vm {
         }
         let mut o = as_object(v);
         loop {
-            let proto =
-                if self.proxies_exist { crate::proxy::get_prototype_of(self, o)? } else { o.shape().live().proto };
+            let proto = if self.proxies_exist {
+                crate::proxy::get_prototype_of(self, unsafe { Obj::from_ptr(o) })?
+            } else {
+                o.shape().live().proto
+            };
             if !proto.is_cell() {
                 return Ok(false);
             }
@@ -4765,7 +4768,7 @@ impl Vm {
             )));
         }
         let mut o = as_object(obj);
-        if crate::proxy::chain_has_proxy(self, o) {
+        if crate::proxy::chain_has_proxy(self, unsafe { Obj::from_ptr(o) }) {
             let k = self.property_key(key);
             return crate::proxy::generic_has(self, obj, k);
         }
@@ -4808,7 +4811,7 @@ impl Vm {
         let o = Obj::of(obj);
         let key = self.property_key(key);
         if self.proxies_exist {
-            return crate::proxy::delete(self, o.ptr(), key);
+            return crate::proxy::delete(self, o, key);
         }
         Ok(self.delete_own(o, key))
     }
@@ -5215,7 +5218,7 @@ impl Vm {
             let proto = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
             return self.get_index_from(unsafe { Obj::from_ptr(proto) }, i, obj);
         }
-        if crate::proxy::chain_has_proxy(self, as_object(obj)) {
+        if crate::proxy::chain_has_proxy(self, Obj::of(obj)) {
             let k = self.property_key(key);
             return crate::proxy::generic_get(self, obj, k, obj);
         }
@@ -5387,7 +5390,7 @@ impl Vm {
             self.store_failed = true;
             return Ok(());
         }
-        if crate::proxy::chain_has_proxy(self, as_object(obj)) {
+        if crate::proxy::chain_has_proxy(self, Obj::of(obj)) {
             let k = self.property_key(key);
             if !crate::proxy::generic_set(self, obj, k, value, obj)? {
                 self.store_failed = true;
@@ -5711,8 +5714,8 @@ impl Vm {
     /// conversion's error (see `conv_error`).
     pub(crate) fn for_in_key_array(&mut self, v: Value) -> Value {
         // (Through a proxy's traps: what they throw, a conversion's error.)
-        if v.is_cell() && crate::proxy::chain_has_proxy(self, as_object(v)) {
-            let names = match crate::proxy::for_in_names(self, as_object(v)) {
+        if v.is_cell() && crate::proxy::chain_has_proxy(self, Obj::of(v)) {
+            let names = match crate::proxy::for_in_names(self, Obj::of(v)) {
                 Ok(n) => n,
                 Err(e) => {
                     self.conv_error.get_or_insert(e);
@@ -6060,7 +6063,7 @@ impl Vm {
                     *out.add(k) = if local {
                         self.open_upvalue(regs.add(idx as usize))
                     } else {
-                        *Self::upvalues(crate::object::Obj::from_ptr(current)).add(idx as usize)
+                        *Self::upvalues(Obj::from_ptr(current)).add(idx as usize)
                     };
                 }
                 o

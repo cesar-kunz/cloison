@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::builtins::is_class;
-use crate::object::{Class, Obj, Object, as_object, object_value};
+use crate::object::{Class, Obj, object_value};
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, string_units};
 
@@ -251,9 +251,9 @@ fn agent_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_class(b, Class::SharedArrayBuffer) {
         return Err(Error::type_error("$262.agent.broadcast: not a SharedArrayBuffer"));
     }
-    let o: *mut Object = as_object(b);
+    let o = Obj::of(b);
     let block = crate::shared::block_of(o);
-    let growable = crate::typed::is_resizable(unsafe { Obj::from_ptr(o) });
+    let growable = crate::typed::is_resizable(o);
     let id = arg(a, 1);
     let id = if id.is_number() { Value::number(id.to_number()) } else { Value::UNDEFINED };
     let agents: Vec<Arc<Mailbox>> = vm.agent.started.iter().map(|a| a.mailbox.clone()).collect();
@@ -332,12 +332,12 @@ fn agent_monotonic_now(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `$262.agent`, on `$262` (`host`).
-pub(crate) fn install(vm: &mut Vm, host: *mut Object) {
+pub(crate) fn install(vm: &mut Vm, host: Obj) {
     EPOCH.get_or_init(Instant::now);
     let op = object_value(vm.object_prototype);
     let agent = vm.new_plain(op);
     let a_agent = vm.intern_name("agent");
-    vm.add_property_with(unsafe { Obj::from_ptr(host) }, a_agent, object_value(agent.ptr()), crate::object::DONT_ENUM);
+    vm.add_property_with(host, a_agent, object_value(agent.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
         agent,
         &[

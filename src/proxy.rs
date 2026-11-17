@@ -18,7 +18,7 @@
 
 use crate::interp::{call_function, to_boolean};
 use crate::jit::HashSet;
-use crate::object::{Class, Obj, Object, as_object, object_value};
+use crate::object::{Class, Obj, Object, object_value};
 use crate::props::{Desc, is_callable, is_object, same_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -42,7 +42,7 @@ pub(crate) fn install(vm: &mut Vm) {
 }
 
 /// Whether `o` is a proxy.
-pub(crate) fn is_proxy(vm: &Vm, o: *mut Object) -> bool {
+pub(crate) fn is_proxy(vm: &Vm, o: Obj) -> bool {
     match o.class() {
         Class::Proxy => true,
         Class::Native => o.code() == vm.proxy_codes[0] || o.code() == vm.proxy_codes[1],
@@ -52,7 +52,7 @@ pub(crate) fn is_proxy(vm: &Vm, o: *mut Object) -> bool {
 
 /// Whether `o` or an object on its prototype chain is a proxy (none
 /// before the first is made).
-pub(crate) fn chain_has_proxy(vm: &Vm, mut o: *mut Object) -> bool {
+pub(crate) fn chain_has_proxy(vm: &Vm, mut o: Obj) -> bool {
     if !vm.proxies_exist {
         return false;
     }
@@ -64,23 +64,23 @@ pub(crate) fn chain_has_proxy(vm: &Vm, mut o: *mut Object) -> bool {
         if !p.is_cell() {
             return false;
         }
-        o = as_object(p);
+        o = Obj::of(p);
     }
 }
 
-fn slot(o: *mut Object, i: usize) -> Value {
-    unsafe { *Object::inline(o, i) }
+fn slot(o: Obj, i: usize) -> Value {
+    unsafe { *Object::inline(o.ptr(), i) }
 }
 
-fn set_slot(o: *mut Object, i: usize, v: Value) {
+fn set_slot(o: Obj, i: usize, v: Value) {
     unsafe {
-        let at = Object::inline(o, i);
-        crate::heap::store(o.cast(), at, v);
+        let at = Object::inline(o.ptr(), i);
+        crate::heap::store(o.ptr().cast(), at, v);
     }
 }
 
 /// A proxy's target and handler (a TypeError once revoked).
-fn parts(o: *mut Object) -> Result<(Value, Value)> {
+fn parts(o: Obj) -> Result<(Value, Value)> {
     let (t, h) = (slot(o, 0), slot(o, 1));
     if !t.is_cell() {
         return Err(Error::type_error("Cannot perform an operation on a revoked proxy"));
@@ -154,17 +154,17 @@ pub(crate) fn create(vm: &mut Vm, target: Value, handler: Value) -> Result<Value
     let class = if callable { Class::Native } else { Class::Proxy };
     let full = vm.root_shape(class, Value::NULL, 2);
     let bare = vm.root_shape(class, Value::NULL, 0);
-    let o = vm.heap.alloc_object(full.live());
+    let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(full.live())) };
     unsafe {
-        crate::object::set_shape(o, bare);
+        crate::object::set_shape(o.ptr(), bare);
         if callable {
             let constructs = crate::intrinsics::is_constructor(target);
-            (*o).code = vm.proxy_codes[usize::from(constructs)];
+            (*o.ptr()).code = vm.proxy_codes[usize::from(constructs)];
         }
     }
     set_slot(o, 0, target);
     set_slot(o, 1, handler);
-    Ok(object_value(o))
+    Ok(object_value(o.ptr()))
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -189,7 +189,7 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         crate::object::set_shape(r, bare);
         (*r).code = vm.proxy_codes[2];
     }
-    set_slot(r, 0, p);
+    set_slot(unsafe { Obj::from_ptr(r) }, 0, p);
     let out = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     let (a_proxy, a_revoke) = (vm.intern_name("proxy"), vm.intern_name("revoke"));
     vm.create_data_property(out, Key::Name(a_proxy), p)?;
@@ -199,11 +199,11 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// A revocable proxy's `revoke()`: its proxy's target and handler gone.
 fn revoke(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let r = vm.callee;
+    let r = vm.callee_obj();
     let p = slot(r, 0);
     if p.is_cell() {
-        set_slot(as_object(p), 0, Value::NULL);
-        set_slot(as_object(p), 1, Value::NULL);
+        set_slot(Obj::of(p), 0, Value::NULL);
+        set_slot(Obj::of(p), 1, Value::NULL);
         set_slot(r, 0, Value::NULL);
     }
     Ok(Value::UNDEFINED)
@@ -212,12 +212,12 @@ fn revoke(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// A callable proxy called (`apply`) or constructed (`construct`).
 fn trampoline(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     let constructing = vm.is_construct();
-    let p = vm.callee;
+    let p = vm.callee_obj();
     let nt = std::mem::replace(&mut vm.new_target, Value::EMPTY);
     let (t, h) = parts(p)?;
     let list = crate::array::new_array_of(vm, args)?;
     if constructing {
-        let nt = if nt == Value::EMPTY { object_value(p) } else { nt };
+        let nt = if nt == Value::EMPTY { object_value(p.ptr()) } else { nt };
         let Some(f) = trap(vm, h, "construct")? else {
             return crate::intrinsics::construct_with(vm, t, args, nt);
         };
@@ -235,13 +235,13 @@ fn trampoline(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
 
 // ---- The internal methods of proxies ----
 
-fn get(vm: &mut Vm, p: *mut Object, key: Key, receiver: Value) -> Result<Value> {
+fn get(vm: &mut Vm, p: Obj, key: Key, receiver: Value) -> Result<Value> {
     let (t, h) = parts(p)?;
     match trap(vm, h, "get")? {
         Some(f) => {
             let k = trap_key(vm, key);
             let v = call_function(vm, f, h, &[t, k, receiver])?;
-            if let Some(d) = get_own_property(vm, as_object(t), key)?
+            if let Some(d) = get_own_property(vm, Obj::of(t), key)?
                 && d.configurable == Some(false)
             {
                 if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
@@ -257,7 +257,7 @@ fn get(vm: &mut Vm, p: *mut Object, key: Key, receiver: Value) -> Result<Value> 
     }
 }
 
-fn set(vm: &mut Vm, p: *mut Object, key: Key, v: Value, receiver: Value) -> Result<bool> {
+fn set(vm: &mut Vm, p: Obj, key: Key, v: Value, receiver: Value) -> Result<bool> {
     let (t, h) = parts(p)?;
     match trap(vm, h, "set")? {
         Some(f) => {
@@ -265,7 +265,7 @@ fn set(vm: &mut Vm, p: *mut Object, key: Key, v: Value, receiver: Value) -> Resu
             if !to_boolean(call_function(vm, f, h, &[t, k, v, receiver])?) {
                 return Ok(false);
             }
-            if let Some(d) = get_own_property(vm, as_object(t), key)?
+            if let Some(d) = get_own_property(vm, Obj::of(t), key)?
                 && d.configurable == Some(false)
             {
                 if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
@@ -281,7 +281,7 @@ fn set(vm: &mut Vm, p: *mut Object, key: Key, v: Value, receiver: Value) -> Resu
     }
 }
 
-fn has(vm: &mut Vm, p: *mut Object, key: Key) -> Result<bool> {
+fn has(vm: &mut Vm, p: Obj, key: Key) -> Result<bool> {
     let (t, h) = parts(p)?;
     match trap(vm, h, "has")? {
         Some(f) => {
@@ -289,11 +289,11 @@ fn has(vm: &mut Vm, p: *mut Object, key: Key) -> Result<bool> {
             if to_boolean(call_function(vm, f, h, &[t, k])?) {
                 return Ok(true);
             }
-            if let Some(d) = get_own_property(vm, as_object(t), key)? {
+            if let Some(d) = get_own_property(vm, Obj::of(t), key)? {
                 if d.configurable == Some(false) {
                     return Err(broken("has", "hid a non-configurable property"));
                 }
-                if !is_extensible(vm, as_object(t))? {
+                if !is_extensible(vm, Obj::of(t))? {
                     return Err(broken("has", "hid a property of a non-extensible target"));
                 }
             }
@@ -307,12 +307,12 @@ fn has(vm: &mut Vm, p: *mut Object, key: Key) -> Result<bool> {
 
 /// `o.[[Get]](key, receiver)`.
 pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> Result<Value> {
-    let mut cur = as_object(o);
+    let mut cur = Obj::of(o);
     loop {
         if is_proxy(vm, cur) {
             return get(vm, cur, key, receiver);
         }
-        if let Some(d) = vm.own_property(unsafe { Obj::from_ptr(cur) }, key) {
+        if let Some(d) = vm.own_property(cur, key) {
             if d.is_accessor() {
                 return match d.get.filter(|g| !g.is_undefined()) {
                     Some(g) => call_function(vm, g, receiver, &[]),
@@ -325,25 +325,25 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
         if !p.is_cell() {
             return Ok(Value::UNDEFINED);
         }
-        cur = as_object(p);
+        cur = Obj::of(p);
     }
 }
 
 /// `o.[[Set]](key, v, receiver)`: whether it was set.
 pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
-    let mut cur = as_object(o);
+    let mut cur = Obj::of(o);
     let found = loop {
         if is_proxy(vm, cur) {
             return set(vm, cur, key, v, receiver);
         }
-        if let Some(d) = vm.own_property(unsafe { Obj::from_ptr(cur) }, key) {
+        if let Some(d) = vm.own_property(cur, key) {
             break Some(d);
         }
         let p = cur.shape().live().proto;
         if !p.is_cell() {
             break None;
         }
-        cur = as_object(p);
+        cur = Obj::of(p);
     };
     match found {
         Some(d) if d.is_accessor() => match d.set.filter(|s| !s.is_undefined()) {
@@ -358,7 +358,7 @@ pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: V
             if !is_object(receiver) {
                 return Ok(false);
             }
-            let r = as_object(receiver);
+            let r = Obj::of(receiver);
             match get_own_property(vm, r, key)? {
                 Some(e) if e.is_accessor() || e.writable == Some(false) => Ok(false),
                 Some(_) => define_property(vm, r, key, &Desc { value: Some(v), ..Desc::default() }),
@@ -370,26 +370,26 @@ pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: V
 
 /// `o.[[HasProperty]](key)`.
 pub(crate) fn generic_has(vm: &mut Vm, o: Value, key: Key) -> Result<bool> {
-    let mut cur = as_object(o);
+    let mut cur = Obj::of(o);
     loop {
         if is_proxy(vm, cur) {
             return has(vm, cur, key);
         }
-        if vm.own_property(unsafe { Obj::from_ptr(cur) }, key).is_some() {
+        if vm.own_property(cur, key).is_some() {
             return Ok(true);
         }
         let p = cur.shape().live().proto;
         if !p.is_cell() {
             return Ok(false);
         }
-        cur = as_object(p);
+        cur = Obj::of(p);
     }
 }
 
 /// `o.[[Delete]](key)`: whether it's gone.
-pub(crate) fn delete(vm: &mut Vm, o: *mut Object, key: Key) -> Result<bool> {
+pub(crate) fn delete(vm: &mut Vm, o: Obj, key: Key) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return Ok(vm.delete_own(unsafe { Obj::from_ptr(o) }, key));
+        return Ok(vm.delete_own(o, key));
     }
     let (t, h) = parts(o)?;
     match trap(vm, h, "deleteProperty")? {
@@ -398,28 +398,28 @@ pub(crate) fn delete(vm: &mut Vm, o: *mut Object, key: Key) -> Result<bool> {
             if !to_boolean(call_function(vm, f, h, &[t, k])?) {
                 return Ok(false);
             }
-            if let Some(d) = get_own_property(vm, as_object(t), key)? {
+            if let Some(d) = get_own_property(vm, Obj::of(t), key)? {
                 if d.configurable == Some(false) {
                     return Err(broken("deleteProperty", "deleted a non-configurable property"));
                 }
-                if !is_extensible(vm, as_object(t))? {
+                if !is_extensible(vm, Obj::of(t))? {
                     return Err(broken("deleteProperty", "deleted a property of a non-extensible target"));
                 }
             }
             Ok(true)
         }
-        None => delete(vm, as_object(t), key),
+        None => delete(vm, Obj::of(t), key),
     }
 }
 
 /// `o.[[GetOwnProperty]](key)`.
-pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<Option<Desc>> {
+pub(crate) fn get_own_property(vm: &mut Vm, o: Obj, key: Key) -> Result<Option<Desc>> {
     if !is_proxy(vm, o) {
-        return Ok(vm.own_property(unsafe { Obj::from_ptr(o) }, key));
+        return Ok(vm.own_property(o, key));
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "getOwnPropertyDescriptor")? else {
-        return get_own_property(vm, as_object(t), key);
+        return get_own_property(vm, Obj::of(t), key);
     };
     let k = trap_key(vm, key);
     let r = call_function(vm, f, h, &[t, k])?;
@@ -428,19 +428,19 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
             "The proxy's 'getOwnPropertyDescriptor' trap returned neither an object nor undefined",
         ));
     }
-    let target = get_own_property(vm, as_object(t), key)?;
+    let target = get_own_property(vm, Obj::of(t), key)?;
     if r.is_undefined() {
         if let Some(td) = target {
             if td.configurable == Some(false) {
                 return Err(broken("getOwnPropertyDescriptor", "hid a non-configurable property"));
             }
-            if !is_extensible(vm, as_object(t))? {
+            if !is_extensible(vm, Obj::of(t))? {
                 return Err(broken("getOwnPropertyDescriptor", "hid a property of a non-extensible target"));
             }
         }
         return Ok(None);
     }
-    let extensible = is_extensible(vm, as_object(t))?;
+    let extensible = is_extensible(vm, Obj::of(t))?;
     let mut d = vm.to_descriptor(r)?;
     // (Completed: absent fields take their defaults.)
     if d.is_accessor() {
@@ -474,26 +474,26 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
 }
 
 /// `o.[[DefineOwnProperty]](key, d)`: whether it was defined.
-pub(crate) fn define_property(vm: &mut Vm, o: *mut Object, key: Key, d: &Desc) -> Result<bool> {
+pub(crate) fn define_property(vm: &mut Vm, o: Obj, key: Key, d: &Desc) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return vm.define_own_property(unsafe { Obj::from_ptr(o) }, key, d);
+        return vm.define_own_property(o, key, d);
     }
     proxy_define(vm, o, key, d)
 }
 
 /// A proxy's `[[DefineOwnProperty]]`.
-pub(crate) fn proxy_define(vm: &mut Vm, o: *mut Object, key: Key, d: &Desc) -> Result<bool> {
+pub(crate) fn proxy_define(vm: &mut Vm, o: Obj, key: Key, d: &Desc) -> Result<bool> {
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "defineProperty")? else {
-        return define_property(vm, as_object(t), key, d);
+        return define_property(vm, Obj::of(t), key, d);
     };
     let k = trap_key(vm, key);
     let dv = from_partial_descriptor(vm, d);
     if !to_boolean(call_function(vm, f, h, &[t, k, dv])?) {
         return Ok(false);
     }
-    let target = get_own_property(vm, as_object(t), key)?;
-    let extensible = is_extensible(vm, as_object(t))?;
+    let target = get_own_property(vm, Obj::of(t), key)?;
+    let extensible = is_extensible(vm, Obj::of(t))?;
     let config_false = d.configurable == Some(false);
     match target {
         None if !extensible => Err(broken("defineProperty", "added a property to a non-extensible target")),
@@ -539,17 +539,17 @@ fn from_partial_descriptor(vm: &mut Vm, d: &Desc) -> Value {
 }
 
 /// `o.[[OwnPropertyKeys]]()`: indices, names, then symbols.
-pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
+pub(crate) fn own_keys(vm: &mut Vm, o: Obj) -> Result<Vec<Key>> {
     if !is_proxy(vm, o) {
-        let mut keys: Vec<Key> = vm.own_keys(unsafe { Obj::from_ptr(o) }).into_iter().map(|(k, _)| k).collect();
-        for s in crate::symbol::own_symbol_keys(vm, unsafe { Obj::from_ptr(o) }) {
+        let mut keys: Vec<Key> = vm.own_keys(o).into_iter().map(|(k, _)| k).collect();
+        for s in crate::symbol::own_symbol_keys(vm, o) {
             keys.push(Key::Name(crate::symbol::symbol_atom(vm, s)));
         }
         return Ok(keys);
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "ownKeys")? else {
-        return own_keys(vm, as_object(t));
+        return own_keys(vm, Obj::of(t));
     };
     let r = call_function(vm, f, h, &[t])?;
     if !is_object(r) {
@@ -575,7 +575,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
     }
     // Every non-configurable key of the target's (and of a non-extensible
     // one's, every key and no other).
-    let target = as_object(t);
+    let target = Obj::of(t);
     let extensible = is_extensible(vm, target)?;
     let (mut fixed, mut other) = (Vec::new(), Vec::new());
     for k in own_keys(vm, target)? {
@@ -608,7 +608,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
 
 /// `o`'s own enumerable string keys (not symbols), in order: what
 /// `Object.keys`, `for … in` and `JSON.stringify` list.
-pub(crate) fn enumerable_own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
+pub(crate) fn enumerable_own_keys(vm: &mut Vm, o: Obj) -> Result<Vec<Key>> {
     let mut out = Vec::new();
     for key in own_keys(vm, o)? {
         if let Key::Name(a) = key
@@ -624,70 +624,70 @@ pub(crate) fn enumerable_own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key
 }
 
 /// `o.[[GetPrototypeOf]]()`.
-pub(crate) fn get_prototype_of(vm: &mut Vm, o: *mut Object) -> Result<Value> {
+pub(crate) fn get_prototype_of(vm: &mut Vm, o: Obj) -> Result<Value> {
     if !is_proxy(vm, o) {
         return Ok(o.shape().live().proto);
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "getPrototypeOf")? else {
-        return get_prototype_of(vm, as_object(t));
+        return get_prototype_of(vm, Obj::of(t));
     };
     let r = call_function(vm, f, h, &[t])?;
     if !is_object(r) && !r.is_null() {
         return Err(Error::type_error("The proxy's 'getPrototypeOf' trap returned neither an object nor null"));
     }
-    if !is_extensible(vm, as_object(t))? && !same_value(r, get_prototype_of(vm, as_object(t))?) {
+    if !is_extensible(vm, Obj::of(t))? && !same_value(r, get_prototype_of(vm, Obj::of(t))?) {
         return Err(broken("getPrototypeOf", "reported a non-extensible target's prototype otherwise"));
     }
     Ok(r)
 }
 
 /// `o.[[SetPrototypeOf]](proto)`: whether it was set.
-pub(crate) fn set_prototype_of(vm: &mut Vm, o: *mut Object, proto: Value) -> Result<bool> {
+pub(crate) fn set_prototype_of(vm: &mut Vm, o: Obj, proto: Value) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return Ok(vm.set_prototype_of(unsafe { Obj::from_ptr(o) }, proto));
+        return Ok(vm.set_prototype_of(o, proto));
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "setPrototypeOf")? else {
-        return set_prototype_of(vm, as_object(t), proto);
+        return set_prototype_of(vm, Obj::of(t), proto);
     };
     if !to_boolean(call_function(vm, f, h, &[t, proto])?) {
         return Ok(false);
     }
-    if !is_extensible(vm, as_object(t))? && !same_value(proto, get_prototype_of(vm, as_object(t))?) {
+    if !is_extensible(vm, Obj::of(t))? && !same_value(proto, get_prototype_of(vm, Obj::of(t))?) {
         return Err(broken("setPrototypeOf", "changed a non-extensible target's prototype"));
     }
     Ok(true)
 }
 
 /// `o.[[IsExtensible]]()`.
-pub(crate) fn is_extensible(vm: &mut Vm, o: *mut Object) -> Result<bool> {
+pub(crate) fn is_extensible(vm: &mut Vm, o: Obj) -> Result<bool> {
     if !is_proxy(vm, o) {
-        return Ok(Vm::is_extensible(unsafe { Obj::from_ptr(o) }));
+        return Ok(Vm::is_extensible(o));
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "isExtensible")? else {
-        return is_extensible(vm, as_object(t));
+        return is_extensible(vm, Obj::of(t));
     };
     let r = to_boolean(call_function(vm, f, h, &[t])?);
-    if r != is_extensible(vm, as_object(t))? {
+    if r != is_extensible(vm, Obj::of(t))? {
         return Err(broken("isExtensible", "reported the target's extensibility otherwise"));
     }
     Ok(r)
 }
 
 /// `o.[[PreventExtensions]]()`: whether it now isn't extensible.
-pub(crate) fn prevent_extensions(vm: &mut Vm, o: *mut Object) -> Result<bool> {
+pub(crate) fn prevent_extensions(vm: &mut Vm, o: Obj) -> Result<bool> {
     if !is_proxy(vm, o) {
-        vm.prevent_extensions(unsafe { Obj::from_ptr(o) });
+        vm.prevent_extensions(o);
         return Ok(true);
     }
     let (t, h) = parts(o)?;
     let Some(f) = trap(vm, h, "preventExtensions")? else {
-        return prevent_extensions(vm, as_object(t));
+        return prevent_extensions(vm, Obj::of(t));
     };
     let r = to_boolean(call_function(vm, f, h, &[t])?);
-    if r && is_extensible(vm, as_object(t))? {
+    if r && is_extensible(vm, Obj::of(t))? {
         return Err(broken("preventExtensions", "reported an extensible target as not"));
     }
     Ok(r)
@@ -695,16 +695,16 @@ pub(crate) fn prevent_extensions(vm: &mut Vm, o: *mut Object) -> Result<bool> {
 
 /// The target a proxy (or proxy of a proxy …) stands for at the end, for
 /// `Array.isArray` (a TypeError once revoked).
-pub(crate) fn final_target(vm: &Vm, mut o: *mut Object) -> Result<*mut Object> {
+pub(crate) fn final_target(vm: &Vm, mut o: Obj) -> Result<Obj> {
     while is_proxy(vm, o) {
-        o = as_object(parts(o)?.0);
+        o = Obj::of(parts(o)?.0);
     }
     Ok(o)
 }
 
 /// `for … in`'s keys of `o`: its own enumerable string keys, then its
 /// prototypes' not seen before, through proxies' traps.
-pub(crate) fn for_in_names(vm: &mut Vm, o: *mut Object) -> Result<Vec<Vec<u16>>> {
+pub(crate) fn for_in_names(vm: &mut Vm, o: Obj) -> Result<Vec<Vec<u16>>> {
     // This follows the same shadowing rule as the ordinary path in
     // `Vm::for_in_key_array`; proxy traps must not turn it quadratic.
     let mut seen: HashSet<Key> = HashSet::default();
@@ -734,7 +734,7 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: *mut Object) -> Result<Vec<Vec<u16>>>
         if !p.is_cell() {
             return Ok(out);
         }
-        cur = as_object(p);
+        cur = Obj::of(p);
     }
 }
 
@@ -743,11 +743,11 @@ pub(crate) fn is_array(vm: &Vm, v: Value) -> Result<bool> {
     if !is_object(v) {
         return Ok(false);
     }
-    let o = final_target(vm, as_object(v))?;
+    let o = final_target(vm, Obj::of(v))?;
     Ok(o.class() == Class::Array)
 }
 
 /// Proxy `o`'s target (a TypeError once revoked).
-pub(crate) fn target(o: *mut Object) -> Result<Value> {
+pub(crate) fn target(o: Obj) -> Result<Value> {
     Ok(parts(o)?.0)
 }

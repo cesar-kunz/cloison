@@ -34,7 +34,7 @@
 
 use crate::interp::call_function;
 use crate::js::ast::{IMPORT_PARAMS, ImportName, ModuleInfo, Phase};
-use crate::object::{Obj, Object, as_object, object_value};
+use crate::object::{Obj, Object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, same_value};
 use crate::raw::ObjectPtr;
@@ -209,7 +209,7 @@ enum Template {
     DeferDone,
 }
 
-fn template(vm: &mut Vm, t: Template) -> *mut Object {
+fn template(vm: &mut Vm, t: Template) -> Obj {
     if vm.modules.templates.is_empty() {
         let any = crate::jit::Ty::Any;
         let fs: [(NativeFn, u32); 12] = [
@@ -247,12 +247,12 @@ fn template(vm: &mut Vm, t: Template) -> *mut Object {
             vm.modules.templates.push(o.ptr());
         }
     }
-    vm.modules.templates[t as usize]
+    unsafe { Obj::from_ptr(vm.modules.templates[t as usize]) }
 }
 
 fn closure(vm: &mut Vm, t: Template, data: &[Value]) -> Value {
     let t = template(vm, t);
-    native_closure(vm, unsafe { Obj::from_ptr(t) }, data)
+    native_closure(vm, t, data)
 }
 
 fn rec(vm: &Vm, m: usize) -> &Record {
@@ -1275,7 +1275,7 @@ fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Valu
                 return Err(Error::type_error("The 'with' option of import() must be an object"));
             }
             // (EnumerableOwnProperties: through a proxy's traps too.)
-            let o = as_object(attrs);
+            let o = Obj::of(attrs);
             for key in crate::proxy::own_keys(vm, o)? {
                 if crate::symbol::is_symbol(vm.key_value(key)) {
                     continue;
@@ -1375,14 +1375,14 @@ fn defer_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// `%AbstractModuleSource%`: a constructor that always throws, whose
 /// prototype's `@@toStringTag` getter names a module source's class
 /// (`$262.AbstractModuleSource`, on `host`: not a global).
-pub(crate) fn install(vm: &mut Vm, host: *mut Object) {
+pub(crate) fn install(vm: &mut Vm, host: Obj) {
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
     let proto = vm.new_plain(op);
     let c = vm.native_function("AbstractModuleSource", abstract_source_ctor, 0, any, true);
     crate::builtins::link_constructor(vm, c, proto);
     let a = vm.intern_name("AbstractModuleSource");
-    vm.add_property_with(unsafe { Obj::from_ptr(host) }, a, object_value(c.ptr()), crate::object::DONT_ENUM);
+    vm.add_property_with(host, a, object_value(c.ptr()), crate::object::DONT_ENUM);
     vm.modules.abstract_source = vec![object_value(c.ptr()), object_value(proto.ptr())];
 }
 

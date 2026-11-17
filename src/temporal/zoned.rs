@@ -674,11 +674,11 @@ fn to_temporal_instant(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     create_instant(vm, t as i128 * 1_000_000)
 }
 
-pub(crate) fn install_now(vm: &mut Vm, temporal: *mut Object) {
+pub(crate) fn install_now(vm: &mut Vm, temporal: Obj) {
     let op = object_value(vm.object_prototype);
     let now = vm.new_plain(op);
     let a = vm.intern_name("Now");
-    vm.add_property_with(unsafe { Obj::from_ptr(temporal) }, a, object_value(now.ptr()), crate::object::DONT_ENUM);
+    vm.add_property_with(temporal, a, object_value(now.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
         now,
         &[

@@ -1072,7 +1072,7 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
     if !is_object(promises) {
         return Err(Error::type_error("Promise.allKeyed: the argument is not an object"));
     }
-    let o = as_object(promises);
+    let o = Obj::of(promises);
     let a_then = vm.a_then;
     let keys = vm.new_array();
     let values = vm.new_array();

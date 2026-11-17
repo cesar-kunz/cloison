@@ -6688,7 +6688,7 @@ impl Vm {
         let s = self.ctor_root(f);
         // (Given to an object a full marking under way may not trace.)
         crate::object::mark_shape(s);
-        object_value(self.heap.alloc_object(s.live()))
+        object_value(self.heap.alloc_plain(s.live()))
     }
 
     /// The shape `new f` gives `this` now: the root for `f.prototype` and

@@ -1028,11 +1028,40 @@ impl Heap {
     /// slots (a closure's upvalues), its class's words after the header
     /// (`code`, `aux`) and the extra words zero, the slots `undefined`.
     pub fn alloc_object_extra(&mut self, shape: &Shape, extra: usize) -> *mut Object {
+        self.alloc_object_with(shape, object_header(shape), crate::layout::extra_words(shape.class), extra)
+    }
+
+    /// [`Heap::alloc_object`] of a plain object (no words past the header):
+    /// inlined where objects are made most, literals and `new`.
+    #[inline(always)]
+    pub fn alloc_plain(&mut self, shape: &Shape) -> *mut Object {
+        debug_assert_eq!(crate::layout::extra_words(shape.class), 0);
+        // (`object_header`'s, without its checks.)
+        let cap = shape.capacity.get() as u64;
+        let header = [
+            shape as *const Shape as u64,
+            crate::layout::header_word(Class::Plain, crate::object::EXTERNAL, cap),
+            0,
+            0,
+        ];
+        debug_assert_eq!(header, object_header(shape));
+        self.alloc_object_with(shape, header, 0, 0)
+    }
+
+    /// [`Heap::alloc_object_extra`] with `header`, `object_header(shape)`,
+    /// and `words`, the class's.
+    #[inline(always)]
+    fn alloc_object_with(
+        &mut self,
+        shape: &Shape,
+        header: [u64; crate::layout::HEADER_WORDS],
+        words: usize,
+        extra: usize,
+    ) -> *mut Object {
         let cap = shape.capacity.get() as usize;
-        let words = crate::layout::extra_words(shape.class);
         let o = self.alloc(object_bytes(words + cap + extra)).cast::<Object>();
         unsafe {
-            o.cast::<[u64; crate::layout::HEADER_WORDS]>().write(object_header(shape));
+            o.cast::<[u64; crate::layout::HEADER_WORDS]>().write(header);
             let after = o.cast::<u8>().add(HEADER_BYTES).cast::<u64>();
             // (Not `write_bytes`: a call to `memset` for none, a plain
             // object's.)

@@ -1126,7 +1126,9 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     }
     let fenv = if crate::props::is_object(decl) { decl } else { local };
     let envs = [Value::UNDEFINED, local, fenv].into_iter().chain(scopes.iter().copied());
-    vm.with_eval_envs(envs, |vm| crate::interp::run_script_with(vm, code, this, kept, as_object(carrier)))
+    vm.with_eval_envs(envs, |vm| {
+        crate::interp::run_script_with(vm, code, this, kept, crate::object::Obj::of(carrier).ptr())
+    })
 }
 
 /// A direct `eval` site's binding (see [`site_bindings`]): its name, kind,

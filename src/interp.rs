@@ -1121,9 +1121,11 @@ handlers! {
         }
         (*frame_vm(regs)).intrinsic_code = frame_code(regs);
         // (What a conversion or a string past the longest left pending,
-        // thrown as a native's caller throws it: see `call_function_on`.)
+        // thrown as a native's caller throws it: see `call_function_on`. As
+        // a native, it holds the atoms it takes, a key list across a
+        // getter's call: see `Vm::held_atoms`.)
         let r = with_top(regs, None, |vm| {
-            let r = f(vm, args);
+            let r = vm.run_native(|vm| f(vm, args));
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
         });
         next_or_throw!(Op::Intrinsic.size(), r)

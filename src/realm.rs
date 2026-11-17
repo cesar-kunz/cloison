@@ -50,7 +50,9 @@ impl Field for *mut Object {
 
 impl Field for Obj {
     fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
-        f(crate::gc::Root::Object(&mut crate::object::obj_slots(std::slice::from_mut(self))[0]))
+        // SAFETY: the slot goes to the collector, which writes there only
+        // where the cell moved.
+        f(crate::gc::Root::Object(&mut unsafe { crate::object::obj_slots(std::slice::from_mut(self)) }[0]))
     }
     fn trace(&self, out: &mut Vec<Value>) {
         out.push(object_value(self.ptr()));

@@ -1600,11 +1600,15 @@ impl Obj {
     }
 }
 
-/// Cells `v` as slots, for a collection that moves them (`gc::Root`):
-/// what it writes there is where each moved, never null, as `Obj` holds.
-pub(crate) fn obj_slots(v: &mut [Obj]) -> &mut [*mut Object] {
+/// Cells `v` as slots, for a collection that moves them (`gc::Root`).
+///
+/// # Safety
+/// Only a cell's new address, never null, may be written through them
+/// (as the collector does when it moves one): `Obj` holds a non-null
+/// pointer to a live cell.
+pub(crate) unsafe fn obj_slots(v: &mut [Obj]) -> &mut [*mut Object] {
     // SAFETY: `Obj` is a transparent `NonNull<Object>`, of `*mut Object`'s
-    // layout; the collector writes only cells' new addresses.
+    // layout.
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), v.len()) }
 }
 

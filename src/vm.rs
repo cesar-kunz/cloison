@@ -7655,15 +7655,18 @@ impl Vm {
         ] {
             f(Root::Object(o));
         }
+        // SAFETY: the slots go to the collector, which writes there only
+        // where a cell moved.
+        let obj_slots = |v| unsafe { crate::object::obj_slots(v) };
         for v in [
-            crate::object::obj_slots(&mut self.typed_prototypes),
-            crate::object::obj_slots(&mut self.typed_constructors),
-            crate::object::obj_slots(&mut self.collection_prototypes),
+            obj_slots(&mut self.typed_prototypes),
+            obj_slots(&mut self.typed_constructors),
+            obj_slots(&mut self.collection_prototypes),
             &mut self.promise_roots[..],
-            crate::object::obj_slots(&mut self.iterator_roots),
-            crate::object::obj_slots(&mut self.symbol_roots),
-            crate::object::obj_slots(&mut self.error_prototypes),
-            crate::object::obj_slots(&mut self.shadow_roots),
+            obj_slots(&mut self.iterator_roots),
+            obj_slots(&mut self.symbol_roots),
+            obj_slots(&mut self.error_prototypes),
+            obj_slots(&mut self.shadow_roots),
             &mut self.intl_roots[..],
             &mut self.bound_fns[..],
         ] {
@@ -7742,8 +7745,9 @@ impl Vm {
 
     /// After a full marking: forget the tagged templates whose codes are all
     /// freed and whose arrays it didn't find (`live`: a cell found).
-    pub(crate) fn prune_templates(&mut self, live: impl Fn(Obj) -> bool) {
-        self.template_cache.retain(|_, (o, codes)| !codes.is_empty() || live(unsafe { Obj::from_ptr(*o) }));
+    pub(crate) fn prune_templates(&mut self, live: impl Fn(*mut Object) -> bool) {
+        // (A pointer: the cell may be dead, which an `Obj` never is.)
+        self.template_cache.retain(|_, (o, codes)| !codes.is_empty() || live(*o));
     }
 
     /// The string constants' slots.

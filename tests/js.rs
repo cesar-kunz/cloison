@@ -10177,3 +10177,50 @@ for (var i = 0; i < 50; i++) { spread(mk(false)); rest(mk(false)); }
 "#;
     assert_eq!(value(src), "0:1 0:1 0:1");
 }
+
+/// A store through the runtime (a proxy on the receiver's chain) whose
+/// trap is a native that writes (`unshift`, bound) changes another
+/// array's elements: compiled code holding that array's type reads them
+/// as they are now, not as int32 (#333). Named, string-keyed and indexed
+/// stores, with other writing natives as the trap.
+#[test]
+fn a_native_trap_writing_in_a_compiled_store_is_seen_after_it() {
+    let src = r#"
+"use strict";
+var out = [];
+function trial(writer, store) {
+  var A = [];
+  for (var i = 0; i < 100; i++) A.push(i + 1);
+  var t1 = function (t, k, v, r) { return true; };
+  var traps = [Reflect.set, t1];
+  var handler = { set: t1 };
+  function C() {}
+  C.prototype = new Proxy(A, handler);
+  function f(h, k) {
+    var o = new C();
+    var a = h[0];
+    store(o, k);
+    var b = h[0] + 1;
+    return [a, b, h.length];
+  }
+  var r, N = 3000;
+  for (var k = 0; k < N; k++) {
+    handler.set = k == N - 1 ? writer : traps[k & 1];
+    r = f(A, k & 1023);
+  }
+  return JSON.stringify(r);
+}
+var call = Function.prototype.call;
+var writers = [call.bind(Array.prototype.unshift), call.bind(Array.prototype.splice),
+  call.bind(Array.prototype.fill), call.bind(Array.prototype.reverse)];
+var stores = [function (o, k) { o.x = k; }, function (o, k) { o["y" + (k & 1)] = k; },
+  function (o, k) { o[k & 3] = k; }];
+for (var w = 0; w < writers.length; w++)
+  for (var s = 0; s < stores.length; s++) out.push(trial(writers[w], stores[s]));
+out.join(" ")"#;
+    assert_eq!(
+        value(src),
+        "[1,\"x1\",103] [1,\"y11\",103] [1,\"31\",103] [1,\"1\",1] [1,\"1\",1] [1,2,4] [1,2,100] [1,2,100] [1,2,100] \
+         [1,101,100] [1,101,100] [1,101,100]"
+    );
+}

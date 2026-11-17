@@ -1054,7 +1054,9 @@ extern "C" fn cloison_rt_create_regexp(p: Value, f: Value) -> u64 {
 /// `args[0][args[1]] = args[2]` (what `set_keyed` stencils don't store
 /// themselves: a typed array's element, one past an array's length, a
 /// named property, …); 0 where it would throw or run code (the
-/// interpreter does it). It may change the elements' type, so the
+/// interpreter does it), a native that writes too, as a proxy's trap or a
+/// setter (see [`reading`]: it could change other objects' elements, which
+/// no epoch says, #333). It may change the elements' type, so the
 /// receiver's shape: `set_keyed_rt` forgets exact shapes (a named
 /// property's transition gives a shape extending the old one).
 extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
@@ -1069,11 +1071,13 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
     if o.is_cell() && key.is_cell() && Obj::of(key).class() == Class::String {
         let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
         vm.store_failed = false;
-        return u64::from(
-            vm.set_named_plain(o, key, v).is_some()
-                && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
-                && !vm.store_failed,
-        );
+        return reading(vm, |vm| {
+            u64::from(
+                vm.set_named_plain(o, key, v).is_some()
+                    && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
+                    && !vm.store_failed,
+            )
+        });
     }
     if !o.is_cell() || !key.is_int32() || key.as_i32_unchecked() < 0 {
         return 0;
@@ -1125,9 +1129,7 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
     // (A store that did nothing: the interpreter's again, which throws in
     // strict code. One whose conversion needed a call too.)
     vm.store_failed = false;
-    vm.conv_redo = false;
-    let stored = vm.set_keyed(o, key, v).is_ok() && !vm.store_failed;
-    u64::from(stored && !std::mem::take(&mut vm.conv_redo))
+    reading(vm, |vm| u64::from(vm.set_keyed(o, key, v).is_ok() && !vm.store_failed))
 }
 
 /// `o.name` (`name` an `Atom`), or 0 where it would throw or call a
@@ -1154,9 +1156,17 @@ extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
     let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
     vm.store_failed = false;
     let old = if a[0].is_cell() { Obj::of(a[0]).shape() } else { std::ptr::null() };
-    let ok = vm.set_named_rt(a[0], name, a[2]).is_some()
-        && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
-        && !vm.store_failed;
+    // (Replay-checked, as the store may run a native, a proxy's `set`
+    // trap: one that writes, `Array.prototype.unshift` bound, could change
+    // an array's elements under code that holds its type, moving no epoch
+    // (#333). It is left to the redo.)
+    let ok = reading(vm, |vm| {
+        u64::from(
+            vm.set_named_rt(a[0], name, a[2]).is_some()
+                && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
+                && !vm.store_failed,
+        )
+    }) != 0;
     if ok {
         vm.mega_store_note(a[0], old, name);
     }

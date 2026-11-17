@@ -4191,7 +4191,9 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
     if global {
         set_last_index(vm, r, 0.0)?;
     }
-    let results = vm.handle_scope(|vm| -> Result<Vec<Value>> {
+    // (One handle scope for both loops: the second runs user code, and the
+    // results, `exec`'s own objects maybe, are held by `results` alone.)
+    vm.handle_scope(|vm| -> Result<Value> {
         let mut results = Vec::new();
         loop {
             let res = rx_exec(vm, r, s)?;
@@ -4209,67 +4211,66 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
                 set_last_index(vm, r, advance(&su, i, unicode))?;
             }
         }
-        Ok(results)
-    })?;
-    let mut out = Vec::new();
-    let mut next = 0;
-    for res in results {
-        let n = get_length(vm, res, "length")?;
-        let ncaps = (n - 1.0).max(0.0) as usize;
-        let matched = get_units(vm, res, "0")?;
-        let ai = vm.intern_name("index");
-        let pv = vm.get(res, ai)?;
-        let p = to_number(pv);
-        let position = if p.is_nan() { 0 } else { p.max(0.0).min(su.len() as f64) as usize };
-        let mut caps = Vec::with_capacity(ncaps);
-        for k in 1..=ncaps {
-            let v = vm.get_keyed(res, Value::from_i32(k as i32))?;
-            caps.push(if v.is_undefined() {
-                None
-            } else {
-                let sv = crate::intrinsics::to_string(vm, v)?;
-                Some(string_units(sv).unwrap_or(&[]).to_vec())
-            });
-        }
-        let ag = vm.intern_name("groups");
-        let named = vm.get(res, ag)?;
-        let replacement = if functional {
-            let mut args = vec![vm.new_string(&matched)];
-            for c in &caps {
-                args.push(match c {
-                    Some(u) => vm.new_string(u),
-                    None => Value::UNDEFINED,
+        let mut out = Vec::new();
+        let mut next = 0;
+        for res in results {
+            let n = get_length(vm, res, "length")?;
+            let ncaps = (n - 1.0).max(0.0) as usize;
+            let matched = get_units(vm, res, "0")?;
+            let ai = vm.intern_name("index");
+            let pv = vm.get(res, ai)?;
+            let p = to_number(pv);
+            let position = if p.is_nan() { 0 } else { p.max(0.0).min(su.len() as f64) as usize };
+            let mut caps = Vec::with_capacity(ncaps);
+            for k in 1..=ncaps {
+                let v = vm.get_keyed(res, Value::from_i32(k as i32))?;
+                caps.push(if v.is_undefined() {
+                    None
+                } else {
+                    let sv = crate::intrinsics::to_string(vm, v)?;
+                    Some(string_units(sv).unwrap_or(&[]).to_vec())
                 });
             }
-            args.push(Value::from_i32(position as i32));
-            args.push(s);
-            if !named.is_undefined() {
-                args.push(named);
-            }
-            let v = vm.handle_scope(|vm| {
-                vm.handles.extend_from_slice(&args);
-                crate::interp::call_function(vm, replace, Value::UNDEFINED, &args)
-            })?;
-            let sv = crate::intrinsics::to_string(vm, v)?;
-            // (Past the longest string, if it is used: thrown before a long
-            // string's units are read.)
+            let ag = vm.intern_name("groups");
+            let named = vm.get(res, ag)?;
+            let replacement = if functional {
+                let mut args = vec![vm.new_string(&matched)];
+                for c in &caps {
+                    args.push(match c {
+                        Some(u) => vm.new_string(u),
+                        None => Value::UNDEFINED,
+                    });
+                }
+                args.push(Value::from_i32(position as i32));
+                args.push(s);
+                if !named.is_undefined() {
+                    args.push(named);
+                }
+                let v = vm.handle_scope(|vm| {
+                    vm.handles.extend_from_slice(&args);
+                    crate::interp::call_function(vm, replace, Value::UNDEFINED, &args)
+                })?;
+                let sv = crate::intrinsics::to_string(vm, v)?;
+                // (Past the longest string, if it is used: thrown before a long
+                // string's units are read.)
+                if position >= next {
+                    check_string_len(out.len() + (position - next) + string_len(sv).unwrap_or(0))?;
+                }
+                string_units(sv).unwrap_or(&[]).to_vec()
+            } else {
+                let named = if named.is_undefined() { named } else { object_value((vm.to_object(named)?).ptr()) };
+                substitution(vm, &matched, &su, position, &caps, named, &template)?
+            };
             if position >= next {
-                check_string_len(out.len() + (position - next) + string_len(sv).unwrap_or(0))?;
+                out.extend_from_slice(&su[next..position]);
+                out.extend_from_slice(&replacement);
+                next = (position + matched.len()).min(su.len());
+                check_string_len(out.len())?;
             }
-            string_units(sv).unwrap_or(&[]).to_vec()
-        } else {
-            let named = if named.is_undefined() { named } else { object_value((vm.to_object(named)?).ptr()) };
-            substitution(vm, &matched, &su, position, &caps, named, &template)?
-        };
-        if position >= next {
-            out.extend_from_slice(&su[next..position]);
-            out.extend_from_slice(&replacement);
-            next = (position + matched.len()).min(su.len());
-            check_string_len(out.len())?;
         }
-    }
-    out.extend_from_slice(&su[next.min(su.len())..]);
-    vm.try_new_string(&out)
+        out.extend_from_slice(&su[next.min(su.len())..]);
+        vm.try_new_string(&out)
+    })
 }
 
 /// SpeciesConstructor(r, %RegExp%).

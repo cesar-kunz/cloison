@@ -119,12 +119,27 @@ fn generate_from<'p>(
     };
 
     let mut decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
-    let boxed = boxed_lexicals(p, &decls);
+    let mut boxed = boxed_lexicals(p, &decls);
+    // A loop's block-scoped variables in a scope object of the loop's, a
+    // new one at each iteration, where there are too many for registers.
+    let mut loop_boxes: Vec<LoopBoxes> = (0..p.functions.len()).map(|_| LoopBoxes::default()).collect();
     // A function with more variables than registers keeps the last ones
     // in a scope object (`%env`, a register; see `Gen::function`).
     let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
     // Its variables in another's register (see below), with that one.
     let mut shared: Vec<Vec<(&str, &str)>> = vec![Vec::new(); p.functions.len()];
+    // (The script's own variables are all in registers: past them, so
+    // its loops', see below.)
+    if decls[0].len() > LOCAL_REGS {
+        let regs = decls[0].len();
+        let mut nests = captured_loop_lexicals(p, 0);
+        loop_boxes[0].take(p, &mut nests, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
+        let lb = &loop_boxes[0];
+        decls[0].retain(|n| !lb.vars.contains_key(n));
+        decls[0].splice(0..0, LOOP_BOXES[..lb.regs].iter().copied());
+        shared[0].extend(lb.vars.iter().map(|(&n, &r)| (n, r)));
+        boxed[0].extend(lb.vars.keys().copied());
+    }
     for i in 1..p.functions.len() {
         if p.functions[i].has_eval || p.functions[i].generator || p.functions[i].is_async {
             // Its parameters and `var`s in its scope object, where direct
@@ -150,8 +165,23 @@ fn generate_from<'p>(
             };
             d.extend(rest.iter().copied().filter(|&n| !in_env(n)));
             let env_vars: Vec<&str> = rest.iter().copied().filter(|&n| in_env(n)).collect();
-            d.extend(env_vars.iter().copied());
-            overflow[i] = decls[i][..params].iter().copied().filter(|&n| in_env(n)).chain(env_vars).collect();
+            overflow[i] =
+                decls[i][..params].iter().copied().filter(|&n| in_env(n)).chain(env_vars.iter().copied()).collect();
+            // (Past the registers, the variables of its loops that nested
+            // functions use in the loops' scope objects: the largest
+            // loops', until the rest fits.)
+            if d.len() > LOCAL_REGS {
+                let regs = d.len();
+                let mut nests = captured_loop_lexicals(p, i);
+                loop_boxes[i].take(p, &mut nests, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
+                let lb = &loop_boxes[i];
+                d.retain(|n| !lb.vars.contains_key(n));
+                d.splice(params + 1..params + 1, LOOP_BOXES[..lb.regs].iter().copied());
+                shared[i].extend(lb.vars.iter().map(|(&n, &r)| (n, r)));
+                boxed[i].retain(|n| !lb.vars.contains_key(n));
+                boxed[i].extend(lb.vars.keys().copied());
+            }
+            d.extend(env_vars);
             decls[i] = d;
             continue;
         }
@@ -165,7 +195,7 @@ fn generate_from<'p>(
                 .collect();
             let mut d: Vec<&str> = decls[i][..params].to_vec();
             d.push(ENV);
-            d.extend(implicit.iter().copied());
+            let fixed = d.len() + implicit.len();
             // (Registers first for the block-scoped ones of its loops that
             // nested functions use: each iteration's is a binding of its
             // own, which the one scope object can't hold. Those of one
@@ -173,14 +203,24 @@ fn generate_from<'p>(
             // the others' too: no two loops' are live at once, and a
             // binding's start closes what closures made of its register.)
             let mut loops = captured_loop_lexicals(p, i);
+            // (A loop with more of them than the registers left has them
+            // in a scope object of its own, a new one for each iteration,
+            // and so the loops in it: one register for each such loop,
+            // by depth. The largest loops, until the others' fit.)
+            loop_boxes[i].take(p, &mut loops, |most, _, objects| fixed + objects + most > LOCAL_REGS)?;
+            let lb = &loop_boxes[i];
+            d.extend(LOOP_BOXES[..lb.regs].iter().copied());
+            // (The objects' registers stay registers, whatever the
+            // parameters leave.)
+            let kept = d.len();
+            d.extend(implicit.iter().copied());
+            shared[i].extend(lb.vars.iter().map(|(&n, &r)| (n, r)));
+            boxed[i].extend(lb.vars.keys().copied());
+            let mut loops: Vec<Vec<&str>> = loops.into_iter().map(|l| l.1).collect();
             let most = (0..loops.len()).max_by_key(|&k| loops[k].len());
             let slots = most.map_or(Vec::new(), |k| loops.swap_remove(k));
             // (Without such a loop, what is past the registers overflows
             // as ever, `arguments` and the function's name too.)
-            if !slots.is_empty() && d.len() + slots.len() > LOCAL_REGS {
-                let left = LOCAL_REGS.saturating_sub(d.len());
-                return unsupported(f.pos, format_args!("more than {left} variables of one loop used by closures"));
-            }
             for (&n, &slot) in loops.iter().flat_map(|l| l.iter().zip(&slots)) {
                 shared[i].push((n, slot));
             }
@@ -190,7 +230,7 @@ fn generate_from<'p>(
             d.extend(decls[i][params..].iter().copied().filter(apart));
             // (A few of them in registers past the others', not to put
             // out of theirs the variables declared last.)
-            overflow[i] = d.split_off((LOCAL_REGS + slots.len().min(LOOP_REGS)).min(d.len()));
+            overflow[i] = d.split_off((LOCAL_REGS + (lb.regs + slots.len()).min(LOOP_REGS)).max(kept).min(d.len()));
             d.extend(overflow[i].iter().copied());
             decls[i] = d;
         }
@@ -270,8 +310,19 @@ fn generate_from<'p>(
         match emit[i] {
             Emit::Skip => {}
             Emit::Compile => {
-                let mut f = Gen::new(p, &decls, &overflow[i], &overflow, &boxed, &scopes, &names, i, lazy.is_some())
-                    .function()?;
+                let mut f = Gen::new(
+                    p,
+                    &decls,
+                    &overflow[i],
+                    &overflow,
+                    &boxed,
+                    &loop_boxes[i],
+                    &scopes,
+                    &names,
+                    i,
+                    lazy.is_some(),
+                )
+                .function()?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
                 if i != 0 {
@@ -1273,8 +1324,8 @@ fn declared_in<'a>(s: &'a Stmt, p: &'a Program, annex_b: bool, out: &mut Vec<&'a
 /// variables declared in it (its head too; the parser's own, as a class's
 /// home objects) that `f`'s nested functions use: each iteration's a
 /// binding of its own, which the closures made in it keep.
-fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<Vec<&'a str>> {
-    fn stmt<'a>(s: &'a Stmt, p: &'a Program, f: usize, out: &mut Vec<Vec<&'a str>>) {
+fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<(&'a Stmt<'a>, Vec<&'a str>)> {
+    fn stmt<'a>(s: &'a Stmt<'a>, p: &'a Program, f: usize, out: &mut Vec<(&'a Stmt<'a>, Vec<&'a str>)>) {
         match &s.kind {
             StmtKind::For { .. }
             | StmtKind::ForIn { .. }
@@ -1291,7 +1342,7 @@ fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<Vec<&'a str>>
                     }
                 }
                 if !ns.is_empty() {
-                    out.push(ns);
+                    out.push((s, ns));
                 }
             }
             StmtKind::If(_, a, b) => {
@@ -1323,11 +1374,141 @@ fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<Vec<&'a str>>
             j = p.functions[k].parent;
         }
     }
-    for ns in &mut out {
+    for (_, ns) in &mut out {
         ns.retain(|n| used.contains(n));
     }
-    out.retain(|ns| !ns.is_empty());
+    out.retain(|(_, ns)| !ns.is_empty());
     out
+}
+
+/// The loops in statement `s` (itself, if one), not those in other loops,
+/// or with `nested` those too.
+fn loops_in<'a>(s: &'a Stmt<'a>, nested: bool, out: &mut Vec<&'a Stmt<'a>>) {
+    match &s.kind {
+        StmtKind::For { body, .. }
+        | StmtKind::ForIn { body, .. }
+        | StmtKind::ForOf { body, .. }
+        | StmtKind::While(_, body)
+        | StmtKind::DoWhile(body, _) => {
+            out.push(s);
+            if nested {
+                loops_in(body, nested, out);
+            }
+        }
+        StmtKind::If(_, a, b) => {
+            loops_in(a, nested, out);
+            if let Some(b) = b {
+                loops_in(b, nested, out);
+            }
+        }
+        StmtKind::With(_, _, body) | StmtKind::Labeled(_, body) => loops_in(body, nested, out),
+        StmtKind::Block(b) => b.iter().for_each(|s| loops_in(s, nested, out)),
+        StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| loops_in(s, nested, out)),
+        StmtKind::Try(b, c, t) => try_blocks(b, c, t).for_each(|s| loops_in(s, nested, out)),
+        _ => {}
+    }
+}
+
+/// The registers of loops' scope objects (see [`LoopBoxes`]), by how many
+/// loops with one enclose the loop: no two of a depth are live at once.
+const LOOP_BOXES: [&str; 32] = [
+    "%loop^0", "%loop^1", "%loop^2", "%loop^3", "%loop^4", "%loop^5", "%loop^6", "%loop^7", "%loop^8", "%loop^9",
+    "%loop^10", "%loop^11", "%loop^12", "%loop^13", "%loop^14", "%loop^15", "%loop^16", "%loop^17", "%loop^18",
+    "%loop^19", "%loop^20", "%loop^21", "%loop^22", "%loop^23", "%loop^24", "%loop^25", "%loop^26", "%loop^27",
+    "%loop^28", "%loop^29", "%loop^30", "%loop^31",
+];
+
+/// A loop's scope object: the register it is in, and its variables.
+struct LoopBox<'a> {
+    reg: &'static str,
+    vars: Vec<&'a str>,
+}
+
+/// A function's loops whose block-scoped variables that nested functions
+/// use are in a scope object, a new one for each iteration, where the
+/// function has no register for each (see [`generate_from`]): by loop
+/// (its statement's address), and each such variable's object's register.
+/// The object is a box of several variables (see [`boxed_lexicals`]),
+/// which closures capture as they would each variable. A loop's own
+/// variables, not those of the loops in it, which have theirs: a block's
+/// bindings are made once in an iteration of the nearest loop, so one
+/// object for the iteration holds them all.
+#[derive(Default)]
+struct LoopBoxes<'a> {
+    loops: HashMap<usize, LoopBox<'a>>,
+    vars: HashMap<&'a str, &'static str>,
+    /// How many registers they take.
+    regs: usize,
+}
+
+impl<'a> LoopBoxes<'a> {
+    /// The scope objects of loop `s` and of the loops in it, for `names`,
+    /// the variables to place (those of a loop in it there, the others
+    /// in its own); `depth` loops with one enclose it.
+    fn add(&mut self, p: &'a Program<'_>, s: &'a Stmt<'a>, names: &[&'a str], depth: usize) -> R<()> {
+        deep(s.pos)?;
+        let (StmtKind::For { body, .. }
+        | StmtKind::ForIn { body, .. }
+        | StmtKind::ForOf { body, .. }
+        | StmtKind::While(_, body)
+        | StmtKind::DoWhile(body, _)) = &s.kind
+        else {
+            return Ok(());
+        };
+        // What each loop in it places: the variables declared there, and
+        // the parser's own made there.
+        let mut inner = Vec::new();
+        loops_in(body, false, &mut inner);
+        let mut parts: Vec<Vec<&str>> = Vec::new();
+        let mut own: Vec<&str> = names.to_vec();
+        for l in &inner {
+            let mut declared = Vec::new();
+            declared_in(l, p, false, &mut declared);
+            let mut all = Vec::new();
+            loops_in(l, true, &mut all);
+            let hidden = |n: &str| p.loop_hidden.get(n).is_some_and(|h| all.iter().any(|l| l.pos == h.1));
+            let part: Vec<&str> = own.iter().copied().filter(|n| declared.contains(n) || hidden(n)).collect();
+            own.retain(|n| !part.contains(n));
+            parts.push(part);
+        }
+        let below = if own.is_empty() {
+            depth
+        } else {
+            let Some(&reg) = LOOP_BOXES.get(depth) else {
+                return unsupported(s.pos, "loops nested this deep with this many variables used by closures");
+            };
+            self.regs = self.regs.max(depth + 1);
+            self.vars.extend(own.iter().map(|&n| (n, reg)));
+            self.loops.insert(s as *const Stmt as usize, LoopBox { reg, vars: own });
+            depth + 1
+        };
+        for (l, part) in inner.into_iter().zip(parts) {
+            if !part.is_empty() {
+                self.add(p, l, &part, below)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The loops among `nests` (see [`captured_loop_lexicals`]), largest
+    /// first, taken out of them and given scope objects while `over`:
+    /// called with the largest left's variables, how many have been
+    /// placed, and the registers of the objects so far.
+    fn take(
+        &mut self,
+        p: &'a Program<'_>,
+        nests: &mut Vec<(&'a Stmt<'a>, Vec<&'a str>)>,
+        over: impl Fn(usize, usize, usize) -> bool,
+    ) -> R<()> {
+        while let Some(k) = (0..nests.len()).max_by_key(|&k| nests[k].1.len()) {
+            if !over(nests[k].1.len(), self.vars.len(), self.regs) {
+                break;
+            }
+            let (s, names) = nests.swap_remove(k);
+            self.add(p, s, &names, 0)?;
+        }
+        Ok(())
+    }
 }
 
 /// Whether `name` in function `index` is a named function expression's
@@ -2139,6 +2320,8 @@ struct Gen<'a> {
     overflows: &'a [Vec<&'a str>],
     /// Every function's variables in boxes (see [`boxed_lexicals`]).
     boxed: &'a [Vec<&'a str>],
+    /// The function's loops with a scope object (see [`LoopBoxes`]).
+    loop_boxes: &'a LoopBoxes<'a>,
     /// The next free temporary.
     temp: usize,
     acc: Acc,
@@ -2185,6 +2368,10 @@ struct Gen<'a> {
     /// A `for (let …)` loop's captured variables, for [`Gen::looping`] to
     /// give each iteration its own.
     fresh: Vec<&'a str>,
+    /// The scope object of the loop about to be compiled, for its code to
+    /// make each iteration's, and those of its variables each takes over
+    /// (a `for (let …)` head's).
+    fresh_box: Option<(&'a LoopBox<'a>, Vec<&'a str>)>,
     /// Compiling the function's entry (see [`Gen::fresh_binding`]).
     entering: bool,
     /// Compiling its parameters' defaults (a direct `eval` there may not
@@ -2218,6 +2405,7 @@ impl<'a> Gen<'a> {
         overflow: &'a [&'a str],
         overflows: &'a [Vec<&'a str>],
         boxed: &'a [Vec<&'a str>],
+        loop_boxes: &'a LoopBoxes<'a>,
         scopes: &'a Scopes<'a>,
         names: &'a std::cell::RefCell<HashSet<Name>>,
         index: usize,
@@ -2236,7 +2424,8 @@ impl<'a> Gen<'a> {
                 .map(|(i, &n)| (n, (i + 1) as u8))
                 .collect()
         };
-        for &(n, with) in &decls[index].shared {
+        // (Not a loop's scope object's: no register is the variable.)
+        for &(n, with) in decls[index].shared.iter().filter(|s| !loop_boxes.vars.contains_key(s.0)) {
             locals.insert(n, locals[with]);
         }
         // (Past the registers of the variables: some of the scope object's
@@ -2270,6 +2459,7 @@ impl<'a> Gen<'a> {
             overflow,
             overflows,
             boxed,
+            loop_boxes,
             shared_ics: HashMap::default(),
             string_ids: HashMap::default(),
             number_ids: HashMap::default(),
@@ -2300,6 +2490,7 @@ impl<'a> Gen<'a> {
             cleared: std::ptr::null(),
             depth: 0,
             fresh: Vec::new(),
+            fresh_box: None,
             entering: false,
             in_params: false,
             param_tdz_near: {
@@ -2474,8 +2665,9 @@ impl<'a> Gen<'a> {
             self.temp = mark;
         }
         // Each boxed variable's first box (see `boxed_lexicals`).
+        // (Not those of a loop's scope object, which the loop makes.)
         let boxed = self.boxed;
-        for &n in &boxed[self.index] {
+        for &n in boxed[self.index].iter().filter(|n| !self.loop_boxes.vars.contains_key(*n)) {
             let mark = self.temp;
             let t = self.alloc(self.f.pos)?;
             self.emit(Op::LdaUndefined, &[]);
@@ -3111,6 +3303,15 @@ impl<'a> Gen<'a> {
     /// A new binding for block-scoped `n`: its register's upvalue closed,
     /// and (`hole`) the register not initialized.
     fn fresh_binding(&mut self, n: &str, hole: bool, pos: Pos) -> R<()> {
+        // (In its loop's scope object, new at each iteration: the
+        // binding is new with it.)
+        if self.loop_boxes.vars.contains_key(n) {
+            if hole {
+                self.emit(Op::LdaHole, &[]);
+                self.init_var(n, pos)?;
+            }
+            return Ok(());
+        }
         if self.boxed[self.index].contains(&n) {
             return self.fresh_box(n, hole, pos);
         }
@@ -3152,6 +3353,54 @@ impl<'a> Gen<'a> {
         self.new_box(r, t, n);
         self.temp = mark;
         Ok(())
+    }
+
+    /// A new scope object for loop `b` (see [`LoopBoxes`]): its register's
+    /// upvalue closed (closures so far keep the old object), its
+    /// variables not initialized, but `copy`, which keep their values
+    /// (ECMA-262 CreatePerIterationEnvironment).
+    fn fresh_loop_box(&mut self, b: &LoopBox<'a>, copy: &[&str], pos: Pos) -> R<()> {
+        let r = self.locals[b.reg];
+        let mark = self.temp;
+        let t = self.alloc(pos)?;
+        let cap = b.vars.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
+        let ic = self.auto_ic(&format!("[]{cap}"));
+        self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
+        self.star(t);
+        // (A store leaves the value in `acc`, for the next one.)
+        let mut last = None;
+        for &n in &b.vars {
+            if copy.contains(&n) {
+                self.named(Op::GetNamed, r, &self.env_key(n));
+                last = None;
+            } else {
+                // (One never read before it is set: a function's, the
+                // parser's own.)
+                let op = match self.p.lexicals.get(n) {
+                    Some(l) if l.hoisted => Op::LdaUndefined,
+                    _ => Op::LdaHole,
+                };
+                if last != Some(op) {
+                    self.emit(op, &[]);
+                    last = Some(op);
+                }
+            }
+            self.named(Op::SetNamed, t, &self.env_key(n));
+        }
+        self.emit(Op::CloseUpvalue, &[Arg::Reg(r)]);
+        self.mov(t, r);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// The scope object of loop `s`, if it has one, made (its first).
+    fn enter_loop(&mut self, s: &Stmt) -> R<Option<&'a LoopBox<'a>>> {
+        let boxes = self.loop_boxes;
+        let b = boxes.loops.get(&(s as *const Stmt as usize));
+        if let Some(b) = b {
+            self.fresh_loop_box(b, &[], s.pos)?;
+        }
+        Ok(b)
     }
 
     /// A box into register `r` whose variable `n` is register `v`'s value.
@@ -3737,13 +3986,18 @@ impl<'a> Gen<'a> {
             }
             return Ok(Var::Reg(r));
         }
+        // (Its loop's scope object's.)
+        if let Some(b) = self.loop_boxes.vars.get(name) {
+            return Ok(Var::Scope(self.locals[b]));
+        }
         if self.overflow.contains(&name) {
             return Ok(Var::Scope(self.locals[ENV]));
         }
         // An enclosing function's variable in its scope object, through
         // that object's register (an upvalue).
         let mut f = self.f.parent;
-        while let Some(k) = f.filter(|&k| k != 0) {
+        // (The script's variables too, if a loop's scope object has some.)
+        while let Some(k) = f.filter(|&k| k != 0 || !self.boxed[0].is_empty()) {
             if self.decls[k].position(name).is_some() {
                 // (In its scope object: see `generate`.)
                 if self.overflows[k].contains(&name) {
@@ -7060,6 +7314,8 @@ impl<'a> Gen<'a> {
             }
             StmtKind::For { init, test, update, body } => {
                 let mut fresh = Vec::new();
+                let scope = self.enter_loop(s)?;
+                let mut head = Vec::new();
                 match init {
                     Some(ForInit::Var(ds)) => self.var_decls(ds)?,
                     Some(ForInit::Lexical(_, ds)) => {
@@ -7077,6 +7333,10 @@ impl<'a> Gen<'a> {
                         for n in &fresh {
                             self.fresh_binding(n, false, s.pos)?;
                         }
+                        if let Some(b) = scope {
+                            head = b.vars.iter().copied().filter(|v| ds.iter().any(|(n, _)| &**n == *v)).collect();
+                            self.fresh_loop_box(b, &head, s.pos)?;
+                        }
                     }
                     Some(ForInit::Expr(e)) => self.effect(e)?,
                     None => {}
@@ -7086,13 +7346,18 @@ impl<'a> Gen<'a> {
                     Some(c) => first_test_passes(init.as_ref(), c),
                 };
                 self.fresh = fresh;
+                self.fresh_box = scope.map(|b| (b, head));
                 self.looping(labels, *test, *update, body, !first_passes)?;
             }
             StmtKind::While(c, body) => {
                 let first_passes = matches!(c.kind, ExprKind::Bool(true));
+                self.fresh_box = self.enter_loop(s)?.map(|b| (b, Vec::new()));
                 self.looping(labels, Some(c), None, body, !first_passes)?;
             }
-            StmtKind::DoWhile(body, c) => self.looping(labels, Some(c), None, body, false)?,
+            StmtKind::DoWhile(body, c) => {
+                self.fresh_box = self.enter_loop(s)?.map(|b| (b, Vec::new()));
+                self.looping(labels, Some(c), None, body, false)?
+            }
             StmtKind::With(o, name, body) => {
                 // (Each time the statement runs, its own binding: closures in
                 // it keep their object, `for (…) with (o) f = () => x`. First:
@@ -7114,9 +7379,11 @@ impl<'a> Gen<'a> {
                 res?;
             }
             StmtKind::ForIn { name, object, body, fresh, .. } => {
+                self.fresh_box = self.enter_loop(s)?.map(|b| (b, Vec::new()));
                 self.for_in(labels, name, *fresh, object, body, s.pos)?
             }
             StmtKind::ForOf { kind, target, iterable, body, pattern, is_await } => {
+                self.fresh_box = self.enter_loop(s)?.map(|b| (b, Vec::new()));
                 self.for_of(labels, *kind, target, pattern.as_deref(), iterable, body, *is_await, s.pos)?
             }
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
@@ -7268,6 +7535,7 @@ impl<'a> Gen<'a> {
         is_await: bool,
         pos: Pos,
     ) -> R<()> {
+        let scope = self.fresh_box.take();
         let it = self.alloc(pos)?;
         // (`for await`: whether over a sync iterator, stepped as
         // AsyncFromSyncIterator; `[record, sync, v]` for the intrinsics.
@@ -7343,6 +7611,10 @@ impl<'a> Gen<'a> {
         self.resume_try();
         self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
         self.jump_if(Jmp::True, done);
+        // (Each iteration's scope object, if the loop has one.)
+        if let Some((b, _)) = &scope {
+            self.fresh_loop_box(b, &[], pos)?;
+        }
         match (kind, &target.kind) {
             _ if pattern.is_some() => {
                 let p = pattern.unwrap();
@@ -7442,6 +7714,7 @@ impl<'a> Gen<'a> {
     /// `keys; i = 0; Jump test; body: x = keys[i]; …; continue: i++;
     /// test: keys.length > i, back to body; break:`.
     fn for_in(&mut self, labels: Vec<Name>, name: &str, fresh: bool, object: &Expr, body: &'a Stmt, pos: Pos) -> R<()> {
+        let scope = self.fresh_box.take();
         if fresh {
             self.fresh_binding(name, true, pos)?;
         }
@@ -7462,6 +7735,10 @@ impl<'a> Gen<'a> {
         let (top, cont, test, brk) = (self.loop_label(), self.label(), self.label(), self.label());
         self.jump(test);
         self.bind(top);
+        // (Each iteration's scope object, if the loop has one.)
+        if let Some((b, _)) = &scope {
+            self.fresh_loop_box(b, &[], pos)?;
+        }
         self.ldar(i);
         let ic = self.auto_ic("[]keyed");
         self.emit(Op::GetKeyed, &[Arg::Reg(keys), ic]);
@@ -7544,6 +7821,7 @@ impl<'a> Gen<'a> {
         jump_to_test: bool,
     ) -> R<()> {
         let fresh = std::mem::take(&mut self.fresh);
+        let scope = self.fresh_box.take();
         let (top, cont, test_l, brk) = (self.loop_label(), self.label(), self.label(), self.label());
         if jump_to_test {
             self.jump(test_l);
@@ -7556,6 +7834,11 @@ impl<'a> Gen<'a> {
         // `for (let i …)`: closures of this iteration keep its `i`.
         for n in fresh {
             self.fresh_binding(n, false, body.pos)?;
+        }
+        // (Its scope object, if it has one: the next iteration's, with
+        // the head's variables as they are, before the update.)
+        if let Some((b, head)) = &scope {
+            self.fresh_loop_box(b, head, body.pos)?;
         }
         if let Some(u) = update {
             self.effect(u)?;

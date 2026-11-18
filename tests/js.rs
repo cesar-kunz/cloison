@@ -2865,7 +2865,8 @@ fn a_loop_test_s_class_bindings_stay_fresh_past_the_registers() {
 /// registers of another's (no two loops' are live at once), so any number
 /// of loops fits; the parser's own variables too (a class's home objects
 /// and inner name, an object's); one loop with more than the registers
-/// left is refused, not given one binding for all its iterations. The
+/// left has them in a scope object, a new one at each iteration (it was
+/// refused: #298), beside loops whose variables share registers. The
 /// expected values are V8's, SpiderMonkey's and JSC's.
 #[test]
 fn loop_bindings_share_registers_past_them() {
@@ -2903,8 +2904,18 @@ fn loop_bindings_share_registers_past_them() {
     );
     assert_eq!(value(&src), "0 1:9,,2:4,,7:8:1:undefined,8:9:1:undefined,11,21,12,13,4,12,5,15,7,1,0,8,101,1 199");
     let lets: String = (0..200).map(|i| format!("const c{i} = j + {i}; fs.push(() => c{i});\n")).collect();
-    let e = compile_error(&format!("(() => {{ var fs = []; for (var j = 0; j < 2; j++) {{ {lets} }} }})();"));
-    assert!(e.contains("unsupported: more than 159 variables of one loop used by closures"), "{e}");
+    let src = format!(
+        r#"(() => {{
+  var fs = [], gs = [];
+  for (const a of [1, 2]) {{ let a2 = a * 2; gs.push(() => a + ":" + a2); }}
+  for (var j = 0; j < 2; j++) {{ {lets} gs.push(() => j + c0 + c199); }}
+  for (const b of [7, 8]) {{ let b2 = b + 1; gs.push(() => b + ":" + b2); }}
+  var s = 0;
+  for (const f of fs) s += f();
+  return fs.length + " " + s + " " + fs[0]() + " " + fs[399]() + " " + gs.map(f => f()).join();
+}})();"#
+    );
+    assert_eq!(value(&src), "400 40000 0 200 1:2,2:4,201,203,7:8,8:9");
 }
 
 /// The registers such variables have past the others' are the
@@ -2939,8 +2950,10 @@ fn loop_binding_registers_leave_room_for_temporaries() {
 }
 
 /// Parameters alone past the registers, with `arguments` (which then has
-/// none): without a loop whose variables closures use there is nothing
-/// to refuse, and with one it is refused as above.
+/// none): no register is left for a loop's variables that closures use,
+/// which its scope object has, a new one at each iteration (it was
+/// refused: #298). Loops nested deeper than there are registers for
+/// their scope objects are still refused.
 #[test]
 fn parameters_past_the_registers_need_no_loop_bindings() {
     let params: Vec<String> = (0..159).map(|i| format!("p{i}")).collect();
@@ -2948,11 +2961,671 @@ fn parameters_past_the_registers_need_no_loop_bindings() {
     let src =
         format!("(function ({params}) {{ var v = arguments.length + p0; return v + arguments[1]; }})(10, 20, 30);");
     assert_eq!(value(&src), "33");
-    let e = compile_error(&format!(
-        "(function ({params}) {{ var fs = []; for (let j = 0; j < 3; j++) fs.push(() => j); return fs; }})();"
-    ));
-    assert!(e.contains("unsupported: more than 0 variables of one loop used by closures"), "{e}");
+    let src = format!(
+        "(function ({params}) {{ var fs = []; for (let j = 0; j < 3; j++) fs.push(() => j + p0); \
+         return fs.map(f => f()).join() + arguments.length; }})(10, 20);"
+    );
+    assert_eq!(value(&src), "10,11,122");
+    let nest = |depth: usize| {
+        let open: String =
+            (0..depth).map(|i| format!("for (let j{i} = 0; j{i} < 1; j{i}++) {{ fs.push(() => j{i}); ")).collect();
+        format!("(function ({params}) {{ var fs = []; {open}{} return fs.length; }})();", "}".repeat(depth))
+    };
+    assert_eq!(value(&nest(32)), "32");
+    let e = compile_error(&nest(33));
+    assert!(e.contains("unsupported: loops nested this deep with this many variables used by closures"), "{e}");
 }
+
+/// `body` in code that leaves no register for the block-scoped variables
+/// of its loops that closures use, which are then in a scope object of
+/// each loop's, a new one at each iteration (#298): a function with 159
+/// parameters (sloppy, strict, an arrow, a method), a script with 170
+/// other block-scoped variables, a function with those and a direct
+/// `eval`, and a generator with 170 other such variables in boxes. First
+/// in a function with registers for them all. `out.join("\n")` is each
+/// one's value.
+fn past_the_registers(body: &str, strict: bool) -> Vec<(&'static str, String)> {
+    let list = |f: &dyn Fn(usize) -> String, sep: &str| (0..170).map(f).collect::<Vec<_>>().join(sep);
+    let params = (0..159).map(|i| format!("p{i}")).collect::<Vec<_>>().join(", ");
+    let block = format!("{{ let {}; }}", list(&|i| format!("b{i}"), ", "));
+    let boxed = format!(
+        "{{ let {}; var keep = () => {}; }}",
+        list(&|i| format!("b{i} = {i}"), ", "),
+        list(&|i| format!("b{i}"), " + ")
+    );
+    let end = "\nout.join('\\n');";
+    let mut v = vec![
+        ("in registers", format!("var out = [];\n(function () {{\n{body}\n}})();{end}")),
+        ("a function", format!("var out = [];\n(function ({params}) {{\n{body}\n}})();{end}")),
+        ("an arrow", format!("var out = [];\n(({params}) => {{\n{body}\n}})();{end}")),
+        ("a script", format!("var out = [];\n{block}\n{body}{end}")),
+        ("with a direct eval", format!("var out = [];\n(function () {{\n{block}\neval('0');\n{body}\n}})();{end}")),
+        ("a generator", format!("var out = [];\nfor (const _ of (function* () {{\n{boxed}\n{body}\n}})());{end}")),
+    ];
+    if strict {
+        v.push(("strict", format!("var out = [];\n(function ({params}) {{\n'use strict';\n{body}\n}})();{end}")));
+        v.push(("a method", format!("var out = [];\nnew (class {{ m({params}) {{\n{body}\n}} }})().m();{end}")));
+    }
+    v
+}
+
+/// Loops whose block-scoped variables that closures use have no registers
+/// (see `past_the_registers`): each iteration has its own scope object
+/// for them, a `for (let …)` loop's with the head's variables as the
+/// iteration before left them (ECMA-262 CreatePerIterationEnvironment), so
+/// a closure keeps its iteration's bindings, and the update and the test
+/// run on the new ones. Such a loop was refused (#298). The expected
+/// values are V8's, SpiderMonkey's and JavaScriptCore's (`LOOP_SCOPE_CASES`:
+/// a name, whether strict code may have it, the code, what it gives).
+#[test]
+fn loops_past_the_registers_have_a_scope_object_per_iteration() {
+    for (name, strict, body, want) in LOOP_SCOPE_CASES {
+        for (how, src) in past_the_registers(body, *strict) {
+            assert_eq!(value(&src), *want, "{name}, {how}");
+        }
+    }
+    // More variables than one object has inline: a head's, the body's.
+    let sum = (0..180).map(|k| format!("h{k}")).collect::<Vec<_>>().join(" + ");
+    let head = (0..180).map(|k| format!("h{k} = {k}")).collect::<Vec<_>>().join(", ");
+    let body = format!(
+        "var fs = [];\nfor (let {head}; h0 < 2; h0++, h179 += 2) fs.push(() => {sum});\n\
+         out.push(fs.map(f => f()).join());"
+    );
+    for (how, src) in past_the_registers(&body, true) {
+        assert_eq!(value(&src), "16110,16113", "a head's, {how}");
+    }
+    let lets: String = (0..200).map(|k| format!("  const c{k} = j * 1000 + {k}; fs.push(() => c{k});\n")).collect();
+    let body = format!(
+        "var fs = [];\nfor (var j = 0; j < 3; j++) {{\n{lets}}}\n\
+         var s = 0; for (const f of fs) s += f(); out.push(fs.length, s, fs[0](), fs[599]());"
+    );
+    for (how, src) in past_the_registers(&body, true) {
+        assert_eq!(value(&src), "600\n659700\n0\n2199", "a body's, {how}");
+    }
+}
+
+/// Such loops in a generator and in an async function: the scope objects
+/// outlive the `yield`s and `await`s in the loops, each iteration's its
+/// own. With 159 parameters, and with 170 other block-scoped variables
+/// in boxes.
+#[test]
+fn loop_scope_objects_outlive_yields_and_awaits() {
+    let params = (0..159).map(|i| format!("p{i}")).collect::<Vec<_>>().join(", ");
+    let boxed = format!(
+        "{{ let {}; var keep = () => {}; }}",
+        (0..170).map(|i| format!("b{i} = {i}")).collect::<Vec<_>>().join(", "),
+        (0..170).map(|i| format!("b{i}")).collect::<Vec<_>>().join(" + ")
+    );
+    for (params, boxed) in [("", ""), (&*params, ""), ("", &*boxed)] {
+        for (name, body, want) in LOOP_SCOPE_GENERATOR_CASES {
+            let src = format!(
+                "var out = [];\nvar it = (function* ({params}) {{\n{boxed}\n{body}\n}})(); var r, n = 0;\n\
+                 while (!(r = it.next(n++ * 100)).done) out.push('y' + r.value);\nout.join('\\n');"
+            );
+            assert_eq!(value(&src), *want, "{name}");
+        }
+        for (name, body, want) in LOOP_SCOPE_ASYNC_CASES {
+            let src = format!(
+                "var out = [];\n(async function ({params}) {{\n{boxed}\n{body}\n}})()\
+                 .then(() => {{ globalThis.out = out.join('\\n'); }}, e => {{ globalThis.out = 'rejected ' + e; }});"
+            );
+            assert_eq!(out_after_jobs(&src), *want, "{name}");
+        }
+    }
+}
+
+const LOOP_SCOPE_CASES: &[(&str, bool, &str, &str)] = &[
+    (
+        "for_let_basic",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) fs.push(() => i);
+out.push(fs.map(f => f()).join());
+"#,
+        "0,1,2",
+    ),
+    (
+        "for_let_body_mutation",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 6; i++) { fs.push(() => i); i += 1; fs.push(() => i); }
+out.push(fs.map(f => f()).join());
+"#,
+        "1,1,3,3,5,5",
+    ),
+    (
+        "for_let_head_closures",
+        true,
+        r#"
+var fs = [];
+for (let i = 0, g = () => i, h = () => ++i; i < 3; fs.push(() => i), i++) { fs.push(g, () => i); if (i == 1) h(); }
+out.push(fs.map(f => f()).join());
+"#,
+        "1,0,1,1,1,2,1,2,3",
+    ),
+    (
+        "for_let_update_closure",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; fs.push(() => i), i < 3; fs.push(() => i), i++) { fs.push(() => i * 10); }
+out.push(fs.map(f => f()).join());
+var gs = [];
+for (let i = 0, j = 10; i < 3; i++, j--) { gs.push(() => [i, j], () => { i++; j++; }); }
+gs[1](); gs[3](); gs[3]();
+out.push(JSON.stringify(gs.filter((_, k) => k % 2 == 0).map(f => f())));
+"#,
+        "0,0,1,1,10,2,2,20,3,3\n[[1,11],[3,11],[2,8]]",
+    ),
+    (
+        "for_let_setter_shares_iteration",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { fs.push([() => i, v => { i = v; }]); }
+fs[0][1](40); fs[1][1](50);
+out.push(fs.map(p => p[0]()).join());
+"#,
+        "40,50,2",
+    ),
+    (
+        "for_let_test_sees_copy",
+        true,
+        r#"
+var log = [];
+var set;
+for (let i = 0; i < 3; i++) { if (i == 0) set = () => { i = 100; }; else if (i == 1) set(); log.push(i); }
+out.push(log.join());
+"#,
+        "0,1,2",
+    ),
+    (
+        "for_const_head",
+        true,
+        r#"
+var fs = [];
+for (const c = { n: 0 }; c.n < 3; c.n++) fs.push(() => c.n);
+out.push(fs.map(f => f()).join());
+try { for (const k = 0; k < 2; k++) fs.push(() => k); } catch (e) { out.push(e.constructor.name); }
+"#,
+        "3,3,3\nTypeError",
+    ),
+    (
+        "for_of",
+        true,
+        r#"
+var fs = [];
+for (const v of [1, 2, 3]) fs.push(() => v);
+for (let v of [4, 5]) { fs.push(() => v); v += 10; }
+for (const [a, { b, c = a + b }] of [[1, { b: 2 }], [3, { b: 4, c: 5 }]]) fs.push(() => a + ":" + b + ":" + c);
+out.push(fs.map(f => f()).join());
+"#,
+        "1,2,3,14,15,1:2:3,3:4:5",
+    ),
+    (
+        "for_in",
+        true,
+        r#"
+var fs = [];
+for (const k in { x: 1, y: 2 }) fs.push(() => k);
+for (let k in { p: 1, q: 2 }) { fs.push(() => k); k += "!"; }
+for (var w in { m: 1, n: 2 }) { let l = w + w; fs.push(() => l); }
+out.push(fs.map(f => f()).join());
+"#,
+        "x,y,p!,q!,mm,nn",
+    ),
+    (
+        "for_of_tdz_iterable",
+        true,
+        r#"
+var f;
+try { for (const x of (f = () => x, [x])) out.push("no"); } catch (e) { out.push(e.constructor.name); }
+try { f(); out.push("no"); } catch (e) { out.push(e.constructor.name); }
+for (const y of (f = () => typeof y, [1])) { out.push(f.call === undefined); }
+try { f(); out.push("no"); } catch (e) { out.push(e.constructor.name); }
+try { for (let k in (f = () => k, { a: k })) out.push("no"); } catch (e) { out.push(e.constructor.name); }
+"#,
+        "ReferenceError\nReferenceError\nfalse\nReferenceError\nReferenceError",
+    ),
+    (
+        "body_declarations",
+        true,
+        r#"
+var fs = [];
+for (var j = 0; j < 3; j++) {
+  let a = j * 2; const b = a + 1;
+  class C { static s = j; m() { return C.s + a; } }
+  function h() { return a + b; }
+  fs.push(() => a, () => b, () => new C().m(), h, () => h() + 1);
+  a++;
+}
+out.push(fs.map(f => f()).join());
+"#,
+        "1,1,1,2,3,3,3,4,6,7,5,5,7,10,11",
+    ),
+    (
+        "while_do_while",
+        true,
+        r#"
+var fs = [], n = 0;
+while (n < 3) { let a = n * 2; fs.push(() => a); n++; if (n == 2) continue; a += 100; }
+do { let b = n; const c = () => b; fs.push(c, () => c() + 1); n--; } while (n > 0);
+out.push(fs.map(f => f()).join());
+"#,
+        "100,2,104,3,4,2,3,1,2",
+    ),
+    (
+        "while_test_class",
+        true,
+        r#"
+var fs = [], n = 0;
+while (fs.push(class C { static m() { return C.k; } static k = n++; }) < 3) { let z = n; fs.push(() => z); }
+out.push(fs.map(f => typeof f.m == "function" ? f.m() : f()).join());
+"#,
+        "0,1,1",
+    ),
+    (
+        "tdz",
+        true,
+        r#"
+for (var j = 0; j < 2; j++) {
+  try { f(); out.push("no"); } catch (e) { out.push(e.constructor.name); }
+  try { a = 1; out.push("no"); } catch (e) { out.push(e.constructor.name); }
+  try { out.push(typeof a); } catch (e) { out.push(e.constructor.name); }
+  function f() { return a; }
+  let a = j;
+  out.push(f());
+  const c = 5;
+  try { c = 6; } catch (e) { out.push(e.constructor.name); }
+  try { (() => { c = 7; })(); } catch (e) { out.push(e.constructor.name); }
+  out.push(c);
+}
+for (let i = (() => { try { return i; } catch (e) { out.push(e.constructor.name); return 0; } })(); i < 1; i++) {}
+"#,
+        "ReferenceError\nReferenceError\nReferenceError\n0\nTypeError\nTypeError\n5\nReferenceError\nReferenceError\nReferenceError\n1\nTypeError\nTypeError\n5\nReferenceError",
+    ),
+    (
+        "tdz_per_iteration",
+        true,
+        r#"
+var g;
+for (var j = 0; j < 3; j++) {
+  if (j > 0) { try { g2(); out.push("no"); } catch (e) { out.push(e.constructor.name); } out.push(g()); }
+  function g2() { return a; }
+  let a = j;
+  g = () => a;
+}
+"#,
+        "ReferenceError\n0\nReferenceError\n1",
+    ),
+    (
+        "nested_loops",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 2; i++) {
+  let a = i * 10;
+  for (let j = 0; j < 2; j++) {
+    let b = a + j;
+    for (const k of [0, 1]) { const c = b * 2 + k; fs.push(() => [i, j, k, a, b, c].join("")); }
+    fs.push(() => i + "/" + j + "/" + b);
+  }
+  fs.push(() => "a" + a);
+}
+out.push(fs.map(f => f()).join());
+"#,
+        "000000,001001,0/0/0,010012,011013,0/1/1,a0,100101020,101101021,1/0/10,110101122,111101123,1/1/11,a10",
+    ),
+    (
+        "nested_inner_sees_outer_update",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 2; i++) {
+  let a = 0;
+  for (let j = 0; j < 2; j++) { fs.push(() => a + ":" + j); a++; }
+  fs.push(() => a);
+}
+out.push(fs.map(f => f()).join());
+"#,
+        "2:0,2:1,2,2:0,2:1,2",
+    ),
+    (
+        "continue_break_labels",
+        true,
+        r#"
+var fs = [];
+out: for (const p of [1, 2, 3]) {
+  let u = p * 2;
+  for (const q of [10, 20]) {
+    let w = q + u;
+    fs.push(() => p + q + ":" + u + ":" + w);
+    if (q === 10 && p === 2) continue out;
+    if (p === 3) break out;
+    u++;
+  }
+  fs.push(() => "u" + u);
+}
+for (let i = 0; i < 5; i++) { let t = i; if (i % 2) continue; fs.push(() => t + "," + i); if (i == 2) break; }
+blk: for (let i = 0; i < 2; i++) { inner: { let z = i; fs.push(() => "z" + z); if (i == 0) break inner; fs.push(() => "y" + z); } }
+out.push(fs.map(f => f()).join());
+"#,
+        "11:4:12,21:4:23,u4,12:4:14,13:6:16,0,0,2,2,z0,z1,y1",
+    ),
+    (
+        "return_from_loop",
+        true,
+        r#"
+function run(n) {
+  var fs = [];
+  for (let i = 0; i < 5; i++) { let d = i * 2; fs.push(() => d + i); if (i == n) return fs; }
+  return fs;
+}
+out.push(run(2).map(f => f()).join(), run(9).map(f => f()).join());
+"#,
+        "0,3,6\n0,3,6,9,12",
+    ),
+    (
+        "try_finally",
+        true,
+        r#"
+var fs = [];
+for (const r of [4, 5, 6]) { try { fs.push(() => r); if (r === 4) continue; if (r === 6) break; } finally { let t = r * 3; fs.push(() => t); } }
+for (let i = 0; i < 3; i++) {
+  let v = i;
+  try { if (i == 1) throw i; fs.push(() => "ok" + v); } catch (e) { let w = e + v; fs.push(() => "c" + w + e); } finally { v += 10; }
+}
+for (let i = 0; i < 2; i++) { try { throw { i }; } catch ({ i: x }) { fs.push(() => "x" + x + i); } }
+function thrower() { for (let i = 0; i < 3; i++) { let s = i; fs.push(() => "t" + s); if (i == 1) throw "boom"; } }
+try { thrower(); } catch (e) { fs.push(() => e); }
+out.push(fs.map(f => f()).join());
+"#,
+        "4,12,5,15,6,18,ok10,c21,ok12,x00,x11,t0,t1,boom",
+    ),
+    (
+        "switch_in_loop",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 4; i++) {
+  switch (i) {
+    case 0: let a = "a" + i; fs.push(() => a);
+    case 1: let b = "b" + i; fs.push(() => b); break;
+    case 2: try { fs.push(() => a); a; } catch (e) { fs.push(() => e.constructor.name); } break;
+    default: const d = i; fs.push(() => d);
+  }
+}
+out.push(fs.map(f => { try { return f(); } catch (e) { return "!" + e.constructor.name; } }).join());
+"#,
+        "a0,b0,b1,!ReferenceError,ReferenceError,3",
+    ),
+    (
+        "closures_nested_deeper",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { let a = i; fs.push(() => () => () => a + i, function () { return (() => { a += 5; return a; })(); }); }
+out.push(fs[0]()()(), fs[1](), fs[0]()()(), fs[2]()()(), fs[5](), fs[4]()()());
+"#,
+        "0\n5\n5\n2\n7\n9",
+    ),
+    (
+        "class_in_loop",
+        true,
+        r#"
+var cs = [];
+for (let i = 0; i < 3; i++) {
+  cs.push(class K { static n = i; #p = i * 2; get p() { return this.#p + K.n; } static make() { return new K(); } });
+  const o = { __proto__: { v() { return i; } }, v() { return super.v() + 1; } };
+  cs.push(o);
+}
+out.push(cs.map(c => c.make ? c.make().p : c.v()).join());
+"#,
+        "0,1,3,2,6,3",
+    ),
+    (
+        "with_in_loop",
+        false,
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { let y = i; with ({ x: i * 2 }) { fs.push(() => x + y); } }
+out.push(fs.map(f => f()).join());
+"#,
+        "0,3,6",
+    ),
+    (
+        "eval_in_loop",
+        false,
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { let a = i * 3; fs.push(eval("() => a + i"), () => eval("a - i"), eval("(function () { a++; return a; })")); eval("a += 100"); }
+out.push(fs.map(f => f()).join());
+for (let i = 0; i < 2; i++) { const c = i; try { eval("c = 5"); } catch (e) { out.push(e.constructor.name); } try { eval("d; let d"); } catch (e) { out.push(e.constructor.name); } fs.push(() => c); }
+for (let i = 0; i < 2; i++) { eval("var ev" + i + " = i"); let q = i; fs.push(() => q); }
+out.push(typeof ev0, typeof ev1);
+"#,
+        "100,100,101,104,102,104,108,104,107\nTypeError\nReferenceError\nTypeError\nReferenceError\nnumber\nnumber",
+    ),
+    (
+        "sloppy_block_function",
+        false,
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { { function bf() { return i; } } fs.push(bf); let k = i; fs.push(() => k); }
+out.push(fs.map(f => f()).join(), typeof bf);
+"#,
+        "0,0,1,1,2,2\nfunction",
+    ),
+    (
+        "arguments_and_this",
+        false,
+        r#"
+function A() { this.v = 7; var fs = []; for (let i = 0; i < 2; i++) { let t = i; fs.push(() => this.v + t + arguments.length); } return fs; }
+out.push(new A(1, 2).map(f => f()).join());
+"#,
+        "9,10",
+    ),
+    (
+        "hot_loop",
+        true,
+        r#"
+var acc = 0, last;
+for (let i = 0; i < 20000; i++) { let sq = i * 2; const f = () => sq + i; acc += f(); if (i % 5000 == 0) last = f; }
+out.push(acc, last());
+"#,
+        "599970000\n45000",
+    ),
+    (
+        "destructuring_defaults",
+        true,
+        r#"
+var fs = [];
+for (let [a = 1, b = () => a] of [[], [5]]) { fs.push(b, () => a); a++; }
+for (const { x, ...rest } of [{ x: 1, y: 2 }, { x: 3, z: 4 }]) fs.push(() => x + JSON.stringify(rest));
+out.push(fs.map(f => f()).join());
+"#,
+        "2,2,6,6,1{\"y\":2},3{\"z\":4}",
+    ),
+    (
+        "label_continue_in_do",
+        true,
+        r#"
+var fs = [], n = 0;
+a: do { let m = n; b: for (let i = 0; i < 3; i++) { fs.push(() => m + "-" + i); if (i == 1) continue a; } } while (++n < 3);
+out.push(fs.map(f => f()).join());
+"#,
+        "0-0,0-1,1-0,1-1,2-0,2-1",
+    ),
+    (
+        "sequential_loops_share",
+        true,
+        r#"
+var fs = [];
+for (const a of [1, 2]) { let a2 = a * 2; fs.push(() => a + ":" + a2, v => { a2 = v; }); }
+for (const b of [7, 8]) { let b2 = b + 1; fs[1](b2); fs.push(() => b + ":" + b2 + ":" + fs[0]()); }
+while (fs.length < 8) { let n = fs.length; fs[3](n); fs.push(() => n + fs[2]()); }
+out.push(fs.map(f => f()).join());
+"#,
+        "1:9,,2:7,,7:8:1:undefined,8:9:1:undefined,62:undefined,72:undefined",
+    ),
+    (
+        "recursion",
+        true,
+        r#"
+function rec(d) { var fs = []; for (let i = 0; i < 2; i++) { let v = d * 10 + i; fs.push(() => v + "@" + i); if (d < 2) fs.push(...rec(d + 1)); fs.push(() => v); } return fs; }
+out.push(rec(0).map(f => f()).join());
+"#,
+        "0@0,10@0,20@0,20,21@1,21,10,11@1,20@0,20,21@1,21,11,0,1@1,10@0,20@0,20,21@1,21,10,11@1,20@0,20,21@1,21,11,1",
+    ),
+    (
+        "test_closure",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; fs.push(() => "t" + i), i < 2; i++) { let q = i; fs.push(() => "b" + q + i); }
+out.push(fs.map(f => f()).join());
+"#,
+        "t0,b00,t1,b11,t2",
+    ),
+    (
+        "for_in_delete",
+        true,
+        r#"
+var fs = [], o = { a: 1, b: 2, c: 3 };
+for (const k in o) { let v = o[k]; fs.push(() => k + v); delete o.b; }
+out.push(fs.map(f => f()).join());
+"#,
+        "a1,c3",
+    ),
+    (
+        "break_through_finally",
+        true,
+        r#"
+var fs = [];
+lab: { for (let i = 0; i < 3; i++) { let m = i; try { fs.push(() => "m" + m); if (i == 1) break lab; } finally { let n = m * 2; fs.push(() => "n" + n); } } fs.push(() => "not here"); }
+function r() { for (const v of [1, 2, 3]) { let w = v; try { fs.push(() => "w" + w); if (v == 2) return "ret" + w; } finally { fs.push(() => "fin" + w); } } }
+out.push(r(), fs.map(f => f()).join());
+"#,
+        "ret2\nm0,n0,m1,n2,w1,fin1,w2,fin2",
+    ),
+    (
+        "loop_in_catch_and_switch",
+        true,
+        r#"
+var fs = [];
+try { throw 3; } catch (e) { for (let i = 0; i < e; i++) { let c = e * i; fs.push(() => c + i + e); } }
+switch (fs.length) { case 3: for (const z of [1, 2]) { let zz = z * z; fs.push(() => zz + z); } }
+if (fs.length) for (let i = 0; i < 2; i++) fs.push(() => "if" + i); else for (let i = 0; i < 2; i++) fs.push(() => "else" + i);
+out.push(fs.map(f => f()).join());
+"#,
+        "3,7,11,2,6,if0,if1",
+    ),
+    (
+        "iter_close",
+        true,
+        r#"
+var fs = [], closed = 0;
+var it = { [Symbol.iterator]() { var n = 0; return { next: () => ({ done: false, value: n++ }), return() { closed++; return {}; } }; } };
+for (const v of it) { let d = v * 2; fs.push(() => d + v); if (v == 2) break; }
+try { for (const v of it) { let d = v; fs.push(() => "t" + d); if (v == 1) throw "x"; } } catch (e) { fs.push(() => e); }
+out.push(fs.map(f => f()).join(), closed);
+"#,
+        "0,3,6,t0,t1,x\n2",
+    ),
+    (
+        "empty_iterations",
+        true,
+        r#"
+var fs = [];
+for (let i = 5; i < 3; i++) fs.push(() => i);
+for (const v of []) fs.push(() => v);
+for (const k in {}) fs.push(() => k);
+while (false) { let a = 1; fs.push(() => a); }
+do { let a = 1; fs.push(() => a); } while (false);
+for (let i = 0; ; i++) { let s = i; if (i == 2) break; fs.push(() => s); }
+for (let i = 0, f = () => i; ; ) { fs.push(f, () => i); i = 9; break; }
+out.push(fs.map(f => f()).join());
+"#,
+        "1,0,1,0,9",
+    ),
+    (
+        "closure_in_nested_block",
+        true,
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { { let a = i; { let b = a + 1; if (b) { const c = b + 1; fs.push(() => [i, a, b, c].join("")); } } } }
+out.push(fs.map(f => f()).join());
+"#,
+        "0012,1123,2234",
+    ),
+    (
+        "getter_setter_closures",
+        true,
+        r#"
+var os = [];
+for (let i = 0; i < 3; i++) { let v = i; os.push({ get v() { return v; }, set v(x) { v = x + i; } }); }
+os[1].v = 10; os[2].v = 20;
+out.push(os.map(o => o.v).join());
+"#,
+        "0,11,22",
+    ),
+    (
+        "compound_ops",
+        false,
+        r#"
+var fs = [];
+for (let i = 0; i < 2; i++) { let a = i, b = "s", c = null, d = 1; a += 5; a++; --a; b += a; c ??= i; d **= 3; d ||= 9; [a, d] = [d, a]; ({ c } = { c: c + 1 }); fs.push(() => [a, b, c, d, typeof a, delete a].join("|")); }
+out.push(fs.map(f => f()).join());
+"#,
+        "1|s5|1|5|number|false,1|s6|2|6|number|false",
+    ),
+];
+
+const LOOP_SCOPE_GENERATOR_CASES: &[(&str, &str, &str)] = &[
+    (
+        "gen_yield_in_loop",
+        r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { let a = i * 2; fs.push(() => a + ":" + i); const got = yield i; a += got; fs.push(() => a); }
+for (const v of [7, 8]) { const w = yield v; fs.push(() => v + w); }
+try { for (let i = 0; i < 2; i++) { let b = i; try { yield "t" + i; } finally { fs.push(() => "f" + b + i); } } } finally { fs.push(() => "end"); }
+out.push(fs.map(f => f()).join());
+"#,
+        "y0\ny1\ny2\ny7\ny8\nyt0\nyt1\n100:0,100,202:1,202,304:2,304,407,508,f00,f11,end",
+    ),
+    (
+        "gen_return_mid_loop",
+        r#"
+var fs = [];
+try { for (let i = 0; i < 5; i++) { let a = i; fs.push(() => a); try { if (i == 1) return "r"; yield a; } finally { let z = a + 1; fs.push(() => "z" + z); } } } finally { out.push(fs.map(f => f()).join()); }
+"#,
+        "y0\n0,z1,1,z2",
+    ),
+    (
+        "gen_nested_yield",
+        r#"
+var fs = [];
+for (let i = 0; i < 2; i++) { let a = i; for (const j of [5, 6]) { let b = j + a; fs.push(() => a + ":" + b + ":" + i + j); yield* [b]; a++; } fs.push(() => "a" + a); }
+out.push(fs.map(f => f()).join());
+"#,
+        "y5\ny7\ny6\ny8\n2:5:05,2:7:06,a2,3:6:15,3:8:16,a3",
+    ),
+];
+
+const LOOP_SCOPE_ASYNC_CASES: &[(&str, &str, &str)] = &[(
+    "async_await_in_loop",
+    r#"
+var fs = [];
+for (let i = 0; i < 3; i++) { let a = i * 2; fs.push(() => a + ":" + i); a += await Promise.resolve(10); fs.push(() => a); }
+for (const v of [7, 8]) { const w = await v; fs.push(() => v + w); }
+for await (const v of [Promise.resolve(1), 2]) { let z = v * 3; fs.push(() => z + v); }
+for (let i = 0; i < 2; i++) { let b = i; try { await null; if (i) throw 1; } catch (e) { fs.push(() => "c" + b + e); } finally { fs.push(() => "f" + b); } }
+out.push(fs.map(f => f()).join());
+"#,
+    "10:0,10,12:1,12,14:2,14,14,16,4,8,f0,c11,f1",
+)];
 
 /// A `finally` block run by a `continue` or `break` leaving its `try` is
 /// entered as any block: new bindings, which closures made then keep.

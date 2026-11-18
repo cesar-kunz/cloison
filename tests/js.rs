@@ -10433,4 +10433,16 @@ fn a_function_with_thousands_of_upvalues_reads_each() {
     };
     assert_eq!(value(&many_upvalues(3, 100)), format!("{} 150 2249 1050", sum(3, 100)));
     assert_eq!(value(&many_upvalues(60, 150)), format!("{} 150 59299 30000", sum(60, 150)));
+    // The far ones compiled too (the offset in a register), not exits
+    // at each call. (`v59_148`, used last, is a far one; written here.)
+    let src = many_upvalues(60, 150).replacen("} return s", "v59_148++; v59_148--; } return s", 1);
+    let m = cloison::js::compile(&src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(20);
+    vm.run(&m).unwrap();
+    let stencils = vm.jit_stencils("inner").expect("inner compiled");
+    assert!(stencils.iter().any(|s| s.starts_with("lda_upvalue_far")), "{stencils:?}");
+    assert!(stencils.iter().any(|s| s == "sta_upvalue_far"), "{stencils:?}");
+    let st = vm.jit_stats("inner").unwrap();
+    assert!(st.exits <= 2 && st.compiles <= 3, "{st:?}");
 }

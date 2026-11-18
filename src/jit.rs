@@ -2805,12 +2805,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 | Op::ToNumber
                 | Op::Negate
                 | Op::BitNot => {}
-                // (Past the offset the stencils reach in the function
-                // object, see `MAX_SLOT_OFF`: the interpreter's.)
-                Op::LdaUpvalue | Op::StaUpvalue if vm => {
-                    imm = index_at(code, pc + 1) as i32;
-                    bail = crate::vm::UPVALUES_OFF + 8 * imm as usize > MAX_SLOT_OFF as usize;
-                }
+                Op::LdaUpvalue | Op::StaUpvalue if vm => imm = index_at(code, pc + 1) as i32,
                 Op::Nop | Op::Return | Op::LdaTrue | Op::LdaFalse | Op::LdaUndefined | Op::LdaNull | Op::LdaHole => {}
                 // (The binding's name, for the interpreter's error: an
                 // exit leaves the throw to it.)
@@ -5111,19 +5106,36 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 out.acc = I32;
             }
             let post = int.then_some("check_acc_int");
+            // The cell's offset in the function object, an access's
+            // immediate in the stencils but `_c` and `_far`: past
+            // `MAX_SLOT_OFF`, `_far` (in a register), or in an inlined
+            // frame whose function isn't known the interpreter's.
+            let at = crate::vm::UPVALUES_OFF + 8 * insn.imm as usize;
+            let far = at > MAX_SLOT_OFF as usize;
             return match spec.props.get(i).copied() {
-                Some(Prop::UpvalueAt { off }) => Sel {
-                    ops: Some(((crate::vm::UPVALUES_OFF + 8 * insn.imm as usize) as i32, off as i64 as u64, 0)),
-                    ..Sel::new(if load { "lda_upvalue_fr" } else { "sta_upvalue_fr" }, "", out)
-                },
                 Some(Prop::Upvalue { cell, .. }) if cell != 0 => Sel {
                     ops: Some((0, cell, 0)),
                     post,
                     ..Sel::new(if load { "lda_upvalue_c" } else { "sta_upvalue_c" }, "", out)
                 },
+                Some(Prop::UpvalueAt { .. }) if far => {
+                    if load {
+                        out.acc = Any;
+                    }
+                    Sel::new("bail", "", out)
+                }
+                Some(Prop::UpvalueAt { off }) => Sel {
+                    ops: Some((at as i32, off as i64 as u64, 0)),
+                    ..Sel::new(if load { "lda_upvalue_fr" } else { "sta_upvalue_fr" }, "", out)
+                },
+                _ if far => Sel {
+                    post,
+                    ops: Some((at as i32, 0, 0)),
+                    ..Sel::new(if load { "lda_upvalue_far" } else { "sta_upvalue_far" }, "", out)
+                },
                 _ => Sel {
                     post,
-                    ops: Some(((crate::vm::UPVALUES_OFF + 8 * insn.imm as usize) as i32, 0, 0)),
+                    ops: Some((at as i32, 0, 0)),
                     ..Sel::new(if load { "lda_upvalue" } else { "sta_upvalue" }, "", out)
                 },
             };

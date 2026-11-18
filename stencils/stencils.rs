@@ -6782,6 +6782,27 @@ stencil!("sta_upvalue_c"; |s| {
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
+// `_far`: the cell's offset past what an access's immediate reaches (see
+// `ldst_imm!`, the JIT's `MAX_SLOT_OFF`), a function's with thousands of
+// upvalues: the offset in a register, the 32-bit immediate.
+// (A macro: in the stencils' bodies, no `unsafe` of its own.)
+macro_rules! upvalue_cell_far {
+    ($regs:expr) => {
+        *((*($regs.byte_sub(FUNC_OFF) as *const *mut u8)).add(imm_zext() as usize) as *const *const Upvalue)
+    };
+}
+// target x86_64 lda_upvalue_far: 5 now 6 `mov rax, [r13-80]; mov r10d, off; mov rax, [rax+r10]; mov rax, [rax]; mov r12, [rax]`, LLVM zero-extends `r10d` again (judged 2026-11-18)
+// target aarch64 lda_upvalue_far: 6 `ldur x8, [x21, #-80]; movz; movk; ldr x8, [x8, x9]; ldr x8, [x8]; ldr x20, [x8]`
+stencil!("lda_upvalue_far"; |s| {
+    s.acc = *(*upvalue_cell_far!(s.regs)).at;
+    next!(s)
+});
+stencil!("sta_upvalue_far"; |s| {
+    let u = upvalue_cell_far!(s.regs);
+    store_word((*u).at, s.acc);
+    upvalue_barrier(s.tag, u, s.acc);
+    next!(s)
+});
 
 // target aarch64 lda_global: 10 global object (3), `ldr` shape, shape (3), `cmp`, `b.ne`, `ldr` (docs/arm64-targets.md)
 // target x86_64 lda_global: 5 `movabs rax, global; movabs r10, shape; cmp [rax], r10; jne exit; mov r12, [rax+off]` (judged 2026-10-26)

@@ -180,6 +180,29 @@ Unicode's ID_Start and ID_Continue), early errors for invalid syntax that
 the parser accepts (most of the failures left), and private names in a
 direct `eval`.
 
+## Embedding
+
+The crate is a library too (`cloison::vm`). A run returns a `Local`, the
+value as the host may hold it: valid until the VM's next run or next
+operation that may run JavaScript, and refused (a panic) after that, or
+by another VM. A value kept longer is a `Global`, a root the collector
+keeps and updates.
+
+```rust
+use cloison::vm::{Global, Vm, display};
+
+let mut vm = Vm::new();
+let o = vm.run(&cloison::js::compile("({k: 'v'.repeat(3)})").unwrap()).unwrap();
+let o = Global::new(&vm, o);
+vm.run(&cloison::js::compile("for (var i = 0; i < 1e6; i++) var x = {i: [i]};").unwrap()).unwrap();
+let k = vm.intern("k");
+assert_eq!(display(o.local().get(&mut vm, k).unwrap(), &vm), "vvv");
+```
+
+The operations are `Local`'s (`get`, `set`, `get_keyed`, `call_other`,
+`to_number`, `string_units`, ...); see its documentation for the rule
+and what enforces it.
+
 ## Testing
 
 The differential tests run each program in four engine configurations

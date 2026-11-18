@@ -689,6 +689,22 @@ pub(crate) fn get_prototype_of(vm: &mut Vm, o: Obj) -> Result<Value> {
     Ok(r)
 }
 
+/// A step of a walk up `o`'s prototype chain (OrdinaryHasInstance,
+/// `isPrototypeOf`, for-in): `o.[[GetPrototypeOf]]()`, a proxy counted in
+/// `hops`. Past [`MAX_FORWARDS`] proxies a RangeError, as a lookup's: a
+/// cycle through a proxy (10.1.2.1 step 7.b.i) has no end, and nothing
+/// else bounds the walk (#336).
+pub(crate) fn walk_prototype(vm: &mut Vm, o: Obj, hops: &mut u32) -> Result<Value> {
+    if !is_proxy(vm, o) {
+        return Ok(o.shape().live().proto);
+    }
+    *hops += 1;
+    if *hops > MAX_FORWARDS {
+        return Err(Error::range_error("Maximum call stack size exceeded"));
+    }
+    get_prototype_of(vm, o)
+}
+
 /// `o.[[SetPrototypeOf]](proto)`: whether it was set.
 pub(crate) fn set_prototype_of(vm: &mut Vm, o: Obj, proto: Value) -> Result<bool> {
     if !is_proxy(vm, o) {
@@ -757,6 +773,7 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: Obj) -> Result<Vec<Vec<u16>>> {
     let mut seen: HashSet<Key> = HashSet::default();
     let mut out = Vec::new();
     let mut cur = o;
+    let mut hops = 0;
     loop {
         for key in own_keys(vm, cur)? {
             if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) || seen.contains(&key) {
@@ -777,7 +794,7 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: Obj) -> Result<Vec<Vec<u16>>> {
                 out.push(u);
             }
         }
-        let p = get_prototype_of(vm, cur)?;
+        let p = walk_prototype(vm, cur, &mut hops)?;
         if !p.is_cell() {
             return Ok(out);
         }

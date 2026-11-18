@@ -73,7 +73,6 @@ built-ins/Object/keys/order-after-define-property-with-function.js
 built-ins/Object/prototype/hasOwnProperty/symbol_property_toPrimitive.js
 built-ins/Object/prototype/hasOwnProperty/symbol_property_toString.js
 built-ins/Object/prototype/hasOwnProperty/symbol_property_valueOf.js
-built-ins/Object/prototype/isPrototypeOf/arg-is-proxy.js
 built-ins/Object/prototype/setPrototypeOf-with-non-circular-values-__proto__.js
 built-ins/Object/prototype/setPrototypeOf-with-non-circular-values.js
 built-ins/Object/prototype/toString/symbol-tag-map-builtin.js

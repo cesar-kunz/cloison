@@ -4810,9 +4810,10 @@ impl Vm {
             return Err(Error::type_error("Function has non-object prototype in instanceof check"));
         }
         let mut o = as_object(v);
+        let mut hops = 0;
         loop {
             let proto = if self.proxies_exist {
-                crate::proxy::get_prototype_of(self, unsafe { Obj::from_ptr(o) })?
+                crate::proxy::walk_prototype(self, unsafe { Obj::from_ptr(o) }, &mut hops)?
             } else {
                 unsafe { Obj::from_ptr(o) }.shape().live().proto
             };

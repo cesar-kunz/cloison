@@ -8830,8 +8830,9 @@ fn globals_keep_host_values_across_runs() {
 /// #323: a raw `Value` kept past a collection that freed its cell is
 /// refused by the VM's operations (they panic) rather than read. Of the
 /// objects the host had, the script dropped and collected, a stale word
-/// may keep a few (the native stack is scanned conservatively): those
-/// still read as they were.
+/// may keep a few (the native stack is scanned conservatively), and a
+/// cell made at a freed address since reads as that cell: those read
+/// whatever live object is there, nothing crashes.
 #[test]
 fn stale_raw_values_are_refused() {
     use cloison::value::Value;
@@ -8844,10 +8845,10 @@ fn stale_raw_values_are_refused() {
     run(&mut vm, "a = null; $262.gc(); $262.gc();");
     let k = vm.intern("k");
     let mut refused = 0;
-    for (i, &o) in objs.iter().enumerate() {
+    for &o in &objs {
         match catch_unwind(AssertUnwindSafe(|| vm.get(o, k))) {
             Err(_) => refused += 1,
-            Ok(r) => assert_eq!(display(r.unwrap(), &vm), "v".repeat(i % 7) + &i.to_string()),
+            Ok(r) => drop(display(r.unwrap(), &vm)),
         }
     }
     assert!(refused >= 150, "{refused} of 200 refused");
@@ -8884,10 +8885,12 @@ fn display_checks_the_value_against_its_vm() {
 /// #342: JavaScript a host operation runs (a getter `Vm::get` reads, the
 /// callback of a native `Vm::call_other` calls) collects as a run's does:
 /// the heap stays near what the same code takes run from a script, not
-/// growing with all it allocated. The operation's own values (the array
-/// `forEach` walks, raw from the run before) are rooted meanwhile.
+/// growing with all it allocated. The operation's own values are rooted
+/// meanwhile: the callback, raw from the run just before and referred to
+/// by nothing else (what is kept across runs is held as a `Global`).
 #[test]
 fn host_operations_collect() {
+    use cloison::vm::Global;
     let mut vm = Vm::new();
     let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     let o = run(&mut vm, "({get x() { for (var i = 0; i < 3e6; i++) var a = {b: [i]}; return 1; }})");
@@ -8896,9 +8899,11 @@ fn host_operations_collect() {
     // (3e6 objects and arrays: over 200 MiB uncollected.)
     assert!(vm.heap_allocated() < 96 << 20, "heap {} MiB", vm.heap_allocated() >> 20);
     let arr = run(&mut vm, "var n = 0; [{v: 1}, {v: 2}, {v: 3}].concat(Array(500).fill(0).map((_, i) => ({v: i})))");
-    let cb = run(&mut vm, "(function (e) { for (var i = 0; i < 6000; i++) var a = {b: [i]}; n += e.v; })");
+    let arr = Global::new(&vm, arr);
     let each = run(&mut vm, "Array.prototype.forEach");
-    vm.call_other(each, arr, &[cb]).unwrap();
+    let each = Global::new(&vm, each);
+    let cb = run(&mut vm, "(function (e) { for (var i = 0; i < 6000; i++) var a = {b: [i]}; n += e.v; })");
+    vm.call_other(each.get(&vm), arr.get(&vm), &[cb]).unwrap();
     assert!(vm.heap_allocated() < 96 << 20, "heap {} MiB", vm.heap_allocated() >> 20);
     assert_eq!(display(run(&mut vm, "n"), &vm), (6 + 499 * 500 / 2).to_string());
 }

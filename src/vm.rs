@@ -3555,8 +3555,8 @@ impl Vm {
     /// `interp::current_vm` too: a cons string key made flat, a native
     /// getter), its native stack's limit from here, the VM stack free from
     /// its base for the JS functions it calls (getters, traps, a key's
-    /// `toString`), and `roots`, the host's values it operates on, checked
-    /// (`check_value`, for operation `what`) and rooted, with what is
+    /// `toString`), and `roots` and `args`, the host's values it operates
+    /// on, checked (`check_value`, for operation `what`) and rooted, with what is
     /// pushed to `handles`. What a conversion threw is `f`'s error, none
     /// left pending for the next operation. The JavaScript it runs
     /// collects as a run's would (#342): the collector's native stack
@@ -3566,9 +3566,15 @@ impl Vm {
     /// stale as after a run (see [`Vm::run`]).
     #[cold]
     #[inline(never)]
-    fn host<R>(&mut self, what: &str, roots: &[Value], f: impl FnOnce(&mut Vm) -> Result<R>) -> Result<R> {
+    fn host<R>(
+        &mut self,
+        what: &str,
+        roots: &[Value],
+        args: &[Value],
+        f: impl FnOnce(&mut Vm) -> Result<R>,
+    ) -> Result<R> {
         self.usable()?;
-        roots.iter().for_each(|&v| self.check_value(v, what));
+        roots.iter().chain(args).for_each(|&v| self.check_value(v, what));
         /// What `host` changed, back on return or unwinding.
         struct Entered {
             vm: *mut Vm,
@@ -3609,6 +3615,7 @@ impl Vm {
                 Entered { vm, top: (*vm).native_top, limit: (*vm).native_limit, handles: (*vm).handles.len(), outer };
             (*vm).unmovable += 1;
             (*vm).handles.extend_from_slice(roots);
+            (*vm).handles.extend_from_slice(args);
             if outer {
                 std::ptr::write_volatile(&raw mut (*vm).heap.gc.stack_base, &raw const here as usize & !7);
             }
@@ -3625,7 +3632,7 @@ impl Vm {
     /// `obj[name]`.
     pub fn get(&mut self, obj: Value, name: Atom) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::get", &[obj], |vm| vm.get(obj, name));
+            return self.host("Vm::get", &[obj], &[], |vm| vm.get(obj, name));
         }
         self.check_own(obj, "Vm::get");
         if !obj.is_cell() {
@@ -3878,7 +3885,7 @@ impl Vm {
         {
             // The run is over: its `toString` runs as a host's operation
             // (a throwing one leaves the error's own message).
-            if let Ok(s) = self.host("Vm::uncaught_message", &[v], |_| Ok(crate::interp::to_string_units(v))) {
+            if let Ok(s) = self.host("Vm::uncaught_message", &[v], &[], |_| Ok(crate::interp::to_string_units(v))) {
                 return String::from_utf16_lossy(&s);
             }
         }
@@ -4043,7 +4050,7 @@ impl Vm {
     /// `obj[name] = value`.
     pub fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
         if !self.running() {
-            return self.host("Vm::set", &[obj, value], |vm| vm.set(obj, name, value));
+            return self.host("Vm::set", &[obj, value], &[], |vm| vm.set(obj, name, value));
         }
         self.check_own(obj, "Vm::set");
         self.check_own(value, "Vm::set");
@@ -4618,7 +4625,7 @@ impl Vm {
     /// (`Value::to_number`, the primitives' alone, is the VM's: #343.)
     pub fn to_number(&mut self, v: Value) -> Result<f64> {
         if !self.running() {
-            return self.host("Vm::to_number", &[v], |vm| vm.to_number(v));
+            return self.host("Vm::to_number", &[v], &[], |vm| vm.to_number(v));
         }
         self.check_own(v, "Vm::to_number");
         let d = crate::interp::to_number(v);
@@ -4734,7 +4741,7 @@ impl Vm {
     /// became a prototype), OrdinaryHasInstance.
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
         if !self.running() {
-            return self.host("Vm::instance_of", &[v, f], |vm| vm.instance_of(v, f));
+            return self.host("Vm::instance_of", &[v, f], &[], |vm| vm.instance_of(v, f));
         }
         self.check_own(v, "Vm::instance_of");
         self.check_own(f, "Vm::instance_of");
@@ -4859,7 +4866,7 @@ impl Vm {
     /// element `key`.
     pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
         if !self.running() {
-            return self.host("Vm::has_property", &[obj, key], |vm| vm.has_property(obj, key));
+            return self.host("Vm::has_property", &[obj, key], &[], |vm| vm.has_property(obj, key));
         }
         self.check_own(obj, "Vm::has_property");
         self.check_own(key, "Vm::has_property");
@@ -4900,7 +4907,7 @@ impl Vm {
     /// [`Vm::delete_named`]). False for what can't be deleted.
     pub fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
         if !self.running() {
-            return self.host("Vm::delete_property", &[obj, key], |vm| vm.delete_property(obj, key));
+            return self.host("Vm::delete_property", &[obj, key], &[], |vm| vm.delete_property(obj, key));
         }
         self.check_own(obj, "Vm::delete_property");
         self.check_own(key, "Vm::delete_property");
@@ -5302,7 +5309,7 @@ impl Vm {
     /// `obj[key]`.
     pub fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::get_keyed", &[obj, key], |vm| vm.get_keyed(obj, key));
+            return self.host("Vm::get_keyed", &[obj, key], &[], |vm| vm.get_keyed(obj, key));
         }
         self.check_own(obj, "Vm::get_keyed");
         self.check_own(key, "Vm::get_keyed");
@@ -5477,7 +5484,7 @@ impl Vm {
 
     pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
         if !self.running() {
-            return self.host("Vm::set_keyed", &[obj, key, value], |vm| vm.set_keyed(obj, key, value));
+            return self.host("Vm::set_keyed", &[obj, key, value], &[], |vm| vm.set_keyed(obj, key, value));
         }
         self.check_own(obj, "Vm::set_keyed");
         self.check_own(key, "Vm::set_keyed");
@@ -5805,7 +5812,7 @@ impl Vm {
     /// further up. Null and undefined have none.
     pub fn for_in_keys(&mut self, v: Value) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::for_in_keys", &[v], |vm| Ok(vm.for_in_key_array(v)));
+            return self.host("Vm::for_in_keys", &[v], &[], |vm| Ok(vm.for_in_key_array(v)));
         }
         self.check_own(v, "Vm::for_in_keys");
         let keys = self.for_in_key_array(v);
@@ -6956,7 +6963,7 @@ impl Vm {
     #[inline]
     pub fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::call_other", &[&[f, this][..], args].concat(), |vm| vm.call_other(f, this, args));
+            return self.host("Vm::call_other", &[f, this], args, |vm| vm.call_other(f, this, args));
         }
         self.call_own(f, this, args)
     }
@@ -6994,7 +7001,7 @@ impl Vm {
     /// constructs (`Array`, `Object`) makes its object.
     pub fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::construct_other", &[&[f][..], args].concat(), |vm| vm.construct_other(f, args));
+            return self.host("Vm::construct_other", &[f], args, |vm| vm.construct_other(f, args));
         }
         self.check_own(f, "Vm::construct_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::construct_other"));
@@ -9512,7 +9519,8 @@ out.join();"#;
             let r = catch_unwind(AssertUnwindSafe(|| b.enter(|_| panic!("unwinding"))));
             assert!(r.is_err());
             assert!(std::ptr::eq(crate::interp::current_vm(), pa));
-            let r = catch_unwind(AssertUnwindSafe(|| b.host("test", &[], |_| -> Result<()> { panic!("unwinding") })));
+            let r =
+                catch_unwind(AssertUnwindSafe(|| b.host("test", &[], &[], |_| -> Result<()> { panic!("unwinding") })));
             assert!(r.is_err());
             assert!(std::ptr::eq(crate::interp::current_vm(), pa));
             assert!(std::ptr::eq(crate::heap::owner(a.global as usize), pa));
@@ -9526,7 +9534,7 @@ out.join();"#;
         // And what `host` entered.
         let mut c = Vm::new();
         let r = catch_unwind(AssertUnwindSafe(|| {
-            c.host("test", &[], |c| -> Result<()> {
+            c.host("test", &[], &[], |c| -> Result<()> {
                 c.conv_thrown = true;
                 panic!("unwinding")
             })

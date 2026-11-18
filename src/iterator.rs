@@ -1031,7 +1031,8 @@ fn zip_keyed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// A zip's open iterators, closed with completion `c` (IteratorCloseAll).
 /// (In a handle scope: each `close` runs user code, and `its` must not
-/// move under it.)
+/// move under it. No cell moves while every `return()` runs, as in
+/// `zip_step`'s `next()`s.)
 fn close_all(vm: &mut Vm, state: Value, c: Result<()>) -> Result<()> {
     vm.handle_scope(|vm| {
         let (iters, open) = (get(vm, state, ITER)?, get(vm, state, INNER_NEXT)?);

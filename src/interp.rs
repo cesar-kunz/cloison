@@ -4620,8 +4620,10 @@ fn on_vm_stack(vm: &Vm, args: &[Value]) -> bool {
 /// from them after its entry's safepoint (`Vm::pending_args`): from a Rust
 /// `Vec` (`apply`'s list, a bound function's), they would be copies no
 /// collection updates. Without a free top (compiled code's runtime calls),
-/// as they are, and no cell may move meanwhile (`Vm::unmovable`). No
-/// safepoint comes before the copy.
+/// as they are, in a handle scope: held in its handles (a cell only `args`
+/// refers to, the pattern string `builtins::delegate` makes, stays alive)
+/// and no cell moving meanwhile (`Vm::unmovable`). No safepoint comes
+/// before the copy.
 #[inline(always)]
 pub(crate) fn with_args_on_stack(
     vm: &mut Vm,
@@ -4633,10 +4635,10 @@ pub(crate) fn with_args_on_stack(
         return f(vm, args);
     }
     if top.is_null() {
-        vm.unmovable += 1;
-        let r = f(vm, args);
-        vm.unmovable -= 1;
-        return r;
+        return vm.handle_scope(|vm| {
+            vm.handles.extend_from_slice(args);
+            f(vm, args)
+        });
     }
     unsafe {
         let n = args.len();

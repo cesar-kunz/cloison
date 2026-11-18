@@ -10070,9 +10070,13 @@ out.join(" ")
 /// properties added meanwhile (#331; ECMA-262 CopyDataProperties): a
 /// getter deleting the rest and collecting can't have their names' atoms
 /// freed and given to new ones. What SpiderMonkey and JavaScriptCore give.
+/// (Through `value`, every tier, not `run_moving`: a full marking prunes
+/// atoms, no evacuation needed. Every name is new, a counter's, so only
+/// `src` holds its atom.)
 #[test]
 fn object_spread_and_rest_hold_their_keys_across_getters() {
     let src = r#"
+var uid = 0;
 function mk(evil) {
   var names = [], src = {};
   Object.defineProperty(src, "a", { enumerable: true, configurable: true, get: function () {
@@ -10080,10 +10084,10 @@ function mk(evil) {
     for (var k of names) delete src[k];
     names = null;
     for (var j = 0; j < 4; j++) $262.gc();
-    for (var j = 0; j < 200; j++) src["late_" + j + "_" + Math.random()] = j;
+    for (var j = 0; j < 200; j++) src["late_" + j + "_" + uid++] = j;
     return 1;
   }});
-  for (var i = 0; i < 50; i++) { var n = "victim_" + i + "_" + Math.random(); names.push(n); src[n] = i; }
+  for (var i = 0; i < 50; i++) { var n = "victim_" + i + "_" + uid++; names.push(n); src[n] = i; }
   return src;
 }
 function spread(s) { return { ...s }; }

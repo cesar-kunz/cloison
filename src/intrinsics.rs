@@ -6,7 +6,7 @@
 use crate::interp::{call_function, to_string_units};
 use crate::js::ast::{
     EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_LIVE_THIS,
-    EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS,
+    EVAL_NAME, EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS,
 };
 use crate::object::{Class, Obj, as_object, object_value};
 use crate::props::Desc;
@@ -1878,6 +1878,9 @@ fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             let get = crate::promise::binding_accessor(vm, false, &data);
             let set = crate::promise::binding_accessor(vm, true, &data);
             vm.define_own_property(Obj::of(o), key, &Desc::accessor(get, set, true, false))?;
+        } else if b & EVAL_NAME as i32 == EVAL_NAME as i32 {
+            // (A function expression's own name: immutable.)
+            vm.define_own_property(Obj::of(o), key, &Desc::data(t[1], false, true, false))?;
         } else if t[1] != Value::HOLE {
             vm.create_data_property(o, key, t[1])?;
         }
@@ -1899,7 +1902,13 @@ fn bound_accessors(vm: &mut Vm, o: Value, f: Value, bindings: &[SiteBinding], pl
         let v = if var == name { n } else { crate::builtins::str_value(vm, var) };
         let data = [f, Value::from_i32(((up as i32) << 4) | kind), n, v];
         let get = crate::promise::binding_accessor(vm, false, &data);
-        let set = crate::promise::binding_accessor(vm, true, &data);
+        // (A function expression's own name: no setter, a store does
+        // nothing, in strict code throws.)
+        let set = if *kind & EVAL_NAME as i32 == EVAL_NAME as i32 {
+            Value::UNDEFINED
+        } else {
+            crate::promise::binding_accessor(vm, true, &data)
+        };
         vm.define_own_property(Obj::of(o), key, &Desc::accessor(get, set, true, false))?;
     }
     Ok(())

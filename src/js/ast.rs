@@ -338,6 +338,11 @@ pub const EVAL_BOXED: u8 = 8;
 /// An enclosing function's (past the `eval`'s function's own scope): a
 /// `var` the `eval` declares shadows it, as a variable of the function's.
 pub const EVAL_OUTER: u8 = 16;
+/// A named function expression's own name (never block-scoped, so no
+/// `const` nor catch parameter: both bits): immutable, but a store does
+/// nothing, and throws only in strict code (ECMA-262 9.1.1.1.5
+/// SetMutableBinding, step 5: funcEnv's binding is not a strict one).
+pub const EVAL_NAME: u8 = EVAL_CONST | EVAL_CATCH;
 /// What a binding `intrinsics::eval_scope` is given the value of (in
 /// place of an upvalue: `(tag << 4) | kind`) is: a module's imported
 /// binding (the value the object holding it), or a binding by its value.

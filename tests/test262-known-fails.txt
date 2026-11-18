@@ -278,14 +278,12 @@ language/expressions/async-arrow-function/await-as-param-rest-nested-arrow-param
 language/expressions/async-arrow-function/early-errors-arrow-arguments-in-formal-parameters.js
 language/expressions/async-arrow-function/early-errors-arrow-eval-in-formal-parameters.js
 language/expressions/async-arrow-function/early-errors-arrow-formals-body-duplicate.js
-language/expressions/async-function/named-strict-error-reassign-fn-name-in-body-in-eval.js
 language/expressions/async-generator/early-errors-expression-await-as-function-binding-identifier.js
 language/expressions/async-generator/early-errors-expression-formals-contains-await-expr.js
 language/expressions/async-generator/early-errors-expression-formals-contains-yield-expr.js
 language/expressions/async-generator/early-errors-expression-yield-as-function-binding-identifier.js
 language/expressions/async-generator/eval-var-scope-syntax-err.js
 language/expressions/async-generator/named-eval-var-scope-syntax-err.js
-language/expressions/async-generator/named-strict-error-reassign-fn-name-in-body-in-eval.js
 language/expressions/async-generator/named-yield-star-async-next.js
 language/expressions/async-generator/yield-star-async-next.js
 language/expressions/call/tco-call-args.js
@@ -380,10 +378,8 @@ language/expressions/delete/identifier-strict-recursive.js
 language/expressions/delete/identifier-strict.js
 language/expressions/function/arguments-with-arguments-fn.js
 language/expressions/function/eval-var-scope-syntax-err.js
-language/expressions/function/named-strict-error-reassign-fn-name-in-body-in-eval.js
 language/expressions/generators/arguments-with-arguments-fn.js
 language/expressions/generators/eval-var-scope-syntax-err.js
-language/expressions/generators/named-strict-error-reassign-fn-name-in-body-in-eval.js
 language/expressions/generators/param-dflt-yield.js
 language/expressions/generators/yield-as-function-expression-binding-identifier.js
 language/expressions/generators/yield-as-generator-expression-binding-identifier.js

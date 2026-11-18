@@ -648,6 +648,12 @@ fn bound_kind(p: &Program, name: &str) -> Option<u8> {
     p.eval_upvalues.iter().find(|(n, ..)| &**n == name).map(|&(_, k, ..)| k)
 }
 
+/// Whether direct `eval` site binding `name` is a function expression's
+/// own name (`EVAL_NAME`).
+fn bound_name(p: &Program, name: &str) -> bool {
+    bound_kind(p, name).is_some_and(|k| k & EVAL_NAME == EVAL_NAME)
+}
+
 /// The key of a direct `eval`'s site's binding in its box (`EVAL_BOXED`).
 fn bound_box_key<'p>(p: &'p Program, name: &str) -> &'p str {
     p.eval_upvalues.iter().find(|(n, ..)| &**n == name).map_or("", |(_, _, key, _)| &**key)
@@ -797,6 +803,8 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
             && let Some(k) = p.functions[i].parent
         {
             refs.extend(eval_outer_names(p, decls, k).into_iter().map(|(_, v)| v));
+            // (And the function's own name, a function expression's.)
+            refs.extend(own_name(p, k));
         }
         // (In a direct `eval`'s function: its scope object, and an arrow's
         // `this` for the `eval`.)
@@ -1336,6 +1344,11 @@ fn own_name_binding(p: &Program, index: usize, name: &str) -> bool {
     let mut g = index;
     let top = loop {
         if g == 0 {
+            // (A direct `eval`'s code compiled for its site's bindings: one
+            // of them may be, unless its own block-scoped one has the name.)
+            if bound_name(p, name) && !p.lexicals.contains_key(name) {
+                break None;
+            }
             return false;
         }
         if named(g) {
@@ -1361,7 +1374,8 @@ fn own_name_binding(p: &Program, index: usize, name: &str) -> bool {
         if Some(g) == top {
             return !shadows(g);
         }
-        if top.is_none() && f.parent == Some(0) {
+        // (The wrapper's parameter, or the `eval`'s code's upvalue.)
+        if top.is_none() && (g == 0 || f.parent == Some(0) && !bound_name(p, name)) {
             return true;
         }
         if shadows(g) {
@@ -1373,7 +1387,7 @@ fn own_name_binding(p: &Program, index: usize, name: &str) -> bool {
 
 /// The name a named function expression `f` binds in its body, if it or a
 /// function nested in it refers to it (shadowed or not: then the variable
-/// is just unused).
+/// is just unused), or calls `eval` directly, whose code may.
 fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
     let func = &p.functions[f];
     let name = func.name.as_deref().filter(|_| func.binds_name)?;
@@ -1397,7 +1411,9 @@ fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
                 if func.binds_name
                     && let Some(n) = func.name.as_deref()
                     && !used[q]
-                    && refs.get_or_insert_with(|| references(&p.functions[g])).contains(&n)
+                    // (A direct `eval`'s code may refer to any name.)
+                    && (p.functions[g].has_eval
+                        || refs.get_or_insert_with(|| references(&p.functions[g])).contains(&n))
                 {
                     used[q] = true;
                 }
@@ -4128,7 +4144,12 @@ impl<'a> Gen<'a> {
     }
 
     fn own_name_binding(&self, name: &str) -> bool {
+        // (Not a catch parameter of the name, in a register of its own
+        // while its clause is compiled, see `try_catch`: the parser renames
+        // one apart from a function's name only where it sees the function,
+        // not in a direct `eval`'s code or a lazily compiled function.)
         own_name_binding(self.p, self.index, name)
+            && !(self.locals.contains_key(name) && !self.decls[self.index].contains(&name))
     }
 
     /// Store the accumulator in variable `name`: a `const` throws, a
@@ -5520,9 +5541,18 @@ impl<'a> Gen<'a> {
             // (Block-scoped first: an enclosing function's after.)
             bindings.sort_by_key(|b| b.2 & EVAL_BLOCK_SCOPED as i32 == 0);
             let lexical = bindings.iter().filter(|b| b.2 & EVAL_BLOCK_SCOPED as i32 != 0).count();
+            // (A function expression's own name, the function's or an
+            // enclosing one's, is funcEnv's binding, outside the function's
+            // variables: as an enclosing function's, but immutable.)
+            if let Some(n) = own_name(self.p, self.index)
+                && !bindings.iter().any(|(o, ..)| *o == n)
+            {
+                bindings.push((n, n, EVAL_NAME as i32));
+            }
             for (n, v) in eval_outer_names(self.p, self.decls, self.index) {
                 if !bindings.iter().any(|(o, ..)| *o == n) {
-                    bindings.push((n, v, 0));
+                    let kind = if n == v && self.own_name_binding(n) { EVAL_NAME } else { 0 };
+                    bindings.push((n, v, kind as i32));
                 }
             }
             let mut kept: Vec<(&str, &str, i32, Option<usize>)> = Vec::new();

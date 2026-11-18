@@ -18120,7 +18120,9 @@ extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
         }
         // A collection at the safepoint or the allocation may have unbound
         // the site (`age_functions`, `retire_functions`): no code to enter
-        // (#321).
+        // (#321). As for a shape that differs, the `this` allocated is
+        // dropped and the runtime allocates another: rare, a collection
+        // there unbinding this very site.
         if (*s).entry == 0 {
             return cloison_rt_call(regs, site);
         }

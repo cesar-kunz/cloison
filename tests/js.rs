@@ -4586,6 +4586,44 @@ sum;
     }
 }
 
+/// A code's only closure, whose upvalues the JIT folds as constants into
+/// direct calls' lowerings (`VmState::root_func`), dead while its code
+/// lives on: it was read from freed memory, a dead `inner` folded into
+/// `f`'s compiled code or a crash (#348). Freed memory poisoned, cells
+/// moved, collections every 64 KB. (Caught by the debug-assertion build:
+/// `constant_upvalue` checks it reads a cell. Without the check, a stale
+/// read mostly finds the upvalue unclosed and folds nothing.)
+#[test]
+fn a_dead_root_closure_is_not_folded_from() {
+    let src = r#"
+var keep = [];
+function make(i) {
+  return (0, eval)("(function () { var k = " + i + "; function inner() { return k * 2; } " +
+                   "return { f: function () { return inner() + k; } }; })()");
+}
+var sum = 0;
+for (var r = 0; r < 3; r++)
+  for (var i = 0; i < 600; i++) {
+    var o = make(i);
+    for (var n = 0; n < 30; n++) sum += o.f();
+    if (i % 50 == 0) keep.push(o);
+  }
+for (var i = 0; i < keep.length; i++) sum += keep[i].f();
+sum;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [2, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_code_room(64 << 10);
+        vm.set_gc_evacuate_all();
+        vm.set_gc_verify(64 << 10);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r, Ok("48548700".to_string()), "tier at {budget}");
+        vm.verify_heap();
+    }
+}
+
 /// Arrays past `heap::LARGE` (here 3968 typed arrays, 32 KB of elements)
 /// are cells of their own blocks: one in a small block left the young
 /// values stored more than 8 KB into it, behind cards a minor collection

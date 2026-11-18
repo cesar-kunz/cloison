@@ -11903,14 +11903,24 @@ fn timed<T>(total: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> T) -> T {
 
 fn lower(state: &mut VmState, epoch: u32) -> Lowered {
     LOWERING.with(|l| l.set(l.get() + 1));
-    struct Done;
+    /// The lowering's end: its count, and the handles it took back.
+    struct Done(*mut crate::vm::Vm, usize);
     impl Drop for Done {
         fn drop(&mut self) {
             LOWERING.with(|l| l.set(l.get() - 1));
+            unsafe { (*self.0).handles.truncate(self.1) };
         }
     }
-    let _done = Done;
     let vm = state.vm;
+    // The root closure, whose upvalues the lowering folds
+    // (`constant_upvalue`), is a root while it runs: a full collection
+    // under it can't forget a borrowed state's (`forget_dead_root_funcs`).
+    // (Not moved meanwhile: no collection evacuates while a state is
+    // borrowed, see `shape_words`.)
+    let _done = Done(vm, unsafe { (*vm).handles.len() });
+    if !state.root_func.is_null() {
+        unsafe { (*vm).handles.push(crate::object::object_value(state.root_func)) };
+    }
     let from = unsafe { (*vm).heap.kept_mark() };
     let mut low = timed(&LOWER_NS, || lower_frames(state, epoch));
     low.kept = unsafe { (*vm).heap.kept_since(from) };
@@ -16748,7 +16758,7 @@ impl JitFunction {
                 if n > 0 && !f.is_null() {
                     vm.root_func = f;
                     // (As at a direct call's lowering: see `forget_dead_root_funcs`.)
-                    unsafe { (*crate::interp::current_vm()).heap.note(crate::object::object_value(f)) };
+                    unsafe { (*vm.vm).heap.note(crate::object::object_value(f)) };
                     vm.int_upvalues = (0..n)
                         .map(|k| unsafe {
                             let cell = *crate::vm::Vm::upvalues(Obj::from_ptr(f)).add(k);
@@ -18540,7 +18550,9 @@ pub fn census(vm: &crate::vm::Vm) -> (Vec<(&'static str, usize)>, Vec<(&'static 
 /// upvalues): a constant taken from a dead cell, or a crash.
 pub(crate) fn forget_dead_root_funcs(vm: &crate::vm::Vm, live: &dyn Fn(usize) -> bool) {
     for code in vm.codes.iter().chain(&vm.condemned) {
-        // (Borrowed: being compiled, which no collection interrupts.)
+        // (Borrowed: being lowered, its root closure a root till the
+        // lowering ends, see `lower`. A collection can run under a lowering:
+        // `jit::compiling`.)
         let Ok(mut jit) = code.jit.try_borrow_mut() else { continue };
         if let Some(v) = jit.as_mut().and_then(|f| f.vm.as_mut())
             && !v.root_func.is_null()

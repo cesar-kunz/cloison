@@ -10421,8 +10421,9 @@ fn many_upvalues(levels: usize, per: usize) -> String {
 }
 
 /// Thousands of upvalues (#325), read and written in compiled loops.
-/// Past what the JIT's stencils reach in the function object, the
-/// instruction is the interpreter's.
+/// Past the offset an access's immediate reaches in the function object
+/// (the JIT's `MAX_SLOT_OFF`), they compile through the `_far` stencils,
+/// the offset in a register.
 #[test]
 fn a_function_with_thousands_of_upvalues_reads_each() {
     // (The last call's 5 rounds of 150: the first and the last variable
@@ -10433,9 +10434,14 @@ fn a_function_with_thousands_of_upvalues_reads_each() {
     };
     assert_eq!(value(&many_upvalues(3, 100)), format!("{} 150 2249 1050", sum(3, 100)));
     assert_eq!(value(&many_upvalues(60, 150)), format!("{} 150 59299 30000", sum(60, 150)));
-    // The far ones compiled too (the offset in a register), not exits
-    // at each call. (`v59_148`, used last, is a far one; written here.)
-    let src = many_upvalues(60, 150).replacen("} return s", "v59_148++; v59_148--; } return s", 1);
+    // The far ones compiled too, not an exit at each of the 1,000 calls
+    // (as when they bailed: one a call). (`v59_148`, used last, is a far
+    // one; written here.)
+    let src = many_upvalues(60, 150).replacen("} return s", "v59_148++; v59_148--; } return s", 1).replacen(
+        "t < 30;",
+        "t < 1000;",
+        1,
+    );
     let m = cloison::js::compile(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(20);
@@ -10444,5 +10450,5 @@ fn a_function_with_thousands_of_upvalues_reads_each() {
     assert!(stencils.iter().any(|s| s.starts_with("lda_upvalue_far")), "{stencils:?}");
     assert!(stencils.iter().any(|s| s == "sta_upvalue_far"), "{stencils:?}");
     let st = vm.jit_stats("inner").unwrap();
-    assert!(st.exits <= 2 && st.compiles <= 3, "{st:?}");
+    assert!(st.exits < 100 && st.compiles < 20, "{st:?}");
 }

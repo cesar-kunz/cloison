@@ -7360,6 +7360,12 @@ var a = new Array(5000).fill(-1);
 /// constructor's code idle (direct calls enter it unseen) and unbind the
 /// site, which then entered its code at address 0. What V8, SpiderMonkey
 /// and JavaScriptCore give.
+///
+/// What it covers depends on the schedule: a full collection landing at
+/// that allocation, once the code has been idle for `IDLE_UNBIND` full
+/// collections (`jit::age_limits`, read once from the environment:
+/// `CLOISON_JIT_IDLE_UNBIND=0` turns the unbinding off, and the test
+/// passes covering nothing). With the defaults it crashed without the fix.
 #[test]
 fn constructs_whose_site_a_collection_unbinds_go_through_the_runtime() {
     let src = r#"

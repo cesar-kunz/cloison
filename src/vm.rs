@@ -949,7 +949,8 @@ pub struct Vm {
     pub(crate) interp_megas: Box<[InterpMega]>,
     /// Typed array shapes whose `length` is %TypedArray%.prototype's
     /// builtin getter's (see [`TypedLength`]). Cleared when shapes are
-    /// freed, as `interp_megas`.
+    /// freed, as `interp_megas`, and when cells move (`forget_lookups`):
+    /// it holds its holders by address.
     typed_lengths: [TypedLength; TYPED_LENGTHS],
     /// Some typed array's shape has had an own `length` (a transition
     /// adding it), or some typed array a prototype other than its kind's
@@ -9625,5 +9626,53 @@ sum;
         heap.budget = heap.gc.budget();
         let mut vm = Vm::with_heap(heap);
         assert_eq!(vm.run(&module).map(display).as_deref(), Ok("71410696"));
+    }
+
+    /// `known(ta, p)`: what `Vm::typed_lengths` gives for typed array
+    /// `ta`: 0 nothing, 1 prototype `p`, 2 another address.
+    fn known(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+        let r = match vm.known_typed_length(Obj::of(a[0])) {
+            None => 0,
+            Some(h) if h == Obj::of(a[1]) => 1,
+            Some(_) => 2,
+        };
+        Ok(Value::from_i32(r))
+    }
+
+    /// What a collection moving cells does to the VM's caches of addresses
+    /// (`gc::Evacuation`).
+    fn forget(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        vm.forget_lookups();
+        Ok(Value::UNDEFINED)
+    }
+
+    /// The same as the test above (#329), whatever the collections'
+    /// schedule: what `Vm::typed_lengths` knows goes with the other caches
+    /// of addresses a collection moving cells forgets (else the holder
+    /// would be known at its old address). (A collection could also drop
+    /// it as shapes died, so `forget_lookups` is called alone.)
+    #[test]
+    fn typed_lengths_are_forgotten_with_the_lookups() {
+        let src = r#"
+const TAP = Object.getPrototypeOf(Uint8Array.prototype);
+const P = {};
+for (let i = 0; i < 20; i++) P['k' + i] = i;
+Object.defineProperty(P, 'length', Object.getOwnPropertyDescriptor(TAP, 'length'));
+Object.setPrototypeOf(P, TAP);
+const ta = new Uint8Array(7);
+Object.setPrototypeOf(ta, P);
+function f(t) { return t.length; }
+for (let i = 0; i < 100; i++) f(ta);
+const before = known(ta, P);
+forget();
+before + "," + known(ta, P);
+"#;
+        let module = crate::js::compile(src).unwrap();
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(i64::MAX);
+        let g = vm.global_obj();
+        vm.define_native(g, "known", known, 2, crate::jit::Ty::Any, false);
+        vm.define_native(g, "forget", forget, 0, crate::jit::Ty::Any, false);
+        assert_eq!(vm.run(&module).map(display).as_deref(), Ok("1,0"));
     }
 }

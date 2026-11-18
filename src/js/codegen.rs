@@ -458,14 +458,32 @@ const ENV: &str = "%env";
 
 /// The name an enclosing function's scope object is passed down under,
 /// by that function's depth (see [`depth`]), where a function between has
-/// a scope object of its own (an async function's, a generator's): the
-/// two can't share `ENV`.
-const OUTER_ENVS: [&str; 32] = [
-    "%env^0", "%env^1", "%env^2", "%env^3", "%env^4", "%env^5", "%env^6", "%env^7", "%env^8", "%env^9", "%env^10",
-    "%env^11", "%env^12", "%env^13", "%env^14", "%env^15", "%env^16", "%env^17", "%env^18", "%env^19", "%env^20",
-    "%env^21", "%env^22", "%env^23", "%env^24", "%env^25", "%env^26", "%env^27", "%env^28", "%env^29", "%env^30",
-    "%env^31",
-];
+/// a scope object of its own (one with many variables, an async
+/// function's, a generator's): the two can't share `ENV`.
+///
+/// Any depth has one. The names past the table's are made on demand and
+/// kept for the process's life, one per depth of nesting ever compiled: a
+/// function nested deeper than the table once had no name to pass the
+/// object down under, and read the variables in it from another scope
+/// object, as `undefined`.
+fn outer_env(depth: usize) -> &'static str {
+    const NAMES: [&str; 32] = [
+        "%env^0", "%env^1", "%env^2", "%env^3", "%env^4", "%env^5", "%env^6", "%env^7", "%env^8", "%env^9", "%env^10",
+        "%env^11", "%env^12", "%env^13", "%env^14", "%env^15", "%env^16", "%env^17", "%env^18", "%env^19", "%env^20",
+        "%env^21", "%env^22", "%env^23", "%env^24", "%env^25", "%env^26", "%env^27", "%env^28", "%env^29", "%env^30",
+        "%env^31",
+    ];
+    static DEEPER: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    if let Some(&name) = NAMES.get(depth) {
+        return name;
+    }
+    let mut deeper = DEEPER.lock().unwrap_or_else(|e| e.into_inner());
+    while deeper.len() <= depth - NAMES.len() {
+        let name = format!("%env^{}", NAMES.len() + deeper.len());
+        deeper.push(Box::leak(name.into_boxed_str()));
+    }
+    deeper[depth - NAMES.len()]
+}
 
 /// How many functions enclose function `i`.
 fn depth(p: &Program, i: usize) -> usize {
@@ -604,7 +622,7 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> R
         .iter()
         .map(|&n| {
             // (The parent's own scope object, passed down under its depth.)
-            if OUTER_ENVS.get(depth(p, parent)) == Some(&n) { ENV } else { n }
+            if outer_env(depth(p, parent)) == n { ENV } else { n }
         })
         .map(|n| match decls[parent].position(n) {
             Some(k) if parent != 0 || script_local(p, n) => match u8::try_from(k + 1) {
@@ -826,14 +844,8 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
                     j = p.functions[m].parent;
                 }
                 // (Under another name where a function between has its own.)
-                let env = if chain[1..].iter().any(|&m| decls[m].contains(&ENV)) {
-                    match OUTER_ENVS.get(depth(p, k)) {
-                        Some(&env) => env,
-                        None => continue,
-                    }
-                } else {
-                    ENV
-                };
+                let env =
+                    if chain[1..].iter().any(|&m| decls[m].contains(&ENV)) { outer_env(depth(p, k)) } else { ENV };
                 for c in chain {
                     if !upvalues[c].contains(&env) {
                         upvalues[c].push(env);
@@ -3720,9 +3732,8 @@ impl<'a> Gen<'a> {
                 // (In its scope object: see `generate`.)
                 if self.overflows[k].contains(&name) {
                     let ups = &self.scopes.upvalues[self.index];
-                    let outer = OUTER_ENVS.get(depth(self.p, k));
-                    if let Some(u) =
-                        ups.iter().position(|n| Some(n) == outer).or_else(|| ups.iter().position(|&n| n == ENV))
+                    let outer = outer_env(depth(self.p, k));
+                    if let Some(u) = ups.iter().position(|&n| n == outer).or_else(|| ups.iter().position(|&n| n == ENV))
                     {
                         return Ok(Var::ScopeUpvalue(upvalue(u)));
                     }

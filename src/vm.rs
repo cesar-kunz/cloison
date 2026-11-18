@@ -7584,10 +7584,10 @@ impl Vm {
     /// collection: the VM is then [`poisoned`](Vm::poisoned), its runs and
     /// operations failing. With the JIT on, a panic in a runtime call that
     /// compiled code made is kept till the code has left (the copied
-    /// stencils have no unwind tables), then unwinds the same; a few of
-    /// those calls, which have no way to leave (`typeof`, `arguments`, a
-    /// closure capturing registers, closing upvalues), still abort the
-    /// process (see `jit::unwinding`).
+    /// stencils have no unwind tables), then unwinds the same: the code
+    /// leaves at once, without using what the call would have given (no
+    /// store, no call, no return of a value made from it), and no such
+    /// call aborts the process (see `jit::unwinding`).
     ///
     /// The VM may move between runs: the code the JIT made for it where it
     /// was is dropped as the next run starts (see `Vm::rehome`), and its
@@ -9743,6 +9743,19 @@ out.join();"#;
             // its caller's code too (`direct_exit`).
             "function fill(a, n) { for (var j = 0; j < n; j++) a.push({j: j}); return a; } \
              var all = []; for (;;) all.push(fill([], 4));",
+            // In runtime calls that had no way to leave (#358): making
+            // `arguments`, the frame's own and an inlined frame's, and a
+            // closure of the frame's registers; two cons strings made
+            // flat to compare them.
+            "function f() { var s = 0; for (var j = 0; j < 2; j++) s += j; return arguments; } \
+             function run() { var all = []; for (;;) all.push(f(1, 2, 3, 4, 5, 6, 7, 8)); } run();",
+            "function f() { return arguments; } \
+             function run() { var all = []; for (;;) all.push(f(1, 2, 3, 4, 5, 6, 7, 8)); } run();",
+            "function f(i) { var k = i; return function () { return k; }; } \
+             function run() { var all = []; for (;;) all.push(f(1)); } run();",
+            "var p = 'p'.repeat(4000), q = 'q'.repeat(4000), all = [], n = 0; \
+             function f(a, b) { return a === b; } \
+             for (;;) { var a = p + q, b = p + q; if (f(a, b)) n++; all.push(a, b); }",
             // In a run nested in a native's (`$262.evalScript`), called
             // from compiled code.
             "var all = []; function g() { $262.evalScript('for (var j = 0; j < 20000; j++) all.push({j: j, a: [j]});'); } \
@@ -9781,6 +9794,204 @@ out.join();"#;
                 vm.verify_heap();
             }
         }
+    }
+
+    thread_local! {
+        /// Calls of `mark()` (below) on the thread.
+        static MARKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// `mark()`: a native compiled code calls, counted.
+    fn mark(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        MARKS.with(|m| m.set(m.get() + 1));
+        Ok(Value::UNDEFINED)
+    }
+
+    /// A panic in a runtime call whose result compiled code used at once,
+    /// with no way to leave (#358: `typeof`, `arguments`, a closure
+    /// capturing registers, closing upvalues, `===` on two strings, a
+    /// `new` settling its constructor's shape), unwinds out of the run as
+    /// the others' (#324), not aborting the process, and the code does
+    /// nothing with the value the call gave in its place: no store to the
+    /// heap, no call of a native, no further instruction of a caller, no
+    /// return to the host. Each script counts `before` what it is about to
+    /// do and, `after`, what it did (a field written, a global, `mark()`
+    /// called); the panic, made at the `nth` call of the runtime function
+    /// by compiled code, leaves one thing begun and nothing done after it.
+    /// In the hot tier and the warm one, the call in the code entered, in
+    /// a function it inlines, and in one it calls directly.
+    #[test]
+    fn a_panic_in_a_runtime_call_used_at_once_does_nothing_more() {
+        use crate::jit::Failpoint::{self, *};
+        // (`o.n` counts in step with `after`; `g` keeps what was made.)
+        let head = "var before = 0, after = 0, o = {n: 0, v: undefined}; \
+                    var x = ['same', 'text'].join(' '), y = ['same', 'text'].join(' '), z = ['same', 'texu'].join(' '); ";
+        let cases: &[(Failpoint, &str)] = &[
+            // The fused test and jump, either way, then the test's value.
+            (
+                StrictEq,
+                "function f(a, b) { before++; if (a === b) { o.n++; mark(); } else { mark(); o.n++; } after++; } \
+              for (var i = 0; i < 30000; i++) f(x, i & 1 ? y : z);",
+            ),
+            (
+                StrictEq,
+                "function f(a, b) { before++; if (a !== b) { o.n++; mark(); } else { mark(); o.n++; } after++; } \
+              for (var i = 0; i < 30000; i++) f(x, i & 1 ? y : z);",
+            ),
+            (
+                StrictEq,
+                "function f(a, b) { before++; var r = a === b; o.v = r; o.n++; mark(); after++; return r; } \
+              for (var i = 0; i < 30000; i++) f(x, i & 1 ? y : z);",
+            ),
+            // In a function with a loop, called directly: returned from.
+            (
+                StrictEq,
+                "function f(a, b) { before++; var r = false; for (var j = 0; j < 2; j++) r = a === b; return r; } \
+              function run() { for (var i = 0; i < 30000; i++) { o.v = f(x, i & 1 ? y : z); o.n++; mark(); after++; } } run();",
+            ),
+            (
+                TypeOf,
+                "function f(v) { before++; var t = typeof v; o.v = t; o.n++; mark(); after++; return t; } \
+              var vs = [1, 'a', {}, undefined, f, 1.5, null, true]; \
+              for (var i = 0; i < 30000; i++) f(vs[i & 7]);",
+            ),
+            (
+                TypeOf,
+                "function f(v) { before++; var t; for (var j = 0; j < 2; j++) t = typeof v; return t; } \
+              var vs = [1, 'a', {}, undefined, f, 1.5, null, true]; \
+              function run() { for (var i = 0; i < 30000; i++) { o.v = f(vs[i & 7]); o.n++; mark(); after++; } } run();",
+            ),
+            // The frame's own `arguments` (made as it is entered: counted
+            // by its caller), then an inlined frame's.
+            (
+                CreateArguments,
+                "function f() { var s = 0; for (var j = 0; j < 2; j++) s += j; var g = arguments; \
+              o.v = g; o.n++; mark(); after++; return g; } \
+              function run() { for (var i = 0; i < 30000; i++) { before++; f(i, 1, 2); } } run();",
+            ),
+            (
+                CreateArguments,
+                "function f() { var s = 0; for (var j = 0; j < 2; j++) s += j; return arguments; } \
+              function run() { for (var i = 0; i < 30000; i++) { before++; o.v = f(i, 1, 2); o.n++; mark(); after++; } } run();",
+            ),
+            (
+                ArgumentsOf,
+                "function f() { var g = arguments; o.v = g; o.n++; mark(); after++; return g; } \
+              function run() { for (var i = 0; i < 30000; i++) { before++; f(i, 1, 2); } } run();",
+            ),
+            (
+                ArgumentsOf,
+                "function f() { return arguments; } \
+              function run() { for (var i = 0; i < 30000; i++) { before++; o.v = f(i, 1, 2); o.n++; mark(); after++; } } run();",
+            ),
+            (
+                CreateClosureLocal,
+                "function f(i) { before++; var k = i; var g = function () { return k; }; \
+              o.v = g; o.n++; mark(); after++; return g; } \
+              for (var i = 0; i < 30000; i++) f(i);",
+            ),
+            (
+                CreateClosureLocal,
+                "function f(i) { before++; var k = i; return function () { return k; }; } \
+              function run() { for (var i = 0; i < 30000; i++) { o.v = f(i); o.n++; mark(); after++; } } run();",
+            ),
+            // The function is done; its caller isn't to go on.
+            (
+                CloseUpvalues,
+                "function f(i) { before++; var k = i; return function () { return k; }; } \
+              for (var i = 0; i < 30000; i++) { o.v = f(i); o.n++; mark(); after++; }",
+            ),
+            (
+                CloseUpvalues,
+                "function f(i) { before++; var k = i; return function () { return k; }; } \
+              function run() { for (var i = 0; i < 30000; i++) { o.v = f(i); o.n++; mark(); after++; } } run();",
+            ),
+            (
+                CloseUpvalues,
+                "function F(i) { before++; var k = i; this.g = function () { return k; }; } \
+              function run() { for (var i = 0; i < 30000; i++) { o.v = new F(i); o.n++; mark(); after++; } } run();",
+            ),
+            (
+                ConstructDone,
+                "function Q(n) { before++; this.a = 0; for (var j = 0; j < n; j++) this.a += j; } \
+              function run() { for (var i = 0; i < 30000; i++) { o.v = new Q(2); o.n++; mark(); after++; } } run();",
+            ),
+            (
+                ConstructDone,
+                "function Q(n) { before++; this.a = 0; for (var j = 0; j < n; j++) this.a += j; } \
+              for (var i = 0; i < 30000; i++) { o.v = new Q(2); o.n++; mark(); after++; }",
+            ),
+        ];
+        let observe = crate::js::compile("[before - after, o.n - after, after].join()").unwrap();
+        let again = crate::js::compile("var s = 0; for (var i = 0; i < 100000; i++) s += [i][0]; s").unwrap();
+        let mut reached = std::collections::HashSet::new();
+        for (k, &(point, src)) in cases.iter().enumerate() {
+            for warm in [false, true] {
+                for nth in [1, 2, 3, 50, 2000] {
+                    let mut vm = Vm::new();
+                    if warm {
+                        vm.set_warm_tier(true);
+                        vm.set_tier_back_edges(2);
+                    }
+                    let g = vm.global_obj();
+                    vm.define_native(g, "mark", mark, 0, crate::jit::Ty::Any, false);
+                    MARKS.with(|m| m.set(0));
+                    let m = crate::js::compile(&format!("{head}{src}")).unwrap();
+                    crate::jit::fail_at(Some((point, nth)));
+                    let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+                    let calls = crate::jit::failpoint_calls();
+                    crate::jit::fail_at(None);
+                    let at = format!("case {k} ({point:?}), warm {warm}, call {nth}");
+                    assert!(crate::interp::current_vm().is_null() && !crate::jit::panic_pending(), "{at}");
+                    assert!(vm.native_top.is_null() && vm.error.is_none() && !vm.poisoned(), "{at}");
+                    let state = vm.run(&observe).map(|v| display(v, &vm)).unwrap();
+                    let marks = MARKS.with(|m| m.get());
+                    match r {
+                        // (Fewer calls than `nth` from compiled code: none
+                        // failed.)
+                        Ok(r) => {
+                            assert!(r.is_ok() && calls < nth, "{at}: {calls}");
+                            assert_eq!((state.as_str(), marks), ("0,0,30000", 30000), "{at}");
+                        }
+                        Err(p) => {
+                            let msg = p.downcast_ref::<String>().cloned().unwrap_or_default();
+                            assert_eq!(msg, format!("failpoint {point:?}"), "{at}");
+                            let after: u32 = state.rsplit(',').next().unwrap().parse().unwrap();
+                            assert_eq!((state.as_str(), marks), (&*format!("1,0,{after}"), after), "{at}");
+                            reached.insert((k, nth));
+                        }
+                    }
+                    assert_eq!(vm.run(&again).map(|v| display(v, &vm)).as_deref(), Ok("4999950000"), "{at}");
+                    vm.verify_heap();
+                }
+            }
+        }
+        // Every case made its runtime call from compiled code, in a tier.
+        for k in 0..cases.len() {
+            assert!(reached.contains(&(k, 1)), "case {k} ({:?}) never called from compiled code", cases[k].0);
+        }
+    }
+
+    /// ToBoolean, the one runtime call compiled code makes with no way to
+    /// leave after it (#358), has nothing to panic in: a cons string is
+    /// told by its length, not made flat (which allocates).
+    #[test]
+    fn to_boolean_makes_no_string_flat() {
+        let mut vm = Vm::new();
+        let s = cons(&mut vm);
+        let empty = vm.run(&crate::js::compile("var e = ''; e + e").unwrap()).unwrap();
+        vm.heap.limit_growth(0);
+        assert!(crate::interp::to_boolean(s) && !crate::interp::to_boolean(empty));
+        assert!(Obj::of(s).elems().is_null());
+        // In compiled code (`jtofalse`'s runtime call) as well.
+        let src = "var s = 'x'.repeat(40) + 'y'.repeat(40), n = 0; \
+                   function f(v) { if (v) n++; return !v; } \
+                   for (var i = 0; i < 30000; i++) f(i & 1 ? s : ''); n";
+        let mut vm = Vm::new();
+        let n = vm.run(&crate::js::compile(src).unwrap()).map(|v| display(v, &vm));
+        assert_eq!(n.as_deref(), Ok("15000"));
+        let s = vm.run(&crate::js::compile("s").unwrap()).unwrap();
+        assert!(Obj::of(s).elems().is_null());
     }
 
     /// `squeeze()`: no more fresh blocks.

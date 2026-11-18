@@ -727,15 +727,14 @@ fn has_stencil(name: &str) -> bool {
 
 // ---- Runtime functions called from stencil slow paths (C ABI) ----
 //
-// A panic in one (the heap limit's, `Heap::fresh_blocks`) aborts the
-// process: it can't unwind out of an `extern "C"` function, and as
-// `extern "C-unwind"` it would have the stencils' frames to unwind
-// through, copied code with no unwind tables registered (compiled with
+// A panic in one (the heap limit's, `Heap::fresh_blocks`) can't unwind
+// out of it: not out of an `extern "C"` function, and as `extern
+// "C-unwind"` it would have the stencils' frames to unwind through,
+// copied code with no unwind tables registered (compiled with
 // `-Cpanic=abort`, jumping from one to the next), where the unwinder
-// finds none and gives up. A run unwinds only interpreted (see `Vm::run`,
-// #143); to unwind from here, a runtime function would catch the panic,
-// keep it in the VM and leave the compiled code as an error no handler
-// catches, for `vm_run` to resume the unwinding from Rust.
+// finds none and gives up. Each catches it, keeps it and has the
+// compiled code leave, for `vm_run` to resume the unwinding from Rust
+// (see `unwinding`).
 
 /// Stencils call it as `(acc, rhs)`. `Add r` computes `r + acc`, so the
 /// operands go to the generic runtime in that order. `AddSmi` (`acc + imm`)
@@ -774,6 +773,13 @@ fn rt_add(acc: Value, r: Value) -> u64 {
 /// or a native's state (`native_top`) unrestored. (Built with `panic =
 /// "abort"`, as cloison's own release profile is, a panic never returns:
 /// this is only a call then. An embedder's profile decides for its build.)
+///
+/// Every runtime call that can panic is made so, and its stencil tests
+/// for `leave` before it uses the result (#358: where the code used it
+/// at once, a test added after the call, off the fast paths; closing
+/// upvalues and `construct_done` hand `EMPTY` to the test the call's
+/// return already makes). One isn't: `cloison_rt_to_boolean`, which has
+/// nothing to panic in (it reads a cell's header) and no way to leave.
 #[inline(always)]
 fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -783,6 +789,66 @@ fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
             leave
         }
     }
+}
+
+/// The runtime calls a test can make panic (`fail_at`): those that
+/// don't reach the heap limit on their own in a script a test can write
+/// (a type's name is allocated once, closing upvalues allocates nothing).
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Failpoint {
+    TypeOf,
+    CreateArguments,
+    ArgumentsOf,
+    CreateClosureLocal,
+    CloseUpvalues,
+    StrictEq,
+    ConstructDone,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The runtime call to panic in, at which of its calls from now (1:
+    /// the next), and how many it had since `fail_at`.
+    static FAIL_AT: std::cell::Cell<Option<(Failpoint, u32)>> = const { std::cell::Cell::new(None) };
+    static FAIL_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Have the thread's `nth` call of runtime function `point` by compiled
+/// code panic ("failpoint <point>"), once; `None`: none.
+#[cfg(test)]
+pub(crate) fn fail_at(at: Option<(Failpoint, u32)>) {
+    FAIL_AT.with(|f| f.set(at));
+    FAIL_CALLS.with(|c| c.set(0));
+}
+
+/// How many calls the failpoint set last had (the one that panicked
+/// included).
+#[cfg(test)]
+pub(crate) fn failpoint_calls() -> u32 {
+    FAIL_CALLS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn hit_failpoint(point: Failpoint) {
+    let Some((p, nth)) = FAIL_AT.with(|f| f.get()) else { return };
+    if p != point {
+        return;
+    }
+    let calls = FAIL_CALLS.with(|c| c.replace(c.get() + 1)) + 1;
+    if calls == nth {
+        FAIL_AT.with(|f| f.set(None));
+        panic!("failpoint {point:?}");
+    }
+}
+
+/// In a runtime call compiled code makes: where a test has it panic
+/// (see [`fail_at`]); nothing in other builds.
+macro_rules! failpoint {
+    ($point:ident) => {
+        #[cfg(test)]
+        hit_failpoint(Failpoint::$point);
+    };
 }
 
 thread_local! {
@@ -978,8 +1044,14 @@ fn arith(op: Op, a: Value, b: Value) -> u64 {
     }
 }
 
-extern "C" fn cloison_rt_strict_eq(a: Value, b: Value) -> bool {
-    crate::interp::strict_equals(a, b)
+/// `a === b` (the strict tests' `__slow` helpers, for two strings or two
+/// BigInts): a boolean, or [`RT_REDO`] to leave (a panic: flattening a
+/// cons string to compare its units allocates).
+extern "C" fn cloison_rt_strict_eq(a: Value, b: Value) -> u64 {
+    unwinding(RT_REDO, || {
+        failpoint!(StrictEq);
+        crate::interp::strict_equals(a, b) as u64
+    })
 }
 
 /// `a % b` (`ModSmi`'s slow path; `b` is the immediate).
@@ -1104,45 +1176,57 @@ fn rt_create_closure(callee: Value, current: Value) -> u64 {
 /// `CreateClosure` of `callee` (a `Code`) in the compiled frame `regs` of
 /// a function whose registers it captures (`create_closure_local`
 /// stencils).
+///
+/// 0 to leave (a panic).
 extern "C" fn cloison_rt_create_closure_local(regs: Value, callee: Value) -> u64 {
-    unsafe {
+    unwinding(0, || unsafe {
+        failpoint!(CreateClosureLocal);
         crate::interp::create_closure_of(regs.to_bits() as *mut Value, callee.to_bits() as *const crate::vm::Code)
             .to_bits()
-    }
+    })
 }
 
 /// Before compiled frame `regs` returns `acc`: its open upvalues closed
-/// (`close_upvalues` stencils); `acc`.
+/// (`close_upvalues` stencils); `acc`. `EMPTY` if it panicked: what the
+/// frame's `Return`, the next stencil, then returns, which a compiled
+/// caller leaves on as on an error (`leave_after_call`), `vm_run`
+/// resuming the panic before it looks (the frame is the code's own: one
+/// whose registers closures capture isn't inlined).
 extern "C" fn cloison_rt_close_upvalues(regs: Value, acc: Value) -> u64 {
-    unsafe {
+    unwinding(Value::EMPTY.to_bits(), || unsafe {
+        failpoint!(CloseUpvalues);
         let vm = &mut *crate::interp::current_vm();
         interp::close_frame_upvalues(vm, regs.to_bits() as *mut Value);
-    }
-    acc.to_bits()
+        acc.to_bits()
+    })
 }
 
 /// The `arguments` of the compiled frame `regs` (`create_arguments`
-/// stencils): found through its header, as `CreateArguments` does.
+/// stencils): found through its header, as `CreateArguments` does. 0 to
+/// leave (a panic).
 extern "C" fn cloison_rt_create_arguments(regs: Value, _: Value) -> u64 {
-    unsafe {
+    unwinding(0, || unsafe {
+        failpoint!(CreateArguments);
         let vm = &mut *crate::interp::current_vm();
         let mut spread = Vec::new();
         let (args, n) = interp::frame_args(vm, regs.to_bits() as *mut Value, &mut spread);
         let callee = interp::frame_callee(regs.to_bits() as *mut Value);
         crate::builtins::arguments_object_of(vm, std::slice::from_raw_parts(args, n), callee).to_bits()
-    }
+    })
 }
 
 /// The `arguments` of an inlined frame running function `func`, its
 /// call's arguments the elements of `array`, which the compiled code made
 /// for them (`arguments_of` stencils). (Nothing collects here: `array`'s
-/// elements stay where they are while the object is made.)
+/// elements stay where they are while the object is made.) 0 to leave (a
+/// panic).
 extern "C" fn cloison_rt_arguments_of(array: Value, func: Value) -> u64 {
-    unsafe {
+    unwinding(0, || unsafe {
+        failpoint!(ArgumentsOf);
         let vm = &mut *crate::interp::current_vm();
         let a = crate::object::as_object(array);
         crate::builtins::arguments_object_of(vm, Object::elems(a), func.to_bits() as *mut Object).to_bits()
-    }
+    })
 }
 
 /// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws or
@@ -1172,10 +1256,14 @@ fn rt_delete_global(_: Value, b: Value) -> u64 {
     Value::from_bool(vm.delete_global(a)).to_bits()
 }
 
-/// `typeof a`: a string constant (`type_of` stencils).
+/// `typeof a`: a string constant (`type_of` stencils); 0 to leave (a
+/// panic: a type's name is allocated the first time it is asked for).
 extern "C" fn cloison_rt_type_of(a: Value, _: Value) -> u64 {
-    let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.type_of_own(a).to_bits()
+    unwinding(0, || {
+        failpoint!(TypeOf);
+        let vm = unsafe { &mut *crate::interp::current_vm() };
+        vm.type_of_own(a).to_bits()
+    })
 }
 
 /// A regular expression literal's new `RegExp`, of pattern `p` and flags
@@ -1376,6 +1464,13 @@ fn rt_in(a: Value, b: Value) -> u64 {
     reading(vm, |vm| vm.has_property(b, a).map_or(0, |r| Value::from_bool(r).to_bits()))
 }
 
+/// ToBoolean of a string or a BigInt (`jtotrue` and `jtofalse`'s helpers
+/// tell the rest themselves). The one runtime call whose result compiled
+/// code uses with no way to leave, and so not under [`unwinding`]: it
+/// can't panic. `interp::to_boolean` reads the cell's class and its
+/// length (a cons string's without flattening it, a BigInt's digits'),
+/// both in the header, behind a test that it is a cell: no allocation,
+/// no safepoint, no user code, no index, no assertion.
 extern "C" fn cloison_rt_to_boolean(a: Value, _: Value) -> bool {
     crate::interp::to_boolean(a)
 }
@@ -18442,10 +18537,12 @@ fn rt_char_code_at(s: Value, k: Value) -> u64 {
 /// `Math.pow(x, y)` for `math_pow` stencils: the double, boxed, or 0 to
 /// leave where `x` or `y` isn't a number (converting it may run code).
 extern "C" fn cloison_rt_pow(x: Value, y: Value) -> u64 {
-    match (x.as_number(), y.as_number()) {
+    // (Nothing known to panic in it; its tables are indexed, and it has
+    // a way to leave.)
+    unwinding(0, || match (x.as_number(), y.as_number()) {
         (Some(x), Some(y)) => Value::from_f64(crate::math::pow(x, y)).to_bits(),
         _ => 0,
-    }
+    })
 }
 
 /// `String.fromCharCode(c)` for `from_char_code` stencils, `c` an int32 or
@@ -18477,8 +18574,12 @@ fn rt_array_push(a: Value, v: Value) -> Value {
 /// do for objects of `this`'s shape from now on (their keys fit the
 /// capacity, which only grows, and the constructor's result is that
 /// shape or already several), the stencil skips the call for that shape.
+///
+/// `this`, the stencil's result; 0 (`EMPTY`) if it panicked, which the
+/// stencil leaves on as on the constructor's error.
 extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
-    unsafe {
+    unwinding(0, || unsafe {
+        failpoint!(ConstructDone);
         let s = &mut *(site.to_bits() as *mut CallSite);
         let o = Obj::of(this);
         let code = s.callee.live();
@@ -18493,8 +18594,8 @@ extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
             crate::object::pin_shape(shape);
             s.ctor.as_mut().unwrap().done_shape = shape as u64;
         }
-        0
-    }
+        this.to_bits()
+    })
 }
 
 /// [`cloison_rt_enter`]: the callee's code exited with `record` and `acc`.

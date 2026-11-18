@@ -299,6 +299,18 @@ macro_rules! rt_redo {
     }};
 }
 
+/// After a runtime call making a value, `$r`, that only fails by
+/// panicking: leave if it did (0, see `jit::unwinding`), before the
+/// instruction, nothing of it done. The code is then on its way out, the
+/// panic resumed once it has left.
+macro_rules! leave_if_panicked {
+    ($s:ident, $r:expr) => {{
+        if $r == 0 {
+            exit!($s)
+        }
+    }};
+}
+
 /// `cloison_rt_add(a, b)`.
 macro_rules! rt_add {
     ($s:ident, $a:expr, $b:expr) => {
@@ -349,7 +361,8 @@ macro_rules! rt_loose_eq {
         rt_redo!($s, rt_call!($s, cloison_rt_loose_eq, $a, $b)) & 1 != 0
     };
 }
-/// `cloison_rt_to_boolean(a)`.
+/// `cloison_rt_to_boolean(a)`. (No way out after it: it can't panic, see
+/// `jit::cloison_rt_to_boolean`.)
 macro_rules! rt_to_boolean {
     ($s:ident, $a:expr) => {
         rt_call!($s, cloison_rt_to_boolean, $a, Value::UNDEFINED) as u8 & 1 != 0
@@ -2418,12 +2431,16 @@ stencil_slow!("test_instanceof_m"; |s| {
 // compiled function's own (one doing so isn't inlined): the runtime's, as
 // the interpreter's, the closure's index the 64-bit immediate.
 stencil!("create_closure_local"; |s| {
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_create_closure_local, Value::from_bits(s.regs as u64), Value::from_bits(imm64())));
+    let r = rt_call!(s, cloison_rt_create_closure_local, Value::from_bits(s.regs as u64), Value::from_bits(imm64()));
+    leave_if_panicked!(s, r);
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 
 // Before the `Return` of a function whose registers closures capture: its
-// open upvalues closed, if it made any (`acc`, boxed, kept).
+// open upvalues closed, if it made any (`acc`, boxed, kept; `EMPTY` if the
+// runtime panicked, for the `Return` to give the caller, which leaves on
+// it: see `jit::cloison_rt_close_upvalues`).
 stencil!("close_upvalues"; |s| {
     s.acc = Value::from_bits(rt_call!(s, cloison_rt_close_upvalues, Value::from_bits(s.regs as u64), s.acc));
     next!(s)
@@ -2434,7 +2451,9 @@ stencil!("close_upvalues"; |s| {
 // finds them through the frame's header. (An inlined frame's are built
 // from its call's arguments: see `jit::Lowering::emit_frame`.)
 stencil!("create_arguments"; |s| {
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_create_arguments, Value::from_bits(s.regs as u64), Value::UNDEFINED));
+    let r = rt_call!(s, cloison_rt_create_arguments, Value::from_bits(s.regs as u64), Value::UNDEFINED);
+    leave_if_panicked!(s, r);
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 
@@ -2447,7 +2466,9 @@ stencil!("arguments_of"; |s| {
         0 => *((s.regs as *const u8).offset(imm64b() as i64 as isize) as *const u64),
         f => f,
     };
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_arguments_of, s.acc, Value::from_bits(f)));
+    let r = rt_call!(s, cloison_rt_arguments_of, s.acc, Value::from_bits(f));
+    leave_if_panicked!(s, r);
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 
@@ -3456,10 +3477,11 @@ macro_rules! rt_compare {
         rt_redo!($s, rt_call!($s, cloison_rt_compare, $a, $b)) as u32 & 3
     };
 }
-/// `cloison_rt_strict_eq(a, b)`: `a === b`.
+/// `cloison_rt_strict_eq(a, b)`: `a === b`. (It converts nothing: it
+/// leaves, as `RT_REDO`, only on a panic, see `jit::unwinding`.)
 macro_rules! rt_strict_eq {
     ($s:ident, $a:expr, $b:expr) => {
-        rt_call!($s, cloison_rt_strict_eq, $a, $b) as u8 & 1 != 0
+        rt_redo!($s, rt_call!($s, cloison_rt_strict_eq, $a, $b)) & 1 != 0
     };
 }
 
@@ -4911,7 +4933,9 @@ stencil!("create_closure"; |s| {
 // `TypeOf` of a boxed `acc` the JIT knows nothing of: its type's name, a
 // string constant, from the runtime.
 stencil!("type_of"; |s| {
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_type_of, s.acc, Value::UNDEFINED));
+    let r = rt_call!(s, cloison_rt_type_of, s.acc, Value::UNDEFINED);
+    leave_if_panicked!(s, r);
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 
@@ -7118,10 +7142,13 @@ stencil!("construct_direct"; |s| {
             if v.to_bits() == 0 || v.is_cell() {
                 v
             } else {
+                // (`this` back, or 0 if it panicked: left below, as on
+                // the constructor's error.)
                 if *p != (*c).done_shape {
-                    rt_call!(s, cloison_rt_construct_done, Value::from_bits(site as u64), Value::from_bits(p as u64));
+                    Value::from_bits(rt_call!(s, cloison_rt_construct_done, Value::from_bits(site as u64), Value::from_bits(p as u64)))
+                } else {
+                    Value::from_bits(p as u64)
                 }
-                Value::from_bits(p as u64)
             }
         } else {
             core::hint::cold_path();

@@ -8903,6 +8903,33 @@ fn host_operations_collect() {
     assert_eq!(display(run(&mut vm, "n"), &vm), (6 + 499 * 500 / 2).to_string());
 }
 
+/// The `WeakRef` targets a host operation's JavaScript keeps (ClearKeptObjects,
+/// at the end of a job: ECMA-262 §9.10) are let go as it returns, as a
+/// run's are: callbacks the host calls between runs made each a target,
+/// which a collection then frees (kept, the review of #342 found them
+/// never dying, the VM's list of them growing with each call).
+#[test]
+fn weak_ref_targets_of_host_callbacks_die() {
+    use cloison::vm::Global;
+    let mut vm = Vm::new();
+    let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    // (A native the host calls, `forEach` of a one-element array, calls
+    // the function: `call_other` calls no bytecode function itself.)
+    let mk = run(&mut vm, "var refs = []; (function () { refs.push(new WeakRef({big: [1, 2, 3]})); })");
+    let mk = Global::new(&vm, mk);
+    let one = run(&mut vm, "[0]");
+    let one = Global::new(&vm, one);
+    let each = run(&mut vm, "Array.prototype.forEach");
+    let each = Global::new(&vm, each);
+    for _ in 0..100 {
+        vm.call_other(each.get(&vm), one.get(&vm), &[mk.get(&vm)]).unwrap();
+    }
+    let alive =
+        run(&mut vm, "$262.gc(); $262.gc(); refs.filter(function (r) { return r.deref() !== undefined; }).length");
+    let alive = display(alive, &vm).parse::<u32>().unwrap();
+    assert!(alive <= 5, "{alive} of 100 targets alive");
+}
+
 /// #343: the host's ToNumber is the VM's, a string parsed, an object's
 /// `valueOf` run, what a conversion throws the error.
 #[test]

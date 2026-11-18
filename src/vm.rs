@@ -3582,6 +3582,9 @@ impl Vm {
                 unsafe {
                     let vm = &mut *self.vm;
                     if self.outer {
+                        // As a run's end (`RunState`): the job is over, its
+                        // `WeakRef` targets no longer kept (ClearKeptObjects).
+                        vm.kept_alive.clear();
                         vm.heap.gc.stack_base = 0;
                         vm.pause_marker();
                     }

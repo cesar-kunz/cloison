@@ -3150,16 +3150,16 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     }
     // (The String methods' fast paths, not the methods: they would find
     // `this`'s `Symbol.<K>`, which may not be this one.)
+    if K == 1 {
+        let u = this_units(s)?;
+        return match_all(vm, s, &u, this);
+    }
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
     // (On the VM stack: the String methods read them after user code, a
     // replacer's or a limit's conversion, and a `Vec` is no root.)
     crate::interp::with_args_on_stack(vm, &args, |vm, args| match K {
         0 => match_fast(vm, s, args),
-        1 => {
-            let u = this_units(s)?;
-            match_all(vm, s, &u, this)
-        }
         2 => replace(vm, s, args, false),
         3 => search_fast(vm, s, args),
         _ => split_fast(vm, s, args),
@@ -4195,17 +4195,20 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
     if global {
         set_last_index(vm, r, 0.0)?;
     }
-    // (One handle scope for both loops: the second runs user code, and the
-    // results, `exec`'s own objects maybe, are held by `results` alone.)
-    vm.handle_scope(|vm| -> Result<Value> {
-        let mut results = Vec::new();
+    // (The results, `exec`'s own objects maybe, kept in the handles for
+    // both loops: the second runs user code. Each is read from there, where
+    // a collection updates it, so cells may move in the getters and
+    // conversions (not in a handle scope, which would pin everything to
+    // the end; only the replacer's call has one). The handles are dropped
+    // here, on errors too.)
+    let base = vm.handles.len();
+    let result = (|| -> Result<Value> {
         loop {
             let res = rx_exec(vm, r, s)?;
             if res.is_null() {
                 break;
             }
             vm.handles.push(res);
-            results.push(res);
             if !global {
                 break;
             }
@@ -4217,7 +4220,8 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
         }
         let mut out = Vec::new();
         let mut next = 0;
-        for res in results {
+        for i in base..vm.handles.len() {
+            let res = vm.handles[i];
             let n = get_length(vm, res, "length")?;
             let ncaps = (n - 1.0).max(0.0) as usize;
             let matched = get_units(vm, res, "0")?;
@@ -4274,7 +4278,9 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
         }
         out.extend_from_slice(&su[next.min(su.len())..]);
         vm.try_new_string(&out)
-    })
+    })();
+    vm.handles.truncate(base);
+    result
 }
 
 /// SpeciesConstructor(r, %RegExp%).

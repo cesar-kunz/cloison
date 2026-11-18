@@ -7706,7 +7706,10 @@ fn below(vm: &mut Vm, src: &str) -> String {
 /// called later; one called directly from compiled code all along stays.
 /// The collections run in a second script, below a zeroed stretch of the
 /// stack: a stale word of the first one's frames pointing into `idle`'s
-/// code would count as a frame running it. The expected values are Node's.
+/// code would count as a frame running it. In release under load it still
+/// fails now and then, `idle`'s code not dropped (2026-11-18: 2 of 380
+/// whole-binary runs four at a time), likely through a stale word the
+/// zeroing doesn't reach: #346. The expected values are Node's.
 #[test]
 fn compiled_code_idle_for_some_collections_is_dropped() {
     let warm = r#"
@@ -7765,8 +7768,10 @@ total;
 /// `loop`'s call lost its latest way, the dead closure's: `loop` runs
 /// from it in the interpreter and is compiled from it again, and all of
 /// it once more. The first script warms up; the second runs below a
-/// zeroed stretch of the stack (see `below`). The expected values are
-/// Node's.
+/// zeroed stretch of the stack (see `below`). In release under load it
+/// still fails now and then with 1 retirement (2026-11-18: 2 of 150
+/// whole-binary runs four at a time, as many as at 100 calls deep), for
+/// a cause not found yet, likely #346's. The expected values are Node's.
 #[test]
 fn code_retired_under_a_running_frame_runs_to_its_exit() {
     let warm = r#"

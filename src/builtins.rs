@@ -1193,22 +1193,8 @@ fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `$262.gc()`: a full collection now (`Vm::collect_full_now`).
 fn host_gc(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    scrub_stack();
     vm.collect_full_now();
     Ok(Value::UNDEFINED)
-}
-
-/// Zero the stretch of the native stack below this frame, where the
-/// collection's frames go next: they don't write every slot, and a word
-/// left there by a frame that returned (a return address into compiled
-/// code) would count as a frame running that code (`jit::kept_by_function`
-/// reads every word of the stacks), keeping it and what it refers to past
-/// the collection a test expects to retire them in (#346). Only for
-/// `$262.gc()`, the hook tests collect with.
-#[inline(never)]
-fn scrub_stack() {
-    let pad = std::hint::black_box([0usize; 1 << 13]);
-    std::hint::black_box(&pad);
 }
 
 /// `$262.detachArrayBuffer(buffer)`: the buffer loses its bytes (its

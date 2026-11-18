@@ -2214,9 +2214,10 @@ handlers! {
     }
 
     // A typed array's element, once the cache has its kind (see
-    // `Vm::get_keyed_miss`) or met several (none a BigInt one's, whose
-    // loads allocate): read directly. Not cold, unlike `slow_get_keyed`:
-    // the keyed loads' misses come here first.
+    // `Vm::get_keyed_miss`), met several, or holds an array's shape, which
+    // `note_bytes` keeps (but a BigInt kind's, whose loads allocate): read
+    // directly. Not cold, unlike `slow_get_keyed`: the keyed loads' misses
+    // come here first.
     #[inline(never)]
     fn typed_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
@@ -2224,9 +2225,14 @@ handlers! {
             let o = crate::object::Obj::from_ptr(as_object(obj));
             let i = acc.as_i32_unchecked() as u32;
             let ic = ic_at(regs, pc, 2);
-            if (*ic).loc == crate::vm::BYTES_LOC && o.class() == Class::TypedArray && i < o.elems_len() {
+            if o.class() == Class::TypedArray && i < o.elems_len() {
                 let kind = crate::object::TypedKind::from_u8(o.kind());
-                if ((*ic).epoch == o.kind() as u32 + 1 || (*ic).epoch == u32::MAX && !kind.is_big())
+                let noted = if (*ic).loc == crate::vm::BYTES_LOC {
+                    (*ic).epoch == o.kind() as u32 + 1 || (*ic).epoch == u32::MAX && !kind.is_big()
+                } else {
+                    !(*ic).shape.is_null() && !kind.is_big()
+                };
+                if noted
                     && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(o)))
                 {
                     next!(any, Op::GetKeyed.size(), kind.load(o.elems().cast(), i as usize))
@@ -2347,6 +2353,7 @@ handlers! {
     fn first_construct(pc, acc, regs, tag) {
         let f = Obj::of(*reg(pc, 1, regs));
         (*f.code()).ics();
+        // (Its caches made: `enter_fast!`'s way to `first_entry` isn't taken.)
         enter_fast!(f, acc, reg(pc, 2, regs), *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
     }
 

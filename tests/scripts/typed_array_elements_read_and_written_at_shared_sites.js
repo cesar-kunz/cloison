@@ -1,8 +1,9 @@
 // Typed arrays' elements read and stored at shared sites: each kind with
 // the values that convert, sites meeting several kinds and BigInt ones,
-// arrays, strings and objects, views of a transferred or resized buffer,
-// keys out of range or not integers. Expected value from V8.
-// expect: Int8Array:undefined,0,1,-1,127,-128,-1,0,127,0,1,2,0,0,0,-1,0,-1,0,3,undefined Uint8Array:undefined,0,1,255,127,128,255,0,127,0,1,2,0,0,0,255,0,255,0,3,undefined Uint8ClampedArray:undefined,0,1,0,128,128,255,255,0,0,2,2,0,0,255,255,255,0,255,3,undefined Int16Array:undefined,0,1,-1,127,128,255,256,-129,0,1,2,0,0,0,-1,0,-1,-7168,3,undefined Uint16Array:undefined,0,1,65535,127,128,255,256,65407,0,1,2,0,0,0,65535,0,65535,58368,3,undefined Int32Array:undefined,0,1,-1,127,128,255,256,-129,0,1,2,0,0,0,65535,-2147483648,2147483647,1410065408,3,undefined Uint32Array:undefined,0,1,4294967295,127,128,255,256,4294967167,0,1,2,0,0,0,65535,2147483648,2147483647,1410065408,3,undefined Float32Array:undefined,0,1,-1,127.5,128,255.5,256,-129,0.5,1.5,2.5,-0,NaN,Infinity,65535,2147483648,-2147483648,10000000000,3.141590118408203,undefined Float64Array:undefined,0,1,-1,127.5,128,255.5,256,-129,0.5,1.5,2.5,-0,NaN,Infinity,65535,2147483648,-2147483649,10000000000,3.14159,undefined Float16Array:undefined,0,1,-1,127.5,128,255.5,256,-129,0.5,1.5,2.5,-0,NaN,Infinity,Infinity,Infinity,-Infinity,Infinity,3.140625,undefined 9/8 0.25/0.5 1n/-2n -7/7 3n/18446744073709551615n 1/2 a/b x/y 8 8.75 8n 8 8n 8.75 b 8.75 60 2.12199579097e-313 undefined 0 60 undefined 1516 undefined 1006 0 16 28888047 7 7 undefined 0 0
+// arrays, strings and objects, a site that met an array first, views of a
+// transferred or resized buffer, keys out of range or not integers.
+// Expected value from V8.
+// expect: Int8Array:undefined,0,1,-1,127,-128,-1,0,127,0,1,2,0,0,0,-1,0,-1,0,3,undefined Uint8Array:undefined,0,1,255,127,128,255,0,127,0,1,2,0,0,0,255,0,255,0,3,undefined Uint8ClampedArray:undefined,0,1,0,128,128,255,255,0,0,2,2,0,0,255,255,255,0,255,3,undefined Int16Array:undefined,0,1,-1,127,128,255,256,-129,0,1,2,0,0,0,-1,0,-1,-7168,3,undefined Uint16Array:undefined,0,1,65535,127,128,255,256,65407,0,1,2,0,0,0,65535,0,65535,58368,3,undefined Int32Array:undefined,0,1,-1,127,128,255,256,-129,0,1,2,0,0,0,65535,-2147483648,2147483647,1410065408,3,undefined Uint32Array:undefined,0,1,4294967295,127,128,255,256,4294967167,0,1,2,0,0,0,65535,2147483648,2147483647,1410065408,3,undefined Float32Array:undefined,0,1,-1,127.5,128,255.5,256,-129,0.5,1.5,2.5,-0,NaN,Infinity,65535,2147483648,-2147483648,10000000000,3.141590118408203,undefined Float64Array:undefined,0,1,-1,127.5,128,255.5,256,-129,0.5,1.5,2.5,-0,NaN,Infinity,65535,2147483648,-2147483649,10000000000,3.14159,undefined Float16Array:undefined,0,1,-1,127.5,128,255.5,256,-129,0.5,1.5,2.5,-0,NaN,Infinity,Infinity,Infinity,-Infinity,Infinity,3.140625,undefined 9/8 0.25/0.5 1n/-2n -7/7 3n/18446744073709551615n 1/2 a/b x/y 8 8.75 8n 8 8n 8.75 b 8.75 60 2.12199579097e-313 undefined 0 60 undefined 1516 undefined 1006 0 16 28888047 7 7 undefined 0 0 5/undefined 1.5/undefined 7n/undefined 3/undefined 7/undefined 1/undefined 9/undefined 5/undefined 1.5/undefined 7n/undefined 3/undefined 7/undefined 1/undefined undefined/undefined
 var out = [];
 function S(v) { return typeof v === "bigint" ? v + "n" : Object.is(v, -0) ? "-0" : String(v); }
 function get(a, i) { return a[i]; }
@@ -36,4 +37,9 @@ var s = 0; for (var i = 0; i < 1000; i++) s += t[i] + u[i] + (t[i + 1000] === un
 out.push(S(s));
 var obj = new Uint8Array(4); put(obj, "1", 7); put(obj, 1.5, 9); out.push(S(get(obj, 1)), S(get(obj, "1")), S(get(obj, 1.5)), S(obj[-0]));
 out.push(S(get(new Uint8Array(2), { valueOf: function () { return 1; }, toString: function () { return "1"; } })));
+// A site that met a plain array first: its cache keeps the array's shape.
+function first(a, i) { return a[i]; }
+var later = [[4, 5], new Float64Array([0.5, 1.5]), new BigUint64Array([6n, 7n]), new Int8Array([-3, 3]), [6, 7], new Uint8ClampedArray([255, 1])];
+var dv = new Uint16Array(new ArrayBuffer(4)); dv[1] = 9; later.push(dv);
+for (var r = 0; r < 3; r++) { if (r == 2) dv.buffer.transfer(); for (var j = 0; j < later.length; j++) if (r > 0) out.push(S(first(later[j], 1)) + "/" + S(first(later[j], 2))); }
 out.join(" ");

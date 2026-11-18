@@ -3,7 +3,7 @@
 //! natives, errors and frames.
 
 use cloison::value::Value;
-use cloison::vm::{Error, Vm, display};
+use cloison::vm::{Error, Global, Local, Vm, display};
 
 /// Run `src` in the interpreter only, then tiering up after 1 and 2 loop
 /// back edges (so loops compile mid-run, and re-enter compiled code right
@@ -15,7 +15,7 @@ fn run_shown(src: &str) -> Result<(Value, String), Error> {
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
-        let r = vm.run(&m).map(|v| (v, display(v, &vm)));
+        let r = vm.run(&m).map(|v| (v.value(), display(v, &vm)));
         results.push(r.as_ref().map(|v| v.1.clone()).map_err(Clone::clone));
         if budget == 1000 {
             assert!(results.windows(2).all(|w| w[0] == w[1]), "interpreter, tier at 1, 2, 1000: {results:?}");
@@ -377,7 +377,7 @@ fn slack_tracking_grows_in_object_capacity() {
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     let second = vm.run(&m).unwrap();
-    assert_eq!(vm.inline_capacity(second), 6);
+    assert_eq!(second.inline_capacity(&vm), 6);
 }
 
 /// `k → B.prototype → A.prototype.m`: the load of `k.m` is cached with
@@ -3049,7 +3049,7 @@ s;";
 }
 
 /// Two VMs, and a cell (an object) of the first's heap.
-fn two_vms() -> (Vm, Vm, Value) {
+fn two_vms() -> (Vm, Vm, Local) {
     let mut a = Vm::new();
     let b = Vm::new();
     let o = a.run(&cloison::js::compile("({x: 1})").unwrap()).unwrap();
@@ -3058,58 +3058,60 @@ fn two_vms() -> (Vm, Vm, Value) {
 
 // A cell of one VM's heap handed to another's API panics rather than being
 // stored there, for the other heap's collector to mark (issue #223); a
-// VM's own cells, and values not cells, pass.
+// VM's own cells, and values not cells, pass. (A `Local` tells by its
+// tag, which is no other VM's: #359.)
 
 #[test]
 fn own_cells_pass_the_api() {
     let (mut a, mut b, o) = two_vms();
     let x = a.intern("x");
-    a.set(o, x, Value::from_i32(2)).unwrap();
-    assert_eq!(display(a.get(o, x).unwrap(), &a), "2");
-    let p = a.new_array();
-    a.set_keyed(p, Value::from_i32(0), o).unwrap();
-    let g = b.global_object();
+    // (Kept through the operations: each may run JavaScript.)
+    let o = Global::new(&a, o);
+    o.local().set(&mut a, x, Local::from(2)).unwrap();
+    assert_eq!(display(o.local().get(&mut a, x).unwrap(), &a), "2");
+    let p = Local::array(&mut a);
+    p.set_keyed(&mut a, Local::from(0), o.local()).unwrap();
     let y = b.intern("y");
-    b.set(g, y, Value::from_i32(3)).unwrap();
-    assert_eq!(display(b.get(g, y).unwrap(), &b), "3");
+    b.global_object().set(&mut b, y, Local::from(3)).unwrap();
+    assert_eq!(display(b.global_object().get(&mut b, y).unwrap(), &b), "3");
 }
 
 #[test]
-#[should_panic(expected = "Vm::set: a value not of this VM's heap")]
+#[should_panic(expected = "Local::set: a Local of another VM")]
 fn another_heaps_value_set_panics() {
     let (_a, mut b, o) = two_vms();
     let g = b.global_object();
     let y = b.intern("y");
-    let _ = b.set(g, y, o);
+    let _ = g.set(&mut b, y, o);
 }
 
 #[test]
-#[should_panic(expected = "Vm::set_keyed: a value not of this VM's heap")]
+#[should_panic(expected = "Local::set_keyed: a Local of another VM")]
 fn another_heaps_object_set_keyed_panics() {
     let (_a, mut b, o) = two_vms();
-    let _ = b.set_keyed(o, Value::from_i32(0), Value::from_i32(1));
+    let _ = o.set_keyed(&mut b, Local::from(0), Local::from(1));
 }
 
 #[test]
-#[should_panic(expected = "Vm::call_other: a value not of this VM's heap")]
+#[should_panic(expected = "Local::call_other: a Local of another VM")]
 fn another_heaps_argument_call_other_panics() {
     let (_a, mut b, o) = two_vms();
     let f = b.run(&cloison::js::compile("Object.keys").unwrap()).unwrap();
-    let _ = b.call_other(f, Value::UNDEFINED, &[o]);
+    let _ = f.call_other(&mut b, Local::UNDEFINED, &[o]);
 }
 
 #[test]
-#[should_panic(expected = "Vm::string_units: a value not of this VM's heap")]
+#[should_panic(expected = "Local::string_units: a Local of another VM")]
 fn another_heaps_string_string_units_panics() {
     let mut a = Vm::new();
     let b = Vm::new();
-    let s = a.new_string(&[65; 64]);
-    let _ = b.string_units(s);
+    let s = Local::string(&mut a, &[65; 64]);
+    let _ = s.string_units(&b);
 }
 
 #[test]
-#[should_panic(expected = "Vm::type_of: a value not of this VM's heap")]
+#[should_panic(expected = "Local::type_of: a Local of another VM")]
 fn another_heaps_value_type_of_panics() {
     let (_a, mut b, o) = two_vms();
-    let _ = b.type_of(o);
+    let _ = o.type_of(&mut b);
 }

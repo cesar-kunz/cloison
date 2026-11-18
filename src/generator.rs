@@ -185,7 +185,7 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     }
     if get(vm, st, STATE).as_i32_unchecked() == COMPLETED {
         return match mode {
-            THROW => Err(Error(String::new(), Some(v))),
+            THROW => Err(Error(String::new(), Some(v), 0)),
             RETURN => Ok((v, true)),
             _ => Ok((Value::UNDEFINED, true)),
         };

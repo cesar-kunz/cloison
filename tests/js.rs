@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cloison::vm::{Vm, display};
+use cloison::vm::{Global, Local, Vm, display};
 
 fn files(dir: &str, ext: &str) -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
@@ -222,7 +222,7 @@ p.then(() => { globalThis.out = log.join(" "); });
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "0 s1 caught 1 2 3 T 4 5 end 6 7");
+    assert_eq!(display(g.get(&mut vm, a).unwrap(), &vm), "0 s1 caught 1 2 3 T 4 5 end 6 7");
 }
 
 /// `globalThis.out` once `src` and its jobs have run.
@@ -232,7 +232,7 @@ fn out_after_jobs(src: &str) -> String {
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    display(vm.get(g, a).unwrap(), &vm)
+    display(g.get(&mut vm, a).unwrap(), &vm)
 }
 
 /// A `for await` left early awaits what `return()` gives, which must be
@@ -2803,7 +2803,10 @@ var log = [];
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
+    assert_eq!(
+        display(g.get(&mut vm, a).unwrap(), &vm),
+        "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23"
+    );
 }
 
 /// A function with more variables than registers whose loops declare
@@ -3173,7 +3176,7 @@ Promise.all([g(), new C().m({ s: 1 })]).then(async v => { for await (const x of 
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "5 2 7 function,function");
+    assert_eq!(display(g.get(&mut vm, a).unwrap(), &vm), "5 2 7 function,function");
 }
 
 /// `Intl.Collator` (the `intl` feature): ICU4X's root collation for
@@ -5417,7 +5420,7 @@ function C() {}
     vm.run(&module).unwrap();
     let a = vm.intern("out");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "1,2 10,21 a,b true 1 SyntaxError 1 TypeError");
+    assert_eq!(display(g.get(&mut vm, a).unwrap(), &vm), "1,2 10,21 a,b true 1 SyntaxError 1 TypeError");
 }
 
 /// An async arrow (or generator) in an async function (or generator)
@@ -5440,7 +5443,7 @@ out.push([...g()].join("/"));
     vm.run(&module).unwrap();
     let a = vm.intern("result");
     let g = vm.global_object();
-    assert_eq!(display(vm.get(g, a).unwrap(), &vm), "5/6,2,2");
+    assert_eq!(display(g.get(&mut vm, a).unwrap(), &vm), "5/6,2,2");
 }
 
 /// `DisposableStack`, `AsyncDisposableStack` and `SuppressedError`:
@@ -5478,7 +5481,7 @@ log.push(e.error, e.suppressed, e.message, e instanceof Error);
     let a = vm.intern("result");
     let g = vm.global_object();
     assert_eq!(
-        display(vm.get(g, a).unwrap(), &vm),
+        display(g.get(&mut vm, a).unwrap(), &vm),
         "true,false,defer,adopt 7,use,true,SuppressedError,TypeError,RangeError,0,TypeError,ReferenceError,async,1,2,m,true,sync in async,true"
     );
 }
@@ -5517,7 +5520,7 @@ log.push(eval("4; { using c = null; }"));
     let a = vm.intern("result");
     let g = vm.global_object();
     assert_eq!(
-        display(vm.get(g, a).unwrap(), &vm),
+        display(g.get(&mut vm, a).unwrap(), &vm),
         "body | dispose b | dispose a | dispose x | ret | dispose y | SuppressedError:y/TypeError | iter | dispose z1 | \
          iter | dispose z2 | loop | dispose w | ident 1 | SyntaxError | SyntaxError | ReferenceError | 4 | async body | \
          async dispose | after"
@@ -5544,7 +5547,7 @@ fn run_module(dir: &Path, main: &str) -> Result<String, String> {
         Ok(()) => {
             let a = vm.intern("result");
             let g = vm.global_object();
-            Ok(display(vm.get(g, a).unwrap(), &vm))
+            Ok(display(g.get(&mut vm, a).unwrap(), &vm))
         }
         Err(cloison::vm::ModuleError::Early(m)) => Err(format!("early: {m}")),
         Err(cloison::vm::ModuleError::Thrown(e)) => Err(vm.uncaught_message(&e)),
@@ -5667,7 +5670,7 @@ fn modules_eval_in_arrows() {
         vm.run_module(dir.join("main.mjs").to_str().unwrap()).unwrap_or_else(|_| panic!("at {budget}"));
         vm.verify_heap();
         let (a, g) = (vm.intern("result"), vm.global_object());
-        assert_eq!(display(vm.get(g, a).unwrap(), &vm), want, "tier at {budget}");
+        assert_eq!(display(g.get(&mut vm, a).unwrap(), &vm), want, "tier at {budget}");
     }
     // (With an `eval` of its own too.)
     assert_eq!(run_module(&dir, "top.mjs").unwrap(), "SyntaxError");
@@ -5692,7 +5695,7 @@ fn modules_eval_sees_many_top_level_bindings() {
         vm.run_module(dir.join("main.mjs").to_str().unwrap()).unwrap_or_else(|_| panic!("at {budget}"));
         vm.verify_heap();
         let (a, g) = (vm.intern("result"), vm.global_object());
-        assert_eq!(display(vm.get(g, a).unwrap(), &vm), "304,1,2,7,307,3", "tier at {budget}");
+        assert_eq!(display(g.get(&mut vm, a).unwrap(), &vm), "304,1,2,7,307,3", "tier at {budget}");
     }
 }
 
@@ -5843,7 +5846,7 @@ fn modules_import_many_names() {
             let a = vm.intern("result");
             let g = vm.global_object();
             assert_eq!(
-                display(vm.get(g, a).unwrap(), &vm),
+                display(g.get(&mut vm, a).unwrap(), &vm),
                 "2,7,1,1,1,2,4,2,2,2,TypeError,12000,2,4,3,6,4,ReferenceError,ReferenceError",
                 "{n} imports, tier at {budget}"
             );
@@ -7457,7 +7460,7 @@ s;
     let module = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     let s = vm.run(&module).unwrap();
-    let o = cloison::object::as_object(s);
+    let o = cloison::object::as_object(s.value());
     unsafe {
         assert!(!(*o).elems.is_null(), "not flat");
         let code = cloison::value::Value::from_bits_unchecked((*o).code as u64);
@@ -8480,7 +8483,7 @@ for (var r = 0; r < 4; r++) {
         vm.run(&module).unwrap();
         assert_eq!(vm.atom_name(a), "held_outside_the_vm", "poison {poison}");
         let g = vm.global_object();
-        vm.set(g, a, cloison::value::Value::from_i32(7)).unwrap();
+        g.set(&mut vm, a, Local::from(7)).unwrap();
         assert_eq!(
             vm.run(&read).map(|v| display(v, &vm)).map_err(|e| e.to_string()).as_deref(),
             Ok("7"),
@@ -8917,15 +8920,16 @@ out.join(" ");
 fn string_units_reads_cons_strings_in_place() {
     let mut b = Vm::new();
     let s = b.run(&cloison::js::compile("'x'.repeat(100) + 'y'").unwrap()).unwrap();
+    let s = Global::new(&b, s);
     let t = b.run(&cloison::js::compile("'z' + 'w'.repeat(50)").unwrap()).unwrap();
     {
         let mut a = Vm::new();
         a.run(&cloison::js::compile("0").unwrap()).unwrap();
     }
-    let (u, w) = (b.string_units(s).unwrap(), b.string_units(t).unwrap());
+    let (u, w) = (s.local().string_units(&b).unwrap(), t.string_units(&b).unwrap());
     assert_eq!((u.len(), u[0], u[100]), (101, b'x' as u16, b'y' as u16));
     assert_eq!((w.len(), w[0], w[50]), (51, b'z' as u16, b'w' as u16));
-    assert!(b.string_units(cloison::value::Value::from_i32(1)).is_none());
+    assert!(Local::from(1).string_units(&b).is_none());
 }
 
 /// A VM is the running one only while it runs (issue #70): a string of
@@ -8940,20 +8944,23 @@ fn values_outlive_another_vm_run() {
         a.run(&cloison::js::compile("0").unwrap()).unwrap();
     }
     assert_eq!(display(s, &b).len(), 200);
+    // (Past `b`'s own runs, as a `Global`.)
+    let s = Global::new(&b, s);
     let mut a = Vm::new();
     a.run(&cloison::js::compile("0").unwrap()).unwrap();
     let m = cloison::js::compile("s.slice(99, 101) + s.length").unwrap();
     assert_eq!(display(b.run(&m).unwrap(), &b), "xy200");
     drop(a);
     assert_eq!(display(b.run(&m).unwrap(), &b), "xy200");
-    assert_eq!(display(s, &b), "x".repeat(100) + &"y".repeat(100));
+    assert_eq!(display(s.local(), &b), "x".repeat(100) + &"y".repeat(100));
     // The message of what a run threw is made after it, as one.
     let e = b.run(&cloison::js::compile("throw new Error('m' + s)").unwrap()).unwrap_err();
-    assert_eq!(b.uncaught_message(&e), format!("Error: m{}", display(s, &b)));
+    assert_eq!(b.uncaught_message(&e), format!("Error: m{}", display(s.local(), &b)));
     // A host's property access between runs makes a cons string key flat.
     let o = b.run(&cloison::js::compile("var o = {}; o[s + 'z'] = 7; o").unwrap()).unwrap();
+    let o = Global::new(&b, o);
     let k = b.run(&cloison::js::compile("s + 'z'").unwrap()).unwrap();
-    assert_eq!(display(b.get_keyed(o, k).unwrap(), &b), "7");
+    assert_eq!(display(o.local().get_keyed(&mut b, k).unwrap(), &b), "7");
 }
 
 /// A host's operations between runs enter the VM as a run does (#70): a
@@ -8974,40 +8981,42 @@ var map = Array.prototype.map, xs = [1, 2, 3], twice = x => x * 2;
 var C = function () {}; Object.defineProperty(C, Symbol.hasInstance, { value: v => v === 7 });
 0"#;
     vm.run(&cloison::js::compile(src).unwrap()).unwrap();
-    let g = vm.global_object();
+    // (Each kept as a `Global`: a `Local` lasts until the next operation.)
     let get = |vm: &mut Vm, name: &str| {
         let a = vm.intern(name);
-        vm.get(g, a).unwrap()
+        let v = vm.global_object().get(vm, a).unwrap();
+        Global::new(vm, v)
     };
     let o = get(&mut vm, "o");
     let gname = vm.intern("g");
-    assert_eq!(display(vm.get(o, gname).unwrap(), &vm), "G1");
+    assert_eq!(display(o.local().get(&mut vm, gname).unwrap(), &vm), "G1");
     let sname = vm.intern("s");
-    vm.set(o, sname, cloison::value::Value::from_i32(3)).unwrap();
+    o.local().set(&mut vm, sname, Local::from(3)).unwrap();
     let key = get(&mut vm, "key");
-    assert_eq!(display(vm.get_keyed(o, key).unwrap(), &vm), "5");
+    assert_eq!(display(o.local().get_keyed(&mut vm, key.local()).unwrap(), &vm), "5");
     let bad = get(&mut vm, "bad");
-    let e = vm.get_keyed(o, bad).unwrap_err();
+    let e = o.local().get_keyed(&mut vm, bad.local()).unwrap_err();
     assert_eq!(vm.uncaught_message(&e), "Error: boom");
-    let e = vm.set_keyed(o, bad, cloison::value::Value::from_i32(1)).unwrap_err();
+    let e = o.local().set_keyed(&mut vm, bad.local(), Local::from(1)).unwrap_err();
     assert_eq!(vm.uncaught_message(&e), "Error: boom");
     // Nothing left pending: the next conversion runs.
-    assert_eq!(display(vm.get_keyed(o, key).unwrap(), &vm), "5");
+    assert_eq!(display(o.local().get_keyed(&mut vm, key.local()).unwrap(), &vm), "5");
     let p = get(&mut vm, "p");
     let x = vm.intern("x");
-    assert_eq!(display(vm.get(p, x).unwrap(), &vm), "Px");
-    let yes = vm.new_string(&"yes".encode_utf16().collect::<Vec<u16>>());
-    assert!(vm.has_property(p, yes).unwrap());
-    let e = vm.for_in_keys(p).unwrap_err();
+    assert_eq!(display(p.local().get(&mut vm, x).unwrap(), &vm), "Px");
+    let yes = Local::string(&mut vm, &"yes".encode_utf16().collect::<Vec<u16>>());
+    assert!(p.local().has_property(&mut vm, yes).unwrap());
+    let e = p.local().for_in_keys(&mut vm).unwrap_err();
     assert_eq!(vm.uncaught_message(&e), "TypeError: no keys");
     let (map, xs, twice) = (get(&mut vm, "map"), get(&mut vm, "xs"), get(&mut vm, "twice"));
-    let r = vm.call_other(map, xs, &[twice]).unwrap();
+    let r = map.local().call_other(&mut vm, xs.local(), &[twice.local()]).unwrap();
+    let r = Global::new(&vm, r);
     let join = vm.intern("join");
-    let join = vm.get(r, join).unwrap();
-    assert_eq!(display(vm.call_other(join, r, &[]).unwrap(), &vm), "2,4,6");
+    let join = r.local().get(&mut vm, join).unwrap();
+    assert_eq!(display(join.call_other(&mut vm, r.local(), &[]).unwrap(), &vm), "2,4,6");
     let c = get(&mut vm, "C");
-    assert!(vm.instance_of(cloison::value::Value::from_i32(7), c).unwrap());
-    assert!(!vm.instance_of(cloison::value::Value::from_i32(8), c).unwrap());
+    assert!(Local::from(7).instance_of(&mut vm, c.local()).unwrap());
+    assert!(!Local::from(8).instance_of(&mut vm, c.local()).unwrap());
     let r = vm.run(&cloison::js::compile("log.join()").unwrap()).unwrap();
     assert_eq!(display(r, &vm), "set 3");
 }
@@ -9021,12 +9030,13 @@ fn another_vms_cons_key_panics_cleanly() {
     let mut b = Vm::new();
     let xy = "var xy = 'x'.repeat(40) + 'y'.repeat(40);";
     let o = a.run(&cloison::js::compile(&format!("{xy} var o = {{ [xy]: 1 }}; o")).unwrap()).unwrap();
+    let o = Global::new(&a, o);
     let k = b.run(&cloison::js::compile(&format!("{xy} xy")).unwrap()).unwrap();
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.get_keyed(o, k)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| o.local().get_keyed(&mut a, k)));
     assert!(r.is_err());
-    assert_eq!(display(b.get_keyed(b.global_object(), k).unwrap(), &b), "undefined");
+    assert_eq!(display(b.global_object().get_keyed(&mut b, k).unwrap(), &b), "undefined");
     let ka = a.run(&cloison::js::compile("'x'.repeat(40) + 'y'.repeat(40)").unwrap()).unwrap();
-    assert_eq!(display(a.get_keyed(o, ka).unwrap(), &a), "1");
+    assert_eq!(display(o.local().get_keyed(&mut a, ka).unwrap(), &a), "1");
     assert_eq!(display(b.run(&cloison::js::compile("xy.length").unwrap()).unwrap(), &b), "80");
 }
 
@@ -9038,7 +9048,6 @@ fn another_vms_cons_key_panics_cleanly() {
 /// alive: they clone and drop then, and are no later VM's.
 #[test]
 fn globals_survive_clones_drops_and_moving_collections() {
-    use cloison::vm::Global;
     let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     for config in 0..3 {
         let mut vm = Vm::new();
@@ -9061,8 +9070,9 @@ fn globals_survive_clones_drops_and_moving_collections() {
                     "(function () {{ var a = []; for (var i = 0; i < 40; i++) a.push({{n: {round} * 100 + i, s: 'v' + i}}); return a; }})()"
                 ),
             );
+            let a = Global::new(&vm, a);
             for i in 0..40 {
-                let v = vm.get_keyed(a, cloison::value::Value::from_i32(i)).unwrap();
+                let v = a.local().get_keyed(&mut vm, Local::from(i)).unwrap();
                 held.push((Global::new(&vm, v), round * 100 + i));
             }
             for _ in 0..15 {
@@ -9077,9 +9087,9 @@ fn globals_survive_clones_drops_and_moving_collections() {
             let full = if round % 3 == 0 { "$262.gc();" } else { "" };
             run(&mut vm, &format!("for (var i = 0; i < 3e4; i++) var x = {{i: [i]}}; {full}"));
             for (g, id) in &held {
-                let o = g.get(&vm);
-                assert_eq!(display(vm.get(o, n).unwrap(), &vm), id.to_string(), "config {config}, round {round}");
-                assert_eq!(display(vm.get(o, s).unwrap(), &vm), format!("v{}", id % 100));
+                let got = display(g.local().get(&mut vm, n).unwrap(), &vm);
+                assert_eq!(got, id.to_string(), "config {config}, round {round}");
+                assert_eq!(display(g.local().get(&mut vm, s).unwrap(), &vm), format!("v{}", id % 100));
             }
         }
         vm.verify_heap();
@@ -9097,11 +9107,10 @@ fn globals_survive_clones_drops_and_moving_collections() {
 /// A value the host keeps across runs as a `Global` (#142): a root, kept
 /// through collections that free what nothing else holds and updated
 /// as they move its cell; of its own VM only; its slot free once
-/// dropped. (The raw `Value` of the issue's reproducer read `undefined`
+/// dropped. (The raw value of the issue's reproducer read `undefined`
 /// after the second run.)
 #[test]
 fn globals_keep_host_values_across_runs() {
-    use cloison::vm::Global;
     let mut vm = Vm::new();
     vm.set_gc_evacuate_all();
     let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
@@ -9115,58 +9124,102 @@ fn globals_keep_host_values_across_runs() {
         run(&mut vm, "for (var i = 0; i < 2e5; i++) var x = {i: [i]}; $262.gc(); $262.gc();");
     }
     let k = vm.intern("k");
-    assert_eq!(display(vm.get(o.get(&vm), k).unwrap(), &vm), "vvv");
-    assert_eq!(o.get(&vm), copy.get(&vm));
-    assert_ne!(o.get(&vm).to_bits(), at, "evacuation moved it, and its Global with it");
+    assert_eq!(display(o.local().get(&mut vm, k).unwrap(), &vm), "vvv");
+    assert_eq!(o.local().to_bits(), copy.local().to_bits());
+    assert_ne!(o.local().to_bits(), at, "evacuation moved it, and its Global with it");
     let other = Vm::new();
     assert!(o.is_of(&vm) && !o.is_of(&other));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| o.get(&other)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| display(o.local(), &other)));
     assert!(r.is_err());
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Global::new(&other, o.get(&vm))));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Global::new(&other, o.local())));
+    assert!(r.is_err());
+    // Past its VM, it is a `Local` of none.
+    drop(vm);
+    let later = Vm::new();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| display(o.local(), &later)));
     assert!(r.is_err());
 }
 
-/// #323: a raw `Value` kept past a collection that freed its cell is
-/// refused by the VM's operations (they panic) rather than read. Of the
-/// objects the host had, the script dropped and collected, a stale word
-/// may keep a few (the native stack is scanned conservatively), and a
-/// cell made at a freed address since reads as that cell: those read
-/// whatever live object is there, nothing crashes.
+/// #323, #359: a `Local` kept past the VM's next run or operation is
+/// refused by every entry (they panic) rather than read: whether a
+/// collection freed its cell or not, and whatever is at its address now.
 #[test]
-fn stale_raw_values_are_refused() {
-    use cloison::value::Value;
-    use cloison::vm::Global;
+fn stale_locals_are_refused() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let mut vm = Vm::new();
     let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     let a = run(&mut vm, "var a = []; for (var i = 0; i < 200; i++) a.push({k: 'v'.repeat(i % 7) + i}); a");
-    let objs: Vec<Value> = (0..200).map(|i| vm.get_keyed(a, Value::from_i32(i)).unwrap()).collect();
-    run(&mut vm, "a = null; $262.gc(); $262.gc();");
+    let a = Global::new(&vm, a);
+    let objs: Vec<Local> = (0..200).map(|i| a.local().get_keyed(&mut vm, Local::from(i)).unwrap()).collect();
     let k = vm.intern("k");
-    let mut refused = 0;
-    for &o in &objs {
-        match catch_unwind(AssertUnwindSafe(|| vm.get(o, k))) {
-            Err(_) => refused += 1,
-            Ok(r) => drop(display(r.unwrap(), &vm)),
-        }
-    }
-    // (199 of 200 here, on x86-64, under each `CLOISON_GC_*` and with the
-    // JIT off: half leaves room for other stacks' stale words.)
-    assert!(refused >= 100, "{refused} of 200 refused");
-    // Nor displayed, kept or called.
-    let dead = objs.iter().copied().find(|&o| catch_unwind(AssertUnwindSafe(|| display(o, &vm))).is_err()).unwrap();
+    // The last is the VM's still; the others were another operation ago,
+    // alive and where they were as they are.
+    assert_eq!(display(objs[199], &vm), "[object Object]");
+    assert!(objs[..199].iter().all(|&o| catch_unwind(AssertUnwindSafe(|| display(o, &vm))).is_err()));
+    assert_eq!(display(objs[199].get(&mut vm, k).unwrap(), &vm), "vvv199");
+    assert!(catch_unwind(AssertUnwindSafe(|| display(objs[199], &vm))).is_err());
+    run(&mut vm, "a = null; $262.gc(); $262.gc();");
+    assert!(objs.iter().all(|&o| catch_unwind(AssertUnwindSafe(|| o.get(&mut vm, k))).is_err()));
+    // Nor displayed, kept, called, or given as an argument.
+    let dead = objs[0];
+    assert!(catch_unwind(AssertUnwindSafe(|| display(dead, &vm))).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| Global::new(&vm, dead))).is_err());
-    assert!(catch_unwind(AssertUnwindSafe(|| vm.type_of(dead))).is_err());
-    let f = run(&mut vm, "(function (x) { return x; })");
-    assert!(catch_unwind(AssertUnwindSafe(|| vm.call_other(f, Value::UNDEFINED, &[dead]))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| dead.type_of(&mut vm))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| dead.string_units(&vm).is_some())).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| dead.call_other(&mut vm, Local::UNDEFINED, &[]))).is_err());
+    let f = run(&mut vm, "Math.max");
+    assert!(catch_unwind(AssertUnwindSafe(|| f.call_other(&mut vm, Local::UNDEFINED, &[dead]))).is_err());
+    // (Refused before the operation began: `f` is the VM's still.)
+    assert_eq!(display(f.call_other(&mut vm, Local::UNDEFINED, &[Local::from(4)]).unwrap(), &vm), "4");
+    // A primitive is of no VM and no moment.
+    let (three, half) = (Local::from(3), Local::from(0.5));
+    run(&mut vm, "1");
+    assert_eq!(
+        (display(three, &vm), display(half, &vm), display(Local::NULL, &vm)),
+        ("3".into(), "0.5".into(), "null".into())
+    );
     // The VM goes on.
     assert_eq!(display(run(&mut vm, "1 + 1"), &vm), "2");
 }
 
-/// #339: `display` takes the VM its value is of, and checks it: another
-/// VM's cell is refused, and one of a VM dropped (whose heap a new VM may
-/// have taken) is refused or a cell of the new VM's heap, never freed
-/// memory.
+/// #359: a stale `Local` whose address a new live object took is refused
+/// as any other (the check of the heap that #323 made took it for that
+/// object: memory-safe, but the wrong one).
+#[test]
+fn a_stale_local_at_a_reused_address_is_refused() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut vm = Vm::new();
+    let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let mut reused = 0;
+    for round in 0..20 {
+        let old = run(&mut vm, &format!("({{old: {round}}})"));
+        // Dropped and collected, then objects of its size made until one
+        // is where it was.
+        let made = run(
+            &mut vm,
+            "$262.gc(); $262.gc(); var made = []; for (var i = 0; i < 4000; i++) made.push({fresh: i}); made",
+        );
+        let made = Global::new(&vm, made);
+        for i in 0..4000 {
+            let new = made.local().get_keyed(&mut vm, Local::from(i)).unwrap();
+            if new.to_bits() == old.to_bits() {
+                reused += 1;
+                assert_eq!(display(new, &vm), "[object Object]");
+                assert!(catch_unwind(AssertUnwindSafe(|| display(old, &vm))).is_err());
+                let fresh = vm.intern("fresh");
+                assert!(catch_unwind(AssertUnwindSafe(|| old.get(&mut vm, fresh))).is_err());
+                break;
+            }
+        }
+    }
+    // (Found on x86-64, also under `CLOISON_GC_STW`, `CLOISON_GC_STRESS`,
+    // `CLOISON_GC_VERIFY` and with the JIT off.)
+    assert!(reused > 0, "no address reused in 20 rounds");
+}
+
+/// #339, #359: `display` takes the VM its value is of, and checks it:
+/// another VM's is refused, and one of a VM dropped, whose heap a new VM
+/// may have taken.
 #[test]
 fn display_checks_the_value_against_its_vm() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -9178,9 +9231,17 @@ fn display_checks_the_value_against_its_vm() {
     drop(b);
     drop(a);
     let c = Vm::new();
-    let _ = catch_unwind(AssertUnwindSafe(|| display(s, &c)));
+    assert!(catch_unwind(AssertUnwindSafe(|| display(s, &c))).is_err());
     let mut c = c;
     assert_eq!(display(c.run(&cloison::js::compile("'ok'").unwrap()).unwrap(), &c), "ok");
+    // Nor a `Global`'s of another VM.
+    let mut d = Vm::new();
+    let o = c.run(&cloison::js::compile("({})").unwrap()).unwrap();
+    let kept = Global::new(&c, o);
+    d.run(&cloison::js::compile("1").unwrap()).unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| display(kept.local(), &d))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| Global::new(&d, kept.local()))).is_err());
+    assert_eq!(display(kept.local(), &c), "[object Object]");
 }
 
 /// #342: JavaScript a host operation runs (a getter `Vm::get` reads, the
@@ -9191,12 +9252,11 @@ fn display_checks_the_value_against_its_vm() {
 /// by nothing else (what is kept across runs is held as a `Global`).
 #[test]
 fn host_operations_collect() {
-    use cloison::vm::Global;
     let mut vm = Vm::new();
     let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     let o = run(&mut vm, "({get x() { for (var i = 0; i < 3e6; i++) var a = {b: [i]}; return 1; }})");
     let x = vm.intern("x");
-    assert_eq!(display(vm.get(o, x).unwrap(), &vm), "1");
+    assert_eq!(display(o.get(&mut vm, x).unwrap(), &vm), "1");
     // (3e6 objects and arrays: over 200 MiB uncollected.)
     assert!(vm.heap_allocated() < 96 << 20, "heap {} MiB", vm.heap_allocated() >> 20);
     let arr = run(&mut vm, "var n = 0; [{v: 1}, {v: 2}, {v: 3}].concat(Array(500).fill(0).map((_, i) => ({v: i})))");
@@ -9204,7 +9264,7 @@ fn host_operations_collect() {
     let each = run(&mut vm, "Array.prototype.forEach");
     let each = Global::new(&vm, each);
     let cb = run(&mut vm, "(function (e) { for (var i = 0; i < 6000; i++) var a = {b: [i]}; n += e.v; })");
-    vm.call_other(each.get(&vm), arr.get(&vm), &[cb]).unwrap();
+    each.local().call_other(&mut vm, arr.local(), &[cb]).unwrap();
     assert!(vm.heap_allocated() < 96 << 20, "heap {} MiB", vm.heap_allocated() >> 20);
     assert_eq!(display(run(&mut vm, "n"), &vm), (6 + 499 * 500 / 2).to_string());
 }
@@ -9216,7 +9276,6 @@ fn host_operations_collect() {
 /// never dying, the VM's list of them growing with each call).
 #[test]
 fn weak_ref_targets_of_host_callbacks_die() {
-    use cloison::vm::Global;
     let mut vm = Vm::new();
     let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     // (A native the host calls, `forEach` of a one-element array, calls
@@ -9228,7 +9287,7 @@ fn weak_ref_targets_of_host_callbacks_die() {
     let each = run(&mut vm, "Array.prototype.forEach");
     let each = Global::new(&vm, each);
     for _ in 0..100 {
-        vm.call_other(each.get(&vm), one.get(&vm), &[mk.get(&vm)]).unwrap();
+        each.local().call_other(&mut vm, one.local(), &[mk.local()]).unwrap();
     }
     let alive =
         run(&mut vm, "$262.gc(); $262.gc(); refs.filter(function (r) { return r.deref() !== undefined; }).length");
@@ -9238,9 +9297,9 @@ fn weak_ref_targets_of_host_callbacks_die() {
     assert!(alive < 50, "{alive} of 100 targets alive");
 }
 
-/// #323 for the thrown value of an `Error` the host keeps: one of
-/// another VM, or past a run that collected it, gives the error's own
-/// message (no panic: a diagnostic), and none reads freed memory.
+/// #323, #359 for the thrown value of an `Error` the host keeps: one of
+/// another VM, or past the VM's next run or operation, gives the error's
+/// own message (no panic: a diagnostic), and none reads freed memory.
 #[test]
 fn stale_thrown_values_give_the_errors_message() {
     let run_err = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap_err();
@@ -9253,9 +9312,22 @@ fn stale_thrown_values_give_the_errors_message() {
     assert_eq!(vm.uncaught_message(&errors[49]), "x".repeat(40) + "49");
     vm.run(&cloison::js::compile("for (var i = 0; i < 1e5; i++) var o = {i: [i]}; $262.gc(); $262.gc();").unwrap())
         .unwrap();
-    let same = errors.iter().filter(|e| vm.uncaught_message(e) == e.0).count();
-    // (Its own message, or a live cell's made at the freed address since.)
-    assert!(same >= 1, "{same} of 50 with their own message");
+    // (Each its own message: not the value of a cell made at the freed
+    // address since, #359.)
+    assert!(errors.iter().all(|e| vm.uncaught_message(e) == e.0));
+    // The last run's or operation's error is read whole, and again; an
+    // earlier one's value is no longer looked at, were it alive.
+    let first = run_err(&mut vm, "throw globalThis.kept = {toString() { return 'first'; }}");
+    assert_eq!((vm.uncaught_message(&first), vm.uncaught_message(&first)), ("first".into(), "first".into()));
+    let o = vm.run(&cloison::js::compile("({get x() { throw {toString() { return 'second'; }}; }})").unwrap()).unwrap();
+    let x = vm.intern("x");
+    let second = o.get(&mut vm, x).unwrap_err();
+    assert_eq!(vm.uncaught_message(&second), "second");
+    assert_eq!(vm.uncaught_message(&first), first.0);
+    // Its value changed by the host is not read either.
+    let mut forged = second.clone();
+    forged.1 = first.1;
+    assert_eq!(vm.uncaught_message(&forged), forged.0);
 }
 
 /// #343: the host's ToNumber is the VM's, a string parsed, an object's
@@ -9265,23 +9337,23 @@ fn host_to_number() {
     let mut vm = Vm::new();
     let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
     let s = run(&mut vm, "'12'");
-    assert_eq!(vm.to_number(s).unwrap(), 12.0);
+    assert_eq!(s.to_number(&mut vm).unwrap(), 12.0);
     let s = run(&mut vm, "' 0x1F '");
-    assert_eq!(vm.to_number(s).unwrap(), 31.0);
+    assert_eq!(s.to_number(&mut vm).unwrap(), 31.0);
     let o = run(&mut vm, "({valueOf() { return 5; }})");
-    assert_eq!(vm.to_number(o).unwrap(), 5.0);
+    assert_eq!(o.to_number(&mut vm).unwrap(), 5.0);
     let o = run(&mut vm, "[]");
-    assert_eq!(vm.to_number(o).unwrap(), 0.0);
+    assert_eq!(o.to_number(&mut vm).unwrap(), 0.0);
     let o = run(&mut vm, "({})");
-    assert!(vm.to_number(o).unwrap().is_nan());
+    assert!(o.to_number(&mut vm).unwrap().is_nan());
     let e = run(&mut vm, "Symbol()");
-    assert!(vm.to_number(e).unwrap_err().to_string().starts_with("TypeError"));
+    assert!(e.to_number(&mut vm).unwrap_err().to_string().starts_with("TypeError"));
     let e = run(&mut vm, "10n");
-    assert!(vm.to_number(e).unwrap_err().to_string().starts_with("TypeError"));
+    assert!(e.to_number(&mut vm).unwrap_err().to_string().starts_with("TypeError"));
     let e = run(&mut vm, "({valueOf() { throw new RangeError('no'); }})");
-    let e = vm.to_number(e).unwrap_err();
+    let e = e.to_number(&mut vm).unwrap_err();
     assert_eq!(vm.uncaught_message(&e), "RangeError: no");
-    assert_eq!(vm.to_number(cloison::value::Value::TRUE).unwrap(), 1.0);
+    assert_eq!(Local::from(true).to_number(&mut vm).unwrap(), 1.0);
     assert_eq!(display(run(&mut vm, "1 + 1"), &vm), "2");
 }
 

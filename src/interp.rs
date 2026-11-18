@@ -6028,7 +6028,7 @@ var fs = [Object.prototype.toString, Object.prototype.valueOf, Function.prototyp
 fs.push(fs.length);
 fs;
 "#;
-        let fs = vm.run(&crate::js::compile(src).unwrap()).unwrap();
+        let fs = vm.run_raw(&crate::js::compile(src).unwrap()).unwrap();
         let n = vm.get_keyed(fs, Value::from_i32(24)).unwrap();
         assert_eq!(n, Value::from_i32(24));
         for i in 0..24 {

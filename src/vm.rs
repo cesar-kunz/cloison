@@ -22,8 +22,22 @@ use crate::value::Value;
 /// A JS exception, or a feature not implemented yet: its message, and for
 /// a `throw`, the value thrown. There is no `try` yet, so every error ends
 /// the run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(pub String, pub Option<Value>);
+///
+/// The value is raw: no operation takes it. [`Vm::uncaught_message`] is
+/// what reads it, and only for the error of the VM's last run or
+/// operation, which the third field tells: the VM's tag as it handed the
+/// error to the host (see [`Local`]), 0 within the VM.
+#[derive(Clone, Debug)]
+pub struct Error(pub String, pub Option<Value>, pub(crate) u64);
+
+impl PartialEq for Error {
+    /// The same message and value thrown, whichever run threw it.
+    fn eq(&self, other: &Error) -> bool {
+        self.0 == other.0 && self.1 == other.1
+    }
+}
+
+impl Eq for Error {}
 
 /// How running a module failed (see [`Vm::run_module`]).
 #[derive(Debug)]
@@ -36,26 +50,26 @@ pub enum ModuleError {
 
 impl Error {
     pub fn type_error(m: impl fmt::Display) -> Error {
-        Error(format!("TypeError: {m}"), None)
+        Error(format!("TypeError: {m}"), None, 0)
     }
     pub fn reference_error(m: impl fmt::Display) -> Error {
-        Error(format!("ReferenceError: {m}"), None)
+        Error(format!("ReferenceError: {m}"), None, 0)
     }
     pub fn new_syntax(m: impl fmt::Display) -> Error {
-        Error(format!("SyntaxError: {m}"), None)
+        Error(format!("SyntaxError: {m}"), None, 0)
     }
     pub fn range_error(m: impl fmt::Display) -> Error {
-        Error(format!("RangeError: {m}"), None)
+        Error(format!("RangeError: {m}"), None, 0)
     }
     pub fn unsupported(m: impl fmt::Display) -> Error {
-        Error(format!("unsupported: {m}"), None)
+        Error(format!("unsupported: {m}"), None, 0)
     }
     /// `throw v`. (No heap object moves or is freed while it's held.) Its
     /// message is [`shown`]: a long string thrown isn't flattened nor
     /// copied whole for a `catch` that needs only the value
     /// ([`Vm::uncaught_message`] shows it whole).
     pub(crate) fn thrown(v: Value) -> Error {
-        Error(shown(v), Some(v))
+        Error(shown(v), Some(v), 0)
     }
 }
 
@@ -1104,7 +1118,7 @@ pub struct Vm {
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
-    /// `typeof`'s results, once made (see [`Vm::type_of`]), then the
+    /// `typeof`'s results, once made (see [`Vm::type_of_own`]), then the
     /// strings of `true`, `false` and `null` (`undefined`'s is `typeof`'s;
     /// see [`Vm::primitive_string`]): string constants, forgotten with
     /// them (`Vm::prune_strings`).
@@ -1114,6 +1128,10 @@ pub struct Vm {
     pub(crate) handles: Vec<Value>,
     /// The values the host keeps as [`Global`]s: roots.
     pub(crate) globals: std::rc::Rc<Globals>,
+    /// The value thrown by the last run or operation, if a cell, for
+    /// [`Vm::uncaught_message`]: the only one an [`Error`] may hold that
+    /// is still what it was.
+    host_error: Option<(Value, u64)>,
     /// Scopes open in which Rust code holds values in copies of its own (a
     /// handle scope's `Vec`s), which a collection can neither find nor
     /// update: no cell may move while there are any (see
@@ -1574,6 +1592,7 @@ impl Vm {
             type_names: [None; 11],
             handles: Vec::new(),
             globals: Default::default(),
+            host_error: None,
             unmovable: 0,
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
@@ -1904,8 +1923,8 @@ impl Vm {
     /// ```compile_fail,E0603
     /// cloison::heap::barrier_young(0x1000 as *const u8, 0x1008 as *const u64);
     /// ```
-    pub fn global_object(&self) -> Value {
-        object_value(self.global)
+    pub fn global_object(&self) -> Local {
+        self.local(object_value(self.global))
     }
 
     /// Bytes of heap blocks in use (see `Heap::allocated`).
@@ -2915,18 +2934,12 @@ impl Vm {
     }
 
     /// A plain object with prototype `proto`.
-    pub fn new_object(&mut self, proto: Value) -> *mut Object {
-        self.check_value(proto, "Vm::new_object");
-        self.new_plain(proto).ptr()
-    }
-
-    /// [`Vm::new_object`], as an [`Obj`].
     pub(crate) fn new_plain(&mut self, proto: Value) -> Obj {
         self.check_own(proto, "Vm::new_object");
         self.new_object_with(Class::Plain, proto, 4)
     }
 
-    pub fn new_array(&mut self) -> Value {
+    pub(crate) fn new_array(&mut self) -> Value {
         object_value(self.heap.alloc_object(self.array_shape.live()))
     }
 
@@ -3596,8 +3609,8 @@ impl Vm {
     /// A tag test alone for a value not a cell. (Only another live heap's:
     /// a raw `Value` kept past its VM, or past a collection that freed its
     /// cell, is dangling, and the heap a later VM takes may be where it
-    /// pointed. [`Vm::check_value`], at the host's entries, refuses those;
-    /// [`Global`] is the handle that keeps one alive.)
+    /// pointed. The host has no raw `Value` to give: its [`Local`]s are
+    /// checked at its entries, see `Vm::host_value`.)
     #[inline(always)]
     fn check_own(&self, v: Value, what: &str) {
         if v.is_cell() && !self.heap.contains(v.to_bits() as usize) {
@@ -3605,26 +3618,49 @@ impl Vm {
         }
     }
 
-    /// Panics, as [`Vm::check_own`], if `v` is a cell of another VM's
-    /// heap, and if it is no cell of this one's but one a collection freed
-    /// or moved since (`Heap::holds_object`): a raw `Value` the host kept
-    /// past its run, or past its VM (#323, #339). For values from outside
-    /// the VM: those of its public operations not run through
-    /// [`Vm::host`], and the roots of those that are. (A cell of this
-    /// heap's that a stale value points at again, another object made
-    /// there since, is still safe to read.)
+    /// The value of `l`, a [`Local`] the host gives operation `what`.
+    /// Panics unless it is a primitive, or tagged as this VM's are now
+    /// (`Globals::stamp`): a cell of another VM's isn't, nor one the host
+    /// kept past a run or an operation that may have collected, whatever
+    /// is at its address now (#359).
     #[inline]
-    fn check_value(&self, v: Value, what: &str) {
-        self.check_own(v, what);
-        if !self.holds_value(v) {
-            stale_cell(what)
+    fn host_value(&self, l: Local, what: &str) -> Value {
+        if l.v.is_cell() && l.stamp != self.globals.stamp.get() {
+            stale_local(what)
         }
+        l.v
     }
 
-    /// Whether [`Vm::check_value`] takes `v`: not a cell, or a live
-    /// object of this VM's heap.
-    fn holds_value(&self, v: Value) -> bool {
-        !v.is_cell() || self.heap.holds_object(v.to_bits() as usize, self.heap.gc.marking)
+    /// `v`, of this VM's, for the host: tagged as this VM's are now.
+    #[inline]
+    fn local(&self, v: Value) -> Local {
+        self.globals.local(v)
+    }
+
+    /// A run, or an operation of the host's that may run JavaScript,
+    /// begins: it may collect, so the [`Local`]s the host has are no
+    /// longer this VM's (their values checked first, and rooted through
+    /// it: see [`Vm::host`]), nor the error it kept.
+    fn host_enter(&mut self) {
+        self.globals.stamp.set(next_stamp());
+        self.host_error = None;
+    }
+
+    /// The run or operation [`Vm::host_enter`] began ends with `r`: its
+    /// error is the one [`Vm::uncaught_message`] reads the value of.
+    fn host_leave<T>(&mut self, mut r: Result<T>) -> Result<T> {
+        if let Err(e) = &mut r {
+            e.2 = self.globals.stamp.get();
+            self.host_error = e.1.filter(|v| v.is_cell()).map(|v| (v, e.2));
+        }
+        r
+    }
+
+    /// [`Vm::host_enter`], `f`, [`Vm::host_leave`].
+    fn host_op<T>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T>) -> Result<T> {
+        self.host_enter();
+        let r = f(self);
+        self.host_leave(r)
     }
 
     /// `f` run from the host between runs, with this VM entered as a run
@@ -3633,25 +3669,18 @@ impl Vm {
     /// getter), its native stack's limit from here, the VM stack free from
     /// its base for the JS functions it calls (getters, traps, a key's
     /// `toString`), and `roots` and `args`, the host's values it operates
-    /// on, checked (`check_value`, for operation `what`) and rooted, with what is
+    /// on (its [`Local`]s', checked as it gave them), rooted, with what is
     /// pushed to `handles`. What a conversion threw is `f`'s error, none
     /// left pending for the next operation. The JavaScript it runs
     /// collects as a run's would (#342): the collector's native stack
     /// starts here, as a run's at its frame, and no cell moves meanwhile
     /// (`unmovable`: the host's slices of arguments, `call_other`'s,
-    /// aren't updated). A raw value the host kept from before is then as
+    /// aren't updated). A value the host kept from before is then as
     /// stale as after a run (see [`Vm::run`]).
     #[cold]
     #[inline(never)]
-    fn host<R>(
-        &mut self,
-        what: &str,
-        roots: &[Value],
-        args: &[Value],
-        f: impl FnOnce(&mut Vm) -> Result<R>,
-    ) -> Result<R> {
+    fn host<R>(&mut self, roots: &[Value], args: &[Value], f: impl FnOnce(&mut Vm) -> Result<R>) -> Result<R> {
         self.usable()?;
-        roots.iter().chain(args).for_each(|&v| self.check_value(v, what));
         /// What `host` changed, back on return or unwinding.
         struct Entered {
             vm: *mut Vm,
@@ -3707,9 +3736,9 @@ impl Vm {
     }
 
     /// `obj[name]`.
-    pub fn get(&mut self, obj: Value, name: Atom) -> Result<Value> {
+    pub(crate) fn get(&mut self, obj: Value, name: Atom) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::get", &[obj], &[], |vm| vm.get(obj, name));
+            return self.host(&[obj], &[], |vm| vm.get(obj, name));
         }
         self.check_own(obj, "Vm::get");
         if !obj.is_cell() {
@@ -3953,22 +3982,30 @@ impl Vm {
     /// `message`, else the error's own.
     ///
     /// The thrown value is a raw one, valid as the run's result is (see
-    /// [`Vm::run`]). Past a collection that freed it, or of another VM,
-    /// the message is the error's own (`e.0`, made as it was thrown),
-    /// with no panic: a diagnostic, under `panic = "abort"` too (#323).
-    /// One a cell made at its freed address since points at is that
-    /// cell's message, its `toString` run: report an `Error` before the
-    /// next run, or hold the value as a [`Global`].
+    /// [`Vm::run`]): it is read for the error of this VM's last run or
+    /// operation only (as often as asked: its `toString` runs each
+    /// time), which the error's tag and the VM's note of the value tell
+    /// (#359). For an earlier error, another VM's, or one whose value
+    /// the host changed, the message is the error's own (`e.0`, made as
+    /// it was thrown), with no panic: a diagnostic, under `panic =
+    /// "abort"` too (#323). Report an `Error` before the next run or
+    /// operation. As an operation that may run JavaScript, it ends the
+    /// host's [`Local`]s.
     pub fn uncaught_message(&mut self, e: &Error) -> String {
-        if e.1.is_some_and(|v| !self.holds_value(v)) {
+        if e.1.is_some_and(|v| v.is_cell() && self.host_error != Some((v, e.2))) {
             return e.0.clone();
         }
         if let Some(v) = e.1
             && crate::props::is_object(v)
         {
             // The run is over: its `toString` runs as a host's operation
-            // (a throwing one leaves the error's own message).
-            if let Ok(s) = self.host("Vm::uncaught_message", &[v], &[], |_| Ok(crate::interp::to_string_units(v))) {
+            // (a throwing one leaves the error's own message), the value
+            // rooted through it and so still the error's after.
+            let kept = self.host_error;
+            self.host_enter();
+            let s = self.host(&[v], &[], |_| Ok(crate::interp::to_string_units(v)));
+            self.host_error = kept;
+            if let Ok(s) = s {
                 return String::from_utf16_lossy(&s);
             }
         }
@@ -4131,9 +4168,9 @@ impl Vm {
     }
 
     /// `obj[name] = value`.
-    pub fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
+    pub(crate) fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
         if !self.running() {
-            return self.host("Vm::set", &[obj, value], &[], |vm| vm.set(obj, name, value));
+            return self.host(&[obj, value], &[], |vm| vm.set(obj, name, value));
         }
         self.check_own(obj, "Vm::set");
         self.check_own(value, "Vm::set");
@@ -4695,27 +4732,21 @@ impl Vm {
         Some(s)
     }
 
-    /// `typeof v`, a string constant (each made once: EarleyBoyer's
-    /// `sc_isNumber` and others spent 3% encoding and looking them up).
-    pub fn type_of(&mut self, v: Value) -> Value {
-        self.check_value(v, "Vm::type_of");
-        self.type_of_own(v)
-    }
-
     /// ECMAScript ToNumber of `v`: a string parsed, an object through its
     /// `@@toPrimitive`, `valueOf` or `toString` (run as a host operation
     /// between runs), a Symbol's or a BigInt's TypeError the error.
     /// (`Value::to_number`, the primitives' alone, is the VM's: #343.)
-    pub fn to_number(&mut self, v: Value) -> Result<f64> {
+    pub(crate) fn to_number(&mut self, v: Value) -> Result<f64> {
         if !self.running() {
-            return self.host("Vm::to_number", &[v], &[], |vm| vm.to_number(v));
+            return self.host(&[v], &[], |vm| vm.to_number(v));
         }
         self.check_own(v, "Vm::to_number");
         let d = crate::interp::to_number(v);
         if self.conv_failed() { Err(self.take_conv_error()) } else { Ok(d) }
     }
 
-    /// [`Vm::type_of`] of a value known to be this VM's (`typeof`'s).
+    /// `typeof v`, a string constant (each made once: EarleyBoyer's
+    /// `sc_isNumber` and others spent 3% encoding and looking them up).
     pub(crate) fn type_of_own(&mut self, v: Value) -> Value {
         const NAMES: [&str; 8] = ["number", "undefined", "boolean", "string", "function", "object", "symbol", "bigint"];
         let k = if v.is_number() {
@@ -4822,9 +4853,9 @@ impl Vm {
     /// there: not looked up for a plain function, of `function_shape`, nor
     /// but in a proxy until some other object has had one, or a proxy
     /// became a prototype), OrdinaryHasInstance.
-    pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
+    pub(crate) fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
         if !self.running() {
-            return self.host("Vm::instance_of", &[v, f], &[], |vm| vm.instance_of(v, f));
+            return self.host(&[v, f], &[], |vm| vm.instance_of(v, f));
         }
         self.check_own(v, "Vm::instance_of");
         self.check_own(f, "Vm::instance_of");
@@ -4948,9 +4979,9 @@ impl Vm {
 
     /// `key in obj`: whether `obj` or its prototypes have the property or
     /// element `key`.
-    pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+    pub(crate) fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
         if !self.running() {
-            return self.host("Vm::has_property", &[obj, key], &[], |vm| vm.has_property(obj, key));
+            return self.host(&[obj, key], &[], |vm| vm.has_property(obj, key));
         }
         self.check_own(obj, "Vm::has_property");
         self.check_own(key, "Vm::has_property");
@@ -4989,9 +5020,9 @@ impl Vm {
     /// `delete obj[key]`: an element becomes a hole; a property is
     /// removed, the object getting a shape of its own without it (see
     /// [`Vm::delete_named`]). False for what can't be deleted.
-    pub fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+    pub(crate) fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
         if !self.running() {
-            return self.host("Vm::delete_property", &[obj, key], &[], |vm| vm.delete_property(obj, key));
+            return self.host(&[obj, key], &[], |vm| vm.delete_property(obj, key));
         }
         self.check_own(obj, "Vm::delete_property");
         self.check_own(key, "Vm::delete_property");
@@ -5391,9 +5422,9 @@ impl Vm {
     }
 
     /// `obj[key]`.
-    pub fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
+    pub(crate) fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::get_keyed", &[obj, key], &[], |vm| vm.get_keyed(obj, key));
+            return self.host(&[obj, key], &[], |vm| vm.get_keyed(obj, key));
         }
         self.check_own(obj, "Vm::get_keyed");
         self.check_own(key, "Vm::get_keyed");
@@ -5566,9 +5597,9 @@ impl Vm {
         self.get(obj, name).ok()
     }
 
-    pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
+    pub(crate) fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
         if !self.running() {
-            return self.host("Vm::set_keyed", &[obj, key, value], &[], |vm| vm.set_keyed(obj, key, value));
+            return self.host(&[obj, key, value], &[], |vm| vm.set_keyed(obj, key, value));
         }
         self.check_own(obj, "Vm::set_keyed");
         self.check_own(key, "Vm::set_keyed");
@@ -5894,9 +5925,9 @@ impl Vm {
     /// object's enumerable properties in insertion order, from `v` up its
     /// prototype chain. A name seen once (even not enumerable) hides it
     /// further up. Null and undefined have none.
-    pub fn for_in_keys(&mut self, v: Value) -> Result<Value> {
+    pub(crate) fn for_in_keys(&mut self, v: Value) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::for_in_keys", &[v], &[], |vm| Ok(vm.for_in_key_array(v)));
+            return self.host(&[v], &[], |vm| Ok(vm.for_in_key_array(v)));
         }
         self.check_own(v, "Vm::for_in_keys");
         let keys = self.for_in_key_array(v);
@@ -5976,61 +6007,29 @@ impl Vm {
     ///
     /// For a string known to fit: past [`MAX_STRING_LEN`] units, see
     /// [`Vm::new_string_with`]. [`Vm::try_new_string`] throws instead.
-    pub fn new_string(&mut self, units: &[u16]) -> Value {
+    pub(crate) fn new_string(&mut self, units: &[u16]) -> Value {
         self.new_string_with(units.len(), |out| out.copy_from_slice(units))
     }
 
     /// [`Vm::new_string`], or a RangeError past [`MAX_STRING_LEN`] units
     /// (2^30, the longest string): for a string of any length.
-    pub fn try_new_string(&mut self, units: &[u16]) -> Result<Value> {
+    pub(crate) fn try_new_string(&mut self, units: &[u16]) -> Result<Value> {
         check_string_len(units.len())?;
         Ok(self.new_string(units))
     }
 
     /// [`Vm::new_string_with`], or a RangeError past [`MAX_STRING_LEN`]
     /// units (`fill` not called).
-    pub fn try_new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Result<Value> {
+    pub(crate) fn try_new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Result<Value> {
         check_string_len(len)?;
         Ok(self.new_string_with(len, fill))
     }
 
-    /// `v`'s code units if it is a string, borrowed from the VM: the
-    /// collector may move the string at the next allocation, which needs
-    /// `&mut self`, and dropping the VM frees it. A cons string's units
-    /// (a concatenation's, see `Vm::new_cons`) are copied out of its
-    /// pieces, not made flat:
-    /// that would allocate, which a shared borrow mustn't (it would move
-    /// the string another call's slice reads), and outside a run, in no
-    /// VM's heap (#70).
-    ///
-    /// ```no_run
-    /// let mut vm = cloison::vm::Vm::new();
-    /// let s = vm.new_string(&[0x61; 3]);
-    /// assert_eq!(vm.string_units(s).as_deref(), Some(&[0x61; 3][..]));
-    /// ```
-    ///
-    /// The units can't outlive the VM (#69):
-    ///
-    /// ```compile_fail,E0597
-    /// let units = {
-    ///     let mut vm = cloison::vm::Vm::new();
-    ///     let s = vm.new_string(&[0x61; 64]);
-    ///     vm.string_units(s).unwrap()
-    /// };
-    /// ```
-    ///
-    /// Nor live across an allocation:
-    ///
-    /// ```compile_fail,E0502
-    /// let mut vm = cloison::vm::Vm::new();
-    /// let s = vm.new_string(&[0x61; 64]);
-    /// let units = vm.string_units(s).unwrap();
-    /// vm.new_string(&[0x62; 64]);
-    /// assert_eq!(units[0], 0x61);
-    /// ```
-    pub fn string_units(&self, v: Value) -> Option<std::borrow::Cow<'_, [u16]>> {
+    /// `v`'s code units if it is a string, borrowed from the VM (see
+    /// [`Local::string_units`]).
+    pub(crate) fn string_units(&self, v: Value) -> Option<std::borrow::Cow<'_, [u16]>> {
         // (The borrow is this VM's: another's string could be freed under it.)
-        self.check_value(v, "Vm::string_units");
+        self.check_own(v, "Vm::string_units");
         units_in_place(v)
     }
 
@@ -6074,7 +6073,7 @@ impl Vm {
     /// without running JS: see `Vm::conv_failed`); outside a run (no
     /// script, no conversion running), it panics. [`Vm::try_new_string_with`]
     /// throws instead.
-    pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
+    pub(crate) fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
         if len > MAX_STRING_LEN {
             return self.string_too_long();
         }
@@ -7045,9 +7044,9 @@ impl Vm {
     /// Call `f` when it isn't a bytecode function (those the interpreter
     /// enters itself).
     #[inline]
-    pub fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
+    pub(crate) fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::call_other", &[f, this], args, |vm| vm.call_other(f, this, args));
+            return self.host(&[f, this], args, |vm| vm.call_other(f, this, args));
         }
         self.call_own(f, this, args)
     }
@@ -7083,9 +7082,9 @@ impl Vm {
 
     /// `new f(…args)` when `f` isn't a bytecode function: a native that
     /// constructs (`Array`, `Object`) makes its object.
-    pub fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
+    pub(crate) fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
         if !self.running() {
-            return self.host("Vm::construct_other", &[f], args, |vm| vm.construct_other(f, args));
+            return self.host(&[f], args, |vm| vm.construct_other(f, args));
         }
         self.check_own(f, "Vm::construct_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::construct_other"));
@@ -7142,18 +7141,18 @@ impl Vm {
         for n in &module.lexical {
             let a = self.intern_name(n);
             if self.lexical_declared.contains(&a) {
-                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None, 0));
             }
             if let Some(d) = self.own_property(self.global_obj(), Key::Name(a))
                 && d.configurable == Some(false)
             {
-                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None, 0));
             }
         }
         for n in &module.declared {
             let a = self.intern_name(n);
             if self.lexical_declared.contains(&a) && !self.annex_b_skipped(module, n) {
-                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None, 0));
             }
         }
         self.global_declarations(module, false)?;
@@ -7212,7 +7211,7 @@ impl Vm {
         for &n in declared.iter().filter(|_| lexical) {
             let a = self.intern_name(n);
             if self.lexical_declared.contains(&a) {
-                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None, 0));
             }
         }
         let g = self.global_obj();
@@ -7374,9 +7373,9 @@ impl Vm {
         let c = code.live();
         let mut module = crate::js::compile_lazy(c.lazy.as_ref().expect("a stub")).map_err(|e| {
             if e.contains("unsupported") {
-                Error(format!("unsupported: in eval'd code: {e}"), None)
+                Error(format!("unsupported: in eval'd code: {e}"), None, 0)
             } else {
-                Error(format!("SyntaxError: {e}"), None)
+                Error(format!("SyntaxError: {e}"), None, 0)
             }
         })?;
         debug_assert_eq!(module.script, 0);
@@ -7564,19 +7563,18 @@ impl Vm {
     /// Load and run `module`; returns its completion value. Its bytecode
     /// is run unchecked, which [`Checked`](crate::asm::Checked) makes safe.
     ///
-    /// The [`Value`]s it returns, and those the host has from the VM
+    /// The [`Local`] it returns, and those the host has from the VM
     /// otherwise, are valid only until the next run (or
-    /// [`Vm::run_module`], or an operation that runs JavaScript: a getter
-    /// [`Vm::get`] reads, a function [`Vm::call_other`] calls) begins: no
-    /// collection runs between them, but one in them frees the cells
-    /// nothing in the VM refers to and moves others, the host's copies left
-    /// pointing at memory reused. A value kept past it is held as a
-    /// [`Global`], which the collector keeps and updates. The VM's
-    /// operations, [`display`] and [`Global::new`] refuse (panic on) one a
-    /// collection freed or moved (#323); one pointing at a cell made there
-    /// since reads that cell. (Values a native reaches within a run are
-    /// checked only for their heap: one it kept from an earlier run, in a
-    /// `static` or a thread-local, isn't checked for being stale.)
+    /// [`Vm::run_module`], or an operation that may run JavaScript: a
+    /// getter [`Local::get`] reads, a function [`Local::call_other`]
+    /// calls) begins: no collection runs between them, but one in them
+    /// frees the cells nothing in the VM refers to and moves others. A
+    /// value kept past it is held as a [`Global`], which the collector
+    /// keeps and updates. The VM's operations, [`display`] and
+    /// [`Global::new`] refuse (panic on) a `Local` kept longer, by its
+    /// tag (#359; see [`Local`]). (Natives are the VM's own: the host
+    /// registers none, and the raw [`Value`]s they are given never leave
+    /// the VM.)
     ///
     /// A panic unwinding out of the run (the heap limit's, `CLOISON_HEAP_
     /// LIMIT`, under an embedder's `catch_unwind`) leaves the VM as between
@@ -7598,7 +7596,7 @@ impl Vm {
     /// move during a run: a native that swaps or replaces the VM it is
     /// given (`std::mem::swap`, `replace`, `take`) aborts the process as
     /// it returns (#357).
-    pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
+    pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Local> {
         self.run_owned(module.clone())
     }
 
@@ -7607,7 +7605,19 @@ impl Vm {
     /// siyuan app's peak, for 6 MB of source). What the load freed, and
     /// the front end before it if the caller dropped the source, then
     /// goes back to the system (see [`release_freed`]).
-    pub fn run_owned(&mut self, module: crate::asm::Checked) -> Result<Value> {
+    pub fn run_owned(&mut self, module: crate::asm::Checked) -> Result<Local> {
+        let v = self.host_op(|vm| vm.run_script(module))?;
+        Ok(self.local(v))
+    }
+
+    /// [`Vm::run`], its value raw: the unit tests'.
+    #[cfg(test)]
+    pub(crate) fn run_raw(&mut self, module: &crate::asm::Checked) -> Result<Value> {
+        self.run(module).map(Local::value)
+    }
+
+    /// [`Vm::run_owned`], its value raw.
+    fn run_script(&mut self, module: crate::asm::Checked) -> Result<Value> {
         self.usable()?;
         let _running = crate::interp::Running::new(self);
         self.declare_script(&module)?;
@@ -7643,10 +7653,14 @@ impl Vm {
     /// An error if the VM is [`poisoned`](Vm::poisoned).
     fn usable(&self) -> Result<()> {
         if let Some(e) = self.marker_panic() {
-            return Err(Error(format!("Error: the VM is poisoned: the collector's marker thread panicked: {e}"), None));
+            return Err(Error(
+                format!("Error: the VM is poisoned: the collector's marker thread panicked: {e}"),
+                None,
+                0,
+            ));
         }
         if self.poisoned() {
-            return Err(Error("Error: the VM is poisoned: a panic unwound out of a collection".into(), None));
+            return Err(Error("Error: the VM is poisoned: a panic unwound out of a collection".into(), None, 0));
         }
         Ok(())
     }
@@ -7699,6 +7713,15 @@ impl Vm {
     /// the promise jobs queued. Fails with an early error (a syntax error,
     /// an import that can't be resolved), or what its evaluation threw.
     pub fn run_module(&mut self, path: &str) -> std::result::Result<(), ModuleError> {
+        self.host_enter();
+        match self.run_main_module(path) {
+            Err(ModuleError::Thrown(e)) => Err(ModuleError::Thrown(self.host_leave::<()>(Err(e)).unwrap_err())),
+            r => r,
+        }
+    }
+
+    /// [`Vm::run_module`], within the VM.
+    fn run_main_module(&mut self, path: &str) -> std::result::Result<(), ModuleError> {
         self.usable().map_err(ModuleError::Thrown)?;
         let _running = crate::interp::Running::new(self);
         let here = 0u8;
@@ -7839,7 +7862,7 @@ impl Vm {
         if !self.job_queue.is_null() {
             v.push(object_value(self.job_queue));
         }
-        if let Some(Error(_, Some(e))) = &self.error {
+        if let Some(Error(_, Some(e), _)) = &self.error {
             v.push(*e);
         }
         for &(k, c, _, _) in &self.key_cache {
@@ -7914,7 +7937,7 @@ impl Vm {
         for r in &mut self.realms {
             r.slots(f);
         }
-        if let Some(Error(_, Some(e))) = &mut self.error {
+        if let Some(Error(_, Some(e), _)) = &mut self.error {
             f(Root::Value(e));
         }
         for (k, c, _, _) in &mut self.key_cache {
@@ -8179,12 +8202,6 @@ impl Vm {
         let jit = code.jit.borrow();
         let names = jit.as_ref()?.last_code()?.stencils().map(String::from).collect();
         Some(names)
-    }
-
-    /// Words of in-object storage in `o` (for tests).
-    pub fn inline_capacity(&self, o: Value) -> u32 {
-        self.check_value(o, "Vm::inline_capacity");
-        unsafe { (*Obj::of(o).shape()).capacity.get() }
     }
 }
 
@@ -8923,22 +8940,30 @@ fn foreign_cell(what: &str) -> ! {
     panic!("{what}: a value not of this VM's heap")
 }
 
-/// [`Vm::check_value`]'s panic.
+/// `Vm::host_value`'s panic.
 #[cold]
 #[inline(never)]
-fn stale_cell(what: &str) -> ! {
-    panic!("{what}: a value a collection freed or moved (a raw Value is valid until the next run: keep it as a Global)")
+fn stale_local(what: &str) -> ! {
+    panic!(
+        "{what}: a Local of another VM, or kept past its VM's next run or operation (a Local is valid until then: keep it as a Global)"
+    )
+}
+
+/// The next of the numbers VMs tag their [`Local`]s with (`Globals::stamp`):
+/// each given once in the process, to one VM, so that one compare tells
+/// both the VM and the moment. (Not 0, a primitive's. 2^64 don't run out.)
+fn next_stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `String(v)` for the values that exist so far, of `vm`'s, without
 /// running any JavaScript (an object is `[object Object]`). Panics if `v`
-/// is a cell not of `vm`'s heap, or one a collection freed or moved (#339:
-/// a value kept past its run, or past its VM, which no longer compiles).
-/// (The value first, so that `display(vm.run(m)?, &vm)` borrows `vm` after
-/// the run.)
-pub fn display(v: Value, vm: &Vm) -> String {
-    vm.check_value(v, "display");
-    display_raw(v)
+/// isn't a [`Local`] of `vm`'s still valid (one of another VM, or kept
+/// past the next run or operation). (The value first, so that
+/// `display(vm.run(m)?, &vm)` borrows `vm` after the run.)
+pub fn display(v: Local, vm: &Vm) -> String {
+    display_raw(vm.host_value(v, "display"))
 }
 
 /// [`display`] unchecked, for the VM's own values: a cell's must be of a
@@ -9030,7 +9055,7 @@ pub(crate) fn string_prefix(v: Value, n: usize) -> Vec<u16> {
 
 /// `v`'s code units if it is a string. The slice is bound to no borrow:
 /// it is only valid until the next allocation can move the string (see
-/// [`Vm::string_units`] for the public, borrowed form).
+/// [`Local::string_units`] for the public, borrowed form).
 pub(crate) fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
     if !v.is_cell() {
         return None;
@@ -9333,23 +9358,326 @@ pub(crate) fn number_ascii(d: f64) -> NumBuf {
     out
 }
 
+/// A value of a VM's in the host's hands: what its runs and operations
+/// return, and what they take. It is valid until the VM's next run
+/// ([`Vm::run`], [`Vm::run_module`]) or next operation that may run
+/// JavaScript (those of `Local` that return a `Result`, and
+/// [`Vm::uncaught_message`]): a collection in one frees the cells nothing
+/// in the VM refers to and moves others, and the host's copy is not a
+/// root. Kept past that, a value is held as a [`Global`], and read again
+/// ([`Global::get`]) after each run or operation.
+///
+/// A `Local` is its value and a tag: a number its VM draws anew, from a
+/// counter of the process, as each run or such operation begins. Every
+/// entry compares the tag with the VM's (one compare; a primitive has
+/// none and is valid anywhere) and panics on another: a `Local` of
+/// another VM, of a VM dropped, or kept too long, whether a collection
+/// freed its cell or not, and whatever was made at its address since
+/// (#359; a check of the heap couldn't tell that one, #323). The values
+/// an operation is given are roots through it, but stale after it like
+/// the others: the rule is the same for all, and doesn't depend on
+/// whether a collection ran.
+///
+/// ```
+/// use cloison::vm::{Global, Local, Vm, display};
+/// let mut vm = Vm::new();
+/// let o = vm.run(&cloison::js::compile("({a: {b: 7}})").unwrap()).unwrap();
+/// let a = vm.intern("a");
+/// let inner = o.get(&mut vm, a).unwrap();
+/// let b = vm.intern("b");
+/// assert_eq!(display(inner.get(&mut vm, b).unwrap(), &vm), "7");
+/// // `o` is stale by now: a `get` may run a getter.
+/// let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| display(o, &vm)));
+/// assert!(r.is_err());
+/// // Primitives never are.
+/// assert_eq!(display(Local::from(3), &vm), "3");
+/// ```
+///
+/// There is no other way to make one of a cell, nor to give the VM a raw
+/// [`Value`]:
+///
+/// ```compile_fail,E0308
+/// let vm = cloison::vm::Vm::new();
+/// cloison::vm::display(cloison::value::Value::from_i32(1), &vm);
+/// ```
+///
+/// ```compile_fail,E0451
+/// let v = cloison::value::Value::from_i32(1);
+/// let l = cloison::vm::Local { v, stamp: 0 };
+/// ```
+///
+/// ```compile_fail,E0624
+/// let mut vm = cloison::vm::Vm::new();
+/// let k = vm.intern("k");
+/// vm.get(cloison::value::Value::from_i32(1), k);
+/// ```
+///
+/// ```compile_fail,E0624
+/// let mut vm = cloison::vm::Vm::new();
+/// vm.call_other(cloison::value::Value::UNDEFINED, cloison::value::Value::UNDEFINED, &[]);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Local {
+    v: Value,
+    /// Its VM's `Globals::stamp` as it was made; 0 for a primitive.
+    stamp: u64,
+}
+
+impl From<i32> for Local {
+    fn from(i: i32) -> Local {
+        Local { v: Value::from_i32(i), stamp: 0 }
+    }
+}
+
+impl From<f64> for Local {
+    fn from(d: f64) -> Local {
+        Local { v: Value::number(d), stamp: 0 }
+    }
+}
+
+impl From<bool> for Local {
+    fn from(b: bool) -> Local {
+        Local { v: Value::from_bool(b), stamp: 0 }
+    }
+}
+
+impl Local {
+    pub const UNDEFINED: Local = Local { v: Value::UNDEFINED, stamp: 0 };
+    pub const NULL: Local = Local { v: Value::NULL, stamp: 0 };
+
+    /// The raw value: to look at (a number, a boolean, its bits to tell
+    /// two apart). A cell's is its address as the `Local` was made, which
+    /// no safe operation takes back.
+    pub fn value(self) -> Value {
+        self.v
+    }
+
+    /// [`Local::value`]'s bits.
+    pub fn to_bits(self) -> u64 {
+        self.v.to_bits()
+    }
+
+    /// A new string of `units` (UTF-16 code units). Panics past
+    /// [`MAX_STRING_LEN`] units: [`Local::try_string`] throws instead.
+    pub fn string(vm: &mut Vm, units: &[u16]) -> Local {
+        let v = vm.new_string(units);
+        vm.local(v)
+    }
+
+    /// [`Local::string`], or a RangeError past [`MAX_STRING_LEN`] units
+    /// (2^30, the longest string): for a string of any length.
+    pub fn try_string(vm: &mut Vm, units: &[u16]) -> Result<Local> {
+        let v = vm.try_new_string(units)?;
+        Ok(vm.local(v))
+    }
+
+    /// A new string of `len` code units, which `fill` writes (they are
+    /// zero before), or a RangeError past [`MAX_STRING_LEN`] units (`fill`
+    /// not called).
+    pub fn try_string_with(vm: &mut Vm, len: usize, fill: impl FnOnce(&mut [u16])) -> Result<Local> {
+        let v = vm.try_new_string_with(len, fill)?;
+        Ok(vm.local(v))
+    }
+
+    /// A new plain object with prototype `proto` (an object or null).
+    pub fn object(vm: &mut Vm, proto: Local) -> Local {
+        let proto = vm.host_value(proto, "Local::object");
+        assert!(
+            proto.is_null() || crate::props::is_object(proto),
+            "Local::object: a prototype neither an object nor null"
+        );
+        let o = vm.new_plain(proto);
+        vm.local(object_value(o.ptr()))
+    }
+
+    /// A new empty array.
+    pub fn array(vm: &mut Vm) -> Local {
+        let v = vm.new_array();
+        vm.local(v)
+    }
+
+    /// `self[name]`.
+    pub fn get(self, vm: &mut Vm, name: Atom) -> Result<Local> {
+        let o = vm.host_value(self, "Local::get");
+        let v = vm.host_op(|vm| vm.get(o, name))?;
+        Ok(vm.local(v))
+    }
+
+    /// `self[name] = value`.
+    pub fn set(self, vm: &mut Vm, name: Atom, value: Local) -> Result<()> {
+        let (o, v) = (vm.host_value(self, "Local::set"), vm.host_value(value, "Local::set"));
+        vm.host_op(|vm| vm.set(o, name, v))
+    }
+
+    /// `self[key]`.
+    pub fn get_keyed(self, vm: &mut Vm, key: Local) -> Result<Local> {
+        let (o, k) = (vm.host_value(self, "Local::get_keyed"), vm.host_value(key, "Local::get_keyed"));
+        let v = vm.host_op(|vm| vm.get_keyed(o, k))?;
+        Ok(vm.local(v))
+    }
+
+    /// `self[key] = value`.
+    pub fn set_keyed(self, vm: &mut Vm, key: Local, value: Local) -> Result<()> {
+        let what = "Local::set_keyed";
+        let (o, k, v) = (vm.host_value(self, what), vm.host_value(key, what), vm.host_value(value, what));
+        vm.host_op(|vm| vm.set_keyed(o, k, v))
+    }
+
+    /// `key in self`: whether it or its prototypes have the property or
+    /// element `key`.
+    pub fn has_property(self, vm: &mut Vm, key: Local) -> Result<bool> {
+        let (o, k) = (vm.host_value(self, "Local::has_property"), vm.host_value(key, "Local::has_property"));
+        vm.host_op(|vm| vm.has_property(o, k))
+    }
+
+    /// `delete self[key]`: false for what can't be deleted.
+    pub fn delete_property(self, vm: &mut Vm, key: Local) -> Result<bool> {
+        let (o, k) = (vm.host_value(self, "Local::delete_property"), vm.host_value(key, "Local::delete_property"));
+        vm.host_op(|vm| vm.delete_property(o, k))
+    }
+
+    /// `self instanceof f`.
+    pub fn instance_of(self, vm: &mut Vm, f: Local) -> Result<bool> {
+        let (v, f) = (vm.host_value(self, "Local::instance_of"), vm.host_value(f, "Local::instance_of"));
+        vm.host_op(|vm| vm.instance_of(v, f))
+    }
+
+    /// The keys a `for (k in self)` visits, as an array of strings.
+    pub fn for_in_keys(self, vm: &mut Vm) -> Result<Local> {
+        let o = vm.host_value(self, "Local::for_in_keys");
+        let v = vm.host_op(|vm| vm.for_in_keys(o))?;
+        Ok(vm.local(v))
+    }
+
+    /// ECMAScript ToNumber: a string parsed, an object through its
+    /// `@@toPrimitive`, `valueOf` or `toString`, a Symbol's or a BigInt's
+    /// TypeError the error.
+    pub fn to_number(self, vm: &mut Vm) -> Result<f64> {
+        let v = vm.host_value(self, "Local::to_number");
+        vm.host_op(|vm| vm.to_number(v))
+    }
+
+    /// `self.call(this, ...args)` when it isn't a bytecode function (a
+    /// native, a bound function, a proxy): a TypeError otherwise.
+    pub fn call_other(self, vm: &mut Vm, this: Local, args: &[Local]) -> Result<Local> {
+        let (f, this) = (vm.host_value(self, "Local::call_other"), vm.host_value(this, "Local::call_other"));
+        let args: Vec<Value> = args.iter().map(|&a| vm.host_value(a, "Local::call_other")).collect();
+        let v = vm.host_op(|vm| vm.call_other(f, this, &args))?;
+        Ok(vm.local(v))
+    }
+
+    /// `new self(...args)` when it is a native that constructs (`Array`,
+    /// `Object`): a TypeError otherwise.
+    pub fn construct_other(self, vm: &mut Vm, args: &[Local]) -> Result<Local> {
+        let f = vm.host_value(self, "Local::construct_other");
+        let args: Vec<Value> = args.iter().map(|&a| vm.host_value(a, "Local::construct_other")).collect();
+        let v = vm.host_op(|vm| vm.construct_other(f, &args))?;
+        Ok(vm.local(v))
+    }
+
+    /// `typeof self`, a string.
+    pub fn type_of(self, vm: &mut Vm) -> Local {
+        let v = vm.host_value(self, "Local::type_of");
+        let s = vm.type_of_own(v);
+        vm.local(s)
+    }
+
+    /// Its code units if it is a string, borrowed from the VM: the
+    /// collector may move the string at the next allocation, which needs
+    /// `&mut Vm`, and dropping the VM frees it. A cons string's units (a
+    /// concatenation's, see `Vm::new_cons`) are copied out of its pieces,
+    /// not made flat: that would allocate, which a shared borrow mustn't
+    /// (it would move the string another call's slice reads), and
+    /// outside a run, in no VM's heap (#70).
+    ///
+    /// ```no_run
+    /// use cloison::vm::{Local, Vm};
+    /// let mut vm = Vm::new();
+    /// let s = Local::string(&mut vm, &[0x61; 3]);
+    /// assert_eq!(s.string_units(&vm).as_deref(), Some(&[0x61; 3][..]));
+    /// ```
+    ///
+    /// The units can't outlive the VM (#69):
+    ///
+    /// ```compile_fail,E0597
+    /// use cloison::vm::{Local, Vm};
+    /// let units = {
+    ///     let mut vm = Vm::new();
+    ///     let s = Local::string(&mut vm, &[0x61; 64]);
+    ///     s.string_units(&vm).unwrap()
+    /// };
+    /// ```
+    ///
+    /// Nor live across an allocation, a run or an operation:
+    ///
+    /// ```compile_fail,E0502
+    /// use cloison::vm::{Local, Vm};
+    /// let mut vm = Vm::new();
+    /// let s = Local::string(&mut vm, &[0x61; 64]);
+    /// let units = s.string_units(&vm).unwrap();
+    /// Local::string(&mut vm, &[0x62; 64]);
+    /// assert_eq!(units[0], 0x61);
+    /// ```
+    ///
+    /// ```compile_fail,E0502
+    /// use cloison::vm::{Local, Vm};
+    /// let mut vm = Vm::new();
+    /// let s = Local::string(&mut vm, &[0x61; 64]);
+    /// let units = s.string_units(&vm).unwrap();
+    /// vm.run(&cloison::js::compile("1").unwrap()).unwrap();
+    /// assert_eq!(units[0], 0x61);
+    /// ```
+    pub fn string_units(self, vm: &Vm) -> Option<std::borrow::Cow<'_, [u16]>> {
+        units_in_place(vm.host_value(self, "Local::string_units"))
+    }
+
+    /// Words of in-object storage if it is an object, else 0 (for tests).
+    pub fn inline_capacity(self, vm: &Vm) -> u32 {
+        let v = vm.host_value(self, "Local::inline_capacity");
+        if !crate::props::is_object(v) {
+            return 0;
+        }
+        unsafe { (*Obj::of(v).shape()).capacity.get() }
+    }
+}
+
 /// The slots of a VM's [`Global`]s: roots, which a collection marks and,
 /// moving their cells, updates (`Vm::each_root_slot`); a slot freed holds
 /// `undefined` until a new `Global` takes it. Shared with the `Global`s,
 /// which free their slots as they drop, the VM or not still there; and
 /// the `Global`s' tag of their VM.
-#[derive(Default)]
 pub(crate) struct Globals {
     pub(crate) slots: RefCell<Vec<Value>>,
     free: RefCell<Vec<u32>>,
+    /// What the host's [`Local`]s of the VM are tagged with, and checked
+    /// against: a number no other VM has or had, and a new one from each
+    /// run and each operation that may run JavaScript (`Vm::host_enter`),
+    /// which is when a collection may free or move what the host holds.
+    /// (Here for [`Global::local`], which has no VM at hand.)
+    stamp: std::cell::Cell<u64>,
 }
 
-/// A value the host keeps from a VM across its runs: a root of the VM's
-/// while it lasts, where a collection finds it and updates it as it
-/// moves the cell (#142). (A raw [`Value`] is a cell only until the next
-/// run: see [`Vm::run`].) Of the VM that made it only: [`Global::get`]
-/// panics given another, and [`Global::new`] given another's cell.
-/// Dropped, its slot is free, its value no longer kept.
+impl Default for Globals {
+    fn default() -> Globals {
+        Globals { slots: Default::default(), free: Default::default(), stamp: std::cell::Cell::new(next_stamp()) }
+    }
+}
+
+impl Globals {
+    /// `v`, of the VM's, for the host: tagged as the VM's are now.
+    #[inline]
+    fn local(&self, v: Value) -> Local {
+        Local { v, stamp: if v.is_cell() { self.stamp.get() } else { 0 } }
+    }
+}
+
+/// A value the host keeps from a VM across its runs and operations: a
+/// root of the VM's while it lasts, where a collection finds it and
+/// updates it as it moves the cell (#142). (A [`Local`] is valid only
+/// until the next run or operation.) Of the VM that made it only: what
+/// [`Global::local`] gives is refused by another, as [`Global::new`]
+/// refuses another's `Local`. Dropped, its slot is free, its value no
+/// longer kept.
 ///
 /// ```
 /// use cloison::vm::{Global, Vm, display};
@@ -9358,7 +9686,7 @@ pub(crate) struct Globals {
 /// let o = Global::new(&vm, o);
 /// vm.run(&cloison::js::compile("for (var i = 0; i < 1e6; i++) var x = {i: [i]};").unwrap()).unwrap();
 /// let k = vm.intern("k");
-/// assert_eq!(display(vm.get(o.get(&vm), k).unwrap(), &vm), "vvv");
+/// assert_eq!(display(o.local().get(&mut vm, k).unwrap(), &vm), "vvv");
 /// ```
 pub struct Global {
     globals: std::rc::Rc<Globals>,
@@ -9366,12 +9694,10 @@ pub struct Global {
 }
 
 impl Global {
-    /// `v`, of `vm`, kept: valid as a raw `Value` is, from the last run or
-    /// operation of `vm`'s, or from within one of its runs (a native's).
-    /// Panics if `v` is a cell of another VM's heap.
-    pub fn new(vm: &Vm, v: Value) -> Global {
-        vm.check_value(v, "Global::new");
-        Global::hold(&vm.globals, v)
+    /// `v`, of `vm`, kept: a `Local` still valid, from the last run or
+    /// operation of `vm`'s. Panics if it is stale or another VM's.
+    pub fn new(vm: &Vm, v: Local) -> Global {
+        Global::hold(&vm.globals, vm.host_value(v, "Global::new"))
     }
 
     /// `v` in a slot of `globals`'s.
@@ -9391,11 +9717,13 @@ impl Global {
     }
 
     /// The value, where it is now (a collection may have moved it), for
-    /// `vm`'s operations until its next run; panics if `vm` isn't the VM
-    /// that made it.
-    pub fn get(&self, vm: &Vm) -> Value {
-        assert!(self.is_of(vm), "Global::get: a global of another VM");
-        self.globals.slots.borrow()[self.slot as usize]
+    /// its VM's operations until the next run or operation: a [`Local`]
+    /// as any, read again after each. (Without the VM, so that it reads
+    /// in the arguments of an operation, which borrows the VM: `f.local()
+    /// .call_other(&mut vm, this.local(), &[])`. Its VM dropped, it is a
+    /// `Local` of no VM.)
+    pub fn local(&self) -> Local {
+        self.globals.local(self.globals.slots.borrow()[self.slot as usize])
     }
 
     /// Whether `vm` is the VM that made it.
@@ -9596,7 +9924,7 @@ try { [1].map(tooLong); out.push("none"); } catch (e) { out.push(e.name); }
 out.push("after");
 out.join();"#;
         let m = crate::js::compile(src).unwrap();
-        let r = vm.run(&m).map(display_raw);
+        let r = vm.run_raw(&m).map(display_raw);
         assert_eq!(r.as_deref(), Ok("RangeError,RangeError,after"));
         assert!(!vm.conv_failed());
         let r = vm.try_new_string_with(MAX_STRING_LEN + 1, |_| unreachable!());
@@ -9617,7 +9945,7 @@ out.join();"#;
 
     fn cons(vm: &mut Vm) -> Value {
         let src = "'x'.repeat(40) + 'y'.repeat(40)";
-        let s = vm.run(&crate::js::compile(src).unwrap()).unwrap();
+        let s = vm.run_raw(&crate::js::compile(src).unwrap()).unwrap();
         assert!(Obj::of(s).elems().is_null());
         s
     }
@@ -9637,8 +9965,7 @@ out.join();"#;
             let r = catch_unwind(AssertUnwindSafe(|| b.enter(|_| panic!("unwinding"))));
             assert!(r.is_err());
             assert!(std::ptr::eq(crate::interp::current_vm(), pa));
-            let r =
-                catch_unwind(AssertUnwindSafe(|| b.host("test", &[], &[], |_| -> Result<()> { panic!("unwinding") })));
+            let r = catch_unwind(AssertUnwindSafe(|| b.host(&[], &[], |_| -> Result<()> { panic!("unwinding") })));
             assert!(r.is_err());
             assert!(std::ptr::eq(crate::interp::current_vm(), pa));
             assert!(std::ptr::eq(crate::heap::owner(a.global as usize), pa));
@@ -9652,7 +9979,7 @@ out.join();"#;
         // And what `host` entered.
         let mut c = Vm::new();
         let r = catch_unwind(AssertUnwindSafe(|| {
-            c.host("test", &[], &[], |c| -> Result<()> {
+            c.host(&[], &[], |c| -> Result<()> {
                 c.conv_thrown = true;
                 panic!("unwinding")
             })
@@ -9686,7 +10013,7 @@ out.join();"#;
             globalThis.count = function () { return a.length; };
             for (;;) a.push(JSON.parse('[[1, 2, 3], {"x": [4, 5]}, "six"]'));"#;
         let m = crate::js::compile(src).unwrap();
-        let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+        let r = catch_unwind(AssertUnwindSafe(|| vm.run_raw(&m)));
         let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
         assert!(msg.is_some_and(|m| m.contains("out of memory")));
         assert!(!vm.poisoned() && crate::interp::current_vm().is_null());
@@ -9705,7 +10032,7 @@ out.join();"#;
               for (var j = 0; j < os.length; j++) moved = moved || addr(os[j]) != at[j];
             }
             [count() > 1000, moved, os[199].k].join()"#;
-        let r = vm.run(&crate::js::compile(src).unwrap()).map(display_raw);
+        let r = vm.run_raw(&crate::js::compile(src).unwrap()).map(display_raw);
         assert_eq!(r.as_deref(), Ok("true,true,vvv"));
         assert_eq!((vm.heap.gc.stack_base, vm.unmovable), (0, 0));
     }
@@ -9779,7 +10106,7 @@ out.join();"#;
                 }
                 vm.heap.limit_growth(32 << 20);
                 let m = crate::js::compile(src).unwrap();
-                let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+                let r = catch_unwind(AssertUnwindSafe(|| vm.run_raw(&m)));
                 let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
                 assert!(msg.is_some_and(|m| m.contains("out of memory")), "{evacuate} {src}");
                 assert!(crate::interp::current_vm().is_null() && !crate::jit::panic_pending(), "{evacuate} {src}");
@@ -9788,10 +10115,10 @@ out.join();"#;
                 let again = crate::js::compile("var s = 0; for (var i = 0; i < 100000; i++) s += [i][0]; s").unwrap();
                 if vm.poisoned() {
                     assert!(evacuate != 0, "{src}");
-                    assert!(vm.run(&again).is_err_and(|e| e.0.contains("poisoned")), "{evacuate} {src}");
+                    assert!(vm.run_raw(&again).is_err_and(|e| e.0.contains("poisoned")), "{evacuate} {src}");
                     continue;
                 }
-                assert_eq!(vm.run(&again).map(|v| display(v, &vm)).as_deref(), Ok("4999950000"), "{evacuate} {src}");
+                assert_eq!(vm.run_raw(&again).map(display_raw).as_deref(), Ok("4999950000"), "{evacuate} {src}");
                 vm.verify_heap();
             }
         }
@@ -10042,7 +10369,7 @@ out.join();"#;
     fn to_boolean_makes_no_string_flat() {
         let mut vm = Vm::new();
         let s = cons(&mut vm);
-        let empty = vm.run(&crate::js::compile("var e = ''; e + e").unwrap()).unwrap();
+        let empty = vm.run_raw(&crate::js::compile("var e = ''; e + e").unwrap()).unwrap();
         vm.heap.limit_growth(0);
         assert!(crate::interp::to_boolean(s) && !crate::interp::to_boolean(empty));
         assert!(Obj::of(s).elems().is_null());
@@ -10053,7 +10380,7 @@ out.join();"#;
         let mut vm = Vm::new();
         let n = vm.run(&crate::js::compile(src).unwrap()).map(|v| display(v, &vm));
         assert_eq!(n.as_deref(), Ok("15000"));
-        let s = vm.run(&crate::js::compile("s").unwrap()).unwrap();
+        let s = vm.run_raw(&crate::js::compile("s").unwrap()).unwrap();
         assert!(Obj::of(s).elems().is_null());
     }
 
@@ -10075,15 +10402,15 @@ out.join();"#;
         vm.define_native(g, "squeeze", squeeze, 0, crate::jit::Ty::Any, false);
         let src = "var a = []; for (var i = 0; i < 200000; i++) a.push({i: i}); squeeze(); $262.gc();";
         let m = crate::js::compile(src).unwrap();
-        let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+        let r = catch_unwind(AssertUnwindSafe(|| vm.run_raw(&m)));
         let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
         assert!(msg.is_some_and(|m| m.contains("out of memory")));
         assert!(vm.poisoned());
         assert_eq!((vm.heap.gc.stack_base, vm.unmovable), (0, 0));
         assert!(vm.native_top.is_null() && crate::interp::current_vm().is_null());
         let poisoned = |r: Result<Value>| r.is_err_and(|e| e.0.contains("poisoned"));
-        assert!(poisoned(vm.run(&crate::js::compile("1").unwrap())));
-        let (o, k) = (vm.global_object(), vm.intern("a"));
+        assert!(poisoned(vm.run_raw(&crate::js::compile("1").unwrap())));
+        let (o, k) = (vm.global_object().value(), vm.intern("a"));
         assert!(poisoned(vm.get(o, k)));
         assert!(matches!(vm.run_module("nowhere.mjs"), Err(ModuleError::Thrown(e)) if e.0.contains("poisoned")));
     }
@@ -10141,28 +10468,28 @@ out.join();"#;
             assert!(vm.open_upvalues.is_empty() && vm.mapped_args.is_empty() && vm.native_top.is_null());
         };
         let mut reference = fresh();
-        reference.run(&setup(false)).unwrap();
+        reference.run_raw(&setup(false)).unwrap();
         reference.set_gc_evacuate_all();
-        let expected = reference.run(&observe).map(display_raw).unwrap();
+        let expected = reference.run_raw(&observe).map(display_raw).unwrap();
         // (After the frames returned: the variables' last values, and
         // `arguments` still aliasing those the closures captured, #163;
         // SpiderMonkey's and JSC's.)
         assert_eq!(expected, "a0b1,a0,b1,2,Ab1,c1,c1,c2,c2,c3,c3");
 
         let mut vm = fresh();
-        assert!(catch_unwind(AssertUnwindSafe(|| vm.run(&setup(true)))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| vm.run_raw(&setup(true)))).is_err());
         between(&vm);
         vm.set_gc_evacuate_all();
-        assert_eq!(vm.run(&observe).map(display_raw).as_deref(), Ok(&*expected));
+        assert_eq!(vm.run_raw(&observe).map(display_raw).as_deref(), Ok(&*expected));
         vm.verify_heap();
 
         let mut vm = fresh();
         let r = vm.enter(|vm| {
-            assert!(catch_unwind(AssertUnwindSafe(|| vm.run(&setup(true)))).is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| vm.run_raw(&setup(true)))).is_err());
             assert!(vm.heap.gc.stack_base != 0 && vm.open_upvalues.is_empty() && vm.mapped_args.is_empty());
             assert!(!vm.conv_failed() && !vm.conv_redo && !vm.conv_replays);
             vm.set_gc_evacuate_all();
-            vm.run(&observe)
+            vm.run_raw(&observe)
         });
         assert_eq!(r.map(display_raw).as_deref(), Ok(&*expected));
         between(&vm);
@@ -10197,9 +10524,9 @@ out.join();"#;
         let mut a = Vm::new();
         let gc = crate::js::compile("$262.gc()").unwrap();
         let x = a.intern_name("unusedSinceTheMarkingBefore");
-        a.run(&gc).unwrap();
+        a.run_raw(&gc).unwrap();
         assert_eq!(a.atoms[x.0 as usize].as_deref(), Some("unusedSinceTheMarkingBefore"));
-        a.run(&gc).unwrap();
+        a.run_raw(&gc).unwrap();
         assert!(a.atoms[x.0 as usize].as_deref() != Some("unusedSinceTheMarkingBefore"));
     }
 
@@ -10211,15 +10538,15 @@ out.join();"#;
         let mut a = Vm::new();
         let mut b = Vm::new();
         let gc = crate::js::compile("$262.gc()").unwrap();
-        a.run(&gc).unwrap();
+        a.run_raw(&gc).unwrap();
         let x = a.intern_name("usedSinceTheMarkingBefore");
-        b.run(&gc).unwrap();
-        b.run(&gc).unwrap();
-        a.run(&gc).unwrap();
+        b.run_raw(&gc).unwrap();
+        b.run_raw(&gc).unwrap();
+        a.run_raw(&gc).unwrap();
         assert_eq!(a.atoms[x.0 as usize].as_deref(), Some("usedSinceTheMarkingBefore"));
         // Unused since, the marking after frees it.
-        a.run(&gc).unwrap();
-        a.run(&gc).unwrap();
+        a.run_raw(&gc).unwrap();
+        a.run_raw(&gc).unwrap();
         assert!(a.atoms[x.0 as usize].as_deref() != Some("usedSinceTheMarkingBefore"));
     }
 
@@ -10265,7 +10592,7 @@ sum;
         heap.gc.verify = 64 << 10;
         heap.budget = heap.gc.budget();
         let mut vm = Vm::with_heap(heap);
-        assert_eq!(vm.run(&module).map(|v| display(v, &vm)).as_deref(), Ok("71410696"));
+        assert_eq!(vm.run_raw(&module).map(display_raw).as_deref(), Ok("71410696"));
     }
 
     /// `known(ta, p)`: what `Vm::typed_lengths` gives for typed array
@@ -10313,7 +10640,7 @@ before + "," + known(ta, P);
         let g = vm.global_obj();
         vm.define_native(g, "known", known, 2, crate::jit::Ty::Any, false);
         vm.define_native(g, "forget", forget, 0, crate::jit::Ty::Any, false);
-        assert_eq!(vm.run(&module).map(|v| display(v, &vm)).as_deref(), Ok("1,0"));
+        assert_eq!(vm.run_raw(&module).map(display_raw).as_deref(), Ok("1,0"));
     }
 
     thread_local! {
@@ -10373,7 +10700,7 @@ before + "," + known(ta, P);
     /// the test expects.)
     fn swap_vm_and_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
         swap_with_other(vm);
-        let (g, k) = (vm.global_object(), vm.intern("got"));
+        let (g, k) = (vm.global_object().value(), vm.intern("got"));
         let r = vm.get(g, k);
         if r.as_ref().ok().map(|&v| display_raw(v)).as_deref() != Some("100000") {
             eprintln!("the getter: {r:?}");
@@ -10389,7 +10716,7 @@ before + "," + known(ta, P);
         OTHER.with(|o| {
             let mut o = o.borrow_mut();
             let o = o.as_mut().unwrap();
-            let (g, k) = (o.global_object(), o.intern("got"));
+            let (g, k) = (o.global_object().value(), o.intern("got"));
             o.get(g, k)
         })
     }
@@ -10407,7 +10734,7 @@ before + "," + known(ta, P);
     /// is back in its place, under the getter's frames.
     fn swap_vm_and_get_swap(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
         swap_with_other(vm);
-        let (g, k) = (vm.global_object(), vm.intern("swapsBack"));
+        let (g, k) = (vm.global_object().value(), vm.intern("swapsBack"));
         vm.get(g, k)
     }
 

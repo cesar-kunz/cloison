@@ -297,7 +297,7 @@ mod tests {
     /// `src`'s completion value, with its VM (kept alive with it).
     fn value(src: &str) -> (Vm, Obj) {
         let mut vm = Vm::new();
-        let v = vm.run(&crate::js::compile(src).unwrap()).unwrap();
+        let v = vm.run_raw(&crate::js::compile(src).unwrap()).unwrap();
         (vm, Obj::of(v))
     }
 

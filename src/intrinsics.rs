@@ -723,10 +723,10 @@ fn derived_return(_: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(v);
     }
     if !v.is_undefined() {
-        return Err(Error(DERIVED_RESULT.into(), None));
+        return Err(Error(DERIVED_RESULT.into(), None, 0));
     }
     if this == Value::HOLE {
-        return Err(Error(DERIVED_THIS.into(), None));
+        return Err(Error(DERIVED_THIS.into(), None, 0));
     }
     Ok(this)
 }
@@ -931,7 +931,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     };
     // (In parameters' defaults, a `var arguments` is an error.)
     if a.get(5) == Some(&Value::TRUE) && !own_strict && declared.iter().any(|&n| vm.atom_name(n) == "arguments") {
-        return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
+        return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None, 0));
     }
     let local = object_value(vm.new_plain(Value::NULL).ptr());
     // (Declared in the function's scope object, under the scope objects
@@ -951,6 +951,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
                 return Err(Error(
                     format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)),
                     None,
+                    0,
                 ));
             }
         }
@@ -969,6 +970,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
             return Err(Error(
                 format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)),
                 None,
+                0,
             ));
         }
     }
@@ -993,7 +995,7 @@ fn eval_shape(shape: Value) -> Result<crate::vm::EvalChain> {
 }
 
 fn too_many_scopes() -> Error {
-    Error("unsupported: a direct eval in more than 128 scopes".into(), None)
+    Error("unsupported: a direct eval in more than 128 scopes".into(), None, 0)
 }
 
 /// The scope objects of bindings among a direct `eval`'s `scopes` inside
@@ -1084,6 +1086,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                     return Err(Error(
                         "SyntaxError: 'arguments' declared by eval in a parameter expression".into(),
                         None,
+                        0,
                     ));
                 }
                 if !module.annex_b.iter().any(|b| *b == name)
@@ -1091,7 +1094,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                         b == name && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
                     })
                 {
-                    return Err(Error(format!("SyntaxError: Identifier '{name}' has already been declared"), None));
+                    return Err(Error(format!("SyntaxError: Identifier '{name}' has already been declared"), None, 0));
                 }
             }
             let code = vm.load(module);
@@ -1240,9 +1243,9 @@ fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// An `eval`'s compile error, thrown.
 pub(crate) fn eval_error(e: String) -> Error {
     if e.contains("unsupported") {
-        Error(format!("unsupported: in eval'd code: {e}"), None)
+        Error(format!("unsupported: in eval'd code: {e}"), None, 0)
     } else {
-        Error(format!("SyntaxError: {e}"), None)
+        Error(format!("SyntaxError: {e}"), None, 0)
     }
 }
 

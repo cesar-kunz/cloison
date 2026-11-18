@@ -328,7 +328,7 @@ pub(crate) fn own_error(vm: &mut Vm, e: Error) -> Error {
         return e;
     }
     let v = crate::builtins::caught(vm, &e);
-    Error(e.0, Some(v))
+    Error(e.0, Some(v), 0)
 }
 
 /// Whether `e` is a derived constructor's bad result's (`intrinsics::

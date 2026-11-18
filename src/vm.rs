@@ -3545,9 +3545,15 @@ impl Vm {
     #[inline]
     fn check_value(&self, v: Value, what: &str) {
         self.check_own(v, what);
-        if v.is_cell() && !self.heap.holds_object(v.to_bits() as usize, self.heap.gc.marking) {
+        if !self.holds_value(v) {
             stale_cell(what)
         }
+    }
+
+    /// Whether [`Vm::check_value`] takes `v`: not a cell, or a live
+    /// object of this VM's heap.
+    fn holds_value(&self, v: Value) -> bool {
+        !v.is_cell() || self.heap.holds_object(v.to_bits() as usize, self.heap.gc.marking)
     }
 
     /// `f` run from the host between runs, with this VM entered as a run
@@ -3874,11 +3880,17 @@ impl Vm {
 
     /// An uncaught error's message: a thrown error object's `name` and
     /// `message`, else the error's own.
+    ///
+    /// The thrown value is a raw one, valid as the run's result is (see
+    /// [`Vm::run`]). Past a collection that freed it, or of another VM,
+    /// the message is the error's own (`e.0`, made as it was thrown),
+    /// with no panic: a diagnostic, under `panic = "abort"` too (#323).
+    /// One a cell made at its freed address since points at is that
+    /// cell's message, its `toString` run: report an `Error` before the
+    /// next run, or hold the value as a [`Global`].
     pub fn uncaught_message(&mut self, e: &Error) -> String {
-        // (The thrown value is a raw one the host kept: checked as the
-        // operations' are, #323.)
-        if let Some(v) = e.1 {
-            self.check_value(v, "Vm::uncaught_message");
+        if e.1.is_some_and(|v| !self.holds_value(v)) {
+            return e.0.clone();
         }
         if let Some(v) = e.1
             && crate::props::is_object(v)
@@ -7490,7 +7502,9 @@ impl Vm {
     /// [`Global`], which the collector keeps and updates. The VM's
     /// operations, [`display`] and [`Global::new`] refuse (panic on) one a
     /// collection freed or moved (#323); one pointing at a cell made there
-    /// since reads that cell.
+    /// since reads that cell. (Values a native reaches within a run are
+    /// checked only for their heap: one it kept from an earlier run, in a
+    /// `static` or a thread-local, isn't checked for being stale.)
     ///
     /// A panic unwinding out of the run (the heap limit's, `CLOISON_HEAP_
     /// LIMIT`, under an embedder's `catch_unwind`) leaves the VM as between

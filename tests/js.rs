@@ -8930,6 +8930,29 @@ fn weak_ref_targets_of_host_callbacks_die() {
     assert!(alive <= 5, "{alive} of 100 targets alive");
 }
 
+/// #323 for the thrown value of an `Error` the host keeps: past a run
+/// that collected it, `uncaught_message` refuses it (a panic) or reads a
+/// live cell, never freed memory.
+#[test]
+fn stale_thrown_values_are_refused() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut vm = Vm::new();
+    let errors: Vec<_> = (0..50)
+        .map(|i| vm.run(&cloison::js::compile(&format!("throw 'x'.repeat(40) + {i}")).unwrap()).unwrap_err())
+        .collect();
+    assert_eq!(vm.uncaught_message(&errors[49]), "x".repeat(40) + "49");
+    vm.run(&cloison::js::compile("for (var i = 0; i < 1e5; i++) var o = {i: [i]}; $262.gc(); $262.gc();").unwrap())
+        .unwrap();
+    let mut refused = 0;
+    for e in &errors {
+        match catch_unwind(AssertUnwindSafe(|| vm.uncaught_message(e))) {
+            Err(_) => refused += 1,
+            Ok(m) => drop(m),
+        }
+    }
+    assert!(refused >= 40, "{refused} of 50 refused");
+}
+
 /// #343: the host's ToNumber is the VM's, a string parsed, an object's
 /// `valueOf` run, what a conversion throws the error.
 #[test]

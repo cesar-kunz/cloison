@@ -10501,8 +10501,37 @@ function b3() {
 }
 function b4() { try { throw 0 } catch (e) { for (var [e] of (function () { for (var x of []); return [[2]] })()); (() => e) } return e }
 log.push(b1(), b2(), b3(), b4());
+// (Nor does a catch block's `var` in a function in the head's pattern, a
+// default or a computed key, outside a catch block or in one.)
+function c1() {
+    var r = [];
+    for (var [a = (function () { try { throw 0 } catch (z) { let q; var z = 1 } })()] of [[]]) r.push(typeof a);
+    (() => a);
+    return r.join("") + typeof z;
+}
+function c2() {
+    try { throw "c" } catch (e) {
+        for (var [e = (function () { try { throw 0 } catch (z) { let q; var z = 1 } })()] of [[5]]);
+        return (() => e)() + typeof z;
+    }
+}
+function c3() {
+    try { throw "c" } catch (e) {
+        for (var [a = (function () { try { throw 0 } catch (e) { var e = 1; (() => e) } })()] of [[]]);
+        return [e, a, (() => e)()].join("");
+    }
+}
+function c4() {
+    for (var {[(function () { try { throw 0 } catch (z) { var z = 1; (() => z) } return "k" })()]: b} of [{k: 7}]);
+    (() => b);
+    return b + typeof z;
+}
+log.push(c1(), c2(), c3(), c4());
 log.join(" ");"#;
-    assert_eq!(value(src), "1 z undefined 1 k 1 1  1 ab 12 123undefined   5undefined ");
+    assert_eq!(
+        value(src),
+        "1 z undefined 1 k 1 1  1 ab 12 123undefined   5undefined  undefinedundefined 5undefined cc 7undefined"
+    );
 }
 
 /// `for (let …; …; …)` copies its bindings into the first iteration's

@@ -152,7 +152,6 @@ fn parse_pass<'a>(
         pending_head: Vec::new(),
         sub: false,
         pending_pattern: None,
-        catch_vars: Vec::new(),
         head_vars: Vec::new(),
         pattern_names: Vec::new(),
         privates: Vec::new(),
@@ -386,11 +385,8 @@ struct Parser<'t, 'a, 'p> {
     sub: bool,
     /// A `for` head's declaration's pattern (see `pattern_declarator`).
     pending_pattern: Option<Pattern<'a>>,
-    /// The last `var_decls`' names a catch parameter shadows: each `var`'s
-    /// name and the parameter's (Annex B.3.4).
-    catch_vars: Vec<(Name, Name)>,
     /// The `var`s the next `for` body declares, from a head whose target
-    /// is a catch parameter (see `catch_vars`).
+    /// is a catch parameter (see `Parser::var_decls`).
     head_vars: Vec<Name>,
     /// The names the last parameter list's patterns bind.
     pattern_names: Vec<Name>,
@@ -695,7 +691,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Tok::Keyword("var") => {
                 self.advance();
-                let decls = self.var_decls(false)?;
+                let (decls, _) = self.var_decls(false)?;
                 self.semicolon()?;
                 StmtKind::Var(decls)
             }
@@ -1249,14 +1245,18 @@ impl<'a> Parser<'_, 'a, '_> {
         Ok(StmtKind::Block(self.lower_using(vec![declaration, lp], names, is_await, pos)))
     }
 
-    fn var_decls(&mut self, no_in: bool) -> R<Vec<(Name, Option<Expr<'a>>)>> {
+    /// A `var` statement's or `for` head's declarations, and the names a
+    /// catch parameter shadows in them: each `var`'s name and the
+    /// parameter's (Annex B.3.4). (Returned, not kept in the parser: a
+    /// function nested in the declarations has `var`s of its own.)
+    fn var_decls(&mut self, no_in: bool) -> R<(Vec<(Name, Option<Expr<'a>>)>, Vec<(Name, Name)>)> {
         let mut decls = Vec::new();
-        self.catch_vars.clear();
+        let mut shadowed = Vec::new();
         loop {
             if self.is("[") || self.is("{") {
-                self.pattern_declarator(None, no_in, &mut decls)?;
+                self.pattern_declarator(None, no_in, &mut decls, &mut shadowed)?;
                 if !self.eat(",") {
-                    return Ok(decls);
+                    return Ok((decls, shadowed));
                 }
                 continue;
             }
@@ -1275,7 +1275,7 @@ impl<'a> Parser<'_, 'a, '_> {
             // initializer stores to the catch parameter (Annex B.3.4).
             let shadow = self.resolve(&written).filter(|t| *t != name);
             if let Some(t) = &shadow {
-                self.catch_vars.push((name.clone(), t.clone()));
+                shadowed.push((name.clone(), t.clone()));
             }
             if let (Some(target), Some(e)) = (shadow, &init) {
                 let pos = e.pos;
@@ -1287,7 +1287,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 decls.push((name, init));
             }
             if !self.eat(",") {
-                return Ok(decls);
+                return Ok((decls, shadowed));
             }
         }
     }
@@ -1337,10 +1337,10 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Some(ForInit::Lexical(constant, decls))
         } else if self.eat("var") {
-            let decls = self.var_decls(true)?;
+            let (decls, catch_vars) = self.var_decls(true)?;
             // `catch (e) { for (var e of …) … }`: the head assigns the catch
             // parameter, and the body declares the `var` (Annex B.3.4).
-            let shadowed = !self.catch_vars.is_empty();
+            let shadowed = !catch_vars.is_empty();
             let names =
                 || -> Vec<Name> { decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect() };
             if let Some(p) = self.pending_pattern.take() {
@@ -1361,7 +1361,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             if decls.len() == 1 && decls[0].1.is_none() && (self.is_of() || self.is("in")) {
                 let name = decls[0].0.clone();
-                let target = match self.catch_vars.first() {
+                let target = match catch_vars.first() {
                     Some((_, t)) => {
                         self.head_vars = vec![name.clone()];
                         Some(t.clone())
@@ -1530,6 +1530,7 @@ impl<'a> Parser<'_, 'a, '_> {
         lexical: Option<u8>,
         no_in: bool,
         decls: &mut Vec<(Name, Option<Expr<'a>>)>,
+        shadowed: &mut Vec<(Name, Name)>,
     ) -> R<()> {
         let pos = self.pos();
         let mut names = Vec::new();
@@ -1565,7 +1566,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     let var = self.resolve_var(n).unwrap_or_else(|| n.clone());
                     let target = self.resolve(n).unwrap_or_else(|| n.clone());
                     if target != var {
-                        self.catch_vars.push((var.clone(), target.clone()));
+                        shadowed.push((var.clone(), target.clone()));
                     }
                     map.push((n.clone(), target));
                     vars.push(var);
@@ -1577,7 +1578,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         };
         for n in names {
-            let set = lexical.is_some() || !self.catch_vars.iter().any(|(v, _)| *v == n);
+            let set = lexical.is_some() || !shadowed.iter().any(|(v, _)| *v == n);
             decls.push((n, set.then_some(Expr { kind: ExprKind::Bound, pos })));
         }
         let mode = if lexical.is_some() { 2 } else { 1 };
@@ -3674,7 +3675,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let mut decls = Vec::new();
         loop {
             if self.is("[") || self.is("{") {
-                self.pattern_declarator(Some(kind), no_in, &mut decls)?;
+                self.pattern_declarator(Some(kind), no_in, &mut decls, &mut Vec::new())?;
                 if !self.eat(",") {
                     return Ok(decls);
                 }

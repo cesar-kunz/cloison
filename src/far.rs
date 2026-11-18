@@ -237,26 +237,42 @@ pub(crate) fn count(o: Obj) -> usize {
 /// search them: sorted once, and again once a key has been added (a store
 /// rehashed into is another; a key deleted since is still there, which
 /// the caller's HasProperty finds absent).
+///
+/// Known by the store's address and its stamp (`MUTATIONS`), which every
+/// store made and every key added takes anew from `stamps`: no other store
+/// has it, even one made at the address of a store freed (#332). (A
+/// double, exact up to 2^53: never exhausted.)
 #[derive(Default)]
 pub(crate) struct SortedKeys {
     store: usize,
-    mutations: usize,
+    mutations: u64,
     keys: Vec<u32>,
+    stamps: u64,
 }
 
 impl SortedKeys {
-    /// Forget the keys, at every collection: the store they are of,
-    /// compared by address, may be freed, and another made at its address
-    /// with as many mutations, or moved (`gc::Evacuation`) (#332).
+    /// Forget the keys: the store they are of, compared by address, may
+    /// have moved (`gc::Evacuation`).
     pub(crate) fn invalidate(&mut self) {
         self.store = 0;
         self.keys.clear();
     }
 }
 
+/// Give store `e` a stamp no store had (see [`SortedKeys`]).
+fn stamp(vm: &mut Vm, e: Obj) {
+    vm.far_keys.stamps += 1;
+    put(e, MUTATIONS, Value::number(vm.far_keys.stamps as f64));
+}
+
+/// Store `e`'s stamp, as the bits of its value (one number each).
+fn stamp_of(e: Obj) -> u64 {
+    slot(e, MUTATIONS).to_bits()
+}
+
 fn sorted(vm: &mut Vm, o: Obj) -> &[u32] {
     let e = store(o);
-    let (at, m) = (e.ptr() as usize, int(e, MUTATIONS));
+    let (at, m) = (e.ptr() as usize, stamp_of(e));
     let c = &mut vm.far_keys;
     if c.store != at || c.mutations != m {
         c.keys = keys(o);
@@ -358,7 +374,7 @@ pub(crate) fn insert(vm: &mut Vm, o: Obj, i: u32, v: Value) {
         b = (b + 1) & mask;
     }
     set_int(e, COUNT, int(e, COUNT) + 1);
-    set_int(e, MUTATIONS, (int(e, MUTATIONS) + 1) & i32::MAX as usize);
+    stamp(vm, e);
 }
 
 /// Remove far element `i` of far array `o`: whether it had it.
@@ -416,7 +432,7 @@ fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> Obj {
     put(e, LENGTH, Value::number(len as f64));
     set_int(e, COUNT, 0);
     set_int(e, USED, 0);
-    set_int(e, MUTATIONS, 0);
+    stamp(vm, e);
     set_int(e, MASK, buckets - 1);
     e
 }
@@ -433,12 +449,9 @@ fn hold(o: Obj, e: Obj) {
 
 /// Move far array `o`'s entries to a store of `buckets` buckets.
 fn rehash(vm: &mut Vm, o: Obj, buckets: usize) {
-    let old = store(o);
     let len = length(o);
-    let mutations = int(old, MUTATIONS);
     let all = entries(o);
     let e = new_store(vm, buckets.max(MIN_BUCKETS), len);
-    set_int(e, MUTATIONS, mutations);
     let mask = int(e, MASK);
     for &(i, v) in &all {
         let mut b = hash(i) & mask;
@@ -576,44 +589,42 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: Obj) {
 
 #[cfg(test)]
 mod tests {
+    use crate::object::Obj;
     use crate::value::Value;
     use crate::vm::{Result, Vm};
 
-    /// Make `vm.far_keys` hold an empty key list for far array `a`'s store
-    /// as it is: what a freed store's list would be for a new store made
-    /// at its address with as many mutations.
+    /// `fake(a, b)`: make `vm.far_keys` hold an empty key list for far
+    /// array `b`'s store's address and far array `a`'s store's stamp: what
+    /// the list of `a`'s store would be, freed, for `b`'s made at its
+    /// address.
     fn fake(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
-        let e = super::store(crate::object::Obj::of(args[0]));
-        vm.far_keys =
-            super::SortedKeys { store: e.ptr() as usize, mutations: super::int(e, super::MUTATIONS), keys: vec![] };
+        let (a, b) = (super::store(Obj::of(args[0])), super::store(Obj::of(args[1])));
+        vm.far_keys.store = b.ptr() as usize;
+        vm.far_keys.mutations = super::stamp_of(a);
+        vm.far_keys.keys.clear();
         Ok(Value::UNDEFINED)
     }
 
-    /// A full collection that moves nothing.
-    fn collect(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-        vm.heap.gc.set_evacuate(false);
-        vm.collect_full_now();
-        Ok(Value::UNDEFINED)
-    }
-
-    /// A collection that moves no cell forgets the sorted far keys all
-    /// the same: the store they were of may be freed and another made at
-    /// its address (#332).
+    /// Two far arrays with as many keys added each: their stores' stamps
+    /// differ, so the sorted keys of one, freed, are not those of the
+    /// other made at its address (#332: each store counted its own keys
+    /// added, and only evacuation dropped the list). The list planted for
+    /// `b`'s own stamp is used: what tells them apart is the stamp.
     #[test]
-    fn far_keys_are_forgotten_by_a_collection_moving_nothing() {
+    fn far_keys_of_a_store_freed_are_not_another_store_made_there() {
         let src = r#"
             var a = []; a[1e8] = 1; a[5] = 2;
-            var count = () => { var n = 0; a.forEach(() => n++); return n; };
-            fake(a);
-            var before = count();
-            collect();
-            before + "," + count()
+            var b = []; b[1e8] = 3; b[6] = 4;
+            var count = (x) => { var n = 0; x.forEach(() => n++); return n; };
+            fake(b, b);
+            var own = count(b);
+            fake(a, b);
+            own + "," + count(b)
         "#;
         let module = crate::js::compile(src).unwrap();
         let mut vm = Vm::new();
         let g = vm.global_obj();
-        vm.define_native(g, "fake", fake, 1, crate::jit::Ty::Any, false);
-        vm.define_native(g, "collect", collect, 0, crate::jit::Ty::Any, false);
+        vm.define_native(g, "fake", fake, 2, crate::jit::Ty::Any, false);
         assert_eq!(vm.run(&module).map(crate::vm::display).as_deref(), Ok("0,2"));
     }
 }

@@ -2290,9 +2290,6 @@ impl Vm {
         }
         self.short_strings.fill(Value::EMPTY);
         self.split_cache.fill((0, 0, Value::EMPTY));
-        // Keyed by a store's address: this collection may free the store
-        // (another can then be made there) or move it (#332).
-        self.far_keys.invalidate();
         if matches!(kind, Collection::Start | Collection::Full) {
             self.heap.finish_sweep();
             // The cells that could still refer to them are swept.
@@ -4044,6 +4041,7 @@ impl Vm {
         }
         // Caches of addresses.
         self.forget_lookups();
+        self.far_keys.invalidate();
         // The cells moved from: free (and poisoned, stressed or verified).
         let poison = mode == Evacuate::All || self.heap.gc.checking();
         for &(p, n) in &from {

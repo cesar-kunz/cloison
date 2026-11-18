@@ -76,6 +76,10 @@ const SHAPE_FULL_MIN: usize = 1 << 18;
 /// of 32 properties made 32 cells, 1.2 KB, a delete).
 const CELL_FULL_MIN: usize = 1 << 20;
 const FULL_MIN: usize = 64 << 20;
+/// The full collections that are stop-the-world after the marker thread
+/// couldn't be started, before it is tried again (a failed start costs
+/// one system call).
+const MARKER_RETRY: u32 = 16;
 /// Under `CLOISON_GC_STRESS`, a full collection also runs once minor ones
 /// have promoted this many bytes since the last: collecting at every
 /// safepoint promotes whatever is live at each, garbage soon after, and
@@ -180,8 +184,7 @@ pub struct Gc {
     full_at: usize,
     /// Every collection full (`CLOISON_GC_FULL`).
     always_full: bool,
-    /// Full collections marked in one pause (`CLOISON_GC_STW`, or the
-    /// marker thread couldn't be started: #341).
+    /// Full collections marked in one pause (`CLOISON_GC_STW`).
     stw: bool,
     /// Concurrent full collections back to back (`CLOISON_GC_CYCLES`).
     cycles: bool,
@@ -245,6 +248,11 @@ pub struct Gc {
     shade: Vec<usize>,
     /// The marker thread, once a cycle needed it.
     pub(crate) marker: Option<Marker>,
+    /// The full collections left stop-the-world before the marker
+    /// thread, which couldn't be started, is tried again (#341).
+    marker_retry: u32,
+    /// How many those are after each failure ([`MARKER_RETRY`]).
+    marker_retry_every: u32,
     /// Bytes allocated between minor collections (`CLOISON_GC_NURSERY`, MiB:
     /// fixed), and whether it grows (see [`NURSERY`]).
     nursery: usize,
@@ -329,6 +337,7 @@ impl Gc {
             nursery_fixed: env("CLOISON_GC_NURSERY"),
             full_at: FULL_MIN,
             growth: std::env::var("CLOISON_GC_GROWTH").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(GROWTH),
+            marker_retry_every: MARKER_RETRY,
             threads: std::env::var("CLOISON_GC_THREADS")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -994,7 +1003,7 @@ fn in_parallel<I: Sync, T: Send>(threads: usize, items: &[I], min: usize, f: imp
             .chunks(per)
             .skip(1)
             .map(|c| {
-                if spawn_refused() {
+                if spawn_refused(false) {
                     return Err(c);
                 }
                 std::thread::Builder::new().spawn_scoped(sc, move || f(c)).map_err(|_| c)
@@ -1015,7 +1024,7 @@ fn helper<'s, T: Send + 's>(
     sc: &'s std::thread::Scope<'s, '_>,
     f: impl FnOnce() -> T + Send + 's,
 ) -> Option<std::thread::ScopedJoinHandle<'s, T>> {
-    if spawn_refused() {
+    if spawn_refused(false) {
         return None;
     }
     std::thread::Builder::new().spawn_scoped(sc, f).ok()
@@ -1024,21 +1033,38 @@ fn helper<'s, T: Send + 's>(
 #[cfg(test)]
 thread_local! {
     /// The collector's threads not to be started from this thread, as
-    /// under a limit of threads: `(every, attempts, refused)`, one
-    /// attempt in `every` refused, from the first (see the tests).
-    static REFUSE_THREADS: std::cell::Cell<Option<(usize, usize, usize)>> = const { std::cell::Cell::new(None) };
+    /// under a limit of threads (see the tests): whether to refuse the
+    /// marker's (`true`) or a helper's `n`th start (from 0, counted apart),
+    /// and the counts so far.
+    static REFUSE_THREADS: std::cell::Cell<Option<Refusals>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether a thread of the collector's is not to be started (the tests'
-/// limit of threads, [`REFUSE_THREADS`]); never outside the tests.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct Refusals {
+    refuse: fn(bool, usize) -> bool,
+    /// The helpers' and the marker's starts tried.
+    helpers: usize,
+    markers: usize,
+    /// Those refused.
+    refused: usize,
+}
+
+/// Whether a thread of the collector's, the marker if `marker`, is not to
+/// be started (the tests' limit of threads, [`REFUSE_THREADS`]); never
+/// outside the tests.
 #[inline(always)]
-fn spawn_refused() -> bool {
+fn spawn_refused(marker: bool) -> bool {
     #[cfg(test)]
-    if let Some((every, attempts, refused)) = REFUSE_THREADS.get() {
-        let refuse = attempts % every == 0;
-        REFUSE_THREADS.set(Some((every, attempts + 1, refused + usize::from(refuse))));
+    if let Some(mut r) = REFUSE_THREADS.get() {
+        let n = if marker { &mut r.markers } else { &mut r.helpers };
+        let refuse = (r.refuse)(marker, *n);
+        *n += 1;
+        r.refused += usize::from(refuse);
+        REFUSE_THREADS.set(Some(r));
         return refuse;
     }
+    let _ = marker;
     false
 }
 
@@ -2076,7 +2102,7 @@ impl Marker {
 
     /// The marker, its thread started; `None` if it can't be.
     fn try_start() -> Option<Marker> {
-        if spawn_refused() {
+        if spawn_refused(true) {
             return None;
         }
         let shared = std::sync::Arc::new(Shared {
@@ -5140,15 +5166,22 @@ impl Heap {
         freed
     }
 
-    /// Whether the marker thread runs, started now if not yet; if it can't
-    /// be (#341), full collections are stop-the-world from now on.
+    /// Whether the marker thread runs, started now if not yet. If it can't
+    /// be (#341, a limit of threads), the full collections are
+    /// stop-the-world until it is tried again, [`MARKER_RETRY`] of them
+    /// later: a limit may be lifted, or threads (agents') end.
     fn has_marker(&mut self) -> bool {
+        if self.gc.marker.is_some() {
+            return true;
+        }
+        if self.gc.marker_retry > 0 {
+            self.gc.marker_retry -= 1;
+            return false;
+        }
+        self.gc.marker = Marker::try_start();
         if self.gc.marker.is_none() {
-            self.gc.marker = Marker::try_start();
-            if self.gc.marker.is_none() {
-                self.gc.stw = true;
-                return false;
-            }
+            self.gc.marker_retry = self.gc.marker_retry_every;
+            return false;
         }
         true
     }
@@ -5491,18 +5524,30 @@ mod tests {
             s
         "#;
         let module = crate::js::compile(src).unwrap();
-        // (Every thread refused, then one in two: the marker, the first,
-        // is, and some helpers start.)
-        for every in [1, 2] {
-            REFUSE_THREADS.set(Some((every, 0, 0)));
+        let run = |refuse: fn(bool, usize) -> bool, retry_every: u32| {
+            REFUSE_THREADS.set(Some(Refusals { refuse, helpers: 0, markers: 0, refused: 0 }));
             let mut vm = Vm::new();
             vm.heap.gc.threads = 4;
-            let r = vm.run(&module).map(crate::vm::display);
+            vm.heap.gc.marker_retry_every = retry_every;
+            // (Every full collection a concurrent one, if it can be.)
+            vm.heap.gc.cycles = !vm.heap.gc.stw && !vm.heap.gc.always_full;
+            let r = vm.run(&module).map(|v| v.as_number());
             vm.verify_heap();
-            let (_, attempts, refused) = REFUSE_THREADS.take().unwrap();
-            assert_eq!(r.map_err(|e| e.0), Ok("45749970".to_string()));
-            assert!(vm.heap.gc.marker.is_none());
-            assert!(refused >= 2 && (every == 1 || refused < attempts), "{refused} of {attempts} refused");
+            let counts = REFUSE_THREADS.take().unwrap();
+            assert_eq!(r.map_err(|e| e.0), Ok(Some(45749970.0)));
+            (vm.heap.gc.marker.is_some(), counts)
+        };
+        // Every thread refused; the marker, and one helper in two.
+        for refuse in [(|_, _| true) as fn(bool, usize) -> bool, |marker, n| marker || n % 2 == 0] {
+            let (marker, c) = run(refuse, MARKER_RETRY);
+            assert!(!marker);
+            assert!(c.refused >= 2 && c.markers >= 1, "{} of {} refused", c.refused, c.helpers + c.markers);
+        }
+        // The marker refused three times, then started: concurrent cycles
+        // again (a collection stop-the-world between tries).
+        let (marker, c) = run(|marker, n| marker && n < 3, 1);
+        if !Vm::new().heap.gc.stw {
+            assert!(marker && c.markers == 4 && c.refused == 3, "{} of {} refused", c.refused, c.markers);
         }
     }
 

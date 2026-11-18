@@ -62,18 +62,20 @@ use crate::interp::{self, Frame, Run};
 use crate::layout::InstanceOfEntry;
 use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, page_size};
 use crate::raw::{Live, ObjectPtr};
-use crate::value::{NumberTag, Value};
+use crate::value::Value;
 
 /// At a full collection, free the versions call sites were bound to before
 /// (`Caches::retired`, see `CallSite::bind`) that nothing runs or names any
 /// more: kept for good, with their code and the cells they embed, as one
 /// might be running when its call site is bound to another (sass retired
 /// 2,483 of 2,701 versions, the TypeScript app 3,873 of 5,690). One is
-/// running while a word of the stacks `words` gives points into its code (a
-/// return address, a frame's exit code) or at it (a direct call's exit
-/// finishing it); it is named while another `Rc` holds it (a call site, its
-/// function's versions) or a call site of its snapshot calls it as its own
-/// (`CallSite::self_code`).
+/// running while one of `words` points into its code (a return address
+/// on compiled code's part of the native stack) or at it (a run entered
+/// it): the words [`running_words`] gives. It is named while another
+/// `Rc` holds it (a call site, its function's versions) or a call site
+/// of its snapshot calls it as its own (`CallSite::self_code`). (A
+/// direct call's exit finds the version it left before anything
+/// collects: `direct_exit`.)
 pub(crate) fn free_retired(vm: &mut crate::vm::Vm, words: &[usize]) {
     let retired = &mut vm.jit_caches.retired;
     if retired.is_empty() {
@@ -187,9 +189,8 @@ impl Drop for JitCode {
 /// site; a call site's caller and the function its inline cache names):
 /// the codes it took, found live with it (#35: they were kept for good).
 /// Compiled code counts while its function (its frame 0) is `live`, or a
-/// frame runs it: a word of the stacks `words` points into its code or at
-/// it (as for `free_retired`; its function's versions may have changed
-/// since). Whether a code was marked: the caller repeats until none is.
+/// frame runs it: one of `words` points into its code or at it (as for
+/// `free_retired`; its function's versions may have changed since). Whether a code was marked: the caller repeats until none is.
 pub(crate) fn mark_referenced_codes(
     words: &mut dyn FnMut() -> Vec<usize>,
     live: &dyn Fn(*const crate::vm::Code) -> bool,
@@ -269,9 +270,9 @@ pub(crate) struct KeptBy {
 /// compiled, by the function compiled (its frame 0, one of `mine`: this
 /// VM's codes not freed), for the marking to hold the cells weakly (see
 /// `Vm::weak_kept`). A function is
-/// held while a frame runs a version of it, a word of the stacks `words`
-/// pointing into its code or at it (as for [`free_retired`]), or its
-/// state is borrowed.
+/// held while a frame runs a version of it, one of `words` pointing into
+/// its code or at it (as for [`free_retired`]), or its state is
+/// borrowed.
 pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::Code) -> bool) -> Vec<KeptBy> {
     fn site_addrs(site: &CallSite, out: &mut Vec<usize>) {
         if let Some(d) = &site.dispatch {
@@ -325,7 +326,7 @@ pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::
             ranges.push((at, at + std::mem::size_of::<JitCode>(), k));
         }
         ranges.sort_unstable();
-        // (The versions a word of the stacks points into, or at.)
+        // (The versions one of the words points into, or at.)
         let mut on: HashSet<usize> = HashSet::default();
         for &w in words {
             let i = ranges.partition_point(|r| r.0 <= w);
@@ -781,12 +782,36 @@ fn rt_add(acc: Value, r: Value) -> u64 {
 /// return already makes). One isn't: `cloison_rt_to_boolean`, which has
 /// nothing to panic in (it reads a cell's header) and no way to leave.
 /// A compiled regular expression's three calls (`regexp::rx_wide_rt` and
-/// the like) are made so too: they give `rx::LEAVE` in a panic's place,
-/// which their pieces leave the attempt on at once (as on a bail), and
-/// the attempt's caller resumes the panic as the code returns, before it
-/// reads the result.
+/// the like) are made so too, through [`catching`]: they give
+/// `rx::LEAVE` in a panic's place, which their pieces leave the attempt
+/// on at once (as on a bail), and the attempt's caller resumes the panic
+/// as the code returns, before it reads the result.
+///
+/// (In a debug build, the call over, the mark the code left on the native
+/// stack for it is made stale: see [`LO_STALE`]. Not for a regular
+/// expression's calls, which mark nothing: the runtime call the
+/// expression runs in, compiled code's, is under way still.)
 #[inline(always)]
-pub(crate) fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
+fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
+    let r = catching(leave, f);
+    #[cfg(debug_assertions)]
+    {
+        let vm = crate::interp::current_vm();
+        if !vm.is_null() {
+            unsafe {
+                let f = &raw mut (*vm).jit_frames;
+                if !(*f).towers.is_null() {
+                    (*f).lo = LO_STALE;
+                }
+            }
+        }
+    }
+    r
+}
+
+/// `f`, or `leave` if it panicked, the panic kept (see [`unwinding`]).
+#[inline(always)]
+pub(crate) fn catching<R>(leave: R, f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
         Err(p) => {
@@ -1522,7 +1547,6 @@ fn runtime_function(name: &str) -> usize {
         "cloison_rt_set_keyed" => cloison_rt_set_keyed as *const () as usize,
         "cloison_rt_in" => cloison_rt_in as *const () as usize,
         "cloison_rt_call" => cloison_rt_call as *const () as usize,
-        "cloison_rt_enter" => cloison_rt_enter as *const () as usize,
         "cloison_rt_construct" => cloison_rt_construct as *const () as usize,
         "cloison_rt_construct_done" => cloison_rt_construct_done as *const () as usize,
         "cloison_rt_array_push" => cloison_rt_array_push as *const () as usize,
@@ -1610,8 +1634,19 @@ mod arch {
     /// and returns the result in rax. Position-independent.
     ///
     /// Entered with rsp ≡ 8 (mod 16), as from any call at an aligned site.
-    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
-        let (mut c, restore) = saves(gprs, fprs);
+    ///
+    /// First it marks where the compiled code's part of the native stack
+    /// ends (`marks.lo`, see [`super::Marks`]): its own return address,
+    /// into the stencil calling, is the lowest word of it.
+    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8], marks: &super::Marks) -> Vec<u8> {
+        let mut c = Vec::new();
+        if marks.lo != 0 {
+            c.extend([0x49, 0xBA]); // movabs r10, lo
+            c.extend(marks.lo.to_le_bytes());
+            c.extend([0x49, 0x89, 0x22]); // mov [r10], rsp
+        }
+        let (save, restore) = saves(gprs, fprs);
+        c.extend(save);
         c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
         c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
         call_abs(&mut c, target);
@@ -1619,7 +1654,7 @@ mod arch {
         c
     }
 
-    /// The wrapper for `cloison_rt_enter` (see [`super::cloison_rt_enter`]), which
+    /// The wrapper for `cloison_rt_enter` (the stencils' name for the call), which
     /// does its work inline, for compiled code calling compiled code: with
     /// `regs` in rax and the site in r11, and the slot registers `gprs` and
     /// `fprs` saved as for any runtime call, it checks the native stack
@@ -1631,9 +1666,24 @@ mod arch {
     /// are saved; `acc` (r12) is declared clobbered by `call_direct`. If the
     /// callee exited, its record is in the cell: `cloison_direct_exit` finishes
     /// the call, and the cell is reset.
+    ///
+    /// Its calls into the runtime mark the native stack as
+    /// [`runtime_wrapper`] does, at its own return address (`saved` bytes
+    /// up, its saves between).
     pub fn enter_wrapper(gprs: &[u8], fprs: &[u8], k: &super::EnterConsts) -> Vec<u8> {
         let disp8 = |d: usize| u8::try_from(d).ok().filter(|&d| d < 0x80).unwrap();
         let (mut c, restore) = saves(gprs, fprs);
+        let saved = saved_bytes(gprs, fprs);
+        // lea rax, [rsp + saved]; movabs r10, lo; mov [r10], rax
+        let mark = |c: &mut Vec<u8>| {
+            if k.marks.lo != 0 {
+                c.extend([0x48, 0x8D, 0x84, 0x24]);
+                c.extend(saved.to_le_bytes());
+                c.extend([0x49, 0xBA]);
+                c.extend(k.marks.lo.to_le_bytes());
+                c.extend([0x49, 0x89, 0x02]);
+            }
+        };
         c.extend([0x4D, 0x8B, 0x53, disp8(k.limit)]); // mov r10, [r11 + limit]
         c.extend([0x49, 0x3B, 0x22]); // cmp rsp, [r10]
         c.extend([0x0F, 0x82, 0, 0, 0, 0]); // jb slow
@@ -1645,8 +1695,15 @@ mod arch {
         c.extend([0x49, 0xC7, 0x45, (disp8(k.flags) as i8).wrapping_neg() as u8, 0, 0, 0, 0]);
         c.extend([0x41, 0xBC]); // mov r12d, undefined
         c.extend(u32::try_from(k.undefined).unwrap().to_le_bytes());
+        if k.marks.shadow != 0 {
+            c.extend([0x49, 0x8B, 0x03]); // mov rax, [r11]
+            shadow_push(&mut c, k.marks.shadow);
+        }
         c.extend([0x41, 0xFF, 0x13]); // call [r11]
         c.extend([0x41, 0x5D, 0x41, 0x5B, 0x5D, 0x5B]); // pop r13, r11, rbp, rbx
+        if k.marks.shadow != 0 {
+            shadow_pop(&mut c, k.marks.shadow);
+        }
         c.extend([0x41, 0x83, 0x3F, 0xFF]); // cmp dword ptr [r15], NO_EXIT
         c.extend([0x0F, 0x85, 0, 0, 0, 0]); // jne exit
         let to_exit = c.len();
@@ -1669,6 +1726,7 @@ mod arch {
         c.extend([0x41, 0x8B, 0x17]); // mov edx, [r15]
         c.extend([0x41, 0xC7, 0x07, 0xFF, 0xFF, 0xFF, 0xFF]); // mov dword ptr [r15], NO_EXIT
         c.extend([0x48, 0x89, 0xC1]); // mov rcx, rax
+        mark(&mut c);
         call_abs(&mut c, k.exit);
         jmp_done(&mut c);
         // slow: cloison_rt_call(regs, site).
@@ -1676,9 +1734,41 @@ mod arch {
         rel(&mut c, to_slow, at);
         c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
         c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+        mark(&mut c);
         call_abs(&mut c, k.call);
         jmp_done(&mut c);
         c
+    }
+
+    /// The compiled code entered at rax (`shadow` holds the address of
+    /// the next free word of the VM's list of them, see
+    /// [`super::Marks`]): `movabs r10, shadow; mov rcx, [r10]; mov [rcx],
+    /// rax; add qword ptr [r10], 8`.
+    fn shadow_push(c: &mut Vec<u8>, shadow: u64) {
+        c.extend([0x49, 0xBA]);
+        c.extend(shadow.to_le_bytes());
+        c.extend([0x49, 0x8B, 0x0A, 0x48, 0x89, 0x01, 0x49, 0x83, 0x02, 0x08]);
+    }
+
+    /// And left: `movabs r10, shadow; sub qword ptr [r10], 8`.
+    fn shadow_pop(c: &mut Vec<u8>, shadow: u64) {
+        c.extend([0x49, 0xBA]);
+        c.extend(shadow.to_le_bytes());
+        c.extend([0x49, 0x83, 0x2A, 0x08]);
+    }
+
+    /// The call of a runtime function from a direct call's cold part,
+    /// which marks the native stack first (see [`runtime_wrapper`]): the
+    /// call's return address, pushed next, is the lowest word of the
+    /// compiled code's part. `lea rax, [rsp - 8]; movabs r10, lo; mov
+    /// [r10], rax`.
+    fn call_marked(c: &mut Vec<u8>, target: u64, lo: u64) {
+        if lo != 0 {
+            c.extend([0x48, 0x8D, 0x44, 0x24, 0xF8, 0x49, 0xBA]);
+            c.extend(lo.to_le_bytes());
+            c.extend([0x49, 0x89, 0x02]);
+        }
+        call_abs(c, target);
     }
 
     /// A direct call without a wrapper (see `call_done` in the stencils):
@@ -1710,10 +1800,14 @@ mod arch {
             }
             c.push(0x50 + (g & 7)); // push g
         }
-        // At the call rsp ≡ 0 (mod 16): the saves take 8 (mod 16).
+        // At the call rsp ≡ 0 (mod 16): the saves take 8 (mod 16). (The
+        // padding is written: a word left as it was could be a return
+        // address into code that has returned, which the collector would
+        // take for a frame running it, see `running_words`.)
         let mut area = 8 * fprs.len();
-        if (8 * gprs.len() + area) % 16 != 8 {
-            area += 8;
+        let pad = (8 * gprs.len() + area) % 16 != 8;
+        if pad {
+            c.extend([0x6A, 0x00]); // push 0
         }
         if area > 0 {
             c.extend([0x48, 0x83, 0xEC, area as u8]); // sub rsp, area
@@ -1762,7 +1856,13 @@ mod arch {
             c.extend(u32::try_from(k.undefined).unwrap().to_le_bytes());
         };
         call(&mut c, &mut |c, cc| jcc(c, cc, To::Slow, &mut to_cold));
+        if k.marks.shadow != 0 {
+            shadow_push(&mut c, k.marks.shadow);
+        }
         c.extend([0xFF, 0xD0]); // call rax
+        if k.marks.shadow != 0 {
+            shadow_pop(&mut c, k.marks.shadow);
+        }
         c.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 - frame]
         c.extend(frame.wrapping_neg().to_le_bytes());
         c.extend([0x41, 0x83, 0x3F, 0xFF]); // cmp dword ptr [r15], NO_EXIT
@@ -1771,6 +1871,9 @@ mod arch {
         c.extend([0x49, 0x89, 0xC4]); // mov r12, rax
         for (i, &x) in fprs.iter().enumerate() {
             c.extend([0xF2, 0x0F, 0x10, 0x44 | (x << 3), 0x24, (8 * i) as u8]); // movsd x, [rsp+8i]
+        }
+        if pad {
+            area += 8;
         }
         if area > 0 {
             c.extend([0x48, 0x83, 0xC4, area as u8]); // add rsp, area
@@ -1793,7 +1896,7 @@ mod arch {
         d.extend([0x41, 0x8B, 0x17]); // mov edx, [r15]
         d.extend([0x41, 0xC7, 0x07, 0xFF, 0xFF, 0xFF, 0xFF]); // mov dword ptr [r15], NO_EXIT
         d.extend([0x48, 0x89, 0xC1]); // mov rcx, rax
-        call_abs(&mut d, k.exit);
+        call_marked(&mut d, k.exit, k.marks.lo);
         d.extend([0xE9, 0, 0, 0, 0]); // jmp done
         to_done.push(d.len());
         // reslow: the site back in r11; slow: cloison_rt_call(regs, site).
@@ -1803,7 +1906,7 @@ mod arch {
         let slow = d.len();
         d.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
         d.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
-        call_abs(&mut d, k.call);
+        call_marked(&mut d, k.call, k.marks.lo);
         d.extend([0xE9, 0, 0, 0, 0]); // jmp done
         to_done.push(d.len());
         // dispatch: the callee (in r10) another closure; its site from the
@@ -1834,7 +1937,13 @@ mod arch {
             jcc_back(&mut d, 0x84, reslow); // jz reslow
             call(&mut d, &mut |d, cc| jcc_back(d, cc, reslow));
             d.extend([0x41, 0x53, 0x41, 0x53]); // push r11; push r11
+            if k.marks.shadow != 0 {
+                shadow_push(&mut d, k.marks.shadow);
+            }
             d.extend([0xFF, 0xD0]); // call rax
+            if k.marks.shadow != 0 {
+                shadow_pop(&mut d, k.marks.shadow);
+            }
             d.extend([0x41, 0x5B, 0x41, 0x5B]); // pop r11; pop r11
             d.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 - frame]
             d.extend(frame.wrapping_neg().to_le_bytes());
@@ -1863,6 +1972,15 @@ mod arch {
         c.extend([0x48, 0xB8]);
         c.extend(target.to_le_bytes());
         c.extend([0xFF, 0xD0]);
+    }
+
+    /// The bytes of stack a wrapper's [`saves`] take.
+    fn saved_bytes(gprs: &[u8], fprs: &[u8]) -> u32 {
+        let mut frame = 8 * fprs.len();
+        if !(8 + 8 * gprs.len() + frame).is_multiple_of(16) {
+            frame += 8;
+        }
+        (8 * gprs.len() + frame) as u32
     }
 
     /// A wrapper's saves of GPRs `gprs` and xmm registers `fprs`, leaving
@@ -2063,6 +2181,12 @@ mod arch {
         for (i, &(st, _, r)) in saves.iter().enumerate() {
             c.push(slot(st, r, i));
         }
+        // (The padding is written: a word left as it was could be a return
+        // address into code that has returned, which the collector would
+        // take for a frame running it, see `running_words`.)
+        if n % 2 == 1 {
+            c.push(0xF900_03FF | (n as u32) << 10); // str xzr, [sp, #8n]
+        }
         mov64(&mut c, 9, site);
         // Branches to the cold part: (instruction, where).
         #[derive(Clone, Copy)]
@@ -2107,7 +2231,27 @@ mod arch {
             to_cold.push((c.len(), To::Slow));
             c.push(0x5400_0000 | cond); // b.<cond> slow
         });
+        // The compiled code entered at x10, in the VM's list of them, and
+        // out of it (see `Marks::shadow`).
+        let shadow_push = |c: &mut Vec<u32>| {
+            if k.marks.shadow != 0 {
+                mov64(c, 16, k.marks.shadow);
+                c.push(0xF940_0211); // ldr x17, [x16]
+                c.push(0xF800_862A); // str x10, [x17], #8
+                c.push(0xF900_0211); // str x17, [x16]
+            }
+        };
+        let shadow_pop = |c: &mut Vec<u32>| {
+            if k.marks.shadow != 0 {
+                mov64(c, 16, k.marks.shadow);
+                c.push(0xF940_0211); // ldr x17, [x16]
+                c.push(0xD100_2231); // sub x17, x17, #8
+                c.push(0xF900_0211); // str x17, [x16]
+            }
+        };
+        shadow_push(&mut c);
         c.push(0xD63F_0140); // blr x10
+        shadow_pop(&mut c);
         c.push(0xD100_02B5 | frame << 10); // sub x21, x21, #frame
         c.push(0xB940_02F0); // ldr w16, [x23]
         c.push(0x3100_061F); // cmn w16, #1
@@ -2134,8 +2278,7 @@ mod arch {
         d.push(0xB940_02E2); // ldr w2, [x23]
         d.push(0x1280_0010); // mov w16, #-1
         d.push(0xB900_02F0); // str w16, [x23]
-        mov64(&mut d, 16, k.exit);
-        d.push(0xD63F_0200); // blr x16
+        call_marked(&mut d, k.exit, k.marks.lo);
         to_done.push(d.len());
         d.push(0x1400_0000); // b done
         // reslow: the site back in x9; slow: cloison_rt_call(regs, site).
@@ -2144,8 +2287,7 @@ mod arch {
         let slow = d.len();
         d.push(0xAA15_03E0); // mov x0, x21
         d.push(0xAA09_03E1); // mov x1, x9
-        mov64(&mut d, 16, k.call);
-        d.push(0xD63F_0200); // blr x16
+        call_marked(&mut d, k.call, k.marks.lo);
         to_done.push(d.len());
         d.push(0x1400_0000); // b done
         // dispatch: the callee (in x16) another closure; its site from the
@@ -2170,8 +2312,10 @@ mod arch {
             d.push(ldr(10, 9, 0)); // ldr x10, [x9]: the entry
             back(&mut d, 0xB400_000A, reslow); // cbz x10, reslow
             setup(&mut d, &mut |d, cond| back(d, 0x5400_0000 | cond, reslow));
-            d.push(0xF81F_0FE9); // str x9, [sp, #-16]!
+            d.push(0xA9BF_27E9); // stp x9, x9, [sp, #-16]! (both words written)
+            shadow_push(&mut d);
             d.push(0xD63F_0140); // blr x10
+            shadow_pop(&mut d);
             d.push(0xF841_07E9); // ldr x9, [sp], #16
             d.push(0xD100_02B5 | frame << 10); // sub x21, x21, #frame
             d.push(0xAA09_03E1); // mov x1, x9
@@ -2204,16 +2348,51 @@ mod arch {
     /// and FP registers `fprs` (d0–d7), calls the C function `target`,
     /// restores them and returns the result in x8. Position-independent; the
     /// target address is a literal after the code.
-    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
-        let (mut c, restore) = saves(gprs, fprs);
+    ///
+    /// The stencil's `bl` comes with the link register it had in x17
+    /// (`rt_call!`), which the wrapper saves with its own return address
+    /// and gives back: the return address of the compiled code calling,
+    /// into its caller's, is on the native stack, never in a register the
+    /// runtime would save who knows where. Then it marks where the
+    /// compiled code's part of the native stack ends (`marks.lo`, see
+    /// [`super::Marks`]): at that pair.
+    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8], marks: &super::Marks) -> Vec<u8> {
+        let (mut c, restore) = saves(gprs, fprs, false);
+        let mut lits = Vec::new();
+        if marks.lo != 0 {
+            let frame = (8 * (gprs.len() + fprs.len())).next_multiple_of(16) as u32;
+            lits.push((c.len(), marks.lo));
+            c.push(0x5800_0010); // ldr x16, literal
+            c.push(0x9100_03F1 | frame << 10); // add x17, sp, #frame
+            c.push(0xF900_0211); // str x17, [x16]
+        }
         c.push(0xAA08_03E0); // mov x0, x8
         c.push(0xAA09_03E1); // mov x1, x9
-        let call = c.len();
-        c.push(0); // ldr x16, literal (patched below)
+        lits.push((c.len(), target));
+        c.push(0x5800_0010); // ldr x16, literal
         c.push(0xD63F_0200); // blr x16
         c.push(0xAA00_03E8); // mov x8, x0
         c.extend(restore);
-        with_literals(c, &[(call, target)])
+        with_literals(c, &lits)
+    }
+
+    /// The call of a runtime function from a direct call's cold part,
+    /// which marks the native stack first (see [`runtime_wrapper`]) at a
+    /// pair it pushes, of an address in its code: what tells the code
+    /// calling, its return address being in x30 for the runtime to save.
+    fn call_marked(d: &mut Vec<u32>, target: u64, lo: u64) {
+        if lo != 0 {
+            d.push(0x1000_0011); // adr x17, .
+            d.push(0xA9BF_47F1); // stp x17, x17, [sp, #-16]!
+            mov64(d, 16, lo);
+            d.push(0x9100_03F1); // mov x17, sp
+            d.push(0xF900_0211); // str x17, [x16]
+        }
+        mov64(d, 16, target);
+        d.push(0xD63F_0200); // blr x16
+        if lo != 0 {
+            d.push(0x9100_43FF); // add sp, sp, #16
+        }
     }
 
     /// The wrapper for `cloison_rt_enter`, doing its work inline: see the
@@ -2227,7 +2406,19 @@ mod arch {
             assert!(off.is_multiple_of(8) && off < 8 * 4096);
             0xF940_0130 | ((off / 8) as u32) << 10
         };
-        let (mut c, restore) = saves(gprs, fprs);
+        let (mut c, restore) = saves(gprs, fprs, true);
+        let frame = (8 * (gprs.len() + fprs.len())).next_multiple_of(16) as u32;
+        let mut lits = Vec::new();
+        // The native stack marked at the wrapper's pair, as
+        // `runtime_wrapper` does, before a call into the runtime.
+        let mark = |c: &mut Vec<u32>, lits: &mut Vec<(usize, u64)>| {
+            if k.marks.lo != 0 {
+                lits.push((c.len(), k.marks.lo));
+                c.push(0x5800_0010); // ldr x16, literal
+                c.push(0x9100_03F1 | frame << 10); // add x17, sp, #frame
+                c.push(0xF900_0211); // str x17, [x16]
+            }
+        };
         c.push(ldr_x16_x9(k.limit)); // ldr x16, [x9, #limit]
         c.push(0xF940_0210); // ldr x16, [x16]
         c.push(0x9100_03F1); // mov x17, sp
@@ -2254,7 +2445,22 @@ mod arch {
         assert!(k.undefined < 1 << 16);
         c.push(0xD280_0014 | (k.undefined as u32) << 5); // mov x20, #undefined
         c.push(0xF940_0130); // ldr x16, [x9]
+        // (The code entered, in the VM's list: see `Marks::shadow`.)
+        if k.marks.shadow != 0 {
+            lits.push((c.len(), k.marks.shadow));
+            c.push(0x5800_000A); // ldr x10, literal
+            c.push(0xF940_014B); // ldr x11, [x10]
+            c.push(0xF800_8570); // str x16, [x11], #8
+            c.push(0xF900_014B); // str x11, [x10]
+        }
         c.push(0xD63F_0200); // blr x16
+        if k.marks.shadow != 0 {
+            lits.push((c.len(), k.marks.shadow));
+            c.push(0x5800_000A); // ldr x10, literal
+            c.push(0xF940_014B); // ldr x11, [x10]
+            c.push(0xD100_216B); // sub x11, x11, #8
+            c.push(0xF900_014B); // str x11, [x10]
+        }
         c.extend(pairs.map(|p| p | 1 << 22)); // ldp, the same
         c.push(0x9102_03FF); // add sp, sp, #128
         c.push(0xAA00_03E8); // mov x8, x0
@@ -2277,8 +2483,9 @@ mod arch {
         c.push(0xAA08_03E3); // mov x3, x8
         c.push(0x1280_0010); // mov w16, #-1
         c.push(0xB900_02F0); // str w16, [x23]
-        let exit = c.len();
-        c.push(0); // ldr x16, literal
+        mark(&mut c, &mut lits);
+        lits.push((c.len(), k.exit));
+        c.push(0x5800_0010); // ldr x16, literal
         c.push(0xD63F_0200); // blr x16
         c.push(0xAA00_03E8); // mov x8, x0
         let at = c.len();
@@ -2289,23 +2496,27 @@ mod arch {
         branch(&mut c, to_slow, at, 19, 5);
         c.push(0xAA08_03E0); // mov x0, x8
         c.push(0xAA09_03E1); // mov x1, x9
-        let call = c.len();
-        c.push(0); // ldr x16, literal
+        mark(&mut c, &mut lits);
+        lits.push((c.len(), k.call));
+        c.push(0x5800_0010); // ldr x16, literal
         c.push(0xD63F_0200); // blr x16
         c.push(0xAA00_03E8); // mov x8, x0
         let at = c.len();
         c.push(0x1400_0000); // b done
         branch(&mut c, at, done, 26, 0);
-        with_literals(c, &[(exit, k.exit), (call, k.call)])
+        with_literals(c, &lits)
     }
 
     /// A wrapper's frame and saves of GPRs `gprs` and FP registers `fprs`,
-    /// and the restores and `ret` after its call.
-    fn saves(gprs: &[u8], fprs: &[u8]) -> (Vec<u32>, Vec<u32>) {
+    /// and the restores and return after its call: the caller's link
+    /// register, which came in x17, and the wrapper's own, as a pair (see
+    /// [`runtime_wrapper`]). `scanned`: its frame may be in the midst of
+    /// compiled code's stack (it calls compiled code), where the collector
+    /// reads every word (see `running_words`), so its padding is written.
+    fn saves(gprs: &[u8], fprs: &[u8], scanned: bool) -> (Vec<u32>, Vec<u32>) {
         let mut c: Vec<u32> = Vec::new();
         let mut r: Vec<u32> = Vec::new();
-        c.push(0xA9BF_7BFD); // stp x29, x30, [sp, #-16]!
-        c.push(0x9100_03FD); // mov x29, sp
+        c.push(0xA9BF_7BF1); // stp x17, x30, [sp, #-16]!
         let n = gprs.len() + fprs.len();
         let frame = (8 * n).next_multiple_of(16) as u32;
         if frame > 0 {
@@ -2319,20 +2530,25 @@ mod arch {
             c.push(slot(st, g, i));
             r.push(slot(ld, g, i));
         }
+        if scanned && n % 2 == 1 {
+            c.push(0xF900_03FF | (n as u32) << 10); // str xzr, [sp, #8n]
+        }
         if frame > 0 {
             r.push(0x9100_03FF | frame << 10); // add sp, sp, #frame
         }
-        r.push(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
-        r.push(0xD65F_03C0); // ret
+        r.push(0xA8C1_47FE); // ldp x30, x17, [sp], #16
+        r.push(0xD65F_0220); // ret x17
         (c, r)
     }
 
-    /// Code `c` as bytes, followed by 64-bit literals, each loaded into x16
-    /// by the `ldr` (literal) placeholder at its index.
+    /// Code `c` as bytes, followed by 64-bit literals, each loaded by the
+    /// `ldr` (literal) at its index, written there with its register and
+    /// no displacement yet.
     fn with_literals(mut c: Vec<u32>, lits: &[(usize, u64)]) -> Vec<u8> {
         for (k, &(at, _)) in lits.iter().enumerate() {
             let lit = c.len() + 2 * k;
-            c[at] = 0x5800_0010 | ((lit - at) as u32) << 5;
+            assert!(c[at] & 0xFFFF_FFE0 == 0x5800_0000);
+            c[at] |= ((lit - at) as u32) << 5;
         }
         let mut bytes: Vec<u8> = c.iter().flat_map(|i| i.to_le_bytes()).collect();
         for &(_, v) in lits {
@@ -8805,66 +9021,424 @@ const MAX_RESULT_ROUNDS: u32 = 3;
 /// Value of `ctx` while running: no exit taken.
 const NO_EXIT: u32 = u32::MAX;
 
-/// Call the generated code at `f` with the machine state: slots start empty
-/// (`enter_*` stencils load them).
-#[cfg(target_arch = "x86_64")]
-unsafe fn call_entry(f: *const u8, acc: Value, regs: *mut Value, ctx: *mut u32) -> Value {
-    type Entry = extern "rust-preserve-none" fn(
-        Value,
-        *mut Value,
-        NumberTag,
-        *mut u32,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-    ) -> Value;
-    let entry: Entry = unsafe { std::mem::transmute(f) };
-    let u = Value::UNDEFINED;
-    entry(acc, regs, NumberTag::new(), ctx, u, u, u, u, u, u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+/// A run of compiled code entered from the runtime, on the native stack:
+/// the code entered and what it calls directly, down to the call into the
+/// runtime it is in. The VM lists those under way (`Frames::towers`, the
+/// innermost first), for the collector to find the versions running (see
+/// [`running_words`]). Made by [`JitCode::enter`] and [`rt_enter`], in
+/// their frames.
+#[repr(C)]
+pub(crate) struct Tower {
+    /// The exit cell, `ctx` in the code: the record of the exit it left
+    /// by, [`NO_EXIT`] while it runs (and if it returned).
+    exit: u32,
+    /// The native stack pointer at the call of the code's entry
+    /// ([`cloison_enter`] writes it): the stack below is the code's, then
+    /// the runtime's it called.
+    hi: usize,
+    /// The VM's mark (`Frames::lo`) when this run began, the outer run's:
+    /// back in place when this one ends.
+    outer_lo: usize,
+    /// The run this one began in a runtime call of, if any.
+    outer: *mut Tower,
+    /// The version entered, if known.
+    code: *const JitCode,
 }
 
+const _: () = assert!(std::mem::offset_of!(Tower, exit) == 0 && std::mem::offset_of!(Tower, hi) == 8);
+
+/// What a VM keeps of the compiled code running on the native stack, for
+/// the collector (see [`running_words`]).
+pub(crate) struct Frames {
+    /// Where the innermost run's part of the native stack ends, written
+    /// by its code before each call into the runtime (the wrappers and
+    /// direct calls, see [`Marks`]): the address of the lowest word
+    /// compiled code pushed, a return address into the code calling.
+    /// 0: the run made no such call yet. Meaningless with no run listed.
+    pub(crate) lo: usize,
+    /// The runs under way, the innermost first.
+    pub(crate) towers: *mut Tower,
+    /// `CLOISON_JIT_SHADOW` (a check, see [`check_running`]): the
+    /// entries of the code direct calls have entered and not left, in
+    /// order, and the address past the last. Empty when off.
+    shadow: Vec<usize>,
+    shadow_top: *mut usize,
+    /// For tests and reports: the versions a scan of every stack word
+    /// took for running that no frame runs (counted when checking).
+    pub(crate) stale: std::cell::Cell<u64>,
+}
+
+/// Entries the shadow list has room for: direct calls nest within
+/// `interp::NATIVE_STACK` (and what a run may have of the thread's stack
+/// before its limit is checked), each at least 16 bytes of it.
+const SHADOW_ROOM: usize = 1 << 18;
+
+impl Default for Frames {
+    fn default() -> Self {
+        let mut f = Frames {
+            lo: 0,
+            towers: std::ptr::null_mut(),
+            shadow: Vec::new(),
+            shadow_top: std::ptr::null_mut(),
+            stale: Default::default(),
+        };
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("CLOISON_JIT_SHADOW").is_some()) {
+            f.shadow_on();
+        }
+        f
+    }
+}
+
+impl Frames {
+    /// Have the code compiled from now on list its direct calls (see
+    /// `Frames::shadow`): before any is compiled.
+    pub(crate) fn shadow_on(&mut self) {
+        if self.shadow.is_empty() {
+            self.shadow = vec![0; SHADOW_ROOM];
+            self.shadow_top = self.shadow.as_mut_ptr();
+        }
+    }
+
+    /// No compiled code runs: a run's start, and its end however it ended.
+    pub(crate) fn reset(&mut self) {
+        (self.lo, self.towers) = (0, std::ptr::null_mut());
+        if !self.shadow.is_empty() {
+            self.shadow_top = self.shadow.as_mut_ptr();
+        }
+    }
+
+    /// Whether a collection checks the versions it finds running against
+    /// a scan of every stack word (see [`check_running`]).
+    pub(crate) fn checking(&self) -> bool {
+        cfg!(debug_assertions) || !self.shadow.is_empty()
+    }
+
+    /// The entries listed.
+    fn shadowed(&self) -> &[usize] {
+        if self.shadow.is_empty() {
+            return &[];
+        }
+        let n = (self.shadow_top as usize - self.shadow.as_ptr() as usize) / 8;
+        assert!(n <= self.shadow.len(), "the shadow list of direct calls overflowed");
+        &self.shadow[..n]
+    }
+}
+
+/// What the code the JIT assembles for calls writes for the collector,
+/// as addresses in the VM compiled for (0: nothing, code compiled for no
+/// VM, which nothing collects under).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Marks {
+    /// `Frames::lo`'s address: written before each call into the runtime.
+    lo: u64,
+    /// `Frames::shadow_top`'s address, if the VM lists its direct calls.
+    shadow: u64,
+}
+
+impl Marks {
+    /// The current VM's.
+    fn current() -> Marks {
+        let vm = crate::interp::current_vm();
+        if vm.is_null() {
+            return Marks::default();
+        }
+        unsafe {
+            let f = &raw mut (*vm).jit_frames;
+            Marks {
+                lo: &raw mut (*f).lo as u64,
+                shadow: if (*f).shadow.is_empty() { 0 } else { &raw mut (*f).shadow_top as u64 },
+            }
+        }
+    }
+}
+
+/// `lo` in debug builds once a runtime call compiled code made is over
+/// (see [`unwinding`]): the code marks the stack anew before its next
+/// one, so a collection that reads this found a call that didn't.
+const LO_STALE: usize = 1;
+
+/// The words of the native stack that tell the compiled versions
+/// running, for a collection whose own frames start at `sp`: the stack
+/// compiled code itself pushed in each run under way (`Frames::towers`),
+/// from the mark its last call into the runtime left (`Frames::lo`) up
+/// to its entry (`Tower::hi`), and the versions entered. A version runs
+/// while one of these words points into its code (a return address) or
+/// at it (as [`free_retired`] and the others read them).
+///
+/// A scan of every stack word found those too, and with them the return
+/// addresses that returned calls left in slots nothing wrote since: in
+/// the runtime's own frames (the collector's, deep enough to reach where
+/// code ran before), and past the VM stack's top. A version that had
+/// returned looked running, and kept what it refers to (#346).
+///
+/// What the words between are: the saves and return addresses of direct
+/// calls (`arch::direct_call`, every word written), the wrappers' frames,
+/// and the stencils' own, under a runtime call. A slot of those a
+/// stencil didn't write may still hold a stale return address; on
+/// x86-64 the red zone a stencil stepped over before its call isn't
+/// read where the mark tells it (below).
+///
+/// None if the marks don't fit the stack (the caller then reads every
+/// word, as before; a debug build panics).
+pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>> {
+    let base = vm.heap.gc.stack_base;
+    let f = &vm.jit_frames;
+    let mut out = Vec::new();
+    let (mut lo, mut t) = (f.lo, f.towers);
+    let mut below = sp;
+    // (The towers are frames above `sp`, and the words between a mark and
+    // its tower's entry are the stack's, once the marks are checked.)
+    unsafe {
+        // Whether `w` is a return address into a stencil's runtime call
+        // (in a version alive): the code there puts back the red zone
+        // (`rt_call!`'s `lea rsp, [rsp + 128]`, after its `lea rsp, [rsp
+        // - 128]` and `call`).
+        #[cfg(target_arch = "x86_64")]
+        let after_red_zone = |w: usize| {
+            const BACK: [u8; 8] = [0x48, 0x8D, 0xA4, 0x24, 0x80, 0, 0, 0];
+            const OVER: [u8; 6] = [0x48, 0x8D, 0x64, 0x24, 0x80, 0xE8];
+            ALIVE.with(|a| {
+                a.borrow().1.iter().any(|&c| {
+                    let start = (*c).mem.ptr as usize;
+                    start + OVER.len() + 4 <= w
+                        && w + BACK.len() <= start + (*c).len
+                        && std::slice::from_raw_parts(w as *const u8, BACK.len()) == BACK
+                        && std::slice::from_raw_parts((w - OVER.len() - 4) as *const u8, OVER.len()) == OVER
+                })
+            })
+        };
+        while !t.is_null() {
+            let tower = &*t;
+            if !tower.code.is_null() {
+                out.push(tower.code as usize);
+            }
+            let hi = tower.hi;
+            if lo != 0 && hi != 0 {
+                if !(below <= lo && lo <= hi && hi <= base && lo.is_multiple_of(8) && hi.is_multiple_of(8)) {
+                    debug_assert!(
+                        lo != LO_STALE,
+                        "compiled code called the runtime without marking its stack (the mark is stale)"
+                    );
+                    debug_assert!(false, "compiled code's stack marks don't fit: {below:#x} {lo:#x} {hi:#x} {base:#x}");
+                    return None;
+                }
+                #[allow(unused_mut)]
+                let mut a = lo;
+                // The mark is at a return address. If into a stencil's
+                // runtime call (the wrapper's own return address), the
+                // 128 bytes above are the red zone the stencil stepped
+                // over: not compiled code's pushes, but what earlier
+                // calls left.
+                #[cfg(target_arch = "x86_64")]
+                if a < hi {
+                    let w = *(a as *const usize);
+                    out.push(w);
+                    a += 8;
+                    if after_red_zone(w) {
+                        a = (a + 128).min(hi);
+                    }
+                }
+                out.extend((a..hi).step_by(8).map(|a| *(a as *const usize)));
+                below = hi;
+            }
+            (lo, t) = (tower.outer_lo, tower.outer);
+        }
+    }
+    Some(out)
+}
+
+/// A check of [`running_words`] (`words`) against a scan of every stack
+/// word (`all`), in debug builds and with `CLOISON_JIT_SHADOW`: the
+/// versions `words` tells are among those `all` tells (they are words of
+/// the stack); and with `CLOISON_JIT_SHADOW`, every version a direct
+/// call entered and hasn't left (the VM's list of them, which the code
+/// keeps as it calls: see `Frames::shadow`) or a run entered is among
+/// those `words` tells. So a version `all` tells and `words` doesn't is
+/// one no call is in: counted (`Frames::stale`).
+pub(crate) fn check_running(vm: &crate::vm::Vm, words: &[usize], all: &[usize]) {
+    let told = |words: &[usize]| -> HashSet<*const JitCode> {
+        ALIVE.with(|a| {
+            let codes = &a.borrow().1;
+            let mut ranges: Vec<(usize, usize, *const JitCode)> = Vec::with_capacity(2 * codes.len());
+            for &c in codes.iter() {
+                let code = unsafe { &*c };
+                ranges.push((code.mem.ptr as usize, code.mem.ptr as usize + code.len.max(1), c));
+                ranges.push((c as usize, c as usize + std::mem::size_of::<JitCode>(), c));
+            }
+            ranges.sort_unstable();
+            words
+                .iter()
+                .filter_map(|&w| {
+                    let i = ranges.partition_point(|r| r.0 <= w).checked_sub(1)?;
+                    (w < ranges[i].1).then_some(ranges[i].2)
+                })
+                .collect()
+        })
+    };
+    let (by_frames, by_scan) = (told(words), told(all));
+    assert!(by_frames.is_subset(&by_scan), "a version told running by a word that isn't on the stack");
+    let entered = told(vm.jit_frames.shadowed());
+    assert!(vm.jit_frames.shadowed().is_empty() || !entered.is_empty(), "direct calls under way into no version alive");
+    for c in &entered {
+        assert!(by_frames.contains(c), "a version a direct call is in isn't told running");
+    }
+    vm.jit_frames.stale.set(vm.jit_frames.stale.get() + (by_scan.len() - by_frames.len()) as u64);
+}
+
+/// Enter compiled code at `entry` for the run `tower`, over the VM frame
+/// `regs`, with `acc`: the machine state the stencils expect (`acc`, the
+/// frame, the tag, `ctx` the tower's exit cell; the slots hold
+/// `undefined` and 0.0, the code's entry loads those it uses from the
+/// frame), the C ABI's callee-saved registers kept (the code uses every
+/// register). The code's result. It writes `Tower::hi`: the native stack
+/// below is the code's own from there, each word of which it pushed.
+#[cfg(target_arch = "x86_64")]
+macro_rules! enter_asm {
+    () => {
+        core::arch::naked_asm!(
+            "push rbp",
+            "push rbx",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            // (Aligned for the call; a word written, as all below.)
+            "push rdi",
+            "mov r15, rdi",
+            "mov rax, rsi",
+            "mov r13, rdx",
+            "mov r12, rcx",
+            "movabs r14, {tag}",
+            "mov [r15 + {hi}], rsp",
+            "mov edi, {undefined}",
+            "mov esi, edi",
+            "mov edx, edi",
+            "mov ecx, edi",
+            "mov r8d, edi",
+            "mov r9d, edi",
+            "xorps xmm0, xmm0",
+            "xorps xmm1, xmm1",
+            "xorps xmm2, xmm2",
+            "xorps xmm3, xmm3",
+            "xorps xmm4, xmm4",
+            "xorps xmm5, xmm5",
+            "xorps xmm6, xmm6",
+            "xorps xmm7, xmm7",
+            "call rax",
+            "add rsp, 8",
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop rbx",
+            "pop rbp",
+            "ret",
+            hi = const std::mem::offset_of!(Tower, hi),
+            tag = const Value::NUMBER_TAG,
+            undefined = const Value::UNDEFINED.to_bits(),
+        )
+    };
+}
+
+/// The arm64 [`cloison_enter`]: slots x24–x28 and x0–x6, d0–d7.
 #[cfg(target_arch = "aarch64")]
-unsafe fn call_entry(f: *const u8, acc: Value, regs: *mut Value, ctx: *mut u32) -> Value {
-    type Entry = extern "rust-preserve-none" fn(
-        Value,
-        *mut Value,
-        NumberTag,
-        *mut u32,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        Value,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-        f64,
-    ) -> Value;
-    let entry: Entry = unsafe { std::mem::transmute(f) };
-    let u = Value::UNDEFINED;
-    entry(acc, regs, NumberTag::new(), ctx, u, u, u, u, u, u, u, u, u, u, u, u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+macro_rules! enter_asm {
+    () => {
+        core::arch::naked_asm!(
+            "stp x29, x30, [sp, #-160]!",
+            "mov x29, sp",
+            "stp x19, x20, [sp, #16]",
+            "stp x21, x22, [sp, #32]",
+            "stp x23, x24, [sp, #48]",
+            "stp x25, x26, [sp, #64]",
+            "stp x27, x28, [sp, #80]",
+            "stp d8, d9, [sp, #96]",
+            "stp d10, d11, [sp, #112]",
+            "stp d12, d13, [sp, #128]",
+            "stp d14, d15, [sp, #144]",
+            "mov x23, x0",
+            "mov x9, x1",
+            "mov x21, x2",
+            "mov x20, x3",
+            "mov x22, #{tag_hi}",
+            "lsl x22, x22, #48",
+            "mov x10, sp",
+            "str x10, [x23, #{hi}]",
+            "mov x24, #{undefined}",
+            "mov x25, x24",
+            "mov x26, x24",
+            "mov x27, x24",
+            "mov x28, x24",
+            "mov x0, x24",
+            "mov x1, x24",
+            "mov x2, x24",
+            "mov x3, x24",
+            "mov x4, x24",
+            "mov x5, x24",
+            "mov x6, x24",
+            "movi d0, #0",
+            "movi d1, #0",
+            "movi d2, #0",
+            "movi d3, #0",
+            "movi d4, #0",
+            "movi d5, #0",
+            "movi d6, #0",
+            "movi d7, #0",
+            "blr x9",
+            "ldp d14, d15, [sp, #144]",
+            "ldp d12, d13, [sp, #128]",
+            "ldp d10, d11, [sp, #112]",
+            "ldp d8, d9, [sp, #96]",
+            "ldp x27, x28, [sp, #80]",
+            "ldp x25, x26, [sp, #64]",
+            "ldp x23, x24, [sp, #48]",
+            "ldp x21, x22, [sp, #32]",
+            "ldp x19, x20, [sp, #16]",
+            "ldp x29, x30, [sp], #160",
+            "ret",
+            hi = const std::mem::offset_of!(Tower, hi),
+            tag_hi = const Value::NUMBER_TAG >> 48,
+            undefined = const Value::UNDEFINED.to_bits(),
+        )
+    };
+}
+
+#[unsafe(naked)]
+extern "C" fn cloison_enter(tower: *mut Tower, entry: *const u8, regs: *mut Value, acc: Value) -> Value {
+    enter_asm!()
+}
+
+/// Run compiled code from `entry` over the frame `regs` with `acc`, as a
+/// run of `vm`'s (if any: listed for the collector while it lasts) that
+/// entered `code` (if known): its result and the exit record it left
+/// ([`NO_EXIT`] if it returned).
+///
+/// # Safety
+/// `entry` must be a compiled entry for the frame `regs`, of code
+/// compiled for `vm`.
+unsafe fn enter_tower(
+    vm: *mut crate::vm::Vm,
+    code: *const JitCode,
+    entry: *const u8,
+    regs: *mut Value,
+    acc: Value,
+) -> (Value, u32) {
+    let mut tower = Tower { exit: NO_EXIT, hi: 0, outer_lo: 0, outer: std::ptr::null_mut(), code };
+    let t = &raw mut tower;
+    unsafe {
+        if !vm.is_null() {
+            let f = &raw mut (*vm).jit_frames;
+            ((*t).outer_lo, (*t).outer) = ((*f).lo, (*f).towers);
+            ((*f).lo, (*f).towers) = (0, t);
+        }
+        let acc = cloison_enter(t, entry, regs, acc);
+        if !vm.is_null() {
+            let f = &raw mut (*vm).jit_frames;
+            ((*f).lo, (*f).towers) = ((*t).outer_lo, (*t).outer);
+        }
+        (acc, (*t).exit)
+    }
 }
 
 /// Machine code for one entry into a bytecode function.
@@ -10330,7 +10904,7 @@ impl JitCode {
                         arch::enter_wrapper(&saved_gprs, &saved_fprs, &EnterConsts::new())
                     } else {
                         let target = runtime_function(name) as u64;
-                        arch::runtime_wrapper(target, &saved_gprs, &saved_fprs)
+                        arch::runtime_wrapper(target, &saved_gprs, &saved_fprs, &Marks::current())
                     };
                     let at = pos;
                     pos += code.len().next_multiple_of(8);
@@ -10571,9 +11145,10 @@ impl JitCode {
     /// # Safety
     /// `regs` must cover every register operand, and the code must have been
     /// compiled for the current types of `acc` and `regs`.
-    unsafe fn enter(&self, acc: Value, regs: &mut [Value]) -> Outcome {
-        let mut exit = NO_EXIT;
-        let acc = unsafe { call_entry(self.mem.ptr.add(self.entry), acc, regs.as_mut_ptr(), &mut exit) };
+    ///
+    /// `vm`: the VM the code was compiled for, if any, which lists the run.
+    unsafe fn enter(&self, vm: *mut crate::vm::Vm, acc: Value, regs: *mut Value) -> Outcome {
+        let (acc, exit) = unsafe { enter_tower(vm, self, self.mem.ptr.add(self.entry), regs, acc) };
         match exit {
             NO_EXIT => Outcome::Return(acc),
             pc => Outcome::Exit { pc: pc as usize, acc },
@@ -17826,7 +18401,7 @@ impl JitFunction {
             let actual = self.entry_types(entry, acc, regs);
             let index = self.version(entry, &actual, &mut acc, regs);
             let code = &self.versions[&entry][index].1;
-            let outcome = unsafe { code.enter(acc, frame.regs()) };
+            let outcome = unsafe { code.enter(std::ptr::null_mut(), acc, frame.regs().as_mut_ptr()) };
             // (As `vm_run`: not left for a later entry to resume.)
             resume_panic();
             match outcome {
@@ -18019,7 +18594,7 @@ unsafe fn vm_run_(vm: &mut crate::vm::Vm, code: &crate::vm::Code, regs: *mut Val
             }
             prepared
         };
-        let Some((jit_code, entry_acc, nregs)) = prepared else {
+        let Some((jit_code, entry_acc, _)) = prepared else {
             return match left {
                 Some((code, frame)) => VmRun::Exit(unsafe { materialize(vm, regs, &code, frame, pc, acc) }),
                 None => {
@@ -18033,8 +18608,7 @@ unsafe fn vm_run_(vm: &mut crate::vm::Vm, code: &crate::vm::Code, regs: *mut Val
                 }
             };
         };
-        let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };
-        let outcome = unsafe { jit_code.enter(entry_acc, regs_slice) };
+        let outcome = unsafe { jit_code.enter(vm_ptr, entry_acc, regs) };
         // A runtime call the code made panicked: on with it, out of the
         // compiled code now (see `unwinding`; with `panic = "abort"`,
         // nothing to test).
@@ -18190,159 +18764,7 @@ unsafe fn materialize(
     }
 }
 
-/// `call_direct` stencils, once their checks passed: call the compiled
-/// entry of the callee of `site` (a `CallSite`), whose frame the compiled
-/// frame `regs` has set up (see `Lowering::direct_setup`). `EMPTY` on an
-/// error.
-///
-/// Compiled code doesn't call this function: a region's wrapper for it
-/// does the same inline, more cheaply (`arch::enter_wrapper`). This one
-/// serves `cloison_rt_construct`, a Rust caller.
-///
-/// Its region's wrapper saves the slot registers the region uses, as for
-/// any runtime call. The callee's code uses every register freely, so this
-/// trampoline saves the C ABI's callee-saved ones. It sets up what the code
-/// expects (`acc` = `undefined`, the frame, the tag, an exit cell on its
-/// stack; the slots start with garbage, as the code's entry loads those it
-/// uses from the frame) and calls the entry. If the code exited,
-/// [`cloison_direct_exit`] finishes the call. In asm, it costs about a third of
-/// a Rust function doing the same through inline asm, which had to align the
-/// stack and step over the red zone around the call.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
-    core::arch::naked_asm!(
-        // Too deep in native calls: through the runtime (a tail call).
-        "mov rax, [rsi + {limit}]",
-        "cmp rsp, [rax]",
-        "jb {call}",
-        "push rbp",
-        "push rbx",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        // Aligned again: [rsp] the exit cell, then `regs` and `site`.
-        "sub rsp, 24",
-        "mov [rsp + 8], rdi",
-        "mov [rsp + 16], rsi",
-        "mov dword ptr [rsp], {no_exit}",
-        "mov rax, [rsi + {frame}]",
-        "lea r13, [rdi + rax * 8]",
-        // The frame's flags: not a `new` frame (its header isn't written
-        // otherwise; see `check_tail_callee`). For `new`, either:
-        // `cloison_rt_construct` makes the result from its own `this`.
-        "mov qword ptr [r13 - {flags}], 0",
-        "movabs r14, {tag}",
-        "mov r15, rsp",
-        "mov r12d, {undefined}",
-        "call qword ptr [rsi]",
-        "cmp dword ptr [rsp], {no_exit}",
-        "jne 3f",
-        "2:",
-        "add rsp, 24",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
-        "ret",
-        "3:",
-        "mov rcx, rax",
-        "mov edx, [rsp]",
-        "mov rsi, [rsp + 16]",
-        "mov rdi, [rsp + 8]",
-        "call {exit}",
-        "jmp 2b",
-        no_exit = const NO_EXIT as i32,
-        flags = const 8 * interp::FLAGS,
-        limit = const std::mem::offset_of!(CallSite, native_limit),
-        call = sym cloison_rt_call,
-        frame = const std::mem::offset_of!(CallSite, frame),
-        tag = const Value::NUMBER_TAG,
-        undefined = const Value::UNDEFINED.to_bits(),
-        exit = sym cloison_direct_exit,
-    )
-}
-
-/// The arm64 `cloison_rt_enter`. The too-deep branch goes to `cloison_rt_call`
-/// through a local `b` placed after the cold tail: a conditional branch
-/// reaches 1 MiB, which the linker doesn't extend (ELF `CONDBR19`; Mach-O
-/// can't relocate one to another function at all), and the two functions
-/// can be further apart (they were, in the library's test binary); a `b`
-/// reaches 128 MiB, and the linker adds a veneer past that.
-#[cfg(target_arch = "aarch64")]
-#[unsafe(naked)]
-extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
-    core::arch::naked_asm!(
-        // Too deep in native calls: through the runtime (a tail call).
-        "ldr x9, [x1, #{limit}]",
-        "ldr x9, [x9]",
-        "mov x10, sp",
-        "cmp x10, x9",
-        "b.lo 4f",
-        "stp x29, x30, [sp, #-192]!",
-        "mov x29, sp",
-        "stp x19, x20, [sp, #16]",
-        "stp x21, x22, [sp, #32]",
-        "stp x23, x24, [sp, #48]",
-        "stp x25, x26, [sp, #64]",
-        "stp x27, x28, [sp, #80]",
-        "stp d8, d9, [sp, #96]",
-        "stp d10, d11, [sp, #112]",
-        "stp d12, d13, [sp, #128]",
-        "stp d14, d15, [sp, #144]",
-        // `regs` and `site`, then the exit cell.
-        "stp x0, x1, [sp, #160]",
-        "mov w9, #-1",
-        "str w9, [sp, #176]",
-        "ldr x9, [x1, #{frame}]",
-        "add x21, x0, x9, lsl #3",
-        // The frame's flags: not a `new` frame (its header isn't written
-        // otherwise; see `check_tail_callee`). For `new`, either:
-        // `cloison_rt_construct` makes the result from its own `this`.
-        "stur xzr, [x21, #-{flags}]",
-        "mov x22, #{tag_hi}",
-        "lsl x22, x22, #48",
-        "add x23, sp, #176",
-        "mov x20, #{undefined}",
-        "ldr x9, [x1]",
-        "blr x9",
-        "ldr w9, [sp, #176]",
-        "cmn w9, #1",
-        "b.ne 3f",
-        "2:",
-        "ldp d14, d15, [sp, #144]",
-        "ldp d12, d13, [sp, #128]",
-        "ldp d10, d11, [sp, #112]",
-        "ldp d8, d9, [sp, #96]",
-        "ldp x27, x28, [sp, #80]",
-        "ldp x25, x26, [sp, #64]",
-        "ldp x23, x24, [sp, #48]",
-        "ldp x21, x22, [sp, #32]",
-        "ldp x19, x20, [sp, #16]",
-        "ldp x29, x30, [sp], #192",
-        "ret",
-        "3:",
-        "mov x3, x0",
-        "mov w2, w9",
-        "ldp x0, x1, [sp, #160]",
-        "bl {exit}",
-        "b 2b",
-        "4:",
-        "b {call}",
-        limit = const std::mem::offset_of!(CallSite, native_limit),
-        call = sym cloison_rt_call,
-        flags = const 8 * interp::FLAGS,
-        frame = const std::mem::offset_of!(CallSite, frame),
-        tag_hi = const Value::NUMBER_TAG >> 48,
-        undefined = const Value::UNDEFINED.to_bits(),
-        exit = sym cloison_direct_exit,
-    )
-}
-
-/// What the inline version of [`cloison_rt_enter`] in a region's wrapper for
+/// What the inline `cloison_rt_enter` in a region's wrapper for
 /// it (`arch::enter_wrapper`) needs: `CallSite` offsets, constants and
 /// the functions it calls.
 /// The slot registers to keep across call `i`, as (GPRs, xmm registers):
@@ -18399,6 +18821,7 @@ struct RawCall {
 /// What [`arch::direct_call`] needs: offsets in a `CallSite`, the frame
 /// header's flags slot, `undefined`, and the runtime functions it calls.
 struct DirectConsts {
+    marks: Marks,
     closure: usize,
     table: usize,
     end_off: usize,
@@ -18414,6 +18837,7 @@ impl DirectConsts {
     fn new() -> Self {
         const { assert!(NO_EXIT == u32::MAX) };
         DirectConsts {
+            marks: Marks::current(),
             closure: std::mem::offset_of!(CallSite, closure),
             table: std::mem::offset_of!(CallSite, table),
             end_off: std::mem::offset_of!(CallSite, end_off),
@@ -18428,6 +18852,7 @@ impl DirectConsts {
 }
 
 struct EnterConsts {
+    marks: Marks,
     limit: usize,
     frame: usize,
     flags: usize,
@@ -18440,6 +18865,7 @@ impl EnterConsts {
     fn new() -> Self {
         const { assert!(NO_EXIT == u32::MAX) };
         EnterConsts {
+            marks: Marks::current(),
             limit: std::mem::offset_of!(CallSite, native_limit),
             frame: std::mem::offset_of!(CallSite, frame),
             flags: 8 * interp::FLAGS,
@@ -18486,8 +18912,25 @@ fn rt_construct(regs: Value, site: Value) -> Value {
         if (*s).entry == 0 {
             return cloison_rt_call(regs, site);
         }
-        *(regs.to_bits() as *mut Value).add((*s).frame) = this;
-        let v = cloison_rt_enter(regs, site);
+        // The callee's entry, as `call_direct` stencils call it once their
+        // checks passed (a region's wrapper for `cloison_rt_enter` does it
+        // inline, `arch::enter_wrapper`): a run of its own here
+        // ([`Tower`]), entered as the driver enters one. Too deep in
+        // native calls, through the runtime; if the code exited,
+        // [`direct_exit`] finishes the call.
+        let here = 0u8;
+        if (&raw const here as usize) < *(*s).native_limit {
+            return rt_call(regs, site);
+        }
+        let caller = regs.to_bits() as *mut Value;
+        let callee = caller.add((*s).frame);
+        *callee = this;
+        // The frame's flags: not a `new` frame (its header isn't written
+        // otherwise; see `check_tail_callee`): this function makes the
+        // result from its own `this`.
+        *callee.sub(interp::FLAGS) = Value::from_bits(0);
+        let (acc, exit) = enter_tower((*s).vm, std::ptr::null(), (*s).entry as *const u8, callee, Value::UNDEFINED);
+        let v = if exit == NO_EXIT { acc } else { direct_exit(&mut *(*s).vm, caller, &mut *s, exit, acc) };
         if v.to_bits() == 0 || crate::props::is_object(v) {
             // An error, or an object: the constructor's, or (through the
             // runtime, the native stack being low) `new`'s already. (Not a
@@ -18626,7 +19069,8 @@ extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
     })
 }
 
-/// [`cloison_rt_enter`]: the callee's code exited with `record` and `acc`.
+/// A direct call's callee code exited with `record` and `acc` (the wrappers'
+/// and direct calls' cold paths call it).
 extern "C" fn cloison_direct_exit(regs: *mut Value, site: *mut CallSite, record: u32, acc: Value) -> Value {
     unwinding(Value::EMPTY, || unsafe { direct_exit(&mut *(*site).vm, regs, &mut *site, record, acc) })
 }
@@ -19329,30 +19773,34 @@ mod tests {
         let subset = |all: &[u8], m: u32| -> Vec<u8> {
             all.iter().enumerate().filter(|(k, _)| m >> k & 1 != 0).map(|(_, &r)| r).collect()
         };
-        let (enter, direct) = (EnterConsts::new(), DirectConsts::new());
-        for gm in 0..1 << gpr_slots.len() {
-            for fm in 0..1 << xmms.len() {
-                let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&xmms, fm));
-                let what = format!("gprs {gprs:?}, fprs {fprs:?}");
-                let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs);
-                check_x86_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
-                let w = arch::enter_wrapper(&gprs, &fprs, &enter);
-                check_x86_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
-                for f_off in [None, Some(0x40)] {
-                    // The hot part, a gap, the cold part, linked as placed.
-                    let call = arch::direct_call(&gprs, &fprs, 0x1234_5678, f_off, 0x100, &direct);
-                    let cold = call.hot.len() + 16;
-                    let mut code = call.hot.clone();
-                    code.resize(cold, 0xCC);
-                    code.extend(&call.cold);
-                    for &(f, to) in &call.hot_to_cold {
-                        arch::link_raw(&mut code, f, cold + to);
+        let lo = 0x1122_3344_5566;
+        for marks in [Marks::default(), Marks { lo, shadow: 0 }, Marks { lo, shadow: 0x7788_99aa_bbcc }] {
+            let (mut enter, mut direct) = (EnterConsts::new(), DirectConsts::new());
+            (enter.marks, direct.marks) = (marks, marks);
+            for gm in 0..1 << gpr_slots.len() {
+                for fm in 0..1 << xmms.len() {
+                    let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&xmms, fm));
+                    let what = format!("gprs {gprs:?}, fprs {fprs:?}");
+                    let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs, &marks);
+                    check_x86_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
+                    let w = arch::enter_wrapper(&gprs, &fprs, &enter);
+                    check_x86_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
+                    for f_off in [None, Some(0x40)] {
+                        // The hot part, a gap, the cold part, linked as placed.
+                        let call = arch::direct_call(&gprs, &fprs, 0x1234_5678, f_off, 0x100, &direct);
+                        let cold = call.hot.len() + 16;
+                        let mut code = call.hot.clone();
+                        code.resize(cold, 0xCC);
+                        code.extend(&call.cold);
+                        for &(f, to) in &call.hot_to_cold {
+                            arch::link_raw(&mut code, f, cold + to);
+                        }
+                        for &(f, to) in &call.cold_to_hot {
+                            arch::link_raw(&mut code, cold + f, to);
+                        }
+                        check_x86_stack(&code, Some(call.hot.len()))
+                            .unwrap_or_else(|e| panic!("direct call, {what}, f_off {f_off:?}: {e}"));
                     }
-                    for &(f, to) in &call.cold_to_hot {
-                        arch::link_raw(&mut code, cold + f, to);
-                    }
-                    check_x86_stack(&code, Some(call.hot.len()))
-                        .unwrap_or_else(|e| panic!("direct call, {what}, f_off {f_off:?}: {e}"));
                 }
             }
         }
@@ -19375,7 +19823,8 @@ mod tests {
         call: bool,
         ret: bool,
         /// `stp x29, x30, [sp, #-16]!` (saves the link register) or `ldp
-        /// x29, x30, [sp], #16` (restores it).
+        /// x29, x30, [sp], #16` (restores it); or a wrapper's pair, with
+        /// x17.
         lr: Option<bool>,
         /// An `ldr` (literal)'s target.
         literal: Option<i64>,
@@ -19391,13 +19840,21 @@ mod tests {
         match i {
             0xA9BF_7BFD => (d.sp, d.sp_access, d.lr) = (-16, true, Some(true)),
             0xA8C1_7BFD => (d.sp, d.sp_access, d.lr) = (16, true, Some(false)),
-            0xD65F_03C0 => (d.ends, d.ret) = (true, true),
+            // A wrapper's: `stp x17, x30, [sp, #-16]!`, `ldp x30, x17, [sp],
+            // #16` and `ret x17`.
+            0xA9BF_7BF1 => (d.sp, d.sp_access, d.lr) = (-16, true, Some(true)),
+            0xA8C1_47FE => (d.sp, d.sp_access, d.lr) = (16, true, Some(false)),
+            0xD65F_03C0 | 0xD65F_0220 => (d.ends, d.ret) = (true, true),
+            // `stp x17, x17, [sp, #-16]!`, `stp x9, x9, [sp, #-16]!`.
+            0xA9BF_47F1 | 0xA9BF_27E9 => (d.sp, d.sp_access) = (-16, true),
+            // `adr x17, .`
+            0x1000_0011 => {}
             _ if i & 0xFFFF_FC1F == 0xD63F_0000 => d.call = true, // blr
             _ if i & 0xFC00_0000 == 0x1400_0000 => (d.branch, d.ends) = (Some(4 * sext(i & 0x3FF_FFFF, 26)), true),
             _ if i & 0xFF00_0010 == 0x5400_0000 || i & 0xFF00_0000 == 0xB400_0000 => {
                 d.branch = Some(4 * sext(i >> 5 & 0x7_FFFF, 19)) // b.cond, cbz x
             }
-            _ if i & 0xFF00_001F == 0x5800_0010 => d.literal = Some(4 * sext(i >> 5 & 0x7_FFFF, 19)), // ldr x16, lit
+            _ if i & 0xFF00_0000 == 0x5800_0000 => d.literal = Some(4 * sext(i >> 5 & 0x7_FFFF, 19)), // ldr x, lit
             // add / sub (immediate), 64-bit, unshifted: sp when rd is.
             _ if i & 0xFFC0_0000 == 0x9100_0000 || i & 0xFFC0_0000 == 0xD100_0000 => {
                 if rd == 31 {
@@ -19419,6 +19876,8 @@ mod tests {
                 assert!(on_sp, "writeback to another register");
                 (d.sp, d.sp_access) = (sext(i >> 12 & 0x1FF, 9), true)
             }
+            // str x post-index, through another register than sp.
+            _ if i & 0xFFE0_0C00 == 0xF800_0400 => assert!(!on_sp, "writeback to sp"),
             // stur x (unscaled), ldr x (register offset).
             _ if i & 0xFFE0_0C00 == 0xF800_0000 || i & 0xFFE0_FC00 == 0xF860_7800 => d.sp_access = on_sp,
             // mov (orr, x or w), add / subs / adds (shifted register): no sp.
@@ -19443,7 +19902,7 @@ mod tests {
     /// branches and literals stay in the code, `sp` is 16-byte aligned at
     /// every access through it and every call (the hardware checks the
     /// former), each instruction is reached with one `sp` and one state of
-    /// the link register, a call is made only while x29 and x30 are saved,
+    /// the link register, a call is made only while x30 is saved,
     /// and it returns, or reaches the code that follows it (`next`), with
     /// them restored and `sp` as on entry.
     #[cfg(target_arch = "aarch64")]
@@ -19517,33 +19976,37 @@ mod tests {
         let subset = |all: &[u8], m: u32| -> Vec<u8> {
             all.iter().enumerate().filter(|(k, _)| m >> k & 1 != 0).map(|(_, &r)| r).collect()
         };
-        let (enter, direct) = (EnterConsts::new(), DirectConsts::new());
-        for gm in 0..1 << gpr_slots.len() {
-            for fm in 0..1 << fp_regs.len() {
-                let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&fp_regs, fm));
-                let what = format!("gprs {gprs:?}, fprs {fprs:?}");
-                let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs);
-                check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
-                let w = arch::enter_wrapper(&gprs, &fprs, &enter);
-                check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
-                // (Direct calls save the slot registers live after them, FP
-                // ones d1–d7.)
-                let fprs: Vec<u8> = fprs.into_iter().filter(|&r| r > 0).collect();
-                for f_off in [None, Some(0x40)] {
-                    // The hot part, a gap, the cold part, linked as placed.
-                    let call = arch::direct_call(&gprs, &fprs, 0x1234_5678, f_off, 0x100, &direct);
-                    let cold = call.hot.len() + 16;
-                    let mut code = call.hot.clone();
-                    code.resize(cold, 0);
-                    code.extend(&call.cold);
-                    for &(at, to) in &call.hot_to_cold {
-                        arch::link_raw(&mut code, at, cold + to);
+        let lo = 0x1122_3344_5566;
+        for marks in [Marks::default(), Marks { lo, shadow: 0 }, Marks { lo, shadow: 0x7788_99aa_bbcc }] {
+            let (mut enter, mut direct) = (EnterConsts::new(), DirectConsts::new());
+            (enter.marks, direct.marks) = (marks, marks);
+            for gm in 0..1 << gpr_slots.len() {
+                for fm in 0..1 << fp_regs.len() {
+                    let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&fp_regs, fm));
+                    let what = format!("gprs {gprs:?}, fprs {fprs:?}");
+                    let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs, &marks);
+                    check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
+                    let w = arch::enter_wrapper(&gprs, &fprs, &enter);
+                    check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
+                    // (Direct calls save the slot registers live after them, FP
+                    // ones d1–d7.)
+                    let fprs: Vec<u8> = fprs.into_iter().filter(|&r| r > 0).collect();
+                    for f_off in [None, Some(0x40)] {
+                        // The hot part, a gap, the cold part, linked as placed.
+                        let call = arch::direct_call(&gprs, &fprs, 0x1234_5678, f_off, 0x100, &direct);
+                        let cold = call.hot.len() + 16;
+                        let mut code = call.hot.clone();
+                        code.resize(cold, 0);
+                        code.extend(&call.cold);
+                        for &(at, to) in &call.hot_to_cold {
+                            arch::link_raw(&mut code, at, cold + to);
+                        }
+                        for &(at, to) in &call.cold_to_hot {
+                            arch::link_raw(&mut code, cold + at, to);
+                        }
+                        check_arm64_stack(&code, Some(call.hot.len()))
+                            .unwrap_or_else(|e| panic!("direct call, {what}, f_off {f_off:?}: {e}"));
                     }
-                    for &(at, to) in &call.cold_to_hot {
-                        arch::link_raw(&mut code, cold + at, to);
-                    }
-                    check_arm64_stack(&code, Some(call.hot.len()))
-                        .unwrap_or_else(|e| panic!("direct call, {what}, f_off {f_off:?}: {e}"));
                 }
             }
         }

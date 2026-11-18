@@ -267,6 +267,8 @@ pub struct Gc {
     last_end: Option<std::time::Instant>,
     /// Print what each kind of root reaches (`CLOISON_GC_ROOTS`).
     roots_report: bool,
+    /// `CLOISON_JIT_RETIRE_ALL`: see `Vm::set_jit_retire_at_gc`.
+    pub(crate) retire_all: bool,
     /// A full marking holds what compiled code refers to weakly (see
     /// `Vm::weak_kept`); off with `CLOISON_GC_STRONG_KEPT`.
     weak_kept: bool,
@@ -321,6 +323,7 @@ impl Gc {
             cycles: env("CLOISON_GC_CYCLES"),
             check_barriers: env("CLOISON_GC_CHECK_BARRIER"),
             roots_report: env("CLOISON_GC_ROOTS"),
+            retire_all: env("CLOISON_JIT_RETIRE_ALL"),
             weak_kept: !env("CLOISON_GC_STRONG_KEPT"),
             weak_now: false,
             frag_report: env("CLOISON_GC_FRAG"),
@@ -2532,6 +2535,7 @@ impl Vm {
             // holds say, whose keys must be pinned if it moves.)
             self.prune_collections(m.mode);
             if full {
+                // (Every stack word: a builtin's frame holds a pattern.)
                 let words = self.stack_words(sp, regs);
                 self.prune_regexps(m.mode, &words);
                 self.prune_symbols(m.mode);
@@ -2589,8 +2593,8 @@ impl Vm {
                 }
                 self.condemn_codes();
                 self.prune_atoms(self.heap.gc.codes_before);
-                // (What the stacks hold, for the versions call sites left.)
-                let words = self.stack_words(sp, regs);
+                // (The frames running, for the versions call sites left.)
+                let words = self.running_words(sp, || self.stack_words(sp, regs));
                 crate::jit::free_retired(self, &words);
             }
             if kind == Collection::Full && self.heap.gc.frag_report {
@@ -2800,7 +2804,7 @@ impl Vm {
         let color = m.mode.color;
         let report = self.heap.gc.roots_report;
         let listed = |vm: &Vm| {
-            let words = unsafe { vm.stack_words(sp, regs) };
+            let words = vm.running_words(sp, || unsafe { vm.stack_words(sp, regs) });
             let set = &vm.code_set;
             crate::jit::kept_by_function(&words, &|c| set.contains(&(c as usize)))
         };
@@ -2815,6 +2819,9 @@ impl Vm {
                 } else {
                     st.kept = listed(self);
                     st.aged = crate::jit::age_functions(self, &st.kept);
+                    if self.heap.gc.retire_all {
+                        st.aged.extend(st.kept.iter().map(|k| k.code));
+                    }
                     self.jit_caches.age();
                     if report {
                         eprintln!("  kept: {} functions idle, to retire", st.aged.len());
@@ -3161,7 +3168,11 @@ impl Vm {
             // function, another VM's too.)
             let set = &self.code_set;
             let mut more = crate::jit::mark_referenced_codes(
-                &mut || words.get_or_insert_with(|| unsafe { self.stack_words(sp, regs) }).clone(),
+                &mut || {
+                    words
+                        .get_or_insert_with(|| self.running_words(sp, || unsafe { self.stack_words(sp, regs) }))
+                        .clone()
+                },
                 &|c| set.contains(&(c as usize)) && unsafe { (*c).mark.load(Relaxed) } >= from,
                 &mut |c| {
                     if !set.contains(&(c as usize)) {
@@ -3403,6 +3414,23 @@ impl Vm {
                 .map(|a| *(a as *const usize))
                 .collect()
         }
+    }
+
+    /// The stack words that tell the compiled versions frames run, for a
+    /// full collection (`jit::free_retired`, `jit::kept_by_function`,
+    /// `jit::mark_referenced_codes`): those of the native stack compiled
+    /// code pushed (`jit::running_words`), not every word (`stack_words`,
+    /// which takes a return address a call left behind for a frame: #346).
+    /// Checked against every word in debug builds (`jit::check_running`).
+    /// `all` gives every word.
+    fn running_words(&self, sp: usize, all: impl Fn() -> Vec<usize>) -> Vec<usize> {
+        let words = crate::jit::running_words(self, sp);
+        if let Some(w) = &words
+            && self.jit_frames.checking()
+        {
+            crate::jit::check_running(self, w, &all());
+        }
+        words.unwrap_or_else(all)
     }
 
     /// Mark the roots every collection has.

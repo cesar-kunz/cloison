@@ -1464,6 +1464,9 @@ pub struct Vm {
     /// What the JIT worked out about functions' bytecode, for every
     /// function's compilations.
     pub(crate) jit_caches: crate::jit::Caches,
+    /// The compiled code running on the native stack, for the collector
+    /// (see `jit::running_words`).
+    pub(crate) jit_frames: crate::jit::Frames,
     /// The current realm (see `realm`), and every realm's intrinsics but
     /// the current's (whose slot is blank): empty until a second realm is
     /// made.
@@ -1530,6 +1533,7 @@ impl Vm {
             code_set: Default::default(),
             condemned: Vec::new(),
             jit_caches: Default::default(),
+            jit_frames: Default::default(),
             global: std::ptr::null_mut(),
             global_lexicals: std::ptr::null_mut(),
             object_prototype: std::ptr::null_mut(),
@@ -8152,6 +8156,29 @@ impl Vm {
         self.symbol_registry.values().map(|&o| object_value(o)).collect()
     }
 
+    /// Have compiled code list the code its direct calls enter, and every
+    /// full collection check the versions it finds running against that
+    /// list (`CLOISON_JIT_SHADOW`; for tests, before anything is
+    /// compiled): it panics if a call is in a version it didn't find. See
+    /// `jit::check_running`.
+    pub fn set_jit_shadow(&mut self) {
+        self.jit_frames.shadow_on();
+    }
+
+    /// The versions a scan of every stack word took for running that no
+    /// frame runs, over the collections checked (debug builds, and with
+    /// [`Vm::set_jit_shadow`]; for tests).
+    pub fn jit_stale_running(&self) -> u64 {
+        self.jit_frames.stale.get()
+    }
+
+    /// Have every full collection retire every function's compiled code,
+    /// whether in use or not (`CLOISON_JIT_RETIRE_ALL`; for tests): the
+    /// versions frames run are all that stays, until they leave them.
+    pub fn set_jit_retire_at_gc(&mut self, on: bool) {
+        self.heap.gc.retire_all = on;
+    }
+
     /// Whether functions are compiled warm first, then hot, or hot from
     /// the start (the default; `CLOISON_WARM` set: warm first). See
     /// `jit::Tier`.
@@ -9940,6 +9967,7 @@ impl RunState {
         if outer {
             vm.heap.gc.stack_base = here & !7;
             vm.host_enter();
+            vm.jit_frames.reset();
         }
         RunState {
             vm,
@@ -9998,6 +10026,7 @@ impl Drop for RunState {
         vm.native_limit = self.native_limit;
         if self.outer {
             vm.heap.gc.stack_base = 0;
+            vm.jit_frames.reset();
             vm.pause_marker();
         }
     }

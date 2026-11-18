@@ -197,7 +197,15 @@ unsafe extern "C" {
 ///   ones the region uses (the rest hold nothing). The `call` pushes a
 ///   return address, so the asm first steps over the 128-byte red zone.
 /// - arm64: arguments in x8 and x9, result in x8. The wrapper may clobber
-///   x7, x9–x17 and v16–v31; `bl` clobbers x30. x18, a temporary on Linux,
+///   x7, x9–x17 and v16–v31. `bl` overwrites x30, so the link register
+///   goes in x17 first: the wrapper saves it on the native stack with its
+///   own return address and gives it back in x30. (Declared clobbered,
+///   LLVM kept it across the call where it liked, in a register the
+///   runtime then saves in a frame of its own: the collector finds the
+///   compiled code running by the return addresses on compiled code's
+///   part of the stack, `jit::running_words`.) The asm is `nostack`
+///   (the wrapper keeps `sp` aligned itself, and there is no red zone),
+///   so LLVM makes no frame for it. x18, a temporary on Linux,
 ///   is clobbered too: C code may use it (not on macOS, where it is
 ///   reserved). Slot registers x24–x28 are
 ///   callee-saved under the C ABI anyway; x0–x6 and v0–v7 are in/out
@@ -243,6 +251,7 @@ macro_rules! rt_call_arm64 {
         let [mut f0, mut f1, mut f2, mut f3, mut f4, mut f5, mut f6] = $s.f;
         let mut facc = $s.facc;
         core::arch::asm!(
+            "mov x17, x30",
             "bl {f}",
             f = sym $f,
             inout("x8") a,
@@ -254,12 +263,12 @@ macro_rules! rt_call_arm64 {
             inout("v5") f4, inout("v6") f5, inout("v7") f6,
             out("x7") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _,
             out("x14") _, out("x15") _, out("x16") _, out("x17") _,
-            out("x30") _,
             out("v16") _, out("v17") _, out("v18") _, out("v19") _,
             out("v20") _, out("v21") _, out("v22") _, out("v23") _,
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             $($extra)*
+            options(nostack),
         );
         $s.g = [g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11].map(Value::from_bits);
         $s.f = [f0, f1, f2, f3, f4, f5, f6];
@@ -6996,19 +7005,22 @@ unsafe fn dispatched(site: *const DirectSite, key: u64, base: *const u8) -> Opti
 /// `src/jit.rs`) passes the tag and `ctx` registers on to the callee and
 /// doesn't preserve `acc`'s. So they must hold the tag and `ctx` at the
 /// call: LLVM otherwise only keeps them across it, free to use them in
-/// between (and `construct_direct` does).
+/// between (and `construct_direct` does). `regs` too: the wrapper gives
+/// the caller's frame register to `cloison_direct_exit` after an exit of
+/// the callee (it held something else there on arm64 once the runtime
+/// call's registers changed, and the exit's version wasn't found).
 #[cfg(target_arch = "x86_64")]
 macro_rules! rt_call_enter {
     ($s:ident, $f:ident, $a:expr, $b:expr) => {{
         let tag: u64 = core::mem::transmute($s.tag);
-        rt_call!($s, $f, $a, $b; out("r12") _, in("r14") tag, in("r15") $s.ctx,)
+        rt_call!($s, $f, $a, $b; out("r12") _, in("r13") $s.regs, in("r14") tag, in("r15") $s.ctx,)
     }};
 }
 #[cfg(target_arch = "aarch64")]
 macro_rules! rt_call_enter {
     ($s:ident, $f:ident, $a:expr, $b:expr) => {{
         let tag: u64 = core::mem::transmute($s.tag);
-        rt_call!($s, $f, $a, $b; out("x20") _, in("x22") tag, in("x23") $s.ctx,)
+        rt_call!($s, $f, $a, $b; out("x20") _, in("x21") $s.regs, in("x22") tag, in("x23") $s.ctx,)
     }};
 }
 

@@ -11,6 +11,8 @@
 //! - Local branches land on an instruction of the stencil.
 //! - No PC-relative reference without a relocation: the JIT copies code,
 //!   not data.
+//! - A runtime call is made as `rt_call!` makes it: around it, what the
+//!   collector relies on to find compiled code's part of the native stack.
 //! - An exit leaves before the stencil changed anything: no memory store
 //!   (but to the native stack) on a path to a branch to `cloison_exit`,
 //!   except in [`STORES_BEFORE_EXIT`].
@@ -111,6 +113,29 @@ pub fn check(name: &str, arch: &str, code: &[u8], relocs: &[Reloc]) -> Vec<Strin
                 continue;
             }
             sym_branch[k] = Some(r.symbol);
+            // A runtime call is `rt_call!`'s. The collector tells where
+            // compiled code's part of the native stack ends by it (see
+            // `jit::running_words`): on x86-64 the call steps over the
+            // red zone and back, 128 bytes it then doesn't read; on arm64
+            // the link register goes to the wrapper in x17, to be saved
+            // on the stack there.
+            if r.symbol.starts_with("cloison_rt_") {
+                let ok = match arch {
+                    "x86_64" => {
+                        i.at >= 5
+                            && code[i.at - 5..i.at] == [0x48, 0x8D, 0x64, 0x24, 0x80]
+                            && code[i.at] == 0xE8
+                            && code.get(i.at + 5..i.at + 13) == Some(&[0x48, 0x8D, 0xA4, 0x24, 0x80, 0, 0, 0])
+                    }
+                    _ => {
+                        let word = |at: usize| u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                        i.at >= 4 && word(i.at - 4) == 0xAA1E_03F1 && word(i.at) & 0xFC00_0000 == 0x9400_0000
+                    }
+                };
+                if !ok {
+                    errors.push(format!("the call of `{}` at {:#x} isn't made as `rt_call!` makes it", r.symbol, i.at));
+                }
+            }
         }
     }
     for (k, i) in insns.iter().enumerate() {

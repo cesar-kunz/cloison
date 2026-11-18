@@ -2999,6 +2999,131 @@ fn more_than_256_upvalues_read_their_variables() {
     assert_eq!(value(&upvalues_of_two_functions(150, 150)), "300,1105,1149");
 }
 
+/// `levels` functions nested in one another, each with `vars` variables
+/// declared with `kind` (`v<level>_<k>`, of value `level * 1000 + k`),
+/// and every `generators`th one a generator (with a scope object of its
+/// own then, however few its variables); `body` is the innermost's.
+fn deep_scopes(levels: usize, vars: usize, kind: &str, generators: usize, body: &str) -> String {
+    let generator = |l: usize| generators != 0 && l % generators == generators - 1;
+    let mut s = String::new();
+    for l in 0..levels {
+        s += &format!("function{} f{l}() {{\n", if generator(l) { "*" } else { "" });
+        s.extend((0..vars).map(|k| format!("{kind} v{l}_{k} = {};", l * 1000 + k)));
+        s += "\n";
+    }
+    s += body;
+    for l in (0..levels).rev() {
+        s += "\n}";
+        if l > 0 {
+            s += &format!("\nreturn f{l}(){};", if generator(l) { ".next().value" } else { "" });
+        }
+    }
+    s + "\n"
+}
+
+/// The last variable of each of `levels`: in its function's scope object
+/// when the function has more variables than registers for them.
+fn deep_names(levels: impl IntoIterator<Item = usize>, vars: usize) -> Vec<String> {
+    levels.into_iter().map(|l| format!("v{l}_{}", vars - 1)).collect()
+}
+
+/// A function reading a variable of every function around it.
+fn deep_reads(levels: usize, vars: usize, kind: &str, generators: usize) -> String {
+    let names = deep_names(0..levels, vars).join(",");
+    let body = format!("return function () {{ return [{names}].reduce((a, b) => a + b); }};");
+    deep_scopes(levels, vars, kind, generators, &body) + "f0()();"
+}
+
+/// One function writing a variable of every function around it, another
+/// reading them: before, and after two rounds of writes.
+fn deep_writes(levels: usize, vars: usize, kind: &str, generators: usize) -> String {
+    let names = deep_names(0..levels, vars);
+    let bumps: String = names.iter().enumerate().map(|(l, n)| format!("{n} += {}; ", l + 1)).collect();
+    let body = format!(
+        "function bump() {{ {bumps} }}\n\
+         function sum() {{ return [{}].reduce((a, b) => a + b); }}\n\
+         return [bump, sum];",
+        names.join(",")
+    );
+    deep_scopes(levels, vars, kind, generators, &body)
+        + "var [bump, sum] = f0(); var a = sum(); bump(); bump(); a + ' ' + sum();"
+}
+
+/// A function using the variables of the levels `at` only, as `expr` of
+/// their names has it.
+fn deep_only(levels: usize, vars: usize, kind: &str, at: &[usize], expr: impl Fn(&[String]) -> String) -> String {
+    let body = format!("return function () {{ return {}; }};", expr(&deep_names(at.iter().copied(), vars)));
+    deep_scopes(levels, vars, kind, 0, &body) + "f0()();"
+}
+
+/// Closures made in a loop, over its variable and those of the levels
+/// `at`: three reading them, three writing the first and the last.
+fn deep_loops(levels: usize, vars: usize, kind: &str, at: &[usize]) -> String {
+    let names = deep_names(at.iter().copied(), vars);
+    let body = format!(
+        "var fs = [];\n\
+         for (let i = 0; i < 3; i++) {{ fs.push(() => i + {}); fs.push(() => {{ {}++; {} += i; }}); }}\n\
+         return fs;",
+        names.join(" + "),
+        names[0],
+        names[names.len() - 1]
+    );
+    deep_scopes(levels, vars, kind, 0, &body)
+        + "var fs = f0(); var a = fs[0]() + ',' + fs[2]() + ',' + fs[4]();\
+           fs[1](); fs[3](); fs[5](); a + ' ' + fs[0]() + ',' + fs[2]() + ',' + fs[4]();"
+}
+
+/// A function reads the variables of the functions around it that are in
+/// scope objects (those with more variables than registers), however deep
+/// they all are: each such object has a name to be passed down under, by
+/// its function's depth. (#356: past 32 levels it had none, and the
+/// variable was read from another function's scope object, as
+/// `undefined`.) The expected values are SpiderMonkey's, JSC's and
+/// QuickJS's.
+#[test]
+fn deep_scope_objects_read_their_variables() {
+    big_stack(|| {
+        // (Around the count past which variables go in a scope object.)
+        assert_eq!(value(&deep_reads(45, 160, "var", 0)), "997155");
+        assert_eq!(value(&deep_reads(45, 161, "var", 0)), "997200");
+        assert_eq!(value(&deep_reads(45, 181, "var", 0)), "998100");
+        assert_eq!(value(&deep_reads(45, 200, "var", 0)), "998955");
+        assert_eq!(value(&deep_reads(45, 200, "let", 0)), "998955");
+        assert_eq!(value(&deep_reads(45, 200, "const", 0)), "998955");
+        assert_eq!(value(&deep_reads(100, 200, "var", 0)), "4969900");
+        // (Among generators, whose scope objects are their own.)
+        assert_eq!(value(&deep_reads(70, 181, "var", 7)), "2427600");
+        assert_eq!(value(&deep_reads(70, 181, "let", 7)), "2427600");
+        assert_eq!(value(&deep_reads(70, 20, "var", 3)), "2416330");
+    });
+}
+
+/// As [`deep_scope_objects_read_their_variables`], written too.
+#[test]
+fn deep_scope_objects_write_their_variables() {
+    big_stack(|| {
+        assert_eq!(value(&deep_writes(45, 200, "var", 0)), "998955 1001025");
+        assert_eq!(value(&deep_writes(70, 181, "let", 0)), "2427600 2432570");
+        assert_eq!(value(&deep_writes(70, 200, "var", 7)), "2428930 2433900");
+    });
+}
+
+/// A function using nothing but variables of scope objects past 32
+/// levels up (#356: refused, "captured from an enclosing function"), in
+/// a direct `eval` too, and closures made in a loop.
+#[test]
+fn deep_scope_objects_alone_and_in_loops() {
+    big_stack(|| {
+        let spaced = |n: &[String]| n.join(" + ' ' + ");
+        assert_eq!(value(&deep_only(45, 200, "var", &[34, 39], spaced)), "34199 39199");
+        assert_eq!(value(&deep_only(45, 200, "let", &[0, 34], spaced)), "199 34199");
+        let evaled = |n: &[String]| format!("eval('{}')", n.join(" + "));
+        assert_eq!(value(&deep_only(45, 200, "var", &[0, 34, 39], evaled)), "73597");
+        assert_eq!(value(&deep_loops(45, 200, "var", &[0, 34, 39, 44])), "117796,117797,117798 117802,117803,117804");
+        assert_eq!(value(&deep_loops(45, 181, "let", &[3, 33, 34])), "70540,70541,70542 70546,70547,70548");
+    });
+}
+
 /// Cons strings (long strings built by `+`, flattened when read) and
 /// sparse integer keys (an object used as a map by numbers), `push` on an
 /// array-like. The expected value is Node's.

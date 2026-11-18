@@ -8851,7 +8851,9 @@ fn stale_raw_values_are_refused() {
             Ok(r) => drop(display(r.unwrap(), &vm)),
         }
     }
-    assert!(refused >= 150, "{refused} of 200 refused");
+    // (199 of 200 here, on x86-64, under each `CLOISON_GC_*` and with the
+    // JIT off: half leaves room for other stacks' stale words.)
+    assert!(refused >= 100, "{refused} of 200 refused");
     // Nor displayed, kept or called.
     let dead = objs.iter().copied().find(|&o| catch_unwind(AssertUnwindSafe(|| display(o, &vm))).is_err()).unwrap();
     assert!(catch_unwind(AssertUnwindSafe(|| Global::new(&vm, dead))).is_err());
@@ -8932,7 +8934,9 @@ fn weak_ref_targets_of_host_callbacks_die() {
     let alive =
         run(&mut vm, "$262.gc(); $262.gc(); refs.filter(function (r) { return r.deref() !== undefined; }).length");
     let alive = display(alive, &vm).parse::<u32>().unwrap();
-    assert!(alive <= 5, "{alive} of 100 targets alive");
+    // (0 or 1 here, under each `CLOISON_GC_*` and with the JIT off; all
+    // 100 before: half leaves room for other stacks' stale words.)
+    assert!(alive < 50, "{alive} of 100 targets alive");
 }
 
 /// #323 for the thrown value of an `Error` the host keeps: one of

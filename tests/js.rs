@@ -10793,3 +10793,326 @@ fn a_function_with_thousands_of_upvalues_reads_each() {
     let st = vm.jit_stats("inner").unwrap();
     assert!(st.exits < 100 && st.compiles < 20, "{st:?}");
 }
+
+/// A direct `eval` sees a named function expression's own name (#307):
+/// funcEnv's immutable binding (ECMA-262 InstantiateOrdinaryFunctionExpression),
+/// which the function's body, the functions in it and the code of an
+/// `eval` in any of them resolve, the `eval`'s own `eval`s too. The
+/// binding was made only for a body seen to use the name, so the code
+/// read a global by the name (a ReferenceError) and a store made one.
+/// A store does nothing, and throws in strict code (9.1.1.1.5
+/// SetMutableBinding: not a strict binding), `delete` is false; a
+/// parameter, a `var`, a function or a block-scoped binding of the name,
+/// a `with`'s object's property and a `var` the `eval` declares shadow
+/// it; a class's inner name is a `const`; an indirect `eval` sees none.
+/// A catch parameter of the name is its own binding, in the code of an
+/// `eval` and in a lazily compiled function too (its stores were dropped
+/// there, the parameter taken for the name).
+/// What V8, SpiderMonkey and JavaScriptCore give.
+#[test]
+fn a_direct_eval_sees_a_function_expressions_own_name() {
+    let src = r#"
+var out = [];
+function t(name, f) { var r; try { r = f(); } catch (e) { r = 'throws ' + e.name; } out.push(name + ': ' + String(r)); }
+var geval = eval;
+t('read', function () { var f = function g() { return eval('typeof g'); }; return f(); });
+t('identity', function () { var f = function g() { return eval('g') === f; }; return f(); });
+t('strict read', function () { var f = function g() { 'use strict'; return eval('g') === f; }; return f(); });
+t('strict eval code', function () { var f = function g() { return eval('"use strict"; g') === f; }; return f(); });
+t('nested fn', function () { var f = function g() { return (function () { return eval('g'); })() === f; }; return f(); });
+t('nested arrow', function () { var f = function g() { return (() => eval('g'))() === f; }; return f(); });
+t('nested 2', function () { var f = function g() { return (function () { return (() => eval('g'))(); })() === f; }; return f(); });
+t('eval in eval', function () { var f = function g() { return eval('eval("g")') === f; }; return f(); });
+t('eval fn in eval', function () { var f = function g() { return eval('(function(){ return eval("g") })()') === f; }; return f(); });
+t('fn in eval no inner eval', function () { var f = function g() { return eval('(function(){ return g })()') === f; }; return f(); });
+t('assign sloppy', function () { var f = function g() { var r = eval('g = 1'); return r + ' ' + (g === f) + ' ' + (eval('g') === f); }; return f(); });
+t('assign strict fn', function () { var f = function g() { 'use strict'; eval('g = 1'); return g === f; }; return f(); });
+t('assign strict eval code', function () { var f = function g() { eval('"use strict"; g = 1'); return g === f; }; return f(); });
+t('assign nested sloppy', function () { var f = function g() { (function () { eval('g = 1'); })(); return g === f; }; return f(); });
+t('assign nested strict', function () { var f = function g() { 'use strict'; (function () { eval('g = 1'); })(); return g === f; }; return f(); });
+t('compound assign', function () { var f = function g() { eval('g += 1; g++'); return g === f; }; return f(); });
+t('compound strict', function () { var f = function g() { eval('"use strict"; g++'); return g === f; }; return f(); });
+t('assign in eval fn', function () { var f = function g() { eval('(function(){ g = 1 })()'); return g === f; }; return f(); });
+t('assign in strict eval fn', function () { var f = function g() { eval('(function(){ "use strict"; g = 1 })()'); return g === f; }; return f(); });
+t('var shadow', function () { var f = function g() { var g = 5; return eval('g'); }; return f(); });
+t('var shadow no init', function () { var f = function g() { var g; return eval('typeof g'); }; return f(); });
+t('param shadow', function () { var f = function g(g) { return eval('g'); }; return f(7); });
+t('fn decl shadow', function () { var f = function g() { function g() { return 1; } return eval('g') !== f && eval('g()'); }; return f(); });
+t('let shadow', function () { var f = function g() { let g = 3; return eval('g'); }; return f(); });
+t('block let shadow', function () { var f = function g() { { let g = 3; return eval('g'); } }; return f(); });
+t('eval var shadow', function () { var f = function g() { eval('var g = 9'); return g + ' ' + eval('g'); }; return f(); });
+t('eval var no init', function () { var f = function g() { eval('var g'); return typeof g + ' ' + eval('typeof g'); }; return f(); });
+t('eval var then delete', function () { var f = function g() { eval('var g = 9'); var a = eval('delete g'); return a + ' ' + (g === f) + ' ' + (eval('g') === f); }; return f(); });
+t('eval function decl shadow', function () { var f = function g() { eval('function g() { return 4 }'); return g() + ' ' + (g !== f); }; return f(); });
+t('strict eval var', function () { var f = function g() { eval('"use strict"; var g = 9'); return g === f; }; return f(); });
+t('eval let', function () { var f = function g() { return eval('let g = 2; g') + ' ' + (g === f); }; return f(); });
+t('nested eval var', function () { var f = function g() { return (function () { eval('var g = 9'); return g; })() + ' ' + (g === f); }; return f(); });
+t('delete', function () { var f = function g() { var a = eval('delete g'); return a + ' ' + (g === f) + ' ' + (eval('g') === f); }; return f(); });
+t('delete nested', function () { var f = function g() { var a = (() => eval('delete g'))(); return a + ' ' + (g === f); }; return f(); });
+t('with shadow', function () { var f = function g() { with ({ g: 1 }) { return eval('g'); } }; return f(); });
+t('with no shadow', function () { var f = function g() { with ({ h: 1 }) { return eval('g') === f; } }; return f(); });
+t('with assign', function () { var o = { g: 1 }; var f = function g() { with (o) { eval('g = 2'); } return o.g + ' ' + (g === f); }; return f(); });
+t('with outside', function () { var o = { g: 1 }; var f; with (o) { f = function g() { return eval('g') === f; }; } return f(); });
+t('with in eval', function () { var f = function g() { return eval('with ({}) { g }') === f; }; return f(); });
+t('with in eval shadow', function () { var f = function g() { return eval('with ({g: 6}) { g }'); }; return f(); });
+t('class read', function () { var C = class D { m() { return eval('D'); } }; return new C().m() === C; });
+t('class static', function () { var C = class D { static m() { return eval('D'); } }; return C.m() === C; });
+t('class ctor', function () { var r; var C = class D { constructor() { r = eval('D'); } }; new C(); return r === C; });
+t('class field', function () { var C = class D { x = eval('D'); }; return new C().x === C; });
+t('class static field', function () { var C = class D { static x = eval('typeof D'); }; return C.x; });
+t('class assign', function () { var C = class D { m() { eval('D = 1'); return D; } }; return new C().m() === C; });
+t('class decl inner', function () { class D { m() { return eval('D'); } } var E = D; D = 1; return new E().m() === E; });
+t('class decl assign', function () { class D { m() { eval('D = 1'); } } var E = D; new E().m(); return D === E; });
+t('class nested arrow', function () { var C = class D { m() { return (() => eval('D'))(); } }; return new C().m() === C; });
+t('class computed key', function () { var C = class D { [eval('typeof D')]() {} }; return 1; });
+t('class heritage', function () { var C = class D extends (eval('typeof D'), Object) {}; return 1; });
+t('generator', function () { var f = function* g() { yield eval('g'); }; return f().next().value === f; });
+t('generator assign', function () { var f = function* g() { eval('g = 1'); yield g; }; return f().next().value === f; });
+t('generator strict assign', function () { var f = function* g() { 'use strict'; eval('g = 1'); yield g; }; return f().next().value === f; });
+t('generator after yield', function () { var f = function* g() { yield 1; yield eval('g'); }; var it = f(); it.next(); return it.next().value === f; });
+t('async', function () { var r; var f = async function g() { r = eval('g'); }; f(); return r === f; });
+t('async gen', function () { var r; var f = async function* g() { r = eval('g'); }; f().next(); return r === f; });
+t('async arrow inside', function () { var r; var f = function g() { (async () => { r = eval('g'); })(); }; f(); return r === f; });
+t('indirect', function () { var f = function g() { return geval('typeof g'); }; return f(); });
+t('indirect 2', function () { var f = function g() { return (0, eval)('typeof g'); }; return f(); });
+t('indirect in eval', function () { var f = function g() { return eval('(0, eval)("typeof g")'); }; return f(); });
+t('outer named', function () { var f = function g() { return function h() { return eval('g') === f && eval('h') !== f; }; }; return f()(); });
+t('outer named shadow', function () { var f = function g() { return function g() { return eval('g') !== f; }; }; return f()(); });
+t('outer named var shadow', function () { var f = function g() { var g = 3; return function () { return eval('g'); }; }; return f()(); });
+t('outer has eval, inner uses', function () { var f = function g() { eval(''); return function () { return g; }; }; return f()() === f; });
+t('outer has eval declares, inner uses', function () { var f = function g() { eval('var g = 2'); return function () { return g; }; }; return f()(); });
+t('param default', function () { var f = function g(a = eval('g')) { return a === f; }; return f(); });
+t('arguments name', function () { var f = function arguments() { return eval('typeof arguments + " " + (arguments === f)'); }; return f(); });
+t('recursion', function () { var f = function g(n) { return n ? eval('g(n - 1)') + 1 : 0; }; return f(5); });
+t('typeof after eval', function () { var f = function g() { eval(''); return typeof g; }; return f(); });
+t('eval name', function () { var f = function eval2() { return eval('eval2') === f; }; return f(); });
+t('lazy', function () { var f = function g() { return function () { return function () { return eval('g'); }; }; }; return f()()() === f; });
+t('catch shadow', function () { var f = function g() { try { throw 1; } catch (g) { return eval('g'); } }; return f(); });
+t('eval closure survives', function () { var f = function g() { return eval('(function () { return g; })'); }; return f()() === f; });
+t('eval closure assign later', function () { var f = function g() { return eval('(function () { g = 1; return g; })'); }; return f()() === f; });
+t('eval arrow strict later', function () { var f = function g() { return eval('"use strict"; (() => { g = 1; })'); }; return f()(); });
+t('param default eval, let body', function () { var f = function g(a = eval('g')) { let g = 1; return a === f; }; return f(); });
+t('param default assign', function () { var f = function g(a = eval('g = 1')) { return g === f; }; return f(); });
+t('param default strict assign', function () { var f = function g(a = eval('"use strict"; g = 1')) { return g === f; }; return f(); });
+t('param default eval, body eval', function () { var f = function g(a = eval('g')) { return a === f && eval('g') === f; }; return f(); });
+t('body eval, var hoisted in block', function () { var f = function g() { var a = eval('typeof g'); { var g = 1; } return a; }; return f(); });
+t('body eval, annex b fn in block', function () { var f = function g() { var a = eval('g') === f; { function g() {} } return a + ' ' + (g !== f); }; return f(); });
+t('let shadow nested', function () { var f = function g() { let g = 3; return (() => eval('g'))(); }; return f(); });
+t('let shadow assign', function () { var f = function g() { let g = 3; eval('g = 4'); return g; }; return f(); });
+t('let tdz', function () { var f = function g() { var a = eval('g'); let g = 3; return a; }; return f(); });
+t('generator boxed', function () { var f = function* g() { let x = 1; yield () => x; yield eval('g = 2; g'); }; var it = f(); it.next(); return it.next().value === f; });
+t('gen nested strict', function () { var f = function* g() { yield (() => { 'use strict'; return eval('g = 2'); })(); }; return f().next().value; });
+t('eval declares then nested fn stores', function () { var f = function g() { eval('var g = 1'); (function () { g = 2; })(); return g; }; return f(); });
+t('nested fn stores, no decl', function () { var f = function g() { eval(''); (function () { g = 2; })(); return g === f; }; return f(); });
+t('nested strict fn stores, no decl', function () { var f = function g() { eval(''); (function () { 'use strict'; g = 2; })(); return g === f; }; return f(); });
+t('new target', function () { var f = function g() { return eval('new.target === g'); }; return new f() instanceof f; });
+t('eval code named fn', function () { return eval('(function g() { return eval("g") })') () instanceof Function; });
+t('eval code named fn assign', function () { return eval('(function g() { "use strict"; eval("g = 1") })')(); });
+t('indirect eval code named fn', function () { return (0, eval)('(function g() { eval("g = 1"); return typeof eval("g") })')(); });
+t('eval let store', function () { var f = function g() { return eval('let g = 2; g = 3; g') + ' ' + (g === f); }; return f(); });
+t('eval block let store', function () { var f = function g() { return eval('{ let g = 2; g = 3; g }') + ' ' + (g === f); }; return f(); });
+t('eval fn let store', function () { var f = function g() { return eval('(function () { let g = 2; g = 3; return g })()') + ' ' + (g === f); }; return f(); });
+t('eval fn block let store', function () { var f = function g() { return eval('(function () { { let g = 2; g = 3; return g } })()') + ' ' + (g === f); }; return f(); });
+t('eval fn var store', function () { var f = function g() { return eval('(function () { var g = 2; g = 3; return g })()') + ' ' + (g === f); }; return f(); });
+t('eval fn param store', function () { var f = function g() { return eval('(function (g) { g = 3; return g })(1)') + ' ' + (g === f); }; return f(); });
+t('eval arrow param store', function () { var f = function g() { return eval('((g) => { g = 3; return () => g })(1)()') + ' ' + (g === f); }; return f(); });
+t('eval const', function () { var f = function g() { return eval('const g = 2; g'); }; return f(); });
+t('eval class named g', function () { var f = function g() { return eval('class g {}; typeof g') + ' ' + (g === f); }; return f(); });
+t('eval named fn expr g', function () { var f = function g() { return eval('(function g() { g = 1; return g })()') !== f; }; return f(); });
+t('eval catch g', function () { var f = function g() { return eval('try { throw 5 } catch (g) { g = 6; g }') + ' ' + (g === f); }; return f(); });
+t('eval for let g', function () { var f = function g() { return eval('var s = 0; for (let g = 0; g < 3; g++) s += g; s') + ' ' + (g === f); }; return f(); });
+t('eval destructure to name', function () { var f = function g() { eval('[g] = [1]; ({ g } = { g: 2 })'); return g === f; }; return f(); });
+t('eval destructure strict', function () { var f = function g() { eval('"use strict"; [g] = [1]'); return g === f; }; return f(); });
+t('eval for-in name', function () { var f = function g() { eval('for (g in { a: 1 }) ;'); return g === f; }; return f(); });
+t('eval for-of name strict', function () { var f = function g() { eval('"use strict"; for (g of [1]) ;'); return g === f; }; return f(); });
+t('eval logical assign', function () { var f = function g() { eval('g &&= 1; g ||= 2; g ??= 3'); return g === f; }; return f(); });
+t('eval logical assign strict', function () { var f = function g() { eval('"use strict"; g ||= 2; g ??= 3;'); try { eval('"use strict"; g &&= 1'); } catch (e) { return e.name; } }; return f(); });
+t('eval typeof', function () { var f = function g() { return eval('typeof g') + eval('"use strict"; typeof g'); }; return f(); });
+t('eval var in nested, outer sees', function () { var f = function g() { var h = function () { eval('var g = 1'); return g; }; return h() + ' ' + (g === f); }; return f(); });
+t('two names', function () { var f = function g() { var h = function k() { return eval('g') === f && eval('k') === h && eval('k = 1, g = 2, k') === h; }; return h(); }; return f(); });
+t('same name twice strict inner', function () { var f = function g() { var h = function g() { 'use strict'; eval('g = 1'); }; return h(); }; return f(); });
+t('eval in loop then yield', function () { var f = function* g() { for (var i = 0; i < 3; i++) yield eval('g') === f; }; return [...f()].join(); });
+t('with around eval declares', function () { var o = {}; var f = function g() { with (o) { eval('var g = 4'); } return g + ' ' + ('g' in o); }; return f(); });
+t('with has name, eval declares', function () { var o = { g: 1 }; var f = function g() { with (o) { eval('var g = 4'); } return (g === undefined) + ' ' + o.g; }; return f(); });
+t('catch g store', function () { return (function g() { try { throw 5; } catch (g) { g = 6; return g; } })(); });
+t('catch g store nested', function () { return (function g() { return (() => { try { throw 5; } catch (g) { g = 6; return g; } })(); })(); });
+t('catch [g] store', function () { return (function g() { try { throw [5]; } catch ([g]) { g = 6; return g; } })(); });
+t('eval catch g', function () { var f = function g() { return eval('try { throw 5 } catch (g) { g = 6; g }') + ' ' + (g === f); }; return f(); });
+t('eval catch g in fn', function () { var f = function g() { return eval('(function () { try { throw 5 } catch (g) { g = 6; return g } })()') + ' ' + (g === f); }; return f(); });
+t('eval catch [g]', function () { var f = function g() { return eval('try { throw [5] } catch ([g]) { g = 6; g }') + ' ' + (g === f); }; return f(); });
+t('eval catch g closure', function () { var f = function g() { return eval('try { throw 5 } catch (g) { (() => { g = 6 })(); g }') + ' ' + (g === f); }; return f(); });
+t('eval catch g eval', function () { var f = function g() { return eval('try { throw 5 } catch (g) { eval("g = 6"); g }') + ' ' + (g === f); }; return f(); });
+t('catch g eval', function () { var f = function g() { try { throw 5; } catch (g) { eval('g = 6'); return g; } }; return f(); });
+t('catch g eval var', function () { var f = function g() { try { throw 5; } catch (g) { eval('var g = 6'); return g; } }; return f(); });
+t('lazy catch g', function () { var f = function g() { return function () { try { throw 5; } catch (g) { g = 6; return g; } }; }; return f()(); });
+t('lazy catch g 2', function () { var f = function g() { return function () { var h = g; try { throw 5; } catch (g) { g = 6; return g + ' ' + (h === f); } }; }; return f()(); });
+t('lazy catch g strict', function () { var f = function g() { 'use strict'; return function () { var h = g; try { throw 5; } catch (g) { g = 6; return g + ' ' + (h === f); } }; }; return f()(); });
+t('Function catch', function () { return new Function('var f = function g() { return function () { var h = g; try { throw 5; } catch (g) { g = 6; return g + " " + (h === f); } }; }; return f()();')(); });
+t('eval catch then after', function () { var f = function g() { return eval('try { throw 5 } catch (g) { g = 6 } g = 7; g') === f; }; return f(); });
+t('eval catch nested try', function () { var f = function g() { return eval('try { throw 5 } catch (g) { try { throw 1 } catch (e) { g = e } g }'); }; return f(); });
+t('eval catch strict', function () { var f = function g() { return eval('"use strict"; try { throw 5 } catch (g) { g = 6; g }'); }; return f(); });
+out.join("\n")
+"#;
+    let expected = "\
+read: function
+identity: true
+strict read: true
+strict eval code: true
+nested fn: true
+nested arrow: true
+nested 2: true
+eval in eval: true
+eval fn in eval: true
+fn in eval no inner eval: true
+assign sloppy: 1 true true
+assign strict fn: throws TypeError
+assign strict eval code: throws TypeError
+assign nested sloppy: true
+assign nested strict: throws TypeError
+compound assign: true
+compound strict: throws TypeError
+assign in eval fn: true
+assign in strict eval fn: throws TypeError
+var shadow: 5
+var shadow no init: undefined
+param shadow: 7
+fn decl shadow: 1
+let shadow: 3
+block let shadow: 3
+eval var shadow: 9 9
+eval var no init: undefined undefined
+eval var then delete: true true true
+eval function decl shadow: 4 true
+strict eval var: true
+eval let: 2 true
+nested eval var: 9 true
+delete: false true true
+delete nested: false true
+with shadow: 1
+with no shadow: true
+with assign: 2 true
+with outside: true
+with in eval: true
+with in eval shadow: 6
+class read: true
+class static: true
+class ctor: true
+class field: true
+class static field: function
+class assign: throws TypeError
+class decl inner: true
+class decl assign: throws TypeError
+class nested arrow: true
+class computed key: throws ReferenceError
+class heritage: throws ReferenceError
+generator: true
+generator assign: true
+generator strict assign: throws TypeError
+generator after yield: true
+async: true
+async gen: true
+async arrow inside: true
+indirect: undefined
+indirect 2: undefined
+indirect in eval: undefined
+outer named: true
+outer named shadow: true
+outer named var shadow: 3
+outer has eval, inner uses: true
+outer has eval declares, inner uses: 2
+param default: true
+arguments name: object false
+recursion: 5
+typeof after eval: function
+eval name: true
+lazy: true
+catch shadow: 1
+eval closure survives: true
+eval closure assign later: true
+eval arrow strict later: throws TypeError
+param default eval, let body: true
+param default assign: true
+param default strict assign: throws TypeError
+param default eval, body eval: true
+body eval, var hoisted in block: undefined
+body eval, annex b fn in block: false true
+let shadow nested: 3
+let shadow assign: 4
+let tdz: throws ReferenceError
+generator boxed: true
+gen nested strict: throws TypeError
+eval declares then nested fn stores: 2
+nested fn stores, no decl: true
+nested strict fn stores, no decl: throws TypeError
+new target: true
+eval code named fn: true
+eval code named fn assign: throws TypeError
+indirect eval code named fn: function
+eval let store: 3 true
+eval block let store: 3 true
+eval fn let store: 3 true
+eval fn block let store: 3 true
+eval fn var store: 3 true
+eval fn param store: 3 true
+eval arrow param store: 3 true
+eval const: 2
+eval class named g: function true
+eval named fn expr g: true
+eval catch g: 6 true
+eval for let g: 3 true
+eval destructure to name: true
+eval destructure strict: throws TypeError
+eval for-in name: true
+eval for-of name strict: throws TypeError
+eval logical assign: true
+eval logical assign strict: TypeError
+eval typeof: functionfunction
+eval var in nested, outer sees: 1 true
+two names: true
+same name twice strict inner: throws TypeError
+eval in loop then yield: true,true,true
+with around eval declares: 4 false
+with has name, eval declares: true 4
+catch g store: 6
+catch g store nested: 6
+catch [g] store: 6
+eval catch g: 6 true
+eval catch g in fn: 6 true
+eval catch [g]: 6 true
+eval catch g closure: 6 true
+eval catch g eval: 6 true
+catch g eval: 6
+catch g eval var: 6
+lazy catch g: 6
+lazy catch g 2: 6 true
+lazy catch g strict: 6 true
+Function catch: 6 true
+eval catch then after: true
+eval catch nested try: 1
+eval catch strict: 6";
+    let got = value(src);
+    for (g, e) in got.lines().zip(expected.lines()) {
+        assert_eq!(g, e);
+    }
+    assert_eq!(got.lines().count(), expected.lines().count());
+}
+
+/// The same past an `await`, the async function's frame gone from the
+/// stack meanwhile.
+#[test]
+fn a_direct_eval_sees_an_async_functions_own_name_after_await() {
+    let src = r#"
+var log = [];
+var f = async function g() {
+    await 0;
+    log.push(eval('g') === f);
+    eval('g = 1');
+    log.push(g === f);
+    try { eval('"use strict"; g = 1'); } catch (e) { log.push(e.name); }
+    await 0;
+    log.push((() => eval('g'))() === f);
+};
+f().then(function () { globalThis.out = log.join(" "); });
+"#;
+    assert_eq!(out_after_jobs(src), "true true TypeError true");
+}

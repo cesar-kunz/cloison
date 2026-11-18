@@ -3641,6 +3641,12 @@ impl Vm {
     /// begins: it may collect, so the [`Local`]s the host has are no
     /// longer this VM's (their values checked first, and rooted through
     /// it: see [`Vm::host`]), nor the error it kept.
+    ///
+    /// The host's entries call it ([`Vm::host_op`]), and so does whatever
+    /// enters the VM from outside a run, where the collector's native
+    /// stack gets its base (`RunState::new`, [`Vm::host`]): a collection
+    /// needs that base, so none runs that the tag doesn't tell, whichever
+    /// entry is added later.
     fn host_enter(&mut self) {
         self.globals.stamp.set(next_stamp());
         self.host_error = None;
@@ -3652,8 +3658,94 @@ impl Vm {
         if let Err(e) = &mut r {
             e.2 = self.globals.stamp.get();
             self.host_error = e.1.filter(|v| v.is_cell()).map(|v| (v, e.2));
+            // An error object's message, for when its value is no longer
+            // read (see [`Vm::uncaught_message`]).
+            if let Some(text) = e.1.and_then(|v| self.error_text(v)) {
+                e.0 = text;
+            }
         }
         r
+    }
+
+    /// What `Error.prototype.toString` gives for `v` if it is an error
+    /// object (one with [[ErrorData]]) whose `name` and `message` are
+    /// found without running JavaScript: data properties, strings or
+    /// missing, through no proxy and no other realm's prototype. Read as
+    /// the error leaves for the host, for the message it keeps.
+    fn error_text(&mut self, v: Value) -> Option<String> {
+        if !crate::props::is_object(v) || !crate::object::is_error(crate::object::as_object(v)) {
+            return None;
+        }
+        let o = Obj::of(v);
+        if !self.realms.is_empty() || crate::proxy::chain_has_proxy(self, o) {
+            return None;
+        }
+        let part = |vm: &Vm, name: Atom, missing: &str| match vm.lookup(o, name) {
+            None => Some(missing.to_string()),
+            Some((h, slot)) if !vm.is_accessor(h, slot) => match h.field(slot) {
+                x if x.is_undefined() => Some(missing.to_string()),
+                x if is_string(x) => Some(shown(x)),
+                _ => None,
+            },
+            Some(_) => None,
+        };
+        let message = self.intern("message");
+        let (name, message) = (part(self, self.a_name, "Error")?, part(self, message, "")?);
+        Some(match (name.is_empty(), message.is_empty()) {
+            (_, true) => name,
+            (true, false) => message,
+            (false, false) => format!("{name}: {message}"),
+        })
+    }
+
+    /// `a`, an atom the host gives operation `what`. Panics unless it
+    /// names a string of this VM's now: [`Atom`]'s number is public, and
+    /// one out of range, or freed since ([`Vm::intern`]'s are kept only
+    /// while something in the VM uses the name), would be read as a name
+    /// later. (Another VM's in range, or one whose number a new name
+    /// took, is that name: not what the host meant, but a name.)
+    #[inline]
+    fn host_atom(&self, a: Atom, what: &str) -> Atom {
+        if !self.atoms.get(a.0 as usize).is_some_and(Option::is_some) {
+            panic!("{what}: an Atom that names nothing in this VM (another VM's, or freed since: intern it again)")
+        }
+        a
+    }
+
+    /// The value `e` threw, for the host to look at or keep (a
+    /// [`Global`]): `None` if it threw none (the VM's own errors: see
+    /// `e.0`), and for a cell, if `e` isn't the error of this VM's last
+    /// run or operation, whose value alone is still what it was. Take it
+    /// at once.
+    ///
+    /// ```
+    /// use cloison::vm::{Global, Vm, display};
+    /// let mut vm = Vm::new();
+    /// let e = vm.run(&cloison::js::compile("var e = new RangeError('no'); e.code = 7; throw e").unwrap()).unwrap_err();
+    /// let thrown = Global::new(&vm, vm.thrown(&e).unwrap());
+    /// let code = vm.intern("code");
+    /// assert_eq!(display(thrown.local().get(&mut vm, code).unwrap(), &vm), "7");
+    /// // (The `get` was an operation: `e` is no longer the last error.)
+    /// assert!(vm.thrown(&e).is_none());
+    /// assert_eq!(vm.uncaught_message(&e), "RangeError: no");
+    /// ```
+    pub fn thrown(&self, e: &Error) -> Option<Local> {
+        let v = e.1?;
+        (!v.is_cell() || self.host_error == Some((v, e.2))).then(|| self.local(v))
+    }
+
+    /// `f` given the values of `args`, the [`Local`]s of operation `what`
+    /// (see [`Vm::host_value`]): on the stack up to 8, the usual call's.
+    fn host_args<T>(&mut self, args: &[Local], what: &str, f: impl FnOnce(&mut Vm, &[Value]) -> T) -> T {
+        let mut few = [Value::UNDEFINED; 8];
+        if args.len() <= few.len() {
+            for (to, &a) in few.iter_mut().zip(args) {
+                *to = self.host_value(a, what);
+            }
+            return f(self, &few[..args.len()]);
+        }
+        let many: Vec<Value> = args.iter().map(|&a| self.host_value(a, what)).collect();
+        f(self, &many)
     }
 
     /// [`Vm::host_enter`], `f`, [`Vm::host_leave`].
@@ -3717,6 +3809,9 @@ impl Vm {
         let vm: *mut Vm = self;
         unsafe {
             let outer = (*vm).heap.gc.stack_base == 0;
+            if outer {
+                (*vm).host_enter();
+            }
             let _entered =
                 Entered { vm, top: (*vm).native_top, limit: (*vm).native_limit, handles: (*vm).handles.len(), outer };
             (*vm).unmovable += 1;
@@ -3986,11 +4081,15 @@ impl Vm {
     /// operation only (as often as asked: its `toString` runs each
     /// time), which the error's tag and the VM's note of the value tell
     /// (#359). For an earlier error, another VM's, or one whose value
-    /// the host changed, the message is the error's own (`e.0`, made as
-    /// it was thrown), with no panic: a diagnostic, under `panic =
-    /// "abort"` too (#323). Report an `Error` before the next run or
-    /// operation. As an operation that may run JavaScript, it ends the
-    /// host's [`Local`]s.
+    /// the host changed, the message is the error's own (`e.0`), with no
+    /// panic: a diagnostic, under `panic = "abort"` too (#323). That one
+    /// was made as the error left the VM, without running JavaScript: an
+    /// error object's `name` and `message` as `Error.prototype.toString`
+    /// joins them (if they are plain string properties), any other
+    /// object's `[object Object]`. So an `Error` reads the same later
+    /// unless its `toString` is its own; for that, report it before the
+    /// next run or operation, or keep its value ([`Vm::thrown`]). As an
+    /// operation that may run JavaScript, it ends the host's [`Local`]s.
     pub fn uncaught_message(&mut self, e: &Error) -> String {
         if e.1.is_some_and(|v| v.is_cell() && self.host_error != Some((v, e.2))) {
             return e.0.clone();
@@ -4002,7 +4101,6 @@ impl Vm {
             // (a throwing one leaves the error's own message), the value
             // rooted through it and so still the error's after.
             let kept = self.host_error;
-            self.host_enter();
             let s = self.host(&[v], &[], |_| Ok(crate::interp::to_string_units(v)));
             self.host_error = kept;
             if let Ok(s) = s {
@@ -9360,12 +9458,25 @@ pub(crate) fn number_ascii(d: f64) -> NumBuf {
 
 /// A value of a VM's in the host's hands: what its runs and operations
 /// return, and what they take. It is valid until the VM's next run
-/// ([`Vm::run`], [`Vm::run_module`]) or next operation that may run
-/// JavaScript (those of `Local` that return a `Result`, and
-/// [`Vm::uncaught_message`]): a collection in one frees the cells nothing
+/// ([`Vm::run`], [`Vm::run_module`]) or next operation that enters the
+/// VM, where JavaScript may run: [`Local::get`], [`set`](Local::set),
+/// [`get_keyed`](Local::get_keyed), [`set_keyed`](Local::set_keyed),
+/// [`has_property`](Local::has_property),
+/// [`delete_property`](Local::delete_property),
+/// [`instance_of`](Local::instance_of),
+/// [`for_in_keys`](Local::for_in_keys), [`to_number`](Local::to_number),
+/// [`call_other`](Local::call_other),
+/// [`construct_other`](Local::construct_other) and
+/// [`Vm::uncaught_message`]. A collection in one frees the cells nothing
 /// in the VM refers to and moves others, and the host's copy is not a
 /// root. Kept past that, a value is held as a [`Global`], and read again
-/// ([`Global::get`]) after each run or operation.
+/// ([`Global::local`]) after each run or operation. The others enter
+/// nothing and end no `Local`, whatever they return: those that make a
+/// value ([`Local::string`], [`try_string`](Local::try_string),
+/// [`try_string_with`](Local::try_string_with), [`Local::object`],
+/// [`Local::array`]: no collection runs outside a run or an operation,
+/// the heap grows), [`Local::type_of`], [`Local::string_units`],
+/// [`display`], [`Vm::thrown`], [`Vm::intern`] and `Global`'s.
 ///
 /// A `Local` is its value and a tag: a number its VM draws anew, from a
 /// counter of the process, as each run or such operation begins. Every
@@ -9498,7 +9609,7 @@ impl Local {
 
     /// `self[name]`.
     pub fn get(self, vm: &mut Vm, name: Atom) -> Result<Local> {
-        let o = vm.host_value(self, "Local::get");
+        let (o, name) = (vm.host_value(self, "Local::get"), vm.host_atom(name, "Local::get"));
         let v = vm.host_op(|vm| vm.get(o, name))?;
         Ok(vm.local(v))
     }
@@ -9506,6 +9617,7 @@ impl Local {
     /// `self[name] = value`.
     pub fn set(self, vm: &mut Vm, name: Atom, value: Local) -> Result<()> {
         let (o, v) = (vm.host_value(self, "Local::set"), vm.host_value(value, "Local::set"));
+        let name = vm.host_atom(name, "Local::set");
         vm.host_op(|vm| vm.set(o, name, v))
     }
 
@@ -9561,8 +9673,7 @@ impl Local {
     /// native, a bound function, a proxy): a TypeError otherwise.
     pub fn call_other(self, vm: &mut Vm, this: Local, args: &[Local]) -> Result<Local> {
         let (f, this) = (vm.host_value(self, "Local::call_other"), vm.host_value(this, "Local::call_other"));
-        let args: Vec<Value> = args.iter().map(|&a| vm.host_value(a, "Local::call_other")).collect();
-        let v = vm.host_op(|vm| vm.call_other(f, this, &args))?;
+        let v = vm.host_args(args, "Local::call_other", |vm, args| vm.host_op(|vm| vm.call_other(f, this, args)))?;
         Ok(vm.local(v))
     }
 
@@ -9570,8 +9681,8 @@ impl Local {
     /// `Object`): a TypeError otherwise.
     pub fn construct_other(self, vm: &mut Vm, args: &[Local]) -> Result<Local> {
         let f = vm.host_value(self, "Local::construct_other");
-        let args: Vec<Value> = args.iter().map(|&a| vm.host_value(a, "Local::construct_other")).collect();
-        let v = vm.host_op(|vm| vm.construct_other(f, &args))?;
+        let v =
+            vm.host_args(args, "Local::construct_other", |vm, args| vm.host_op(|vm| vm.construct_other(f, args)))?;
         Ok(vm.local(v))
     }
 
@@ -9801,6 +9912,7 @@ impl RunState {
         vm.native_limit = here.saturating_sub(crate::interp::NATIVE_STACK);
         if outer {
             vm.heap.gc.stack_base = here & !7;
+            vm.host_enter();
         }
         RunState {
             vm,

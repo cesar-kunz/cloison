@@ -54,7 +54,7 @@ impl Error {
     /// message is [`shown`]: a long string thrown isn't flattened nor
     /// copied whole for a `catch` that needs only the value
     /// ([`Vm::uncaught_message`] shows it whole).
-    pub fn thrown(v: Value) -> Error {
+    pub(crate) fn thrown(v: Value) -> Error {
         Error(shown(v), Some(v))
     }
 }
@@ -3868,6 +3868,11 @@ impl Vm {
     /// An uncaught error's message: a thrown error object's `name` and
     /// `message`, else the error's own.
     pub fn uncaught_message(&mut self, e: &Error) -> String {
+        // (The thrown value is a raw one the host kept: checked as the
+        // operations' are, #323.)
+        if let Some(v) = e.1 {
+            self.check_value(v, "Vm::uncaught_message");
+        }
         if let Some(v) = e.1
             && crate::props::is_object(v)
         {

@@ -666,7 +666,7 @@ pub enum FieldType {
 
 impl FieldType {
     /// The type of a value, as a field type.
-    pub fn of(v: Value) -> FieldType {
+    pub(crate) fn of(v: Value) -> FieldType {
         if v.is_int32() {
             FieldType::Int
         } else if v.is_number() {
@@ -706,7 +706,7 @@ impl FieldType {
 
 /// Whether `v` fits a field type encoded by [`FieldType::encode`] (not 0).
 #[inline(always)]
-pub fn field_fits(want: u64, v: Value) -> bool {
+pub(crate) fn field_fits(want: u64, v: Value) -> bool {
     match want {
         crate::layout::FIELD_INT => v.is_int32(),
         crate::layout::FIELD_NUM => v.is_number(),

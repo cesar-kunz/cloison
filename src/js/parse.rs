@@ -152,7 +152,6 @@ fn parse_pass<'a>(
         pending_head: Vec::new(),
         sub: false,
         pending_pattern: None,
-        head_vars: Vec::new(),
         pattern_names: Vec::new(),
         privates: Vec::new(),
         super_fns: Vec::new(),
@@ -385,9 +384,6 @@ struct Parser<'t, 'a, 'p> {
     sub: bool,
     /// A `for` head's declaration's pattern (see `pattern_declarator`).
     pending_pattern: Option<Pattern<'a>>,
-    /// The `var`s the next `for` body declares, from a head whose target
-    /// is a catch parameter (see `Parser::var_decls`).
-    head_vars: Vec<Name>,
     /// The names the last parameter list's patterns bind.
     pattern_names: Vec<Name>,
     /// The private names of the classes being parsed (innermost last),
@@ -1312,17 +1308,17 @@ impl<'a> Parser<'_, 'a, '_> {
             let decls = self.lexical_decls(constant, true)?;
             if let Some(p) = self.pending_pattern.take() {
                 if self.is_of() {
-                    return self.for_of_pattern(if constant { 3 } else { 2 }, p);
+                    return self.for_of_pattern(if constant { 3 } else { 2 }, p, Vec::new());
                 }
                 if self.eat("in") {
                     let names: Vec<Name> =
                         decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect();
-                    return self.for_in_target(ForInTarget::Pattern(p, Some(constant), names));
+                    return self.for_in_target(ForInTarget::Pattern(p, Some(constant), names), Vec::new());
                 }
             }
             if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
                 let (name, _) = decls.into_iter().next().unwrap();
-                return self.for_of_rest(if constant { 3 } else { 2 }, ExprKind::Ident(name));
+                return self.for_of_rest(if constant { 3 } else { 2 }, ExprKind::Ident(name), Vec::new());
             }
             if decls.len() == 1 && decls[0].1.is_none() && self.eat("in") {
                 let name = decls.into_iter().next().unwrap().0;
@@ -1346,38 +1342,30 @@ impl<'a> Parser<'_, 'a, '_> {
             if let Some(p) = self.pending_pattern.take() {
                 if self.is_of() {
                     if shadowed {
-                        self.head_vars = names();
-                        return self.for_of_pattern(0, p);
+                        return self.for_of_pattern(0, p, names());
                     }
-                    return self.for_of_pattern(1, p);
+                    return self.for_of_pattern(1, p, Vec::new());
                 }
                 if self.eat("in") {
                     if shadowed {
-                        self.head_vars = names();
-                        return self.for_in_target(ForInTarget::Pattern(p, None, Vec::new()));
+                        return self.for_in_target(ForInTarget::Pattern(p, None, Vec::new()), names());
                     }
-                    return self.for_in_target(ForInTarget::Pattern(p, None, names()));
+                    return self.for_in_target(ForInTarget::Pattern(p, None, names()), Vec::new());
                 }
             }
             if decls.len() == 1 && decls[0].1.is_none() && (self.is_of() || self.is("in")) {
                 let name = decls[0].0.clone();
-                let target = match catch_vars.first() {
-                    Some((_, t)) => {
-                        self.head_vars = vec![name.clone()];
-                        Some(t.clone())
-                    }
-                    None => None,
-                };
+                let target = catch_vars.first().map(|(_, t)| t.clone());
                 if self.is_of() {
                     return match target {
-                        Some(t) => self.for_of_rest(0, ExprKind::Ident(t)),
-                        None => self.for_of_rest(1, ExprKind::Ident(name)),
+                        Some(t) => self.for_of_rest(0, ExprKind::Ident(t), vec![name]),
+                        None => self.for_of_rest(1, ExprKind::Ident(name), Vec::new()),
                     };
                 }
                 self.advance();
                 return match target {
-                    Some(t) => self.for_in_rest(false, t),
-                    None => self.for_in_rest(true, name),
+                    Some(t) => self.for_in_rest(false, t, vec![name]),
+                    None => self.for_in_rest(true, name, Vec::new()),
                 };
             }
             Some(ForInit::Var(decls))
@@ -1387,27 +1375,27 @@ impl<'a> Parser<'_, 'a, '_> {
                 || self.call_target(&e))
                 && self.is_of()
             {
-                return self.for_of_rest(0, e.kind);
+                return self.for_of_rest(0, e.kind, Vec::new());
             }
             if matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(..)) && self.is_of() {
                 let e = expr(self.arena, e);
                 let p = self.to_pattern(e)?;
-                return self.for_of_pattern(0, p);
+                return self.for_of_pattern(0, p, Vec::new());
             }
             if (matches!(e.kind, ExprKind::Member(..) | ExprKind::Index(..)) || self.call_target(&e)) && self.eat("in")
             {
-                return self.for_in_target(ForInTarget::Expr(e));
+                return self.for_in_target(ForInTarget::Expr(e), Vec::new());
             }
             if matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(..)) && self.eat("in") {
                 let e = expr(self.arena, e);
                 let p = self.to_pattern(e)?;
-                return self.for_in_target(ForInTarget::Pattern(p, None, Vec::new()));
+                return self.for_in_target(ForInTarget::Pattern(p, None, Vec::new()), Vec::new());
             }
             if let ExprKind::Ident(name) = &e.kind
                 && self.eat("in")
             {
                 let name = name.clone();
-                return self.for_in_rest(false, name);
+                return self.for_in_rest(false, name, Vec::new());
             }
             Some(ForInit::Expr(expr(self.arena, e)))
         };
@@ -1427,14 +1415,13 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// Past `in`: `for (target in object) body` with a target other than a
     /// name, as `for (%forinN in object) { target = %forinN; body }`.
-    fn for_in_target(&mut self, target: ForInTarget<'a>) -> R<StmtKind<'a>> {
+    /// (`vars`: the `var`s its body declares first, see `loop_body`.)
+    fn for_in_target(&mut self, target: ForInTarget<'a>, vars: Vec<Name>) -> R<StmtKind<'a>> {
         let pos = self.pos();
         let k = self.classes;
         self.classes += 1;
         let h: Name = format!("%forin{k}").into();
         self.hidden_var(h.clone());
-        // (Taken before the object, which may have loops of its own.)
-        let vars = std::mem::take(&mut self.head_vars);
         let object = self.expression(false)?;
         self.expect(")")?;
         let body = self.loop_body(vars)?;
@@ -1489,11 +1476,10 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     /// At `of`: `for (target of iterable) body`'s rest.
-    fn for_of_rest(&mut self, kind: u8, target: ExprKind<'a>) -> R<StmtKind<'a>> {
+    /// (`vars`: the `var`s its body declares first, see `loop_body`.)
+    fn for_of_rest(&mut self, kind: u8, target: ExprKind<'a>, vars: Vec<Name>) -> R<StmtKind<'a>> {
         let pos = self.pos();
         self.advance();
-        // (Taken before the iterable, which may have loops of its own.)
-        let vars = std::mem::take(&mut self.head_vars);
         let iterable = self.assignment(false)?;
         match &target {
             ExprKind::Ident(n) => self.head_tdz(std::slice::from_ref(n)),
@@ -1512,11 +1498,11 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     /// `for (pattern of iterable) body`'s rest, at `of`.
-    fn for_of_pattern(&mut self, kind: u8, p: Pattern<'a>) -> R<StmtKind<'a>> {
+    fn for_of_pattern(&mut self, kind: u8, p: Pattern<'a>, vars: Vec<Name>) -> R<StmtKind<'a>> {
         let mut names = Vec::new();
         p.names(&mut names);
         self.pending_head = names;
-        let r = self.for_of_rest(kind, ExprKind::Null)?;
+        let r = self.for_of_rest(kind, ExprKind::Null, vars)?;
         let StmtKind::ForOf { kind, target, iterable, body, .. } = r else { unreachable!() };
         Ok(StmtKind::ForOf { kind, target, pattern: Some(Box::new(p)), iterable, body, is_await: false })
     }
@@ -1724,8 +1710,8 @@ impl<'a> Parser<'_, 'a, '_> {
         })
     }
 
-    /// A `for` loop's body, declaring `vars` (its head's `head_vars`)
-    /// first.
+    /// A `for` loop's body, declaring `vars` first: the function's `var`s
+    /// of a head whose target is a catch parameter (see `var_decls`).
     fn loop_body(&mut self, vars: Vec<Name>) -> R<Stmt<'a>> {
         let pos = self.pos();
         let body = self.sub_statement()?;
@@ -1736,9 +1722,7 @@ impl<'a> Parser<'_, 'a, '_> {
         Ok(Stmt { kind: StmtKind::Block(vec![decl, body]), pos })
     }
 
-    fn for_in_rest(&mut self, var: bool, name: Name) -> R<StmtKind<'a>> {
-        // (Taken before the object, which may have loops of its own.)
-        let vars = std::mem::take(&mut self.head_vars);
+    fn for_in_rest(&mut self, var: bool, name: Name, vars: Vec<Name>) -> R<StmtKind<'a>> {
         let object = self.expression(false)?;
         self.expect(")")?;
         let body = stmt(self.arena, self.loop_body(vars)?);

@@ -348,8 +348,8 @@ pub fn parse(src: &str) -> Result<Checked, String> {
             let (mnemonic, operands) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
             let op = Op::from_name(mnemonic).ok_or_else(|| err(format!("unknown opcode `{mnemonic}`")))?;
             // (A function read here has no upvalues: one indexed would be
-            // past the closure's.)
-            if matches!(op, Op::LdaUpvalue | Op::StaUpvalue) {
+            // past the closure's. Nor the superinstructions with one.)
+            if matches!(op, Op::LdaUpvalue | Op::StaUpvalue | Op::LdaUpvalueStar | Op::StarLdaUpvalue) {
                 return Err(err(format!("{mnemonic}: the text form has no upvalues")));
             }
             // A constant is the only operand, and may contain commas.
@@ -386,9 +386,8 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                     }
                     Operand::Imm => Arg::Imm(t.parse().map_err(|_| err(format!("expected an integer, got `{t}`")))?),
                     Operand::Count => Arg::Count(t.parse().map_err(|_| err(format!("expected a count, got `{t}`")))?),
-                    Operand::Upvalue => {
-                        Arg::Index(t.parse().map_err(|_| err(format!("expected an upvalue index, got `{t}`")))?)
-                    }
+                    // (Refused above: the text form has no upvalues.)
+                    Operand::Upvalue => unreachable!(),
                     Operand::Off => {
                         if !is_ident(t) {
                             return Err(err(format!("expected a label, got `{t}`")));
@@ -887,8 +886,10 @@ mod tests {
         assert!(e.contains("never bound"), "{e}");
         let e = parse("script\n  Ldar 3\nend\n").unwrap_err();
         assert!(e.contains("register"), "{e}");
-        let e = parse("script\n  LdaUpvalue 0\n  Return\nend\n").unwrap_err();
-        assert!(e.contains("no upvalues"), "{e}");
+        for code in ["LdaUpvalue 0", "StaUpvalue 0", "LdaUpvalueStar 0", "StarLdaUpvalue r0"] {
+            let e = parse(&format!("script\n  {code}\n  Return\nend\n")).unwrap_err();
+            assert!(e.contains("no upvalues"), "{code}: {e}");
+        }
     }
 
     /// What [`verify`] rejects: code the interpreter would run off, out

@@ -9716,8 +9716,9 @@ out.join();"#;
     /// do and, `after`, what it did (a field written, a global, `mark()`
     /// called); the panic, made at the `nth` call of the runtime function
     /// by compiled code, leaves one thing begun and nothing done after it.
-    /// In the hot tier and the warm one, the call in the code entered, in
-    /// a function it inlines, and in one it calls directly.
+    /// In the hot tier (where every case is to reach its call) and the
+    /// warm one, the call in the code entered, in a function it inlines,
+    /// and in one it calls directly.
     #[test]
     fn a_panic_in_a_runtime_call_used_at_once_does_nothing_more() {
         use crate::jit::Failpoint::{self, *};
@@ -9809,15 +9810,17 @@ out.join();"#;
                 "function F(i) { before++; var k = i; this.g = function () { return k; }; } \
               function run() { for (var i = 0; i < 30000; i++) { o.v = new F(i); o.n++; mark(); after++; } } run();",
             ),
+            // (Objects of two shapes: one shape settled, the hot tier's
+            // code skips the call.)
             (
                 ConstructDone,
-                "function Q(n) { before++; this.a = 0; for (var j = 0; j < n; j++) this.a += j; } \
-              function run() { for (var i = 0; i < 30000; i++) { o.v = new Q(2); o.n++; mark(); after++; } } run();",
+                "function Q(n, f) { before++; this.a = 0; for (var j = 0; j < n; j++) this.a += j; if (f) this.b = 1; } \
+              function run() { for (var i = 0; i < 30000; i++) { o.v = new Q(2, i & 1); o.n++; mark(); after++; } } run();",
             ),
             (
                 ConstructDone,
-                "function Q(n) { before++; this.a = 0; for (var j = 0; j < n; j++) this.a += j; } \
-              for (var i = 0; i < 30000; i++) { o.v = new Q(2); o.n++; mark(); after++; }",
+                "function Q(n, f) { before++; this.a = 0; for (var j = 0; j < n; j++) this.a += j; if (f) this.b = 1; } \
+              for (var i = 0; i < 30000; i++) { o.v = new Q(2, i & 1); o.n++; mark(); after++; }",
             ),
         ];
         let observe = crate::js::compile("[before - after, o.n - after, after].join()").unwrap();
@@ -9856,7 +9859,7 @@ out.join();"#;
                             assert_eq!(msg, format!("failpoint {point:?}"), "{at}");
                             let after: u32 = state.rsplit(',').next().unwrap().parse().unwrap();
                             assert_eq!((state.as_str(), marks), (&*format!("1,0,{after}"), after), "{at}");
-                            reached.insert((k, nth));
+                            reached.insert((k, warm, nth));
                         }
                     }
                     assert_eq!(vm.run(&again).map(|v| display(v, &vm)).as_deref(), Ok("4999950000"), "{at}");
@@ -9864,9 +9867,15 @@ out.join();"#;
                 }
             }
         }
-        // Every case made its runtime call from compiled code, in a tier.
-        for k in 0..cases.len() {
-            assert!(reached.contains(&(k, 1)), "case {k} ({:?}) never called from compiled code", cases[k].0);
+        // Every case made its runtime call from the hot tier's code, at
+        // its first call and at a late one (but the frame's own
+        // `arguments`: its function is inlined by then, its `arguments`
+        // made as `ArgumentsOf`'s cases have them).
+        for (k, &(point, _)) in cases.iter().enumerate() {
+            for nth in [1, 2000] {
+                let called = reached.contains(&(k, false, nth)) || (point == CreateArguments && nth != 1);
+                assert!(called, "case {k} ({point:?}): no call {nth} from hot code");
+            }
         }
     }
 

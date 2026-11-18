@@ -439,7 +439,7 @@ struct Parser<'t, 'a, 'p> {
     /// its function and where its statement starts.
     loops: Vec<(usize, Pos)>,
     /// (See `Program::loop_hidden`.)
-    loop_hidden: std::collections::HashMap<Name, Pos>,
+    loop_hidden: std::collections::HashMap<Name, (Pos, Pos)>,
     /// Parsing a module: its id (see [`parse_module`]).
     module: Option<i32>,
     /// A module's entries so far (see [`Program::module`]).
@@ -800,7 +800,9 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Keyword("while") => {
                 self.advance();
                 self.expect("(")?;
-                let c = self.expression(false)?;
+                // (The test too: what a class in it binds is each
+                // iteration's own.)
+                let c = self.in_loop(pos, |p| p.expression(false))?;
                 self.expect(")")?;
                 let body = self.in_loop(pos, |p| p.sub_statement())?;
                 StmtKind::While(c, stmt(self.arena, body))
@@ -811,7 +813,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let body = stmt(self.arena, body);
                 self.expect("while")?;
                 self.expect("(")?;
-                let c = self.expression(false)?;
+                let c = self.in_loop(pos, |p| p.expression(false))?;
                 self.expect(")")?;
                 // `do … while (c)` takes an automatic semicolon even
                 // without a line break.
@@ -4660,8 +4662,10 @@ impl<'a> Parser<'_, 'a, '_> {
     /// Hidden variable `n` of the current function, if in a loop of it:
     /// see `Program::loop_hidden`.
     fn note_loop_hidden(&mut self, n: &Name) {
-        if let Some(&(_, pos)) = self.loops.iter().find(|l| l.0 == self.current) {
-            self.loop_hidden.insert(n.clone(), pos);
+        let mut own = self.loops.iter().filter(|l| l.0 == self.current);
+        if let Some(&(_, outer)) = own.next() {
+            let inner = own.next_back().map_or(outer, |l| l.1);
+            self.loop_hidden.insert(n.clone(), (outer, inner));
         }
     }
 

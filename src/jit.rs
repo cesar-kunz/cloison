@@ -3687,7 +3687,7 @@ pub enum Ty {
 impl Ty {
     /// The exact type of a runtime value. All cells are objects so far.
     #[track_caller]
-    pub fn of(v: Value) -> Ty {
+    pub(crate) fn of(v: Value) -> Ty {
         if v.is_int32() {
             Ty::I32
         } else if v.is_double() {

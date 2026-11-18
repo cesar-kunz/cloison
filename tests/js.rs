@@ -7681,15 +7681,27 @@ out.join(" ");
 /// OrdinarySetPrototypeOf allows, 10.1.2.1 step 7.b.i) makes a lookup
 /// on it a RangeError, not a loop (issue #336): the forwards in the
 /// lookup's loop are bounded, as the stack bounds other engines'
-/// recursion. A long chain of such proxies still works.
+/// recursion. So are the walks up the chain, `instanceof`, `isPrototypeOf`
+/// and for-in (whose loop the spec doesn't bound: SpiderMonkey and
+/// QuickJS hang, JavaScriptCore throws a RangeError for for-in). Setting
+/// a prototype, `Reflect.getPrototypeOf` and `Object.keys` end anyway. A
+/// long chain of such proxies still works, and `isPrototypeOf` sees a
+/// proxy's `getPrototypeOf` trap (20.1.3.3).
 #[test]
 fn a_prototype_cycle_through_a_trapless_proxy_is_a_range_error() {
     let src = r#"
 var out = [];
 var t = {}, p = new Proxy(t, {});
 Object.setPrototypeOf(t, p);
-for (var f of [() => "x" in p, () => p.x, () => { p.x = 1; }, () => t.x, () => Object.create(p).x])
+function F() {}
+for (var f of [() => "x" in p, () => p.x, () => { p.x = 1; }, () => t.x, () => Object.create(p).x,
+    () => p instanceof F, () => t instanceof F, () => F.prototype.isPrototypeOf(p), () => { for (var k in p); },
+    () => { for (var k in t); }, () => String(p)])
   try { f(); out.push("no error"); } catch (e) { out.push(e.constructor.name); }
+var o = {};
+o.__proto__ = p;
+Object.setPrototypeOf({}, p);
+out.push(Reflect.getPrototypeOf(p) === p, Object.keys(p).length);
 var q = { y: 1 };
 for (var i = 0; i < 10000; i++) q = new Proxy(q, {});
 out.push("y" in q, q.y, Object.create(q).y);
@@ -7699,9 +7711,13 @@ var log = [];
 var h = new Proxy({}, { get(_, k) { log.push(k); } });
 new Proxy({ a: 1 }, h).a;
 out.push(log.join());
+var proto = {}, tp = new Proxy({}, { getPrototypeOf() { return proto; } });
+out.push(proto.isPrototypeOf(tp), Object.prototype.isPrototypeOf(tp), tp instanceof Object);
+out.push(F.prototype.isPrototypeOf(Object.create(q)), Object.prototype.isPrototypeOf(q));
 out.join(" ");
 "#;
-    assert_eq!(value(src), "RangeError RangeError RangeError RangeError RangeError true 1 1 2 get");
+    let range = "RangeError ".repeat(11);
+    assert_eq!(value(src), format!("{range}true 0 true 1 1 2 get true true true false true"));
 }
 
 /// Code made at run time goes with its last closure, though the JIT took

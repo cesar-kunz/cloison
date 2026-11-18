@@ -26,7 +26,7 @@
 2 src/module.rs
 79 src/object.rs
 16 src/promise.rs
-20 src/props.rs
+18 src/props.rs
 10 src/proxy.rs
 11 src/racy.rs
 23 src/raw.rs

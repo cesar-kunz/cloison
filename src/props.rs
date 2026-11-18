@@ -2076,12 +2076,14 @@ fn object_is_prototype_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
         return Ok(Value::FALSE);
     }
     let o = vm.to_object(this)?;
-    let mut p = unsafe { (*Obj::of(v).shape()).proto };
+    // (Each step V.[[GetPrototypeOf]](), 20.1.3.3: a proxy's trap runs.)
+    let mut hops = 0;
+    let mut p = crate::proxy::walk_prototype(vm, Obj::of(v), &mut hops)?;
     while p.is_cell() {
         if as_object(p) == o.ptr() {
             return Ok(Value::TRUE);
         }
-        p = unsafe { (*Obj::of(p).shape()).proto };
+        p = crate::proxy::walk_prototype(vm, Obj::of(p), &mut hops)?;
     }
     Ok(Value::FALSE)
 }

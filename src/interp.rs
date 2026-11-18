@@ -3963,8 +3963,11 @@ pub(crate) fn generic_less_than(a: Value, b: Value) -> bool {
 pub(crate) fn to_boolean(v: Value) -> bool {
     if let Some(d) = v.as_number() {
         d != 0.0 && !d.is_nan()
-    } else if let Some(u) = string_units(v) {
-        !u.is_empty()
+    } else if let Some(n) = crate::vm::string_len(v) {
+        // (Its length, not its units: a cons string isn't flattened to
+        // tell, which allocates. Compiled code relies on nothing here
+        // panicking: see `jit::cloison_rt_to_boolean`.)
+        n != 0
     } else {
         // Objects are truthy, BigInts but 0n.
         v == Value::TRUE || v.is_cell() && !(is_bigint(v) && Obj::of(v).elems_len() == 0)

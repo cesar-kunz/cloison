@@ -4134,7 +4134,7 @@ impl Vm {
             ] {
                 fw.value(v);
             }
-            if let Some(crate::vm::Error(_, Some(e))) = &mut self.conv_error {
+            if let Some(crate::vm::Error(_, Some(e), _)) = &mut self.conv_error {
                 fw.value(e);
             }
             // (Copies of string constants, which the table's slots have.)
@@ -5496,12 +5496,12 @@ mod tests {
             }
             let g = vm.global_obj();
             vm.define_native(g, "fail_marker", fail_marker, 0, crate::jit::Ty::Any, false);
-            let e = vm.run(&module).unwrap_err().0;
+            let e = vm.run_raw(&module).unwrap_err().0;
             let expected =
                 "Error: the VM is poisoned: the collector's marker thread panicked: a marker panic for the tests";
             assert_eq!(e, expected, "jit: {jit}");
             assert!(vm.poisoned());
-            assert_eq!(vm.run(&crate::js::compile("1").unwrap()).unwrap_err().0, expected);
+            assert_eq!(vm.run_raw(&crate::js::compile("1").unwrap()).unwrap_err().0, expected);
         }
     }
 
@@ -5531,7 +5531,7 @@ mod tests {
             vm.heap.gc.marker_retry_every = retry_every;
             // (Every full collection a concurrent one, if it can be.)
             vm.heap.gc.cycles = !vm.heap.gc.stw && !vm.heap.gc.always_full;
-            let r = vm.run(&module).map(|v| v.as_number());
+            let r = vm.run_raw(&module).map(|v| v.as_number());
             vm.verify_heap();
             let counts = REFUSE_THREADS.take().unwrap();
             assert_eq!(r.map_err(|e| e.0), Ok(Some(45749970.0)));
@@ -5623,7 +5623,7 @@ mod tests {
         vm.define_native(g, "verify", verify_now, 0, crate::jit::Ty::Any, false);
         vm.define_native(g, "marking", marking, 0, crate::jit::Ty::Any, false);
         vm.define_native(g, "stop_cycles", stop_cycles, 0, crate::jit::Ty::Any, false);
-        assert_eq!(vm.run(&module).map(crate::vm::display_raw).as_deref(), Ok("true,false"));
+        assert_eq!(vm.run_raw(&module).map(crate::vm::display_raw).as_deref(), Ok("true,false"));
     }
 
     use std::time::{Duration, Instant};
@@ -5741,7 +5741,7 @@ mod tests {
             g,
             &[("stop_after_final", stop_after_final as crate::vm::NativeFn, 0), ("int32s", int32s, 1)],
         );
-        let r = vm.run(&module).map(crate::vm::display_raw).map_err(|e| e.to_string());
+        let r = vm.run_raw(&module).map(crate::vm::display_raw).map_err(|e| e.to_string());
         assert_eq!(r, Ok("true,0".to_string()));
     }
 }

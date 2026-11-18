@@ -829,35 +829,6 @@ impl Heap {
         v
     }
 
-    /// Whether `a` is where an object (any cell a `Value` may be) starts
-    /// that no collection freed or moved: its first granule's metadata
-    /// `YOUNG`, or the current color (with `marking`, the color before
-    /// too: a cycle under way hasn't reached every live cell, and the one
-    /// before swept the dead ones of that color as it began), not
-    /// forwarded; its first word a shape's address. What the host's raw
-    /// values are checked against (#323, #339): a stale one is then
-    /// either refused or a cell of the heap still, which is safe to read.
-    /// Between runs (the marker paused) or on the VM's thread in a run,
-    /// as the metadata is read there.
-    pub(crate) fn holds_object(&self, a: usize, marking: bool) -> bool {
-        if !self.contains(a) || !a.is_multiple_of(GRANULE) {
-            return false;
-        }
-        let b = (a - self.base) / BLOCK;
-        match self.blocks.get(b) {
-            Some(Block::Small) => {}
-            Some(Block::LargeHead(_)) if a.is_multiple_of(BLOCK) => {}
-            _ => return false,
-        }
-        // SAFETY: a granule of a block in use, its metadata committed, and
-        // its first word read only if a live cell starts there.
-        unsafe {
-            let m = meta_load(a);
-            let live = m & YOUNG != 0 || m & COLOR != 0 && (marking || m & COLOR == self.color);
-            live && m & crate::gc::FORWARDED == 0 && *(a as *const u64) & 7 == 0
-        }
-    }
-
     /// The first granule of the cell that address `a` (in the heap) may be
     /// in: the nearest one before it where a cell starts, unless a cell
     /// ends in between.

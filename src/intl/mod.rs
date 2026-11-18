@@ -73,7 +73,7 @@ pub(crate) fn install(vm: &mut Vm) {
 }
 
 fn data_error(e: String) -> Error {
-    Error(format!("Error: {e}"), None)
+    Error(format!("Error: {e}"), None, 0)
 }
 
 // ---- Objects ----

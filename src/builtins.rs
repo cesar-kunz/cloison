@@ -1116,7 +1116,7 @@ fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
             let what = if b.is_empty() { "parameter list" } else { "function body" };
             let e =
                 crate::js::compile_script_lazy_source(&whole(p, b)).err().unwrap_or_else(|| format!("invalid {what}"));
-            return Err(Error(format!("SyntaxError: {e}"), None));
+            return Err(Error(format!("SyntaxError: {e}"), None, 0));
         }
     }
     run_source_code(vm, &whole(&params, &body))
@@ -1185,7 +1185,8 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
 fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = arg(a, 0);
     let src = crate::js::lex::Source::from_units(string_units(x).unwrap_or(&[]));
-    let module = crate::js::compile_script_lazy_source(&src).map_err(|e| Error(format!("SyntaxError: {e}"), None))?;
+    let module =
+        crate::js::compile_script_lazy_source(&src).map_err(|e| Error(format!("SyntaxError: {e}"), None, 0))?;
     vm.declare_script(&module)?;
     let code = vm.load(module);
     crate::interp::run_script_at(vm, code)
@@ -1256,9 +1257,9 @@ pub(crate) fn run_source(vm: &mut Vm, text: &str) -> Result<Value> {
 fn run_source_code(vm: &mut Vm, src: &crate::js::lex::Source) -> Result<Value> {
     let module = crate::js::compile_script_lazy_source(src).map_err(|e| {
         if e.contains("unsupported") {
-            Error(format!("unsupported: in eval'd code: {e}"), None)
+            Error(format!("unsupported: in eval'd code: {e}"), None, 0)
         } else {
-            Error(format!("SyntaxError: {e}"), None)
+            Error(format!("SyntaxError: {e}"), None, 0)
         }
     })?;
     let code = vm.load(module);
@@ -2200,7 +2201,7 @@ fn encode(vm: &mut Vm, a: &[Value], keep: &[u8]) -> Result<Value> {
         }
         let c = match char::decode_utf16(u[i..].iter().copied()).next() {
             Some(Ok(c)) => c,
-            _ => return Err(Error(String::from("URIError: URI malformed"), None)),
+            _ => return Err(Error(String::from("URIError: URI malformed"), None, 0)),
         };
         i += c.len_utf16();
         let mut b = [0u8; 4];
@@ -2224,7 +2225,7 @@ fn encode_uri(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `decodeURI…`: `%XX` UTF-8 sequences decoded, but those of `reserved`'s
 /// characters.
 fn decode(vm: &mut Vm, a: &[Value], reserved: &[u8]) -> Result<Value> {
-    let malformed = || Error(String::from("URIError: URI malformed"), None);
+    let malformed = || Error(String::from("URIError: URI malformed"), None, 0);
     let u = units(arg(a, 0)).into_owned();
     let mut out = Vec::new();
     let mut i = 0;

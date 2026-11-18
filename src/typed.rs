@@ -1849,7 +1849,7 @@ mod tests {
             [("new Uint8Array(new ArrayBuffer(2 ** 31), 1)", false), ("new Uint8Array(new ArrayBuffer(2 ** 31))", true)]
         {
             let mut vm = Vm::new();
-            let v = vm.run(&crate::js::compile(src).unwrap()).unwrap();
+            let v = vm.run_raw(&crate::js::compile(src).unwrap()).unwrap();
             let flagged = Obj::of(v).flags() & RUNTIME_LENGTH != 0;
             assert_eq!((flagged, vm.checked_length_views), (long, long), "{src}");
         }

@@ -91,7 +91,7 @@ fn evaluate(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // An indirect `eval`'s code (its lexical declarations its own). A
     // syntax error, any (the functions' bodies parsed too), is the
     // caller's.
-    let syntax = |e: String| Error(format!("SyntaxError: {e}"), None);
+    let syntax = |e: String| Error(format!("SyntaxError: {e}"), None, 0);
     crate::js::check_source(&src).map_err(|e| syntax(e.display_source(&src)))?;
     let module = crate::js::compile_indirect_eval_source(&src).map_err(syntax)?;
     let out = crate::realm::run_in(vm, r, |vm| {

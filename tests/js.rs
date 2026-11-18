@@ -8867,8 +8867,7 @@ total + " " + obj.x;
 }
 
 /// Run `src` below a zeroed stretch of the native stack, so that no stale
-/// word of an earlier script's frames (a cell, or an address in compiled
-/// code, which the collector reads as a frame running it) is in what the
+/// word of an earlier script's frames (a cell) is in what the
 /// collections of `src` scan. The stretch is 512 KB of a test thread's
 /// 2 MB: under a smaller `RUST_MIN_STACK` (below 1 MB or so) the tests
 /// using this overflow their stack.
@@ -8883,12 +8882,11 @@ fn below(vm: &mut Vm, src: &str) -> String {
 /// Code aging (`jit::age_functions`): a function's compiled code not used
 /// for a few full collections is dropped, and compiled again if it is
 /// called later; one called directly from compiled code all along stays.
-/// The collections run in a second script, below a zeroed stretch of the
-/// stack: a stale word of the first one's frames pointing into `idle`'s
-/// code would count as a frame running it. In release under load it still
-/// fails now and then, `idle`'s code not dropped (2026-11-18: 2 of 380
-/// whole-binary runs four at a time), likely through a stale word the
-/// zeroing doesn't reach: #346. The expected values are Node's.
+/// The collections run in a second script. (A word of the first one's
+/// frames pointing into `idle`'s code, left on the stack, once counted as
+/// a frame running it: #346. The collector reads the frames now, and the
+/// test neither zeroes the stack nor goes deep to avoid such words.) The
+/// expected values are Node's.
 #[test]
 fn compiled_code_idle_for_some_collections_is_dropped() {
     let warm = r#"
@@ -8914,7 +8912,7 @@ total;
         let mut vm = Vm::new();
         vm.run(&cloison::js::compile(warm).unwrap()).unwrap();
         assert!(vm.jit_stencils("idle").is_some());
-        let r = below(&mut vm, &rounds(n, after));
+        let r = vm.run(&cloison::js::compile(&rounds(n, after)).unwrap()).map(|v| display(v, &vm)).unwrap();
         // Retired, `idle` keeps none of its lowering; compiled, it has one.
         let (insns, tables) = vm.jit_lowering("idle").unwrap();
         let compiled = vm.jit_stencils("idle").is_some();
@@ -8935,10 +8933,12 @@ total;
 /// inside that call (`fire`, reached by a call with too many callees to
 /// be bound, so that no frame leaves its code for it), `loop` is lowered
 /// again for a second closure, made and dropped at a depth the
-/// collections' frames don't reach (2000 calls: a debug build's frames
-/// between the script and the collector reach 100, and a return address
-/// into `deep`'s code left in one counts as a frame running it, which
-/// keeps the closure: #346), and two collections run: the first
+/// collections' frames don't reach (2000 calls: a stale word to the
+/// closure itself, which the frames' slots hold, would keep it, and an
+/// unoptimized build's frames between the script and the collector reach
+/// 100; the return addresses into `deep`'s code left there don't count
+/// as frames running it any more, #346), and two collections run: the
+/// first
 /// keeps what code took since the last one, the second finds the closure
 /// dead, so `loop` is retired (and `other`, and the closure's code). The
 /// version under way stays, kept apart, with what it refers to; its call
@@ -8947,10 +8947,8 @@ total;
 /// `loop`'s call lost its latest way, the dead closure's: `loop` runs
 /// from it in the interpreter and is compiled from it again, and all of
 /// it once more. The first script warms up; the second runs below a
-/// zeroed stretch of the stack (see `below`). In release under load it
-/// still fails now and then with 1 retirement (2026-11-18: 2 of 150
-/// whole-binary runs four at a time, as many as at 100 calls deep), for
-/// a cause not found yet, likely #346's. The expected values are Node's.
+/// zeroed stretch of the stack (see `below`: for the closure's cell).
+/// The expected values are Node's.
 #[test]
 fn code_retired_under_a_running_frame_runs_to_its_exit() {
     let warm = r#"
@@ -12349,4 +12347,99 @@ for (var i = 0; i < 20000; i++) {
 out.push(bad);
 out.join();"#;
     assert_eq!(value(src), "0,0,0,0,0,0,0,20000,0");
+}
+
+/// Compiled code running is kept through a collection that retires every
+/// function's code (`Vm::set_jit_retire_at_gc`), however it was entered:
+/// the collector finds its version by the frames on compiled code's part
+/// of the native stack (`jit::running_words`, #346), and one it missed
+/// would be freed under its frame. Collections run from inside calls
+/// nested through each way in: from the interpreter (a call, a loop
+/// tiering up), a direct call, one of a varying callee (its site's
+/// table), `new`, a closure made at each call (a site bound by code), a
+/// native calling back (`map`, a getter, `valueOf`, `sort`'s comparison),
+/// a generator's body, a promise job, and a frame an exception unwinds
+/// to; then the frames go on in their versions, and leave some by an exit
+/// (`t.v` turns into a string). With the code's direct calls listed
+/// (`Vm::set_jit_shadow`), every collection checks that each version a
+/// call is in was found. Hot from the start, and warm first.
+#[test]
+fn running_versions_are_kept_however_entered() {
+    let src = r#"
+var gcs = 0, at = 0, t = { v: 1 }, log = [];
+function maybe() {
+  at++;
+  if (at % 2111 == 0 && gcs < 16) {
+    gcs++;
+    $262.gc();
+    $262.gc();
+    t.v = gcs % 4 == 0 ? "s" : 1;
+  }
+}
+function leaf(x) { maybe(); return x + t.v; }
+function mid(x) { return leaf(x) + 1; }
+function top(x) { return mid(x) + 1; }
+function direct(n) { var s = 0; for (var i = 0; i < n; i++) s += top(i) | 0; return s; }
+var fs = [];
+for (var k = 0; k < 12; k++) fs.push((0, eval)("(function (x) { return leaf(x) + " + k + "; })"));
+function varying(n) { var s = 0; for (var i = 0; i < n; i++) s += fs[i % 12](i) | 0; return s; }
+function P(x) { this.a = leaf(x); this.b = x; }
+function news(n) { var s = 0; for (var i = 0; i < n; i++) { var p = new P(i); s += (p.a | 0) + p.b; } return s; }
+function made(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) { var f = function (y) { return leaf(y) + i; }; s += f(i) | 0; }
+  return s;
+}
+var arr = [];
+for (var k = 0; k < 40; k++) arr.push(k);
+function back(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) {
+    s += arr.map(function (x) { return mid(x) | 0; })[i % 40];
+    var o = { get g() { return top(i) | 0; }, valueOf: function () { return leaf(i) | 0; } };
+    s += o.g + (o + 1);
+  }
+  arr.slice().sort(function (a, b) { return (leaf(a) | 0) - (leaf(b) | 0); });
+  return s;
+}
+function* gen(n) { for (var i = 0; i < n; i++) yield top(i) | 0; }
+function gens(n) { var s = 0; for (var v of gen(n)) s += v; return s; }
+function thrower(x) { maybe(); if (x % 7 == 3) throw new Error("e" + x); return top(x) | 0; }
+function catches(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) { try { s += thrower(i); } catch (e) { s += e.message.length; } }
+  return s;
+}
+var jobs = 0;
+function later(n) { for (var i = 0; i < n; i++) Promise.resolve(i).then(function (x) { jobs += top(x) | 0; }); }
+for (var r = 0; r < 6; r++) {
+  log.push(direct(700), varying(700), news(700), made(700), back(60), gens(400), catches(400));
+  later(200);
+}
+// (A loop tiering up in the script's own frame.)
+var s = 0;
+for (var i = 0; i < 3000; i++) s += top(i) | 0;
+log.push(s);
+var out;
+Promise.resolve().then(function () { log.push(jobs, gcs); out = log.join(" "); });
+"#;
+    let run = |warm: bool, check: bool| {
+        let mut vm = Vm::new();
+        vm.set_warm_tier(warm);
+        if check {
+            vm.set_jit_shadow();
+            vm.set_jit_retire_at_gc(true);
+        }
+        vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+        let out = vm.run(&cloison::js::compile("out").unwrap()).map(|v| display(v, &vm)).unwrap();
+        let retired = ["leaf", "direct", "news"].map(|f| vm.jit_stats(f).map_or(0, |s| s.retirements));
+        (out, retired)
+    };
+    let (plain, _) = run(false, false);
+    assert!(plain.ends_with(" 16"), "{plain}");
+    for warm in [false, true] {
+        let (out, retired) = run(warm, true);
+        assert_eq!(out, plain, "warm: {warm}");
+        assert!(retired.iter().all(|&n| n >= 3), "warm: {warm}: retired {retired:?}");
+    }
 }

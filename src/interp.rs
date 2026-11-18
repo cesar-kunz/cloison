@@ -4071,9 +4071,16 @@ pub(crate) struct Running {
 
 impl Running {
     pub(crate) fn new(vm: &mut Vm) -> Running {
+        let p: *mut Vm = vm;
+        // (A run of it going on, which entered it elsewhere: a native
+        // moved it through its `&mut Vm`, #357. Its frames run the code
+        // `rehome` would drop.)
+        if !vm.entered_at.is_null() && vm.entered_at != p.cast_const() {
+            crate::vm::moved_running("a run entering it")
+        }
         // (Compiled code made where the VM was before it moved: dropped.)
         vm.rehome();
-        let p: *mut Vm = vm;
+        vm.entered_at = p;
         let owner = vm.heap.set_owner(p);
         Running { vm: p, current: CURRENT_VM.with(|v| v.replace(p)), owner }
     }
@@ -4082,7 +4089,12 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         CURRENT_VM.with(|v| v.set(self.current));
-        unsafe { (*self.vm).heap.set_owner(self.owner) };
+        // (The heap's owner before is also where the run before entered
+        // the VM, `Vm::entered_at`: set together.)
+        unsafe {
+            (*self.vm).heap.set_owner(self.owner);
+            (*self.vm).entered_at = self.owner;
+        }
     }
 }
 

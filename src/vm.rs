@@ -991,6 +991,9 @@ pub struct Vm {
     pub(crate) home: *const Vm,
     /// The runs that dropped compiled code so (see [`Vm::jit_rehomes`]).
     pub(crate) rehomes: u32,
+    /// Where the VM was as the run going on entered it (`interp::Running`),
+    /// null between runs: see [`Vm::entered`].
+    pub(crate) entered_at: *const Vm,
     /// By field cell (its address), the functions whose compiled code took
     /// its type (see `object::FieldCell::relied`).
     pub(crate) field_deps: HashMap<usize, Vec<usize>>,
@@ -1518,6 +1521,7 @@ impl Vm {
             jitted: Vec::new(),
             home: std::ptr::null(),
             rehomes: 0,
+            entered_at: std::ptr::null(),
             field_deps: HashMap::default(),
             relied_cells: HashMap::default(),
             through_deps: HashMap::default(),
@@ -1965,12 +1969,30 @@ impl Vm {
 
     /// Run a native (`f`): the atoms it takes are kept until it returns
     /// (see `held_atoms`).
+    ///
+    /// The native has the VM as a `&mut Vm`, which safe code can swap with
+    /// another VM's or replace (`std::mem::swap`, `replace`): on its
+    /// return, or its unwinding, the VM here must still be the one the run
+    /// entered (see [`Vm::entered`], #357).
     #[inline(always)]
     pub(crate) fn run_native<R>(&mut self, f: impl FnOnce(&mut Vm) -> R) -> R {
+        /// The check, on unwinding too: what unwinding puts back
+        /// (`RunState`, `interp::Running`), it writes to the VM here.
+        struct Entered<'a>(&'a mut Vm);
+        impl Drop for Entered<'_> {
+            #[inline(always)]
+            fn drop(&mut self) {
+                if !self.0.entered() {
+                    moved_running("a native")
+                }
+            }
+        }
         let saved = (self.held_atoms.len(), self.holding, self.held_serial);
         self.held_next += 1;
         (self.holding, self.held_serial) = (true, self.held_next);
-        let r = f(self);
+        let entered = Entered(self);
+        let r = f(&mut *entered.0);
+        drop(entered);
         self.held_atoms.truncate(saved.0);
         (self.holding, self.held_serial) = (saved.1, saved.2);
         r
@@ -3514,10 +3536,32 @@ impl Vm {
         }
     }
 
-    /// Whether this VM is the one running (see `interp::Running`).
+    /// Whether this VM is the one running (see `interp::Running`): the
+    /// one a run entered, here. (It is then `interp::current_vm` too: a
+    /// VM entered that isn't the current one, a run nested in its native
+    /// going on, is borrowed by that native, which waits.) Not one a
+    /// native put in the running one's place (see [`Vm::entered`]), which
+    /// `interp::current_vm` names too: its operations enter it, as
+    /// between runs.
     #[inline(always)]
     fn running(&self) -> bool {
-        std::ptr::eq(crate::interp::current_vm(), self)
+        debug_assert!(!self.entered() || std::ptr::eq(crate::interp::current_vm(), self));
+        self.entered()
+    }
+
+    /// Whether a run entered this VM where it is now (`entered_at`, set
+    /// as a run enters it, is its address). Not so of a VM moved since
+    /// (it was entered at its old place), nor of the one a
+    /// `std::mem::swap` or `replace` left in its place (which no run
+    /// entered there: one running is borrowed, out of safe code's reach).
+    /// A native can do either through its `&mut Vm` (#357): the run's
+    /// frames, its compiled code and `interp::current_vm` then name the
+    /// wrong VM, and the process aborts ([`moved_running`]) before they
+    /// are used, as the native returns ([`Vm::run_native`]) or the VM
+    /// moved is entered again (`interp::Running`).
+    #[inline(always)]
+    pub(crate) fn entered(&self) -> bool {
+        std::ptr::eq(self.entered_at, self)
     }
 
     /// Panics if `v` is a cell of another VM's heap: stored here, this
@@ -7522,7 +7566,10 @@ impl Vm {
     /// was is dropped as the next run starts (see `Vm::rehome`), and its
     /// functions compile again. A VM moved before every run compiles
     /// everything again each time: keep it in one place (a `Box`) if it
-    /// runs often; [`Vm::jit_rehomes`] counts those drops.
+    /// runs often; [`Vm::jit_rehomes`] counts those drops. It may not
+    /// move during a run: a native that swaps or replaces the VM it is
+    /// given (`std::mem::swap`, `replace`, `take`) aborts the process as
+    /// it returns (#357).
     pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
         self.run_owned(module.clone())
     }
@@ -9461,6 +9508,18 @@ impl Drop for RunState {
     }
 }
 
+/// A VM moved, swapped or replaced during its run, found by `what` (see
+/// [`Vm::entered`]). An abort, not a panic: unwinding would put the run's
+/// state back in the VM now in its place, and compiled code, which keeps
+/// a panic till it has left, would run on with the addresses of the VM's
+/// fields where it was.
+#[cold]
+#[inline(never)]
+pub(crate) fn moved_running(what: &str) -> ! {
+    eprintln!("cloison: a Vm was moved or replaced during its run (found by {what}): aborting");
+    std::process::abort();
+}
+
 impl Drop for Vm {
     fn drop(&mut self) {
         self.unbind_versions();
@@ -9938,5 +9997,171 @@ before + "," + known(ta, P);
         vm.define_native(g, "known", known, 2, crate::jit::Ty::Any, false);
         vm.define_native(g, "forget", forget, 0, crate::jit::Ty::Any, false);
         assert_eq!(vm.run(&module).map(|v| display(v, &vm)).as_deref(), Ok("1,0"));
+    }
+
+    thread_local! {
+        /// The VM the natives below swap the running one with.
+        static OTHER: std::cell::RefCell<Option<Vm>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The running VM swapped with the other, as safe code may through a
+    /// native's `&mut Vm`.
+    fn swap_with_other(vm: &mut Vm) {
+        OTHER.with(|o| std::mem::swap(vm, o.borrow_mut().as_mut().unwrap()));
+    }
+
+    /// `swap()`: the running VM swapped with another.
+    fn swap_vm(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        swap_with_other(vm);
+        Ok(Value::UNDEFINED)
+    }
+
+    /// `replace()`: a new VM put in the running one's place
+    /// (`std::mem::replace`'s short form), which is dropped.
+    fn replace_vm(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        drop(std::mem::take(vm));
+        Ok(Value::UNDEFINED)
+    }
+
+    /// `swapPanic()`: the swap, then a panic.
+    fn swap_vm_and_panic(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        swap_with_other(vm);
+        panic!("after the swap")
+    }
+
+    /// `swapGet()`: the swap, then an operation on the VM now in the
+    /// running one's place, a getter's call: the operation of a VM
+    /// between runs, which it is. (An exit if it fails: not the abort
+    /// the test expects.)
+    fn swap_vm_and_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        swap_with_other(vm);
+        let (g, k) = (vm.global_object(), vm.intern("got"));
+        let r = vm.get(g, k);
+        if r.as_ref().ok().map(|&v| display_raw(v)).as_deref() != Some("100000") {
+            eprintln!("the getter: {r:?}");
+            std::process::exit(1);
+        }
+        r
+    }
+
+    /// `swapUse()`: the swap, then an operation on the VM that was
+    /// running, where it is now.
+    fn swap_vm_and_use(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        swap_with_other(vm);
+        OTHER.with(|o| {
+            let mut o = o.borrow_mut();
+            let o = o.as_mut().unwrap();
+            let (g, k) = (o.global_object(), o.intern("got"));
+            o.get(g, k)
+        })
+    }
+
+    /// `swapBack()`: the swap, and the swap back: the running VM is where
+    /// it was as the native returns.
+    fn swap_vm_and_back(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        swap_with_other(vm);
+        swap_with_other(vm);
+        Ok(Value::number(1.0))
+    }
+
+    /// A run of hot code calling native `name` (one of the above) midway,
+    /// from compiled code if `jit`: its result.
+    fn run_swapping(name: &str, jit: bool) -> Result<String> {
+        const GETTER: &str = r#"
+            Object.defineProperty(globalThis, 'got', {get() {
+                var a = []; for (var i = 0; i < 1e5; i++) a.push({i});
+                return a.length;
+            }});"#;
+        let mut other = Vm::new();
+        other.run(&crate::js::compile(GETTER).unwrap()).unwrap();
+        OTHER.with(|o| *o.borrow_mut() = Some(other));
+        let mut vm = Box::new(Vm::new());
+        if !jit {
+            vm.set_tier_back_edges(i64::MAX);
+        }
+        let g = vm.global_obj();
+        let natives: [(&str, NativeFn); 6] = [
+            ("swap", swap_vm),
+            ("replace", replace_vm),
+            ("swapPanic", swap_vm_and_panic),
+            ("swapGet", swap_vm_and_get),
+            ("swapUse", swap_vm_and_use),
+            ("swapBack", swap_vm_and_back),
+        ];
+        for (n, f) in natives {
+            vm.define_native(g, n, f, 0, crate::jit::Ty::Any, false);
+        }
+        let src = format!(
+            r#"{GETTER}
+            function mk(i) {{ return {{a: i, b: i + 1}}; }}
+            function cnt(n) {{ var s = 0; for (var i = 0; i < n; i++) s += mk(i).b; return s; }}
+            function f(k) {{ var r = cnt(1000); if (k == 150) r += {name}() | 0; return r + cnt(1000); }}
+            var r = 0; for (var k = 0; k < 300; k++) r += f(k);
+            r"#
+        );
+        let r = vm.run(&crate::js::compile(&src).unwrap()).map(|v| display(v, &vm));
+        OTHER.with(|o| *o.borrow_mut() = None);
+        r
+    }
+
+    /// `run_swapping(name, jit)` in a child process, which must abort
+    /// with `found` as what found the VM moved (test `test`).
+    fn swapping_aborts(test: &str, name: &str, jit: bool, found: &str) {
+        let message = format!("moved or replaced during its run (found by {found})");
+        crate::heap::tests::aborts(&format!("vm::tests::{test}"), &message, || {
+            let _ = run_swapping(name, jit);
+        });
+    }
+
+    /// A native that swaps the running VM with another through its `&mut
+    /// Vm` aborts the process as it returns (#357: the run went on with
+    /// the other VM in the place its frames, its compiled code and
+    /// `interp::current_vm` name, to an out-of-bounds panic or a
+    /// segmentation fault).
+    #[test]
+    fn a_native_swapping_the_running_vm_aborts() {
+        swapping_aborts("a_native_swapping_the_running_vm_aborts", "swap", false, "a native");
+    }
+
+    /// The same, the native called from compiled code.
+    #[test]
+    fn a_native_swapping_the_running_vm_aborts_compiled_code() {
+        swapping_aborts("a_native_swapping_the_running_vm_aborts_compiled_code", "swap", true, "a native");
+    }
+
+    /// The same of a native that replaces the running VM and drops it.
+    #[test]
+    fn a_native_replacing_the_running_vm_aborts() {
+        swapping_aborts("a_native_replacing_the_running_vm_aborts", "replace", true, "a native");
+    }
+
+    /// The same of one that panics after the swap: unwinding would put the
+    /// run's state back in the other VM.
+    #[test]
+    fn a_native_swapping_the_running_vm_aborts_unwinding() {
+        swapping_aborts("a_native_swapping_the_running_vm_aborts_unwinding", "swapPanic", false, "a native");
+    }
+
+    /// Until the native returns, the VM it put in the running one's place
+    /// isn't taken for it: its operations enter it, as between runs.
+    #[test]
+    fn a_vm_swapped_in_is_not_the_running_one() {
+        swapping_aborts("a_vm_swapped_in_is_not_the_running_one", "swapGet", true, "a native");
+    }
+
+    /// And the running one, where the native moved it, isn't entered
+    /// again: that would drop the code its frames run (`Vm::rehome`).
+    #[test]
+    fn a_running_vm_moved_is_not_entered_again() {
+        swapping_aborts("a_running_vm_moved_is_not_entered_again", "swapUse", true, "a run entering it");
+    }
+
+    /// A native that swaps the running VM back before it returns did
+    /// nothing: the run goes on.
+    #[test]
+    fn a_native_swapping_the_running_vm_back_runs_on() {
+        for jit in [false, true] {
+            assert_eq!(run_swapping("swapBack", jit).as_deref(), Ok("300300001"));
+        }
     }
 }

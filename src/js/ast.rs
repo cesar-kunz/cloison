@@ -28,8 +28,9 @@ pub struct Program<'a> {
     /// object, a property of their own (`x%param`), the name the body's.
     pub shadowed_params: std::collections::HashSet<(usize, Name)>,
     /// The parser's own variables (`Function::hidden`) made in a loop of
-    /// their function: where the outermost such loop's statement starts.
-    pub loop_hidden: std::collections::HashMap<Name, Pos>,
+    /// their function: where the outermost such loop's statement starts,
+    /// and the innermost's.
+    pub loop_hidden: std::collections::HashMap<Name, (Pos, Pos)>,
     /// Direct `eval`'s code: names are looked up in the caller's scope
     /// object first (the variable `%e0`, a `with`'s: see
     /// `intrinsics::direct_eval`).

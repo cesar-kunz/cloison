@@ -1284,7 +1284,7 @@ fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<Vec<&'a str>>
                 let mut ns = Vec::new();
                 declared_in(s, p, false, &mut ns);
                 ns.retain(|n| p.lexicals.contains_key(*n));
-                let hidden = p.functions[f].hidden.iter().filter(|n| p.loop_hidden.get(*n) == Some(&s.pos));
+                let hidden = p.functions[f].hidden.iter().filter(|n| p.loop_hidden.get(*n).map(|l| l.0) == Some(s.pos));
                 for n in hidden.map(|n| &**n) {
                     if !ns.contains(&n) {
                         ns.push(n);

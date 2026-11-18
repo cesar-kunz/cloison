@@ -2841,6 +2841,26 @@ fn loop_bindings_stay_fresh_past_the_registers() {
     assert_eq!(value(&src), "a1,b2,1,2,0,1,p,q,0,11,2,3,0,1,0,1,0,1,0,1,2,5 299");
 }
 
+/// A class in the test of a `while` or `do … while` loop of such a
+/// function: its inner name is each evaluation's own binding too. (The
+/// test was not taken as part of the loop: one binding in the scope
+/// object, so every class's methods saw the last class.) The expected
+/// value is V8's, SpiderMonkey's and JSC's.
+#[test]
+fn a_loop_test_s_class_bindings_stay_fresh_past_the_registers() {
+    let vars: String = (0..200).map(|i| format!("var x{i} = {i};\n")).collect();
+    let src = format!(
+        r#"(() => {{
+{vars}
+  var fs = [], n = 0;
+  while (fs.push(class C {{ static m() {{ return C.k; }} static k = n++; }}) < 3);
+  do {{ }} while (fs.push(class D {{ static m() {{ return D.k; }} static k = n++; }}) < 6);
+  return fs.map(f => f.m()).join() + " " + x199;
+}})();"#
+    );
+    assert_eq!(value(&src), "0,1,2,3,4,5 199");
+}
+
 /// More such variables than registers: those of one loop are in the
 /// registers of another's (no two loops' are live at once), so any number
 /// of loops fits; the parser's own variables too (a class's home objects

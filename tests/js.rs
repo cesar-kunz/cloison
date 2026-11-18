@@ -10254,8 +10254,10 @@ fn a_vm_moved_between_runs_runs_again() {
     let junk = || -> Vec<Box<[u8]>> { (0..64).map(|_| vec![0x41u8; std::mem::size_of::<Vm>()].into()).collect() };
     for evacuate in [false, true] {
         let mut vm = *warmed(evacuate);
+        assert_eq!(vm.jit_rehomes(), 0);
         let j = junk();
         assert_eq!(vm.run(&again).map(display).as_deref(), Ok("25027500"));
+        assert_eq!(vm.jit_rehomes(), 1);
         vm.verify_heap();
         drop(j);
         let (mut a, mut b) = (warmed(evacuate), warmed(evacuate));

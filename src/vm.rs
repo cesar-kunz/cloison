@@ -974,6 +974,8 @@ pub struct Vm {
     /// elsewhere (the VM moved between runs, as safe code may: returned,
     /// boxed, swapped) drops them first (see `Vm::rehome`, #330).
     pub(crate) home: *const Vm,
+    /// The runs that dropped compiled code so (see [`Vm::jit_rehomes`]).
+    pub(crate) rehomes: u32,
     /// By field cell (its address), the functions whose compiled code took
     /// its type (see `object::FieldCell::relied`).
     pub(crate) field_deps: HashMap<usize, Vec<usize>>,
@@ -1493,6 +1495,7 @@ impl Vm {
             relied_slots: Default::default(),
             jitted: Vec::new(),
             home: std::ptr::null(),
+            rehomes: 0,
             field_deps: HashMap::default(),
             relied_cells: HashMap::default(),
             through_deps: HashMap::default(),
@@ -7397,7 +7400,10 @@ impl Vm {
     /// process (see `jit::unwinding`).
     ///
     /// The VM may move between runs: the code the JIT made for it where it
-    /// was is dropped as the next run starts (see `Vm::rehome`).
+    /// was is dropped as the next run starts (see `Vm::rehome`), and its
+    /// functions compile again. A VM moved before every run compiles
+    /// everything again each time: keep it in one place (a `Box`) if it
+    /// runs often; [`Vm::jit_rehomes`] counts those drops.
     pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
         self.run_owned(module.clone())
     }
@@ -7854,10 +7860,15 @@ impl Vm {
         }
         if !self.home.is_null() {
             self.unbind_versions();
+            // (Between runs nothing borrows a function's JIT state: one
+            // skipped would keep the code this drops.)
             for c in self.codes.iter().chain(self.condemned.iter()) {
-                if let Ok(mut j) = c.jit.try_borrow_mut() {
-                    drop(j.take());
-                }
+                drop(c.jit.borrow_mut().take());
+            }
+            // (Counted where there was code: a VM moved before it compiled
+            // anything, out of `Vm::new` say, loses nothing.)
+            if !self.jitted.is_empty() {
+                self.rehomes += 1;
             }
             self.jitted.clear();
         }
@@ -7945,6 +7956,12 @@ impl Vm {
     pub fn jit_stats(&self, function: &str) -> Option<crate::jit::JitStats> {
         let code = self.codes.iter().find(|c| c.name == function)?;
         Some(code.jit.borrow().as_ref()?.stats)
+    }
+
+    /// The runs that started with the VM elsewhere than where its code was
+    /// compiled, which dropped all of it (see [`Vm::run`]).
+    pub fn jit_rehomes(&self) -> u32 {
+        self.rehomes
     }
 
     /// The direct calls' exits so far that left a compiled version retired

@@ -10277,3 +10277,26 @@ fn a_vm_moved_between_runs_runs_again() {
         drop(j);
     }
 }
+
+#[test]
+fn a_constructors_first_new_allocates_one_receiver() {
+    // The heap's cells after the first `new` of 200 constructors, against
+    // after the same with each called first (its caches made then): equal
+    // if a first `new`, which makes the caches, makes one receiver.
+    let cells = |call_first: bool| {
+        let src: String = (0..200)
+            .map(|i| {
+                format!(
+                    "function F{i}() {{}} {} new F{i}();\n",
+                    if call_first { format!("F{i}();") } else { String::new() }
+                )
+            })
+            .collect();
+        let module = cloison::js::compile(&src).unwrap();
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(i64::MAX);
+        vm.run(&module).unwrap();
+        vm.verify_heap()
+    };
+    assert_eq!(cells(false), cells(true));
+}

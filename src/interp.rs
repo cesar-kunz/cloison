@@ -120,6 +120,8 @@ fn unboxed(i: i32) -> Value {
 macro_rules! callee_noted {
     ($regs:expr, $ic:expr, $f:expr) => {{
         let (ic, f): (*mut Ic, Obj) = ($ic, $f);
+        // (Its ways, unrolled.)
+        const _: () = assert!(IC_WAYS == 4);
         let old = (*ic).holder;
         let p = f.ptr();
         old == p || (*ic.add(1)).holder == p || (*ic.add(2)).holder == p || (*ic.add(3)).holder == p || {
@@ -336,14 +338,20 @@ macro_rules! handlers {
             // nothing: a first call (its caches to make) runs the
             // instruction again after `first_entry`; a full stack, a
             // primitive `this` to box or a countdown run out go on in
-            // `call_overflow` or `enter_slow`.
+            // `call_overflow` or `enter_slow`. What runs before it runs
+            // again on a first call, so it must not allocate; with
+            // `$first`, a first call goes on in that handler instead, `this`
+            // in `acc` (see `first_construct`).
             macro_rules! enter_fast {
-                ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
+                ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {
+                    enter_fast!($fo, $this, $args, $argc, $flags, $size, first_entry)
+                };
+                ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr, $first:ident) => {{
+                    let this: Value = $this;
                     let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code;
                     let Some(ics) = callee.live().ics_if_made() else {
-                        tail!(first_entry, Value::UNDEFINED)
+                        tail!($first, this)
                     };
-                    let this: Value = $this;
                     let new = push_frame($regs, $fo, callee, ics, this, $args, $argc, $flags, $pc.add($size));
                     if new.is_null() {
                         tail!(call_overflow, Value::EMPTY)
@@ -2047,7 +2055,7 @@ handlers! {
                 construct_this(regs, fo)
             };
             let args = reg(pc, 2, regs);
-            enter_fast!(fo, this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
+            enter_fast!(fo, this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size(), first_construct)
         }
         tail!(slow_construct, acc)
     }
@@ -2329,6 +2337,17 @@ handlers! {
     fn first_entry(pc, acc, regs, tag) {
         (*Obj::of(*reg(pc, 1, regs)).code()).ics();
         next!(any, 0, Value::UNDEFINED)
+    }
+
+    /// [`first_entry`] of a `Construct`, its receiver `acc`, made already:
+    /// the callee's caches made, entered with it (not run again, which
+    /// would make a second).
+    #[cold]
+    #[inline(never)]
+    fn first_construct(pc, acc, regs, tag) {
+        let f = Obj::of(*reg(pc, 1, regs));
+        (*f.code()).ics();
+        enter_fast!(f, acc, reg(pc, 2, regs), *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
     }
 
     /// Another callee than way 0's: recorded, the call run again.

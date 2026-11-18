@@ -1032,7 +1032,9 @@ impl Heap {
     }
 
     /// [`Heap::alloc_object`] of a plain object (no words past the header):
-    /// inlined where objects are made most, literals and `new`.
+    /// inlined where objects are made most, literals and `new`. `shape`
+    /// must be a `Class::Plain` one whose capacity fits the header, as
+    /// `object_header` checks (here only in debug builds).
     #[inline(always)]
     pub fn alloc_plain(&mut self, shape: &Shape) -> *mut Object {
         debug_assert_eq!(crate::layout::extra_words(shape.class), 0);

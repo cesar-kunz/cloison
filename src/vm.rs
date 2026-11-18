@@ -1402,7 +1402,9 @@ pub struct Vm {
     /// The entries of `ctor_protos` found last, by their prototype's
     /// address: each `new` of a shared constructor (Prototype's
     /// `Class.create`) looks its own up twice, which the map made 100
-    /// instructions. Cleared when entries go.
+    /// instructions. Its pointers are valid while their entries are in
+    /// the map: entries leave only in `sweep_ctor_protos`, which clears
+    /// this first, and any other removal must too.
     ctor_cache: Box<[(u64, *const CtorProto); CTOR_CACHE]>,
     pub(crate) a_prototype: Atom,
     pub(crate) a_constructor: Atom,
@@ -3041,6 +3043,7 @@ impl Vm {
     /// [`Vm::store_field`] given `value`'s type, `FieldType::of(value)`.
     #[inline(always)]
     fn store_field_typed(&mut self, o: Obj, slot: u32, value: Value, t: FieldType) {
+        debug_assert_eq!(t, FieldType::of(value));
         unsafe {
             let shape = o.shape().live();
             let cell = &*shape.fields()[slot as usize];

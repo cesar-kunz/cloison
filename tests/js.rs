@@ -7677,6 +7677,47 @@ out.join(" ");
     );
 }
 
+/// A RegExp String Iterator whose `exec` (or `lastIndex`) threw goes on
+/// at the next `next()`, and a `next()` from inside its `exec` runs (no
+/// "already running" TypeError): since ES2026 it is a manual iterator
+/// with a [[Done]] slot, set only by a null or a non-global match
+/// (22.2.9.2.1, tc39/ecma262#3559), no more ES2025's generator. What
+/// SpiderMonkey, JavaScriptCore and QuickJS give. For-of's steps, which
+/// skip the result object, find the same matches and legacy statics.
+#[test]
+fn match_all_goes_on_after_a_throw() {
+    let src = r#"
+var out = [];
+var calls = 0, boom = true;
+class R extends RegExp { exec(s) { calls++; if (boom) { boom = false; throw new Error("x"); } return calls < 4 ? ["a"] : null; } }
+var it = new R("a", "g")[Symbol.matchAll]("a");
+try { it.next(); } catch (e) { out.push(e.message); }
+out.push(JSON.stringify(it.next()), calls);
+var depth = 0, it2;
+class Q extends RegExp { exec(s) { depth++; if (depth < 3) out.push(JSON.stringify(it2.next())); return null; } }
+it2 = new Q("a", "g")[Symbol.matchAll]("a");
+out.push(JSON.stringify(it2.next()), depth);
+var copy, n = 0;
+class C extends RegExp { exec(s) { copy = this; return RegExp.prototype.exec.call(this, s); } }
+var it5 = new C("\\d", "g")[Symbol.matchAll]("a1b2c3");
+out.push(it5.next().value[0]);
+copy.lastIndex = { valueOf() { if (n++ === 0) throw new Error("li"); return 3; } };
+try { it5.next(); } catch (e) { out.push(e.message); }
+out.push(it5.next().value[0], it5.next().value[0], it5.next().done);
+for (var x of "x1y2".matchAll(/\d/g)) out.push(x[0] + RegExp.lastMatch);
+var r = /b/g;
+r.lastIndex = 2;
+out.push([..."abab".matchAll(r)].map(m => m.index).join("+"), r.lastIndex);
+RegExp.prototype.exec = function () { return null; };
+out.push([..."aXbX".matchAll(/X/g)].length);
+out.join(" ");
+"#;
+    assert_eq!(
+        value(src),
+        r#"x {"value":["a"],"done":false} 2 {"done":true} {"done":true} {"done":true} 3 1 li 2 3 true 11 22 3 2 0"#
+    );
+}
+
 /// A prototype cycle through a proxy without traps (which
 /// OrdinarySetPrototypeOf allows, 10.1.2.1 step 7.b.i) makes a lookup
 /// on it a RangeError, not a loop (issue #336): the forwards in the

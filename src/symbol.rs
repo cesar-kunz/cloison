@@ -747,6 +747,13 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     if is_native(vm, next, array_iterator_next) && it.is_cell() && Obj::of(it).class() == Class::ArrayIterator {
         return array_step(vm, it);
     }
+    // (`matchAll`'s, the same way.)
+    if it.is_cell()
+        && Obj::of(it).class() == Class::RegExpStringIterator
+        && is_native(vm, next, crate::builtins::regexp_string_iterator_next)
+    {
+        return crate::builtins::regexp_string_iterator_step(vm, it);
+    }
     let r = call_function(vm, next, it, &[])?;
     if !is_object(r) {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));

@@ -3233,7 +3233,20 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `matchAll`'s).
 fn match_all(vm: &mut Vm, this: Value, s: &[u16], rv: Value) -> Result<Value> {
     let input = this_string(vm, this, s);
-    rx_match_all(vm, rv, input)
+    // (Its species the RegExp constructor and its getters the builtin
+    // ones: the copy, Construct(%RegExp%, « rv, flags »), made directly,
+    // of its pattern and flags, and of the usual shape, which keeps the
+    // pristine check of each `next()` quick.)
+    let re = regexp_of(rv).unwrap();
+    let (global, unicode) = (re.global, re.unicode || re.unicode_sets);
+    let re: *const crate::regexp::Regex = re;
+    let a_source = vm.a_regexp_source;
+    let source = vm.get(rv, a_source)?;
+    crate::gc::mark_regexp(re);
+    let matcher = regexp_object(vm, re, source);
+    let li = get_length(vm, rv, "lastIndex")?;
+    set_last_index(vm, matcher, li)?;
+    regexp_string_iterator(vm, matcher, input, global, unicode)
 }
 
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
@@ -4454,10 +4467,10 @@ fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
 
 // A RegExp String Iterator's state's cells: the matcher (`undefined` once
 // done: its [[Done]]), the string, [[Global]] and [[Unicode]].
-const RSI_MATCHER: i32 = 0;
-const RSI_STRING: i32 = 1;
-const RSI_GLOBAL: i32 = 2;
-const RSI_UNICODE: i32 = 3;
+const RSI_MATCHER: usize = 0;
+const RSI_STRING: usize = 1;
+const RSI_GLOBAL: usize = 2;
+const RSI_UNICODE: usize = 3;
 
 /// CreateRegExpStringIterator(R, S, global, fullUnicode) (22.2.9.1).
 fn regexp_string_iterator(vm: &mut Vm, matcher: Value, s: Value, global: bool, unicode: bool) -> Result<Value> {
@@ -4473,31 +4486,71 @@ pub(crate) fn regexp_string_iterator_next(vm: &mut Vm, this: Value, _: &[Value])
     if !is_class(this, Class::RegExpStringIterator) {
         return Err(Error::type_error("%RegExpStringIteratorPrototype%.next called on an incompatible receiver"));
     }
-    let state = Value::from_bits(Obj::of(this).code() as u64);
-    let cell = |i: i32| Value::from_i32(i);
-    let matcher = vm.get_keyed(state, cell(RSI_MATCHER))?;
+    match regexp_string_iterator_step(vm, this)? {
+        Some(m) => crate::symbol::iter_result(vm, m, false),
+        None => crate::symbol::iter_result(vm, Value::UNDEFINED, true),
+    }
+}
+
+/// [`regexp_string_iterator_next`] of RegExp String Iterator `this`,
+/// without its result object (for-of's, whose result is unobservable):
+/// the match, `None` when done.
+pub(crate) fn regexp_string_iterator_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
+    // (Its state: a hidden array of its own, dense, read and written in
+    // place.)
+    let state = Obj::of(Value::from_bits(Obj::of(this).code() as u64));
+    let matcher = state.elem(RSI_MATCHER);
     if matcher.is_undefined() {
-        return crate::symbol::iter_result(vm, Value::UNDEFINED, true);
+        return Ok(None);
     }
-    let s = vm.get_keyed(state, cell(RSI_STRING))?;
-    let global = vm.get_keyed(state, cell(RSI_GLOBAL))? == Value::TRUE;
-    let unicode = vm.get_keyed(state, cell(RSI_UNICODE))? == Value::TRUE;
-    let res = rx_exec(vm, matcher, s)?;
-    if res.is_null() {
-        vm.set_keyed(state, cell(RSI_MATCHER), Value::UNDEFINED)?;
-        return crate::symbol::iter_result(vm, Value::UNDEFINED, true);
+    let s = state.elem(RSI_STRING);
+    let global = state.elem(RSI_GLOBAL) == Value::TRUE;
+    let unicode = state.elem(RSI_UNICODE) == Value::TRUE;
+    // (A throw below leaves it as it was: the next `next()` execs again,
+    // as the spec's has it since ES2026, the iterator not a generator any
+    // more, tc39/ecma262#3559; a `next()` from the `exec` runs too.)
+    let (res, empty) = match rsi_exec_pristine(vm, matcher, s)? {
+        Some(r) => r,
+        None => {
+            let res = rx_exec(vm, matcher, s)?;
+            let empty = !res.is_null() && global && get_units(vm, res, "0")?.is_empty();
+            (res, empty)
+        }
+    };
+    if res.is_null() || !global {
+        vm.store_element(state, RSI_MATCHER, Value::UNDEFINED);
+        return Ok((!res.is_null()).then_some(res));
     }
-    if !global {
-        vm.set_keyed(state, cell(RSI_MATCHER), Value::UNDEFINED)?;
-        return crate::symbol::iter_result(vm, res, false);
-    }
-    if get_units(vm, res, "0")?.is_empty() {
+    if empty {
         let i = get_length(vm, matcher, "lastIndex")?;
         let su = string_units(s).unwrap_or(&[]);
         let next = advance(su, i, unicode);
         set_last_index(vm, matcher, next)?;
     }
-    crate::symbol::iter_result(vm, res, false)
+    Ok(Some(res))
+}
+
+/// RegExpExec(`matcher`, `s`) for a RegExp String Iterator's next(), if
+/// `matcher` is a pristine RegExp (its `exec` the builtin, its flags'
+/// getters too): the builtin exec's result and whether its match is
+/// empty, with no Get of `exec` or of the match's "0" (unobservable for
+/// it). `None` for any other matcher.
+#[inline(always)]
+fn rsi_exec_pristine(vm: &mut Vm, matcher: Value, s: Value) -> Result<Option<(Value, bool)>> {
+    if !pristine(vm, matcher)? {
+        return Ok(None);
+    }
+    let re = this_regexp(matcher)?;
+    let su = units(s);
+    with_caps(vm, |vm, caps| {
+        let Some(re) = regexp_match_into(vm, matcher, re, &su, caps)? else {
+            return Ok(Some((Value::NULL, false)));
+        };
+        note_legacy(vm, matcher, s, caps);
+        let (x, y) = caps[0].unwrap();
+        let m = match_array(vm, re, caps, &su, s)?;
+        Ok(Some((m, x == y)))
+    })
 }
 
 /// `get RegExp.prototype.flags`: each flag's getter asked.

@@ -9472,9 +9472,15 @@ out.join();"#;
 
     /// With the JIT on: the heap limit reached in a runtime call compiled
     /// code made (a push growing the elements, an object out of a full
-    /// chunk, a call through the runtime) unwinds out of the run as in the
-    /// interpreter, not aborting the process: the panic is kept till the
-    /// code left (#324). The VM runs again after.
+    /// chunk, a call through the runtime, a constructor's, a run nested in
+    /// a native's) unwinds out of the run as in the interpreter, not
+    /// aborting the process: the panic is kept till the code left (#324).
+    /// The way out runs nothing more: an exit with objects scalar
+    /// replacement didn't allocate doesn't allocate them, on a heap the
+    /// panic may have left mid-way through a collection (the review of
+    /// #324). Collections not moving cells, the default ones, all of them
+    /// moving what they can, and the warm tier's code: a panic out of a
+    /// collection moving cells poisons the VM, else it runs again after.
     #[test]
     fn a_panic_under_compiled_code_unwinds_out_of_the_run() {
         let srcs = [
@@ -9484,21 +9490,57 @@ out.join();"#;
             "function f(o) { var a = []; for (var i = 0; i < 1000; i++) a.push(o); return a; } \
              var all = []; for (;;) all.push(f.call(null, {}));",
             "var a = []; for (var i = 0; ; i++) { var o = {}; o['k' + (i & 7)] = i; o.q = o; a.push(o); }",
+            // `o` and its `inner` scalar replaced, live at the exit of the
+            // concatenation's runtime call.
+            "function Inner() { this.x = 7; } function Outer(v) { this.v = v; this.inner = new Inner(); } \
+             function f(n, w) { var s = 0; for (var i = 0; i < n; i++) { var o = new Outer(i); w = w + i; \
+             s += o.inner.x + o.v; } return s > 0 ? w : ''; } \
+             var w = ''; for (;;) w = f(1000, w);",
+            // In a constructor, inlined; one with a loop, called directly.
+            "function P(i) { this.a = [i, i]; this.o = {i: i}; } var all = []; for (var i = 0; ; i++) all.push(new P(i));",
+            "function Q(n) { this.a = []; for (var j = 0; j < n; j++) this.a.push({j: j}); } \
+             var all = []; for (;;) all.push(new Q(4));",
+            // In a function with a loop, called directly: its exit leaves
+            // its caller's code too (`direct_exit`).
+            "function fill(a, n) { for (var j = 0; j < n; j++) a.push({j: j}); return a; } \
+             var all = []; for (;;) all.push(fill([], 4));",
+            // In a run nested in a native's (`$262.evalScript`), called
+            // from compiled code.
+            "var all = []; function g() { $262.evalScript('for (var j = 0; j < 20000; j++) all.push({j: j, a: [j]});'); } \
+             for (;;) g();",
         ];
-        for src in srcs {
-            let mut vm = Vm::new();
-            vm.heap.gc.set_evacuate(false);
-            vm.heap.limit_growth(32 << 20);
-            let m = crate::js::compile(src).unwrap();
-            let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
-            let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
-            assert!(msg.is_some_and(|m| m.contains("out of memory")), "{src}");
-            assert!(!vm.poisoned() && crate::interp::current_vm().is_null(), "{src}");
-            assert!(!crate::jit::panic_pending() && vm.native_top.is_null() && vm.error.is_none(), "{src}");
-            vm.heap.limit_growth(usize::MAX);
-            let again = "var s = 0; for (var i = 0; i < 100000; i++) s += [i][0]; s";
-            let r = vm.run(&crate::js::compile(again).unwrap()).map(display);
-            assert_eq!(r.as_deref(), Ok("4999950000"), "{src}");
+        // (The warm tier, tiering up early, calls functions with loops
+        // directly: an exit in one leaves its caller too, `direct_exit`;
+        // and constructors through `cloison_rt_construct`.)
+        for evacuate in 0..4 {
+            for src in srcs {
+                let mut vm = Vm::new();
+                match evacuate {
+                    0 => vm.heap.gc.set_evacuate(false),
+                    1 => {}
+                    2 => vm.set_gc_evacuate_all(),
+                    _ => {
+                        vm.set_warm_tier(true);
+                        vm.set_tier_back_edges(2);
+                    }
+                }
+                vm.heap.limit_growth(32 << 20);
+                let m = crate::js::compile(src).unwrap();
+                let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+                let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
+                assert!(msg.is_some_and(|m| m.contains("out of memory")), "{evacuate} {src}");
+                assert!(crate::interp::current_vm().is_null() && !crate::jit::panic_pending(), "{evacuate} {src}");
+                assert!(vm.native_top.is_null() && vm.error.is_none(), "{evacuate} {src}");
+                vm.heap.limit_growth(usize::MAX);
+                let again = crate::js::compile("var s = 0; for (var i = 0; i < 100000; i++) s += [i][0]; s").unwrap();
+                if vm.poisoned() {
+                    assert!(evacuate != 0, "{src}");
+                    assert!(vm.run(&again).is_err_and(|e| e.0.contains("poisoned")), "{evacuate} {src}");
+                    continue;
+                }
+                assert_eq!(vm.run(&again).map(display).as_deref(), Ok("4999950000"), "{evacuate} {src}");
+                vm.verify_heap();
+            }
         }
     }
 

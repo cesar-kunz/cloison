@@ -341,6 +341,10 @@ policy's knobs are `CLOISON_GC_EVACUATE_*`, see `gc::Policy`),
 `CLOISON_GC_SLOTS` (check that slots reach every marked cell and none
 refers to a moved one),
 `CLOISON_GC_CYCLES` (major cycles back to back),
+`CLOISON_JIT_SHADOW` (compiled code lists the code its direct calls enter, and
+each full collection checks that it found every version a call is in),
+`CLOISON_JIT_RETIRE_ALL` (each full collection retires all compiled code but
+the versions frames run),
 `CLOISON_GC_THREADS` (threads a pause scans cards and traces with; 1 for none),
 `CLOISON_GC_CHECK_BARRIER` (find missed barriers), `CLOISON_HEAP_HIST` (cells by
 kind and size), `CLOISON_SEGV` (a backtrace on a crash); for objects,

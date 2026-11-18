@@ -682,9 +682,14 @@ at each function's kept cells:
   interpreter until it is hot again. A stale inline-cache holder alone
   doesn't retire it: the way is cleared and the code stays, as code
   embeds no cell from a cache that it doesn't also keep.
-- **A function a frame runs** is held by version: only the versions the
-  stacks point into (found by the conservative scan of return addresses)
-  stay, with what they and their snapshots keep. Its caches are weak like
+- **A function a frame runs** is held by version: only the versions
+  running stay, with what they and their snapshots keep. They are found
+  by the return addresses on compiled code's own part of the native
+  stack: each run of compiled code entered from the runtime is listed
+  with where its stack starts, and the code marks where it ends before
+  each call into the runtime (`jit::running_words`). A scan of every
+  stack word also took the return addresses that returned calls left in
+  the runtime's frames for frames running, and kept dead code (#346). Its caches are weak like
   any other's, and the function is retired with the running versions
   parked until the frames leave them.
 

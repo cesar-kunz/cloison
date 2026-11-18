@@ -296,14 +296,21 @@ fn hold_entries(o: Obj, e: Value) {
 }
 
 /// Element `i` of entries array `e` (within its length).
+///
+/// Every caller reads an entries array (one `new_entries` made, or its
+/// index, one `new_index` made) below its length: the header slots and
+/// `find`'s chains are by construction, the loops test `len`. Anything
+/// else is a bug here, so it panics.
 fn slot(e: Obj, i: usize) -> Value {
-    if i < e.elems_len() as usize && e.class() == Class::Array {
-        // SAFETY: an array's elements are values, `i` below their length.
-        // (Not `elem`, whose checks on each entry a lookup reads cost
-        // 0.4% instructions on sass, whose maps are these.)
-        return unsafe { *e.elems().add(i) };
-    }
-    e.elem(i)
+    assert!(i < e.elems_len() as usize && e.class() == Class::Array, "entry {i} not in the entries");
+    // (Release builds trust `elems_len` to be within the capacity, as
+    // `set_elems_len` asks; debug builds check it.)
+    debug_assert!(i < crate::raw::values_cap(e.elems()).unwrap_or(0), "entry {i} past the elements");
+    // SAFETY: an array's elements are values, `i` below their length.
+    // (Not `elem`, whose checks on each entry a lookup reads cost 0.55%
+    // instructions on typescript, 0.3% on sass and mathjax: over the 0.5%
+    // the rule asks on typescript alone, and by a margin near the noise.)
+    unsafe { *e.elems().add(i) }
 }
 
 /// Set element `i` of `e` (an array of any values) to `v`.

@@ -1125,7 +1125,13 @@ pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Option
     if i >= vm.length_field(o) {
         return Ok(None);
     }
+    // (The class test is always true for the one caller, which gates on
+    // `is_open_array`; it stays so the SAFETY note below rests on this
+    // function alone.)
     if i < o.elems_len() && o.class() == Class::Array {
+        // (Release builds trust `elems_len` to be within the capacity, as
+        // `set_elems_len` asks; debug builds check it.)
+        debug_assert!((i as usize) < crate::raw::values_cap(o.elems()).unwrap_or(0), "element {i} past the elements");
         // SAFETY: an array's elements are values, `i` below their length.
         // (Not `elem`, whose checks cost 0.7% instructions on excalidraw,
         // which steps through arrays with `for … of`.)

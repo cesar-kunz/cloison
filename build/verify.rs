@@ -34,20 +34,26 @@ const STORES_BEFORE_EXIT: &[(&str, &str)] = &[
     // Recording the exit is the point: its exit is the code's exit tail,
     // which returns to the driver, never an exit stub that resumes.
     ("exit", "records the exit, then goes to the code's exit tail"),
-    // Before its runtime call, it may give an array without elements an
-    // empty room for some (`first_elements`), which changes nothing a
-    // redo would see; its exit after the call is a panic's in it, never
-    // resumed in the interpreter (`jit::unwinding`).
-    ("array_push*__slow", "gives elements room only, or exits for a panic"),
 ];
 
-/// Whether stencil `name` is what entry `n` of [`STORES_BEFORE_EXIT`]
-/// names: the name, or with a `*` any text there.
-fn names(n: &str, name: &str) -> bool {
-    match n.split_once('*') {
-        Some((a, b)) => name.len() >= a.len() + b.len() && name.starts_with(a) && name.ends_with(b),
-        None => n == name,
+/// Whether stencil `name` may store before an exit: one of
+/// [`STORES_BEFORE_EXIT`], or a push's helper (`array_push`, `_nc`, `_i`,
+/// `_i_nc`, of a slot register `g<k>` or memory `m`). Before its runtime
+/// call, such a helper may give an array without elements an empty room
+/// for some (`first_elements`), which changes nothing a redo would see;
+/// its exit after the call is a panic's in it, never resumed in the
+/// interpreter (`jit::unwinding`). Its other exit is before that store.
+fn stores_before_exit(name: &str) -> bool {
+    if STORES_BEFORE_EXIT.iter().any(|&(n, _)| n == name) {
+        return true;
     }
+    let Some(rest) = name.strip_prefix("array_push").and_then(|r| r.strip_suffix("__slow")) else {
+        return false;
+    };
+    let Some(loc) = ["_i_nc_", "_nc_", "_i_", "_"].iter().find_map(|k| rest.strip_prefix(k)) else {
+        return false;
+    };
+    loc == "m" || loc.strip_prefix('g').is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The violations in stencil `name` (code and relocations), on `arch`.
@@ -125,7 +131,7 @@ pub fn check(name: &str, arch: &str, code: &[u8], relocs: &[Reloc]) -> Vec<Strin
     }
 
     // Stores reaching an exit.
-    if STORES_BEFORE_EXIT.iter().any(|&(n, _)| names(n, name)) {
+    if stores_before_exit(name) {
         return errors;
     }
     let succ = |k: usize| -> Vec<usize> {
@@ -310,7 +316,7 @@ pub mod arm64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reloc, check};
+    use super::{Reloc, check, stores_before_exit};
 
     fn r(offset: usize, r_type: u32, symbol: &str) -> Reloc<'_> {
         Reloc { offset, r_type, symbol }
@@ -343,6 +349,20 @@ mod tests {
         // A store after it is fine.
         let code = [&JNE[..], &[0x48, 0x89, 0x07], &JMP].concat();
         assert!(x86(&code, &[r(2, PC32, "cloison_exit"), r(10, PC32, "cloison_continue")]).is_empty());
+    }
+
+    /// Only the push helpers' names, of a slot or memory, are exempt.
+    #[test]
+    fn push_helpers_alone_store_before_an_exit() {
+        for n in ["array_push_g0__slow", "array_push_nc_m__slow", "array_push_i_g11__slow", "array_push_i_nc_g5__slow"]
+        {
+            assert!(stores_before_exit(n), "{n}");
+        }
+        for n in
+            ["array_push_g0", "array_push__slow", "array_push_x_g0__slow", "array_push_g__slow", "array_pop_g0__slow"]
+        {
+            assert!(!stores_before_exit(n), "{n}");
+        }
     }
 
     #[test]

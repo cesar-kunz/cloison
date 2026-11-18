@@ -9330,6 +9330,158 @@ fn stale_thrown_values_give_the_errors_message() {
     assert_eq!(vm.uncaught_message(&forged), forged.0);
 }
 
+/// The review of #359: an `Error` the host kept past the VM's next run or
+/// operation still says what an error object was (its `name` and
+/// `message`, read as it left the VM without running JavaScript), not
+/// `[object Object]`; its own `toString` is run only while it is the last
+/// error.
+#[test]
+fn older_errors_keep_their_messages() {
+    let run_err = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap_err();
+    let mut vm = Vm::new();
+    // Two runs that throw, then the first asked for.
+    let one = run_err(&mut vm, "throw new Error('one')");
+    let two = run_err(&mut vm, "throw new TypeError('two')");
+    assert_eq!((vm.uncaught_message(&one), vm.uncaught_message(&two)), ("Error: one".into(), "TypeError: two".into()));
+    assert_eq!((one.to_string(), two.to_string()), ("Error: one".into(), "TypeError: two".into()));
+    // An unrelated operation in between.
+    let e = run_err(&mut vm, "throw new RangeError('three')");
+    let k = vm.intern("undefined");
+    vm.global_object().get(&mut vm, k).unwrap();
+    assert_eq!(vm.uncaught_message(&e), "RangeError: three");
+    // And a collection: the message is the error's, not read from a cell.
+    vm.run(&cloison::js::compile("for (var i = 0; i < 2e5; i++) var x = {i: [i]}; $262.gc(); $262.gc();").unwrap())
+        .unwrap();
+    assert_eq!((vm.uncaught_message(&one), vm.uncaught_message(&e)), ("Error: one".into(), "RangeError: three".into()));
+    for (src, last, older) in [
+        ("class E extends Error { constructor(m) { super(m); this.name = 'E'; } } throw new E('m')", "E: m", "E: m"),
+        ("var e = new Error('m'); e.name = ''; throw e", "m", "m"),
+        ("throw new Error('')", "Error", "Error"),
+        ("throw new AggregateError([], 'agg')", "AggregateError: agg", "AggregateError: agg"),
+        (
+            "throw new Error('x'.repeat(40) + 'y'.repeat(40))",
+            &("Error: ".to_string() + &"x".repeat(40) + &"y".repeat(40)),
+            "",
+        ),
+        // Its own `toString`, an accessor, a name not a string, a proxy:
+        // nothing is run for the message kept.
+        ("var e = new Error('m'); e.toString = function () { return 'own'; }; throw e", "own", "Error: m"),
+        (
+            "var e = new Error('m'); Object.defineProperty(e, 'message', {get() { return 'got'; }}); throw e",
+            "Error: got",
+            "[object Object]",
+        ),
+        ("var e = new Error('m'); e.name = 5; throw e", "5: m", "[object Object]"),
+        ("throw new Proxy(new Error('p'), {})", "Error: p", "[object Object]"),
+        ("throw {toString() { return 'T'; }}", "T", "[object Object]"),
+        ("throw {message: 'm'}", "[object Object]", "[object Object]"),
+    ] {
+        let e = run_err(&mut vm, src);
+        assert_eq!(vm.uncaught_message(&e), last, "{src}");
+        vm.run(&cloison::js::compile("1").unwrap()).unwrap();
+        let older = if older.is_empty() { last } else { older };
+        assert_eq!((vm.uncaught_message(&e), e.to_string()), (older.to_string(), older.to_string()), "{src}");
+    }
+}
+
+/// The review of #359: the host reaches the value an error threw
+/// (`Vm::thrown`), a `Local` as any, while the error is the VM's last;
+/// kept as a `Global`, it outlives that.
+#[test]
+fn the_host_reaches_a_thrown_value() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let run_err = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap_err();
+    let mut vm = Vm::new();
+    let e = run_err(&mut vm, "class E extends Error {} var e = new E('m'); e.code = 7; throw e");
+    let v = vm.thrown(&e).unwrap();
+    assert_eq!(display(v, &vm), "[object Object]");
+    let thrown = Global::new(&vm, v);
+    let (code, message) = (vm.intern("code"), vm.intern("message"));
+    assert_eq!(display(thrown.local().get(&mut vm, code).unwrap(), &vm), "7");
+    // (An operation since: no longer the last error, nor `v` a `Local`.)
+    assert!(vm.thrown(&e).is_none());
+    assert!(catch_unwind(AssertUnwindSafe(|| display(v, &vm))).is_err());
+    assert_eq!(display(thrown.local().get(&mut vm, message).unwrap(), &vm), "m");
+    let class = vm.run(&cloison::js::compile("for (var i = 0; i < 2e5; i++) var x = {i: [i]}; $262.gc(); E").unwrap());
+    assert!(thrown.local().instance_of(&mut vm, class.unwrap()).unwrap());
+    // An operation's error; a primitive is of any moment; none thrown.
+    let o = vm.run(&cloison::js::compile("({get x() { throw {why: 'getter'}; }})").unwrap()).unwrap();
+    let x = vm.intern("x");
+    let e = o.get(&mut vm, x).unwrap_err();
+    let why = vm.intern("why");
+    let v = vm.thrown(&e).unwrap();
+    assert_eq!(display(v.get(&mut vm, why).unwrap(), &vm), "getter");
+    let five = run_err(&mut vm, "throw 5");
+    let s = run_err(&mut vm, "throw 'a string'");
+    assert_eq!(display(vm.thrown(&s).unwrap(), &vm), "a string");
+    let own = run_err(&mut vm, "null.x");
+    assert!(vm.thrown(&own).is_none() && vm.thrown(&s).is_none());
+    assert_eq!(display(vm.thrown(&five).unwrap(), &vm), "5");
+    // Not another VM's, nor one whose value the host changed.
+    let mut other = Vm::new();
+    let theirs = run_err(&mut other, "throw {}");
+    let mine = run_err(&mut vm, "throw {}");
+    assert!(vm.thrown(&theirs).is_none() && other.thrown(&mine).is_none());
+    let mut forged = mine.clone();
+    forged.1 = theirs.1;
+    assert!(vm.thrown(&forged).is_none() && vm.thrown(&mine).is_some());
+}
+
+/// The review of #359: what ends the host's `Local`s is entering the VM,
+/// not `&mut Vm`: making values between runs collects nothing (the heap
+/// grows) and leaves them valid, as `type_of` and `intern` do.
+#[test]
+fn making_values_between_runs_keeps_locals() {
+    let mut vm = Vm::new();
+    vm.run(
+        &cloison::js::compile("var keep = []; for (var i = 0; i < 2e5; i++) keep.push({i: [i]}); keep = null; 1")
+            .unwrap(),
+    )
+    .unwrap();
+    let first = Local::string(&mut vm, &[0x61; 40]);
+    let o = Local::object(&mut vm, Local::NULL);
+    for i in 0..200_000u32 {
+        let s = Local::try_string(&mut vm, &[0x62; 300]).unwrap();
+        if i % 1000 == 0 {
+            let _ = (Local::array(&mut vm), Local::object(&mut vm, o), s.type_of(&mut vm), vm.intern("k"));
+            let _ = Local::try_string_with(&mut vm, 8, |u| u.fill(0x63)).unwrap();
+        }
+    }
+    assert_eq!(display(first, &vm), "a".repeat(40));
+    assert_eq!(first.string_units(&vm).unwrap().len(), 40);
+    assert_eq!(display(o, &vm), "[object Object]");
+    vm.verify_heap();
+    let k = vm.intern("k");
+    o.set(&mut vm, k, first).unwrap();
+    // More arguments than `call_other` keeps on the stack.
+    let max = vm.run(&cloison::js::compile("Math.max").unwrap()).unwrap();
+    let args: Vec<Local> = (0..20).map(Local::from).collect();
+    assert_eq!(display(max.call_other(&mut vm, Local::UNDEFINED, &args).unwrap(), &vm), "19");
+}
+
+/// The review of #359: an `Atom` is a number the host can make up. One
+/// that names nothing in the VM is refused at the host's entries, not
+/// stored for a later `for-in` to read out of bounds.
+#[test]
+fn atoms_naming_nothing_are_refused() {
+    use cloison::object::Atom;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut vm = Vm::new();
+    for n in [700_000, u32::MAX - 16, u32::MAX] {
+        let g = vm.global_object();
+        assert!(catch_unwind(AssertUnwindSafe(|| g.set(&mut vm, Atom(n), Local::from(1)))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| g.get(&mut vm, Atom(n)))).is_err());
+    }
+    // Another VM's, past this one's.
+    let mut other = Vm::new();
+    let far = (0..200_000).map(|i| other.intern(&format!("name{i}"))).last().unwrap();
+    let g = vm.global_object();
+    assert!(catch_unwind(AssertUnwindSafe(|| g.set(&mut vm, far, Local::from(1)))).is_err());
+    let src = "var s = 0; for (var k in globalThis) s++; Object.getOwnPropertyNames(globalThis).length > 10";
+    assert_eq!(display(vm.run(&cloison::js::compile(src).unwrap()).unwrap(), &vm), "true");
+    vm.verify_heap();
+}
+
 /// #343: the host's ToNumber is the VM's, a string parsed, an object's
 /// `valueOf` run, what a conversion throws the error.
 #[test]

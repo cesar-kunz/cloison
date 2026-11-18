@@ -765,9 +765,15 @@ fn rt_add(acc: Value, r: Value) -> u64 {
 /// embedder's `catch_unwind` around `Vm::run` couldn't catch it). The
 /// panic is kept ([`JIT_PANIC`]), and `leave` (the call's "leave"
 /// result: `RT_REDO`, 0, `EMPTY`) has the code leave at once, to
-/// `vm_run`, which resumes it. A call from a frame under that code, made
-/// through the runtime (`cloison_rt_call`), catches it again and leaves
-/// in turn. (Release builds abort on a panic: this is only a call then.)
+/// `vm_run`, which resumes it ([`resume_panic`]). A call from a frame
+/// under that code, made through the runtime (`cloison_rt_call`), catches
+/// it again and leaves in turn. Until then the code runs only its way out
+/// (exit stubs, the `EMPTY` a direct call's exit gives its caller); what
+/// of the runtime that reaches does nothing once a panic is kept
+/// ([`panic_pending`]): the panic may have left a collection unfinished,
+/// or a native's state (`native_top`) unrestored. (Built with `panic =
+/// "abort"`, as cloison's own release profile is, a panic never returns:
+/// this is only a call then. An embedder's profile decides for its build.)
 #[inline(always)]
 fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -784,6 +790,9 @@ thread_local! {
     /// has left, as it can't unwind through it (see [`unwinding`]). The
     /// thread's: the code entered last on it leaves first.
     static JIT_PANIC: std::cell::Cell<Option<Box<dyn std::any::Any + Send>>> = const { std::cell::Cell::new(None) };
+    /// Whether `JIT_PANIC` holds one: what entering code tests after (a
+    /// flag, without a destructor, is cheaper to reach).
+    static PANIC_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cold]
@@ -795,16 +804,30 @@ fn keep_panic(p: Box<dyn std::any::Any + Send>) {
         let first = k.take().unwrap_or(p);
         k.set(Some(first));
     });
+    PANIC_KEPT.with(|f| f.set(true));
 }
 
 /// Whether a runtime call's panic waits for compiled code to leave.
+#[inline(always)]
 pub(crate) fn panic_pending() -> bool {
-    JIT_PANIC.with(|k| {
-        let p = k.take();
-        let pending = p.is_some();
-        k.set(p);
-        pending
-    })
+    cfg!(panic = "unwind") && PANIC_KEPT.with(|f| f.get())
+}
+
+/// After compiled code returned: the panic a runtime call it made kept, if
+/// any, on its way now (see [`unwinding`]).
+#[inline(always)]
+fn resume_panic() {
+    if panic_pending() {
+        resume_kept();
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn resume_kept() -> ! {
+    PANIC_KEPT.with(|f| f.set(false));
+    let p = JIT_PANIC.with(|k| k.take()).expect("a panic kept");
+    std::panic::resume_unwind(p)
 }
 
 /// What a runtime call compiled code makes for an operation returns for
@@ -17663,7 +17686,10 @@ impl JitFunction {
             let actual = self.entry_types(entry, acc, regs);
             let index = self.version(entry, &actual, &mut acc, regs);
             let code = &self.versions[&entry][index].1;
-            match unsafe { code.enter(acc, frame.regs()) } {
+            let outcome = unsafe { code.enter(acc, frame.regs()) };
+            // (As `vm_run`: not left for a later entry to resume.)
+            resume_panic();
+            match outcome {
                 Outcome::Return(v) => return v,
                 Outcome::Exit { pc: exit_pc, acc: exit_acc } => {
                     self.stats.exits += 1;
@@ -17870,14 +17896,9 @@ unsafe fn vm_run_(vm: &mut crate::vm::Vm, code: &crate::vm::Code, regs: *mut Val
         let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };
         let outcome = unsafe { jit_code.enter(entry_acc, regs_slice) };
         // A runtime call the code made panicked: on with it, out of the
-        // compiled code now (see `unwinding`).
-        // (Never with `panic = "abort"`, the release builds': nothing to
-        // check then.)
-        if cfg!(panic = "unwind")
-            && let Some(p) = JIT_PANIC.with(|k| k.take())
-        {
-            std::panic::resume_unwind(p);
-        }
+        // compiled code now (see `unwinding`; with `panic = "abort"`,
+        // nothing to test).
+        resume_panic();
         let (record, exit_acc) = match outcome {
             Outcome::Return(v) => return VmRun::Returned(v),
             Outcome::Exit { pc: record, acc } => (record, acc),
@@ -18347,6 +18368,12 @@ extern "C" fn cloison_rt_materialize(a: Value, b: Value) -> u64 {
 }
 
 fn rt_materialize(regs: Value, mat: Value) -> u64 {
+    // (An exit after a runtime call that panicked, never resumed: its
+    // registers needn't hold the objects, and the heap may be mid-way
+    // through a collection the panic left. See `unwinding`.)
+    if panic_pending() {
+        return 0;
+    }
     unsafe {
         let m = &*(mat.to_bits() as *const Mat);
         let regs = regs.to_bits() as *mut Value;
@@ -18474,15 +18501,16 @@ unsafe fn direct_exit(
     acc: Value,
 ) -> Value {
     unsafe {
+        // (A panic left the code: on to the caller's, which leaves too,
+        // nothing done here: see `unwinding`.)
+        if panic_pending() {
+            return Value::EMPTY;
+        }
         // (Its frame ends with the exception, never an interpreted one
         // that would unwind: closures of its registers keep their values,
         // else their upvalues stay open on the stack past it.)
         if vm.error.is_some() {
             interp::close_frame_upvalues(vm, caller.add(site.frame));
-            return Value::EMPTY;
-        }
-        // (A panic left the code: on to the caller's, which leaves too.)
-        if cfg!(panic = "unwind") && panic_pending() {
             return Value::EMPTY;
         }
         // Through the runtime from now on, or for a site claimed by types,

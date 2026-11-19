@@ -7706,8 +7706,9 @@ impl Vm {
     /// everything again each time: keep it in one place (a `Box`) if it
     /// runs often; [`Vm::jit_rehomes`] counts those drops. It may not
     /// move during a run: a native that swaps or replaces the VM it is
-    /// given (`std::mem::swap`, `replace`, `take`) aborts the process as
-    /// it returns (#357).
+    /// given (`std::mem::swap`, `replace`, `take`) aborts the process,
+    /// at once if the running VM is dropped (see `Drop for Vm`), else as
+    /// the native returns (#357).
     pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Local> {
         self.run_owned(module.clone())
     }

@@ -801,7 +801,7 @@ fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
             unsafe {
                 let f = &raw mut (*vm).jit_frames;
                 if !(*f).towers.is_null() {
-                    (*f).lo = LO_STALE;
+                    *(*f).lo = LO_STALE;
                 }
             }
         }
@@ -1637,10 +1637,15 @@ mod arch {
     ///
     /// First it marks where the compiled code's part of the native stack
     /// ends (`marks.lo`, see [`super::Marks`]): its own return address,
-    /// into the stencil calling, is the lowest word of it.
+    /// into the stencil calling, is the lowest word of it. One
+    /// instruction where the mark's word is in the low 2 GiB (see
+    /// `mark_cell`).
     pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8], marks: &super::Marks) -> Vec<u8> {
         let mut c = Vec::new();
-        if marks.lo != 0 {
+        if marks.lo != 0 && marks.lo < 1 << 31 {
+            c.extend([0x48, 0x89, 0x24, 0x25]); // mov [lo], rsp
+            c.extend((marks.lo as u32).to_le_bytes());
+        } else if marks.lo != 0 {
             c.extend([0x49, 0xBA]); // movabs r10, lo
             c.extend(marks.lo.to_le_bytes());
             c.extend([0x49, 0x89, 0x22]); // mov [r10], rsp
@@ -2719,6 +2724,14 @@ fn code_shift() -> usize {
 static EXEC_RANGE: std::sync::Mutex<(usize, usize, usize)> = std::sync::Mutex::new((0, 0, 0));
 const EXEC_RESERVE: usize = 1 << 30;
 
+/// `len` bytes of anonymous private memory with protection `prot`,
+/// mapped with `flags` besides, if the system has it.
+fn map(len: usize, prot: libc::c_int, flags: libc::c_int) -> Option<*mut u8> {
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | flags;
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, flags, -1, 0) };
+    (p != libc::MAP_FAILED).then_some(p.cast())
+}
+
 impl ExecMem {
     fn new(len: usize) -> Self {
         let len = len.max(1);
@@ -2728,9 +2741,7 @@ impl ExecMem {
         let pages = (offset + len).next_multiple_of(page);
         if range.1 - range.0 < pages {
             let size = EXEC_RESERVE.max(pages);
-            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-            let base = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_NONE, flags, -1, 0) };
-            assert!(base != libc::MAP_FAILED, "mmap failed");
+            let base = map(size, libc::PROT_NONE, libc::MAP_NORESERVE).expect("mmap failed");
             (range.0, range.1) = (base as usize, base as usize + size);
         }
         let start = range.0 as *mut u8;
@@ -9061,12 +9072,13 @@ const _: () = assert!(std::mem::offset_of!(Tower, exit) == 0 && std::mem::offset
 /// What a VM keeps of the compiled code running on the native stack, for
 /// the collector (see [`running_words`]).
 pub(crate) struct Frames {
-    /// Where the innermost run's part of the native stack ends, written
+    /// (A word of its own, [`mark_cell`]'s, not in the VM.) Where the
+    /// innermost run's part of the native stack ends, written
     /// by its code before each call into the runtime (the wrappers and
     /// direct calls, see [`Marks`]): the address of the lowest word
     /// compiled code pushed, a return address into the code calling.
     /// 0: the run made no such call yet. Meaningless with no run listed.
-    pub(crate) lo: usize,
+    pub(crate) lo: *mut usize,
     /// The runs under way, the innermost first.
     pub(crate) towers: *mut Tower,
     /// `CLOISON_JIT_SHADOW` (a check, see [`check_running`]): the
@@ -9086,10 +9098,37 @@ pub(crate) struct Frames {
 /// that found it full would trap.)
 const SHADOW_ROOM: usize = 1 << 18;
 
+/// The marks' words not in use (see [`mark_cell`]).
+static MARK_CELLS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// A word for a VM's mark (`Frames::lo`): on x86-64 Linux in the
+/// low 2 GiB if the system has room there, where a runtime-call
+/// wrapper's store is one instruction (an absolute 32-bit address) and
+/// not two (`arch::runtime_wrapper`; the web apps make a runtime call
+/// every few hundred instructions). Words of pages mapped for them, a
+/// page's worth at a time, never unmapped; a VM dropped gives its word
+/// back.
+fn mark_cell() -> *mut usize {
+    let mut free = MARK_CELLS.lock().unwrap();
+    if free.is_empty() {
+        let low = if cfg!(all(target_arch = "x86_64", target_os = "linux")) { 0x40 } else { 0 }; // MAP_32BIT
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let page = map(page_size(), prot, low).or_else(|| map(page_size(), prot, 0)).expect("mmap failed");
+        free.extend((0..page_size() / 8).rev().map(|k| page as usize + 8 * k));
+    }
+    free.pop().unwrap() as *mut usize
+}
+
+impl Drop for Frames {
+    fn drop(&mut self) {
+        MARK_CELLS.lock().unwrap().push(self.lo as usize);
+    }
+}
+
 impl Default for Frames {
     fn default() -> Self {
         let mut f = Frames {
-            lo: 0,
+            lo: mark_cell(),
             towers: std::ptr::null_mut(),
             shadow: Vec::new(),
             shadow_top: [std::ptr::null_mut(); 2],
@@ -9116,7 +9155,7 @@ impl Frames {
 
     /// No compiled code runs: a run's start, and its end however it ended.
     pub(crate) fn reset(&mut self) {
-        (self.lo, self.towers) = (0, std::ptr::null_mut());
+        self.towers = std::ptr::null_mut();
         if !self.shadow.is_empty() {
             self.shadow_top[0] = self.shadow.as_mut_ptr();
         }
@@ -9160,7 +9199,7 @@ impl Marks {
         unsafe {
             let f = &raw mut (*vm).jit_frames;
             Marks {
-                lo: &raw mut (*f).lo as u64,
+                lo: (*f).lo as u64,
                 shadow: if (*f).shadow.is_empty() { 0 } else { &raw mut (*f).shadow_top as u64 },
             }
         }
@@ -9199,7 +9238,7 @@ pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>>
     let base = vm.heap.gc.stack_base;
     let f = &vm.jit_frames;
     let mut out = Vec::new();
-    let (mut lo, mut t) = (f.lo, f.towers);
+    let mut t = f.towers;
     let mut below = sp;
     // (The versions' code, by start, once a mark asks: see below.)
     #[cfg(target_arch = "x86_64")]
@@ -9207,6 +9246,7 @@ pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>>
     // (The towers are frames above `sp`, and the words between a mark and
     // its tower's entry are the stack's, once the marks are checked.)
     unsafe {
+        let mut lo = *f.lo;
         while !t.is_null() {
             let tower = &*t;
             let hi = tower.hi;
@@ -9379,8 +9419,8 @@ unsafe fn enter_tower(vm: *mut crate::vm::Vm, entry: *const u8, regs: *mut Value
     unsafe {
         if !vm.is_null() {
             let f = &raw mut (*vm).jit_frames;
-            ((*t).outer_lo, (*t).outer) = ((*f).lo, (*f).towers);
-            ((*f).lo, (*f).towers) = (0, t);
+            ((*t).outer_lo, (*t).outer) = (*(*f).lo, (*f).towers);
+            (*(*f).lo, (*f).towers) = (0, t);
         }
         #[cfg(target_arch = "x86_64")]
         let acc = cloison_enter(acc, regs, tag, t.cast(), u, u, u, u, u, u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -9391,7 +9431,7 @@ unsafe fn enter_tower(vm: *mut crate::vm::Vm, entry: *const u8, regs: *mut Value
         );
         if !vm.is_null() {
             let f = &raw mut (*vm).jit_frames;
-            ((*f).lo, (*f).towers) = ((*t).outer_lo, (*t).outer);
+            (*(*f).lo, (*f).towers) = ((*t).outer_lo, (*t).outer);
         }
         (acc, (*t).exit)
     }
@@ -19730,7 +19770,8 @@ mod tests {
             all.iter().enumerate().filter(|(k, _)| m >> k & 1 != 0).map(|(_, &r)| r).collect()
         };
         let lo = 0x1122_3344_5566;
-        for marks in [Marks::default(), Marks { lo, shadow: 0 }, Marks { lo, shadow: 0x7788_99aa_bbcc }] {
+        let low = Marks { lo: 0x4321_0000, shadow: 0 };
+        for marks in [Marks::default(), low, Marks { lo, shadow: 0 }, Marks { lo, shadow: 0x7788_99aa_bbcc }] {
             let (mut enter, mut direct) = (EnterConsts::new(), DirectConsts::new());
             (enter.marks, direct.marks) = (marks, marks);
             for gm in 0..1 << gpr_slots.len() {
@@ -19935,7 +19976,8 @@ mod tests {
             all.iter().enumerate().filter(|(k, _)| m >> k & 1 != 0).map(|(_, &r)| r).collect()
         };
         let lo = 0x1122_3344_5566;
-        for marks in [Marks::default(), Marks { lo, shadow: 0 }, Marks { lo, shadow: 0x7788_99aa_bbcc }] {
+        let low = Marks { lo: 0x4321_0000, shadow: 0 };
+        for marks in [Marks::default(), low, Marks { lo, shadow: 0 }, Marks { lo, shadow: 0x7788_99aa_bbcc }] {
             let (mut enter, mut direct) = (EnterConsts::new(), DirectConsts::new());
             (enter.marks, direct.marks) = (marks, marks);
             for gm in 0..1 << gpr_slots.len() {

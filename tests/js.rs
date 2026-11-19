@@ -3055,6 +3055,38 @@ fn loop_scope_objects_only_when_registers_run_out() {
     assert!(e.contains("unsupported: more variables than registers"), "{e}");
 }
 
+/// A script, a function with a direct `eval` and a generator whose
+/// variables fit in the registers but leave too few for an expression's
+/// temporaries: compiled again with a loop's variables in its scope
+/// objects (even with fewer than 160 left in registers), which frees the
+/// registers the expression needs. They were refused. The expected value
+/// is V8's.
+#[test]
+fn an_expression_out_of_registers_moves_loop_variables_out() {
+    let lets = (0..50).map(|i| format!("x{i} = {i}")).collect::<Vec<_>>().join(", ");
+    let loop_vars = (0..100).map(|k| format!("c{k} = j + {k}")).collect::<Vec<_>>().join(", ");
+    let sum = (0..100).map(|k| format!("c{k}")).collect::<Vec<_>>().join(" + ");
+    let nest = |depth: usize| (0..depth).fold("x0".to_string(), |e, i| format!("x{} * 1 + ({e})", i % 50));
+    let body = |depth: usize| {
+        format!(
+            "var fs = []; let {lets}; for (let j = 0; j < 2; j++) {{ let {loop_vars}; fs.push(() => {sum}); }} \
+             var deep = {}; var out = fs.map(f => f()).join() + ' ' + deep;",
+            nest(depth)
+        )
+    };
+    let b = body(190);
+    for src in [
+        format!("{{ {b} }}\nout;"),
+        format!("(function () {{ eval('0'); {b} return out; }})();"),
+        format!("(function* () {{ {b} yield out; }})().next().value;"),
+    ] {
+        assert_eq!(value(&src), "4950,5050 4455");
+    }
+    // (Deeper than even that leaves room for: refused as it was.)
+    let e = compile_error(&format!("{{ {} }}", body(260)));
+    assert!(e.contains("unsupported: an expression needing more than 256 registers"), "{e}");
+}
+
 /// Loops whose block-scoped variables that closures use have no registers
 /// (see `past_the_registers`): each iteration has its own scope object
 /// for them, a `for (let …)` loop's with the head's variables as the

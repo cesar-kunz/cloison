@@ -109,35 +109,81 @@ fn generate_from<'p>(
     lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
     src: &super::lex::Source,
 ) -> Result<(Module, Vec<&'p str>), Error> {
-    let mut spilled: HashSet<usize> = HashSet::default();
-    let mut refused: HashMap<usize, Error> = HashMap::default();
+    // (By function, at least how many loops have scope objects: see
+    // `generate_with`. Each function's first refusal, in order.)
+    let mut spilled: HashMap<usize, usize> = HashMap::default();
+    let mut refused: std::collections::BTreeMap<usize, Error> = Default::default();
     loop {
-        let full = std::cell::Cell::new(None);
-        match (generate_with(p, lazy, src, &spilled, &full), full.get()) {
-            // (Once for each such function: one that still doesn't fit is
-            // refused, as it was at first.)
-            (Err(e), Some(i)) => match refused.remove(&i) {
-                Some(first) => return Err(first),
+        let mut pass = Pass::default();
+        let r = generate_with(p, lazy, src, &spilled, &mut pass);
+        if pass.full.is_empty() {
+            return r;
+        }
+        // Each function that ran out of registers again with more of its
+        // loops' variables in scope objects: those that leave as many
+        // registers as the others do, and for an expression's
+        // temporaries, at least one more loop than it had. (One with no
+        // loop left to take is refused, as the first of them was.)
+        for (i, e, expression) in pass.full {
+            let taken = pass.taken.get(&i).copied().unwrap_or(0);
+            match spilled.get(&i) {
+                Some(&want) if taken < want => return Err(refused.into_values().next().unwrap_or(e)),
+                Some(_) => {
+                    spilled.insert(i, taken + 1);
+                }
                 None => {
-                    spilled.insert(i);
+                    spilled.insert(i, usize::from(expression));
                     refused.insert(i, e);
                 }
-            },
-            (r, _) => return r,
+            }
         }
     }
 }
 
-/// [`generate_from`], the functions `spilled` with loops' scope objects;
-/// `full`: the function that had no registers left, if it fails so.
+/// Whether function `i` is inside one of the functions in `full` (see
+/// [`Pass`]).
+fn inside(p: &Program, i: usize, full: &[(usize, Error, bool)]) -> bool {
+    let mut j = p.functions[i].parent;
+    while let Some(k) = j {
+        if full.iter().any(|f| f.0 == k) {
+            return true;
+        }
+        j = p.functions[k].parent;
+    }
+    false
+}
+
+/// What a pass of [`generate_with`] found: the functions that ran out of
+/// registers (their errors, and whether an expression's temporaries did),
+/// and how many loops of the functions spilled have scope objects.
+#[derive(Default)]
+struct Pass {
+    full: Vec<(usize, Error, bool)>,
+    taken: HashMap<usize, usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`generate_with`] has run, on this thread.
+    static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`generate_from`], the functions `spilled` with their loops' variables
+/// that nested functions use in the loops' scope objects: the largest
+/// loops', until the rest leaves as many registers as a function's past
+/// them does, and at least so many loops. What has no registers left (a
+/// script, a generator, an async function or one with a direct `eval`:
+/// see `generate_from`) goes in `pass`, and the others compile on.
 #[allow(clippy::type_complexity)]
 fn generate_with<'p>(
     p: &'p Program,
     lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
     src: &super::lex::Source,
-    spilled: &HashSet<usize>,
-    full: &std::cell::Cell<Option<usize>>,
+    spilled: &HashMap<usize, usize>,
+    pass: &mut Pass,
 ) -> Result<(Module, Vec<&'p str>), Error> {
+    #[cfg(test)]
+    PASSES.with(|c| c.set(c.get() + 1));
     let position = positions(src.as_str(), lazy.map(|(_, _, at, _)| at));
     // Functions' source text (`Function.prototype.toString`), as
     // `lex::units_to_string` has its code units (see
@@ -171,10 +217,11 @@ fn generate_with<'p>(
     let mut shared: Vec<Vec<(&str, &str)>> = vec![Vec::new(); p.functions.len()];
     // (The script's own variables are all in registers: if they don't
     // fit, so its loops', see below.)
-    if spilled.contains(&0) {
+    if let Some(&least) = spilled.get(&0) {
         let regs = decls[0].len();
         let mut nests = captured_loop_lexicals(p, 0);
-        loop_boxes[0].take(p, &mut nests, false, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
+        let over = |_, placed, objects| regs - placed + objects > LOCAL_REGS;
+        pass.taken.insert(0, loop_boxes[0].take(p, &mut nests, false, least, over)?);
         let lb = &loop_boxes[0];
         decls[0].retain(|n| !lb.vars.contains_key(n));
         decls[0].splice(0..0, LOOP_BOXES[..lb.regs].iter().copied());
@@ -212,10 +259,11 @@ fn generate_with<'p>(
             // loops that nested functions use in the loops' scope objects:
             // the largest loops', until the rest leaves room for
             // temporaries as a function's past the registers does.)
-            if spilled.contains(&i) {
+            if let Some(&least) = spilled.get(&i) {
                 let regs = d.len();
                 let mut nests = captured_loop_lexicals(p, i);
-                loop_boxes[i].take(p, &mut nests, false, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
+                let over = |_, placed, objects| regs - placed + objects > LOCAL_REGS;
+                pass.taken.insert(i, loop_boxes[i].take(p, &mut nests, false, least, over)?);
                 let lb = &loop_boxes[i];
                 d.retain(|n| !lb.vars.contains_key(n));
                 d.splice(params + 1..params + 1, LOOP_BOXES[..lb.regs].iter().copied());
@@ -249,7 +297,7 @@ fn generate_with<'p>(
             // in a scope object of its own, a new one for each iteration,
             // and so the loops in it: one register for each such loop,
             // by depth. The largest loops, until the others' fit.)
-            loop_boxes[i].take(p, &mut loops, true, |most, _, objects| fixed + objects + most > LOCAL_REGS)?;
+            loop_boxes[i].take(p, &mut loops, true, 0, |most, _, objects| fixed + objects + most > LOCAL_REGS)?;
             let lb = &loop_boxes[i];
             d.extend(LOOP_BOXES[..lb.regs].iter().copied());
             // (The objects' registers stay registers, whatever the
@@ -351,8 +399,12 @@ fn generate_with<'p>(
     for i in root..n {
         match emit[i] {
             Emit::Skip => {}
+            // (Not one inside a function that ran out of registers: what
+            // it is compiled with, its upvalues, comes from that one's
+            // layout, which changes.)
+            Emit::Compile | Emit::Stub if inside(p, i, &pass.full) => {}
             Emit::Compile => {
-                let mut f = Gen::new(
+                let r = Gen::new(
                     p,
                     &decls,
                     &overflow[i],
@@ -364,17 +416,27 @@ fn generate_with<'p>(
                     i,
                     lazy.is_some(),
                 )
-                .function()
-                .inspect_err(|e| {
-                    // (Its variables in registers whatever their number:
-                    // see `generate_from`.)
-                    let f = &p.functions[i];
-                    let kept = i == 0 || f.has_eval || f.generator || f.is_async;
-                    if kept && (e.msg.ends_with(VARIABLES_PAST_REGISTERS) || e.msg.ends_with(EXPRESSION_PAST_REGISTERS))
-                    {
-                        full.set(Some(i));
+                .function();
+                let mut f = match r {
+                    Ok(f) => f,
+                    Err(e) => {
+                        // (Its variables in registers whatever their
+                        // number: see `generate_from`. The others are
+                        // compiled on, for all such functions in one pass.)
+                        let f = &p.functions[i];
+                        let kept = i == 0 || f.has_eval || f.generator || f.is_async;
+                        let expression = e.msg.ends_with(EXPRESSION_PAST_REGISTERS);
+                        if kept && (expression || e.msg.ends_with(VARIABLES_PAST_REGISTERS)) {
+                            pass.full.push((i, e, expression));
+                            continue;
+                        }
+                        // (Another error: the first, as compiling stops at it.)
+                        return Err(match pass.full.drain(..).next() {
+                            Some((_, first, _)) => first,
+                            None => e,
+                        });
                     }
-                })?;
+                };
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
                 if i != 0 {
@@ -1545,18 +1607,21 @@ impl<'a> LoopBoxes<'a> {
     /// The loops among `nests` (see [`captured_loop_lexicals`]), largest
     /// first, taken out of them and given scope objects while `over`:
     /// called with the largest left's variables, how many have been
-    /// placed, and the registers of the objects so far. One nested too
-    /// deep for that is refused if `must`, else left as it is (its
-    /// variables may fit in registers).
+    /// placed, and the registers of the objects so far; and while fewer
+    /// than `least` have been. One nested too deep for that is refused if
+    /// `must`, else left as it is (its variables may fit in registers).
+    /// How many loops it took.
     fn take(
         &mut self,
         p: &'a Program<'_>,
         nests: &mut Vec<(&'a Stmt<'a>, Vec<&'a str>)>,
         must: bool,
+        least: usize,
         over: impl Fn(usize, usize, usize) -> bool,
-    ) -> R<()> {
+    ) -> R<usize> {
+        let mut taken = 0;
         while let Some(k) = (0..nests.len()).max_by_key(|&k| nests[k].1.len()) {
-            if !over(nests[k].1.len(), self.vars.len(), self.regs) {
+            if taken >= least && !over(nests[k].1.len(), self.vars.len(), self.regs) {
                 break;
             }
             let (s, names) = nests.swap_remove(k);
@@ -1566,12 +1631,13 @@ impl<'a> LoopBoxes<'a> {
                     self.loops.extend(own.loops);
                     self.vars.extend(own.vars);
                     self.regs = self.regs.max(own.regs);
+                    taken += 1;
                 }
                 Err(e) if must => return Err(e),
                 Err(_) => {}
             }
         }
-        Ok(())
+        Ok(taken)
     }
 }
 
@@ -7944,4 +8010,33 @@ fn first_test_passes(init: Option<&ForInit>, test: &Expr) -> bool {
         BinOp::Gt => a > b,
         _ => a >= b,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Sibling functions that each run out of registers compile again
+    /// together: one pass more, not one for each (and a third for those
+    /// still out of registers, which take one loop more each time).
+    #[test]
+    fn functions_out_of_registers_compile_again_together() {
+        let lets = (0..230).map(|i| format!("b{i}")).collect::<Vec<_>>().join(", ");
+        let keep = (0..230).map(|i| format!("b{i}")).collect::<Vec<_>>().join(" + ");
+        let loop_ = (0..50).map(|i| format!("f{i} = {i}")).collect::<Vec<_>>().join(", ");
+        let uses = (0..50).map(|i| format!("f{i}")).collect::<Vec<_>>().join(" + ");
+        let sibling = |k: usize| {
+            format!(
+                "function* g{k}() {{ {{ let {lets}; var keep = () => {keep}; }} for (let i = 0; i < 2; i++) {{ let {loop_}; yield () => i + {uses}; }} }}\n"
+            )
+        };
+        let passes = |src: &str| {
+            let before = super::PASSES.with(|c| c.get());
+            crate::js::compile(src).unwrap_or_else(|e| panic!("{e}"));
+            super::PASSES.with(|c| c.get()) - before
+        };
+        assert_eq!(passes(&sibling(0)), 2);
+        let many: String = (0..8).map(sibling).collect();
+        assert_eq!(passes(&many), 2);
+        // (One that fits compiles once.)
+        assert_eq!(passes("function* g() { for (let i = 0; i < 2; i++) yield () => i; }"), 1);
+    }
 }

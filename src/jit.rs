@@ -9101,20 +9101,28 @@ const SHADOW_ROOM: usize = 1 << 18;
 /// The marks' words not in use (see [`mark_cell`]).
 static MARK_CELLS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// The bytes each mark's word has to itself (see [`mark_cell`]): two
+/// cache lines, as the line next to one in use may be fetched with it.
+const MARK_SLOT: usize = 128;
+
 /// A word for a VM's mark (`Frames::lo`): on x86-64 Linux in the
 /// low 2 GiB if the system has room there, where a runtime-call
 /// wrapper's store is one instruction (an absolute 32-bit address) and
 /// not two (`arch::runtime_wrapper`; the web apps make a runtime call
-/// every few hundred instructions). Words of pages mapped for them, a
-/// page's worth at a time, never unmapped; a VM dropped gives its word
-/// back.
+/// every few hundred instructions). Each at the start of a
+/// [`MARK_SLOT`] of its own: compiled code stores to it before every
+/// runtime call, and VMs on other threads storing to words of one line
+/// took it from each other's caches (4 agents making 30M `in` each ran
+/// 4 to 5 times as long as 1, words 8 bytes apart). Slots of pages
+/// mapped for them, a page's worth at a time, as many as VMs need,
+/// never unmapped; a VM dropped gives its slot back.
 fn mark_cell() -> *mut usize {
     let mut free = MARK_CELLS.lock().unwrap();
     if free.is_empty() {
         let low = if cfg!(all(target_arch = "x86_64", target_os = "linux")) { 0x40 } else { 0 }; // MAP_32BIT
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let page = map(page_size(), prot, low).or_else(|| map(page_size(), prot, 0)).expect("mmap failed");
-        free.extend((0..page_size() / 8).rev().map(|k| page as usize + 8 * k));
+        free.extend((0..page_size() / MARK_SLOT).rev().map(|k| page as usize + MARK_SLOT * k));
     }
     free.pop().unwrap() as *mut usize
 }
@@ -19684,6 +19692,23 @@ mod tests {
         assert!(call.op == Op::Call && !call.own_push && call.native == 0);
         assert_eq!(reads(call), [5, 5, 6]);
         assert_eq!(reads(other), [3, 7, 8]);
+    }
+
+    /// The marks' words (`mark_cell`): each in a slot of its own, past
+    /// what one page holds too, so that no two VMs' share a cache line;
+    /// on x86-64 Linux in the low 2 GiB, where the wrappers' store is one
+    /// instruction (`MAP_32BIT`: the system had room there in every run).
+    #[test]
+    fn mark_cells_have_slots_of_their_own() {
+        let n = 3 * page_size() / MARK_SLOT;
+        let mut cells: Vec<usize> = (0..n).map(|_| mark_cell() as usize).collect();
+        cells.sort_unstable();
+        assert!(cells.iter().all(|&c| c.is_multiple_of(MARK_SLOT)));
+        assert!(cells.windows(2).all(|w| w[1] - w[0] >= MARK_SLOT), "two marks within {MARK_SLOT} bytes");
+        if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            assert!(cells.iter().all(|&c| c < 1 << 31), "a mark above 2 GiB");
+        }
+        MARK_CELLS.lock().unwrap().extend(cells);
     }
 
     /// `mod_magic`'s quotients are exact for every dividend below 2^31:

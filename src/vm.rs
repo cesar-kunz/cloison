@@ -9883,7 +9883,10 @@ out.join();"#;
     /// A panic in a runtime call a compiled regular expression makes (a
     /// class, a case fold, astral ranges, for what its code doesn't test
     /// itself) unwinds out of the run too, the match made of the call's
-    /// stand-in answer never seen: nothing is stored after it.
+    /// stand-in answer never seen: nothing is stored after it. The code
+    /// stops matching at the panic: with two alternatives, the first's
+    /// call panicking, the second's (a call too) isn't made, as the
+    /// stand-in answer, taken for a mismatch, had the code try it.
     #[test]
     fn a_panic_under_a_compiled_regexp_unwinds_out_of_the_run() {
         use crate::jit::Failpoint::*;
@@ -9891,6 +9894,12 @@ out.join();"#;
             (RxWide, "var re = /[\u{e0}-\u{ff}]+z/iu, s = '\u{c9}\u{e9}z';"),
             (RxFold, "var re = /\u{e9}z/iu, s = 'a\u{c9}z';"),
             (RxAstral, "var re = /[\u{1F600}-\u{1F64F}]z/u, s = 'a\u{1F601}z';"),
+            // The second alternative's unit past ASCII calls the runtime.
+            (RxFold, "var re = /\u{e9}x|[\u{e0}-\u{ff}]y/iu, s = '\u{c9}y';"),
+            (RxWide, "var re = /[\u{e0}-\u{ff}]x|\u{e9}y/iu, s = '\u{c9}y';"),
+            // (A negated class: no surrogate pair's half, `rx_alone`.)
+            (RxWide, "var re = /[^a-z]x|\u{e9}y/iu, s = '\u{c9}y';"),
+            (RxAstral, "var re = /[\u{1F600}-\u{1F64F}]x|\u{1F601}|\u{e9}/iu, s = '\u{1F601}';"),
         ];
         for (point, decl) in cases {
             for nth in [1, 2, 500] {
@@ -9903,15 +9912,17 @@ out.join();"#;
                 let m = crate::js::compile(&src).unwrap();
                 crate::jit::fail_at(Some((point, nth)));
                 let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+                let calls_after = crate::jit::calls_after_failpoint();
                 crate::jit::fail_at(None);
                 let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
-                assert_eq!(msg, Some(format!("failpoint {point:?}")), "call {nth}");
+                assert_eq!(msg, Some(format!("failpoint {point:?}")), "{decl} call {nth}");
+                assert_eq!(calls_after, 0, "{decl} call {nth}: the code matched on after the panic");
                 assert!(crate::interp::current_vm().is_null() && !crate::jit::panic_pending(), "{point:?} {nth}");
                 assert!(vm.native_top.is_null() && vm.error.is_none() && !vm.poisoned(), "{point:?} {nth}");
                 let state =
                     crate::js::compile("[before - after, o.v === null || o.v[0].length > 1, re.test(s)].join()");
                 let state = vm.run(&state.unwrap()).map(|v| display(v, &vm));
-                assert_eq!(state.as_deref(), Ok("1,true,true"), "{point:?} {nth}");
+                assert_eq!(state.as_deref(), Ok("1,true,true"), "{decl} {nth}");
                 vm.verify_heap();
             }
         }

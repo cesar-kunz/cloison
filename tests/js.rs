@@ -12361,8 +12361,9 @@ out.join();"#;
 /// table), `new`, a closure made at each call (a site bound by code), a
 /// native calling back (`map`, a getter, `valueOf`, `sort`'s comparison),
 /// a generator's body, a promise job, and a frame an exception unwinds
-/// to; then the frames go on in their versions, and leave some by an exit
-/// (`t.v` turns into a string). With the code's direct calls listed
+/// to, and a direct call's cold paths (another callee, an exit) under a
+/// deep recursion; then the frames go on in their versions, and leave
+/// some by an exit (`t.v` turns into a string). With the code's direct calls listed
 /// (`Vm::set_jit_shadow`), every collection checks that each version a
 /// call is in was found. Hot from the start, and warm first.
 #[test]
@@ -12412,10 +12413,37 @@ function catches(n) {
   for (var i = 0; i < n; i++) { try { s += thrower(i); } catch (e) { s += e.message.length; } }
   return s;
 }
+// A direct call's cold paths, in another function's code and deeper on
+// the native stack than the run's last runtime call (the concatenation
+// in `down`, where the interpreter enters it): the callee another closure
+// than the one bound (through the runtime), and the callee leaving by an
+// exit (`u.v` a string), finished in the interpreter. Each collects.
+var u = { v: 1 }, want = 0;
+function force() { if (want) { want = 0; $262.gc(); $262.gc(); } }
+function ex(x) { var r = x + u.v; force(); return r; }
+function hop(n, f, x) { return n ? hop(n - 1, f, x) + 1 : f(x); }
+function via(k, f, x) { return k ? via(k - 1, f, x) + 1 : hop(2, f, x); }
+function down(n, f, x) { if (n == 40) u.s = "" + x; return n ? down(n - 1, f, x) + 1 : via(3, f, x); }
+function under(f, x) { return down(40, f, x) + u.s.length; }
+function cold(n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) s += under(ex, i) | 0;
+  for (var j = 0; j < 3; j++) {
+    want = 1;
+    s += under(function (x) { force(); return x; }, j);
+    for (var i = 0; i < 50; i++) s += under(ex, i) | 0;
+    want = 1;
+    u.v = "s";
+    s += under(ex, j).length;
+    u.v = 1;
+    for (var i = 0; i < 300; i++) s += under(ex, i) | 0;
+  }
+  return s;
+}
 var jobs = 0;
 function later(n) { for (var i = 0; i < n; i++) Promise.resolve(i).then(function (x) { jobs += top(x) | 0; }); }
 for (var r = 0; r < 6; r++) {
-  log.push(direct(700), varying(700), news(700), made(700), back(60), gens(400), catches(400));
+  log.push(direct(700), varying(700), news(700), made(700), back(60), gens(400), catches(400), cold(600));
   later(200);
 }
 // (A loop tiering up in the script's own frame.)
@@ -12443,5 +12471,44 @@ Promise.resolve().then(function () { log.push(jobs, gcs); out = log.join(" "); }
         let (out, retired) = run(warm, true);
         assert_eq!(out, plain, "warm: {warm}");
         assert!(retired.iter().all(|&n| n >= 3), "warm: {warm}: retired {retired:?}");
+    }
+}
+
+/// Compiled code that ran and returned doesn't count as running at a
+/// collection for the return addresses its calls left on the native stack
+/// (#346). `idle` and `deep` run at many native depths, `deep` reaching
+/// `idle` through 1 to 119 nested `map` callbacks, each a run of compiled
+/// code entered from the runtime; then nothing calls them, and the full
+/// collections run from the script, whose frames (and the collector's)
+/// lie where those runs were. Read as frames, the addresses left there
+/// kept the code of one of the two functions compiled (`idle`, and the
+/// callback with `deep` inlined) past the collections that drop
+/// idle code (`jit::age_functions`): the collector reads only the stack
+/// that compiled code running pushed (`jit::running_words`). With the
+/// check on (`Vm::set_jit_shadow`), the versions a scan of every stack
+/// word tells and the frames don't are counted: the failure tells them.
+/// (With `Vm::set_jit_scan_all`, the scan as it was, one version is left
+/// here: release and debug-assertion builds, x86-64, 2026-11-19.)
+#[test]
+fn returned_code_is_not_running_for_its_stale_return_addresses() {
+    let src = r#"
+function idle(x) { var s = 0; for (var i = 0; i < 50; i++) s += (x + i) | 0; return s; }
+function deep(n) { return n == 0 ? idle(1) : [n].map(function (m) { return deep(m - 1) + 1; })[0]; }
+var s = 0;
+for (var i = 0; i < 3000; i++) s += idle(i);
+for (var d = 1; d < 120; d++) s += deep(d);
+for (var k = 0; k < 12; k++) $262.gc();
+s;
+"#;
+    for check in [false, true] {
+        let mut vm = Vm::new();
+        if check {
+            vm.set_jit_shadow();
+        }
+        let r = vm.run(&cloison::js::compile(src).unwrap());
+        assert_eq!(r.map(|v| display(v, &vm)).unwrap(), "228758865");
+        // (The versions alive on this thread, the test's: this VM's.)
+        let left = (vm.jit_stencils("idle").is_some(), cloison::jit::alive().1);
+        assert_eq!(left, (false, 0), "check: {check}, stale versions counted: {}", vm.jit_stale_running());
     }
 }

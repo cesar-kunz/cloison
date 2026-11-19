@@ -11241,3 +11241,46 @@ f().then(function () { globalThis.out = log.join(" "); });
 "#;
     assert_eq!(out_after_jobs(src), "true true TypeError true");
 }
+
+/// `new F()` gives `this` unless the constructor returns an object
+/// (ECMA-262 10.2.2 [[Construct]], steps 10 to 12): a string, a symbol or
+/// a BigInt it returns is a primitive, though a cell here. A direct `new`
+/// from compiled code kept it as the result (`construct_direct` told an
+/// object by its being a cell). What the interpreter gives, and V8,
+/// SpiderMonkey, JavaScriptCore and QuickJS.
+#[test]
+fn a_constructor_returning_a_primitive_cell_gives_this() {
+    let src = r#"
+var results = ["str", Symbol("s"), 10n, 1.5, true, null, undefined];
+var kept = {k: 1};
+function mk(v) {
+  return function F(i) { this.a = i; for (var j = 0; j < 2; j++) this.a += j; return v; };
+}
+function count(F) {
+  var bad = 0;
+  for (var i = 0; i < 20000; i++) {
+    var r = new F(i);
+    if (typeof r !== "object" || r === null || r.a !== i + 1) bad++;
+  }
+  return bad;
+}
+var out = [];
+for (var k = 0; k < results.length; k++) out.push(count(mk(results[k])));
+// An object it returns is the result.
+var G = mk(kept), same = 0;
+for (var i = 0; i < 20000; i++) if (new G(i) === kept) same++;
+out.push(same);
+// Small constructors, their calls bound to one function each.
+function S(i) { this.a = i; return "str"; }
+function T(i) { this.a = i; return 10n; }
+function U(i) { this.a = i; return Symbol.iterator; }
+var bad = 0;
+for (var i = 0; i < 20000; i++) {
+  if (typeof new S(i) !== "object") bad++;
+  if (typeof new T(i) !== "object") bad++;
+  if (typeof new U(i) !== "object") bad++;
+}
+out.push(bad);
+out.join();"#;
+    assert_eq!(value(src), "0,0,0,0,0,0,0,20000,0");
+}

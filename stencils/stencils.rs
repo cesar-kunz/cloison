@@ -7139,7 +7139,12 @@ stencil!("construct_direct"; |s| {
             }
             *(base.add((*c).this_off as usize) as *mut u64) = p as u64;
             let v = Value::from_bits(rt_call_enter!(s, cloison_rt_enter, regs, Value::from_bits(site as u64)));
-            if v.to_bits() == 0 || v.is_cell() {
+            // (An object is the constructor's result; a primitive isn't,
+            // and a string, a symbol or a BigInt is a cell too: told by
+            // the class, read only for a cell.)
+            if v.to_bits() == 0
+                || v.is_cell() && !matches!((*cell(v)).class, class::STRING | class::SYMBOL | class::BIGINT)
+            {
                 v
             } else {
                 // (`this` back, or 0 if it panicked: left below, as on

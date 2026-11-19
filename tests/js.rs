@@ -2979,20 +2979,14 @@ fn parameters_past_the_registers_need_no_loop_bindings() {
 /// `body` in code that leaves no register for the block-scoped variables
 /// of its loops that closures use, which are then in a scope object of
 /// each loop's, a new one at each iteration (#298): a function with 159
-/// parameters (sloppy, strict, an arrow, a method), a script with 170
-/// other block-scoped variables, a function with those and a direct
-/// `eval`, and a generator with 170 other such variables in boxes. First
-/// in a function with registers for them all. `out.join("\n")` is each
-/// one's value.
+/// parameters (sloppy, strict, an arrow, a method); and where the
+/// block-scoped variables are all in registers while they fit, with more
+/// than fit (see `registers_filled`): a script, a function with a direct
+/// `eval`, and a generator. First in a function with registers for them
+/// all. `out.join("\n")` is each one's value.
 fn past_the_registers(body: &str, strict: bool) -> Vec<(&'static str, String)> {
-    let list = |f: &dyn Fn(usize) -> String, sep: &str| (0..170).map(f).collect::<Vec<_>>().join(sep);
     let params = (0..159).map(|i| format!("p{i}")).collect::<Vec<_>>().join(", ");
-    let block = format!("{{ let {}; }}", list(&|i| format!("b{i}"), ", "));
-    let boxed = format!(
-        "{{ let {}; var keep = () => {}; }}",
-        list(&|i| format!("b{i} = {i}"), ", "),
-        list(&|i| format!("b{i}"), " + ")
-    );
+    let (block, boxed) = (registers_filled(false), registers_filled(true));
     let end = "\nout.join('\\n');";
     let mut v = vec![
         ("in registers", format!("var out = [];\n(function () {{\n{body}\n}})();{end}")),
@@ -3007,6 +3001,58 @@ fn past_the_registers(body: &str, strict: bool) -> Vec<(&'static str, String)> {
         v.push(("a method", format!("var out = [];\nnew (class {{ m({params}) {{\n{body}\n}} }})().m();{end}")));
     }
     v
+}
+
+/// Code that fills the registers of a script, a generator, an async
+/// function or a function with a direct `eval`, whose block-scoped
+/// variables are in registers while they fit: 220 in a block (`boxed`:
+/// used by a closure, a generator's in boxes), and a loop with 50 that a
+/// closure uses, 270 for 255 registers. Its loops' ones that closures use
+/// are then in the loops' scope objects, which leaves 220.
+fn registers_filled(boxed: bool) -> String {
+    let list = |n: usize, f: &dyn Fn(usize) -> String, sep: &str| (0..n).map(f).collect::<Vec<_>>().join(sep);
+    let keep =
+        if boxed { format!(" var keep = () => {};", list(220, &|i| format!("b{i}"), " + ")) } else { String::new() };
+    format!(
+        "{{ let {};{keep} }}\nfor (var fq = 0; fq < 1; fq++) {{ let {}; var keepf = () => {}; }}",
+        list(220, &|i| format!("b{i} = {i}"), ", "),
+        list(50, &|i| format!("f{i} = {i}"), ", "),
+        list(50, &|i| format!("f{i}"), " + ")
+    )
+}
+
+/// A script, a generator, an async function and a function with a direct
+/// `eval` use loops' scope objects only when their variables don't fit in
+/// the registers: with 170 or 230 other block-scoped variables, a loop's
+/// stay in registers (a script makes no object), and 33 nested loops fit beside
+/// 165 (more than there are registers for scope objects by depth). With
+/// more other variables than registers, the refusal is the one it was.
+#[test]
+fn loop_scope_objects_only_when_registers_run_out() {
+    let lets = |n: usize| format!("{{ let {}; }}", (0..n).map(|i| format!("b{i}")).collect::<Vec<_>>().join(", "));
+    let body = "var fs = []; for (let i = 0; i < 3; i++) { let a = i * 2; fs.push(() => a + i); }";
+    let end = "fs.map(f => f()).join();";
+    let objects = |src: &str| {
+        let module = cloison::js::compile(src).unwrap_or_else(|e| panic!("{e}"));
+        cloison::asm::disassemble(&module).contains("CreateObject")
+    };
+    for n in [170, 230] {
+        let script = format!("{}\n{body}\n{end}", lets(n));
+        assert!(!objects(&script), "a script, {n}");
+        assert_eq!(value(&script), "0,3,6");
+        let eval = format!("(function () {{ {}\neval('0');\n{body}\nreturn {end} }})();", lets(n));
+        assert_eq!(value(&eval), "0,3,6");
+        let generator = format!("(function* () {{ {}\n{body}\nyield {end} }})().next().value;", lets(n));
+        assert_eq!(value(&generator), "0,3,6");
+    }
+    let filled = format!("{}\n{body}\n{end}", registers_filled(false));
+    assert!(objects(&filled));
+    assert_eq!(value(&filled), "0,3,6");
+    let open: String =
+        (0..33).map(|i| format!("for (let j{i} = 0; j{i} < 1; j{i}++) {{ fs.push(() => j{i}); ")).collect();
+    assert_eq!(value(&format!("{}\nvar fs = []; {open}{} fs.length;", lets(165), "}".repeat(33))), "33");
+    let e = compile_error(&format!("{}\n{body}\n{end}", lets(300)));
+    assert!(e.contains("unsupported: more variables than registers"), "{e}");
 }
 
 /// Loops whose block-scoped variables that closures use have no registers
@@ -3046,16 +3092,13 @@ fn loops_past_the_registers_have_a_scope_object_per_iteration() {
 
 /// Such loops in a generator and in an async function: the scope objects
 /// outlive the `yield`s and `await`s in the loops, each iteration's its
-/// own. With 159 parameters, and with 170 other block-scoped variables
-/// in boxes.
+/// own. With registers for all (159 parameters too: a generator's are in
+/// its scope object), and with more variables than fit in them (see
+/// `registers_filled`).
 #[test]
 fn loop_scope_objects_outlive_yields_and_awaits() {
     let params = (0..159).map(|i| format!("p{i}")).collect::<Vec<_>>().join(", ");
-    let boxed = format!(
-        "{{ let {}; var keep = () => {}; }}",
-        (0..170).map(|i| format!("b{i} = {i}")).collect::<Vec<_>>().join(", "),
-        (0..170).map(|i| format!("b{i}")).collect::<Vec<_>>().join(" + ")
-    );
+    let boxed = registers_filled(true);
     for (params, boxed) in [("", ""), (&*params, ""), ("", &*boxed)] {
         for (name, body, want) in LOOP_SCOPE_GENERATOR_CASES {
             let src = format!(

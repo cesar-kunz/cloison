@@ -89,13 +89,54 @@ enum Emit {
     Stub,
 }
 
+/// What a function whose variables and temporaries don't fit in the
+/// registers fails with (see [`generate_from`]).
+const VARIABLES_PAST_REGISTERS: &str = "more variables than registers";
+const EXPRESSION_PAST_REGISTERS: &str = "an expression needing more than 256 registers";
+
 /// `lazy`: compile only the root given, the functions in it stubs; with
 /// the upvalues the root's stub had (no fewer than it uses).
+///
+/// A script, a generator, an async function and a function with a direct
+/// `eval` keep their block-scoped variables in registers. One that then
+/// has no registers left (its variables', or an expression's) is compiled
+/// again with those of its loops that nested functions use in the loops'
+/// scope objects (see [`LoopBoxes`]): only then, so what fits compiles
+/// as it always did.
 #[allow(clippy::type_complexity)]
 fn generate_from<'p>(
     p: &'p Program,
     lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
     src: &super::lex::Source,
+) -> Result<(Module, Vec<&'p str>), Error> {
+    let mut spilled: HashSet<usize> = HashSet::default();
+    let mut refused: HashMap<usize, Error> = HashMap::default();
+    loop {
+        let full = std::cell::Cell::new(None);
+        match (generate_with(p, lazy, src, &spilled, &full), full.get()) {
+            // (Once for each such function: one that still doesn't fit is
+            // refused, as it was at first.)
+            (Err(e), Some(i)) => match refused.remove(&i) {
+                Some(first) => return Err(first),
+                None => {
+                    spilled.insert(i);
+                    refused.insert(i, e);
+                }
+            },
+            (r, _) => return r,
+        }
+    }
+}
+
+/// [`generate_from`], the functions `spilled` with loops' scope objects;
+/// `full`: the function that had no registers left, if it fails so.
+#[allow(clippy::type_complexity)]
+fn generate_with<'p>(
+    p: &'p Program,
+    lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
+    src: &super::lex::Source,
+    spilled: &HashSet<usize>,
+    full: &std::cell::Cell<Option<usize>>,
 ) -> Result<(Module, Vec<&'p str>), Error> {
     let position = positions(src.as_str(), lazy.map(|(_, _, at, _)| at));
     // Functions' source text (`Function.prototype.toString`), as
@@ -128,12 +169,12 @@ fn generate_from<'p>(
     let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
     // Its variables in another's register (see below), with that one.
     let mut shared: Vec<Vec<(&str, &str)>> = vec![Vec::new(); p.functions.len()];
-    // (The script's own variables are all in registers: past them, so
-    // its loops', see below.)
-    if decls[0].len() > LOCAL_REGS {
+    // (The script's own variables are all in registers: if they don't
+    // fit, so its loops', see below.)
+    if spilled.contains(&0) {
         let regs = decls[0].len();
         let mut nests = captured_loop_lexicals(p, 0);
-        loop_boxes[0].take(p, &mut nests, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
+        loop_boxes[0].take(p, &mut nests, false, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
         let lb = &loop_boxes[0];
         decls[0].retain(|n| !lb.vars.contains_key(n));
         decls[0].splice(0..0, LOOP_BOXES[..lb.regs].iter().copied());
@@ -167,13 +208,14 @@ fn generate_from<'p>(
             let env_vars: Vec<&str> = rest.iter().copied().filter(|&n| in_env(n)).collect();
             overflow[i] =
                 decls[i][..params].iter().copied().filter(|&n| in_env(n)).chain(env_vars.iter().copied()).collect();
-            // (Past the registers, the variables of its loops that nested
-            // functions use in the loops' scope objects: the largest
-            // loops', until the rest fits.)
-            if d.len() > LOCAL_REGS {
+            // (If they didn't fit in the registers, the variables of its
+            // loops that nested functions use in the loops' scope objects:
+            // the largest loops', until the rest leaves room for
+            // temporaries as a function's past the registers does.)
+            if spilled.contains(&i) {
                 let regs = d.len();
                 let mut nests = captured_loop_lexicals(p, i);
-                loop_boxes[i].take(p, &mut nests, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
+                loop_boxes[i].take(p, &mut nests, false, |_, placed, objects| regs - placed + objects > LOCAL_REGS)?;
                 let lb = &loop_boxes[i];
                 d.retain(|n| !lb.vars.contains_key(n));
                 d.splice(params + 1..params + 1, LOOP_BOXES[..lb.regs].iter().copied());
@@ -207,7 +249,7 @@ fn generate_from<'p>(
             // in a scope object of its own, a new one for each iteration,
             // and so the loops in it: one register for each such loop,
             // by depth. The largest loops, until the others' fit.)
-            loop_boxes[i].take(p, &mut loops, |most, _, objects| fixed + objects + most > LOCAL_REGS)?;
+            loop_boxes[i].take(p, &mut loops, true, |most, _, objects| fixed + objects + most > LOCAL_REGS)?;
             let lb = &loop_boxes[i];
             d.extend(LOOP_BOXES[..lb.regs].iter().copied());
             // (The objects' registers stay registers, whatever the
@@ -322,7 +364,17 @@ fn generate_from<'p>(
                     i,
                     lazy.is_some(),
                 )
-                .function()?;
+                .function()
+                .inspect_err(|e| {
+                    // (Its variables in registers whatever their number:
+                    // see `generate_from`.)
+                    let f = &p.functions[i];
+                    let kept = i == 0 || f.has_eval || f.generator || f.is_async;
+                    if kept && (e.msg.ends_with(VARIABLES_PAST_REGISTERS) || e.msg.ends_with(EXPRESSION_PAST_REGISTERS))
+                    {
+                        full.set(Some(i));
+                    }
+                })?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
                 if i != 0 {
@@ -1493,11 +1545,14 @@ impl<'a> LoopBoxes<'a> {
     /// The loops among `nests` (see [`captured_loop_lexicals`]), largest
     /// first, taken out of them and given scope objects while `over`:
     /// called with the largest left's variables, how many have been
-    /// placed, and the registers of the objects so far.
+    /// placed, and the registers of the objects so far. One nested too
+    /// deep for that is refused if `must`, else left as it is (its
+    /// variables may fit in registers).
     fn take(
         &mut self,
         p: &'a Program<'_>,
         nests: &mut Vec<(&'a Stmt<'a>, Vec<&'a str>)>,
+        must: bool,
         over: impl Fn(usize, usize, usize) -> bool,
     ) -> R<()> {
         while let Some(k) = (0..nests.len()).max_by_key(|&k| nests[k].1.len()) {
@@ -1505,7 +1560,16 @@ impl<'a> LoopBoxes<'a> {
                 break;
             }
             let (s, names) = nests.swap_remove(k);
-            self.add(p, s, &names, 0)?;
+            let mut own = LoopBoxes::default();
+            match own.add(p, s, &names, 0) {
+                Ok(()) => {
+                    self.loops.extend(own.loops);
+                    self.vars.extend(own.vars);
+                    self.regs = self.regs.max(own.regs);
+                }
+                Err(e) if must => return Err(e),
+                Err(_) => {}
+            }
         }
         Ok(())
     }
@@ -2558,7 +2622,7 @@ impl<'a> Gen<'a> {
             return unsupported(self.f.pos, "more parameters than registers");
         }
         if self.temp > 256 {
-            return unsupported(self.f.pos, "more variables than registers");
+            return unsupported(self.f.pos, VARIABLES_PAST_REGISTERS);
         }
         // `new.target` first (see `Op::LdaNewTarget`).
         if self.index == 0 && self.p.direct_eval {
@@ -3640,7 +3704,7 @@ impl<'a> Gen<'a> {
 
     fn alloc(&mut self, pos: Pos) -> R<u8> {
         if self.temp > 255 {
-            return unsupported(pos, "an expression needing more than 256 registers");
+            return unsupported(pos, EXPRESSION_PAST_REGISTERS);
         }
         self.temp += 1;
         self.nregs = self.nregs.max(self.temp);

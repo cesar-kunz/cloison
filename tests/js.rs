@@ -12363,21 +12363,44 @@ out.join();"#;
 /// a generator's body, a promise job, and a frame an exception unwinds
 /// to, and a direct call's cold paths (another callee, an exit) under a
 /// deep recursion; then the frames go on in their versions, and leave
-/// some by an exit (`t.v` turns into a string). With the code's direct calls listed
-/// (`Vm::set_jit_shadow`), every collection checks that each version a
-/// call is in was found. Hot from the start, and warm first.
+/// some by an exit (`t.v` turns into a string). Each phase collects in
+/// each round from inside its own calls, and the script says which phase
+/// never did (with one counter for all, the last of 16 collections came
+/// before the direct calls' phase of the last rounds, the loop tiering up
+/// and the promise jobs ran, and the first direct calls' phase never
+/// collected). With the code's direct calls listed (`Vm::set_jit_shadow`),
+/// every collection checks that each version a direct call or a run
+/// entered from the runtime is in was found.
+///
+/// (Measured 2026-11-19: at the collections of the direct calls', `new`'s,
+/// the closures', the cold paths' and the tiering loop's phases, the
+/// frames run compiled versions; in the others the code calling is
+/// interpreted at that point, on master too: a callback `map` calls, say,
+/// and what it calls, never enter compiled code there. Those phases test
+/// that the walk finds nothing where nothing runs compiled.) Hot from the
+/// start, and warm first.
 #[test]
 fn running_versions_are_kept_however_entered() {
     let src = r#"
-var gcs = 0, at = 0, t = { v: 1 }, log = [];
+// Each phase collects from inside its own calls, at its 37th call of
+// `maybe` in each round and every 500 after (a counter per phase and
+// round): `fired` counts them by phase, and the script says which never
+// did.
+var gcs = 0, t = { v: 1 }, log = [], r = 0, ph = "", key = "";
+var calls = Object.create(null), fired = Object.create(null);
+var phases = ["direct", "varying", "news", "made", "map", "getter", "valueOf", "sort", "gens", "catches",
+  "cold", "osr", "jobs"];
+function phase(name) { ph = name; key = name + "/" + r; }
+function collect() {
+  fired[ph] = (fired[ph] || 0) + 1;
+  gcs++;
+  $262.gc();
+  $262.gc();
+  t.v = gcs % 4 == 0 ? "s" : 1;
+}
 function maybe() {
-  at++;
-  if (at % 2111 == 0 && gcs < 16) {
-    gcs++;
-    $262.gc();
-    $262.gc();
-    t.v = gcs % 4 == 0 ? "s" : 1;
-  }
+  var n = calls[key] = (calls[key] || 0) + 1;
+  if (n % 500 == 37) collect();
 }
 function leaf(x) { maybe(); return x + t.v; }
 function mid(x) { return leaf(x) + 1; }
@@ -12396,13 +12419,16 @@ function made(n) {
 var arr = [];
 for (var k = 0; k < 40; k++) arr.push(k);
 function back(n) {
-  var s = 0;
-  for (var i = 0; i < n; i++) {
-    s += arr.map(function (x) { return mid(x) | 0; })[i % 40];
-    var o = { get g() { return top(i) | 0; }, valueOf: function () { return leaf(i) | 0; } };
-    s += o.g + (o + 1);
-  }
-  arr.slice().sort(function (a, b) { return (leaf(a) | 0) - (leaf(b) | 0); });
+  var s = 0, i = 0;
+  phase("map");
+  for (i = 0; i < n; i++) s += arr.map(function (x) { return mid(x) | 0; })[i % 40];
+  var o = { get g() { return top(i) | 0; }, valueOf: function () { return leaf(i) | 0; } };
+  phase("getter");
+  for (i = 0; i < 40 * n; i++) s += o.g;
+  phase("valueOf");
+  for (i = 0; i < 40 * n; i++) s += o + 1;
+  phase("sort");
+  for (i = 0; i < n; i++) arr.slice().sort(function (a, b) { return (leaf(a) | 0) - (leaf(b) | 0) || b - a; });
   return s;
 }
 function* gen(n) { for (var i = 0; i < n; i++) yield top(i) | 0; }
@@ -12419,7 +12445,7 @@ function catches(n) {
 // than the one bound (through the runtime), and the callee leaving by an
 // exit (`u.v` a string), finished in the interpreter. Each collects.
 var u = { v: 1 }, want = 0;
-function force() { if (want) { want = 0; $262.gc(); $262.gc(); } }
+function force() { if (want) { want = 0; collect(); } }
 function ex(x) { var r = x + u.v; force(); return r; }
 function hop(n, f, x) { return n ? hop(n - 1, f, x) + 1 : f(x); }
 function via(k, f, x) { return k ? via(k - 1, f, x) + 1 : hop(2, f, x); }
@@ -12441,17 +12467,32 @@ function cold(n) {
   return s;
 }
 var jobs = 0;
-function later(n) { for (var i = 0; i < n; i++) Promise.resolve(i).then(function (x) { jobs += top(x) | 0; }); }
-for (var r = 0; r < 6; r++) {
-  log.push(direct(700), varying(700), news(700), made(700), back(60), gens(400), catches(400), cold(600));
+function later(n) {
+  for (var i = 0; i < n; i++) Promise.resolve(i).then(function (x) { phase("jobs"); jobs += top(x) | 0; });
+}
+function run(name, f, n) { phase(name); log.push(f(n)); }
+for (r = 0; r < 6; r++) {
+  run("direct", direct, 700);
+  run("varying", varying, 700);
+  run("news", news, 700);
+  run("made", made, 700);
+  log.push(back(15));
+  run("gens", gens, 400);
+  run("catches", catches, 400);
+  run("cold", cold, 600);
   later(200);
 }
 // (A loop tiering up in the script's own frame.)
+phase("osr");
 var s = 0;
 for (var i = 0; i < 3000; i++) s += top(i) | 0;
 log.push(s);
 var out;
-Promise.resolve().then(function () { log.push(jobs, gcs); out = log.join(" "); });
+Promise.resolve().then(function () {
+  var never = phases.filter(function (p) { return !fired[p]; });
+  log.push(jobs, gcs, "never: " + never.join(","));
+  out = log.join(" ");
+});
 "#;
     let run = |warm: bool, check: bool| {
         let mut vm = Vm::new();
@@ -12466,7 +12507,7 @@ Promise.resolve().then(function () { log.push(jobs, gcs); out = log.join(" "); }
         (out, retired)
     };
     let (plain, _) = run(false, false);
-    assert!(plain.ends_with(" 16"), "{plain}");
+    assert!(plain.ends_with(" never: "), "a phase never collected: {plain}");
     for warm in [false, true] {
         let (out, retired) = run(warm, true);
         assert_eq!(out, plain, "warm: {warm}");

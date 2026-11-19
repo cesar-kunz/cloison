@@ -203,6 +203,35 @@ The operations are `Local`'s (`get`, `set`, `get_keyed`, `call_other`,
 `to_number`, `string_units`, ...); see its documentation for the rule
 and what enforces it.
 
+For several values used together across runs and operations, a handle
+scope (`cloison::handles`) roots each one it hands out until the scope
+ends. A `ScopedLocal<'s>` carries the scope's lifetime, `'s`, so the
+compiler rejects one that leaves its scope or reaches another scope:
+
+```rust
+let make = cloison::js::compile("({answer: 41})").unwrap();
+let churn = cloison::js::compile("for (var i = 0; i < 1e5; i++) var x = {i: [i]};").unwrap();
+let n = vm.with_handles(|s| {
+    let object = s.run(&make).map_err(|e| s.owned_error(e))?;
+    let key = s.string("answer").map_err(|e| s.owned_error(e))?;
+    s.run(&churn).map_err(|e| s.owned_error(e))?;
+    let answer = s.get_keyed(object, key).map_err(|e| s.owned_error(e))?;
+    s.to_number(answer).map_err(|e| s.owned_error(e))
+});
+```
+
+Which to use:
+
+- a `Local` for a value used at once: no root, one compare per use;
+- a scope for the values of a sequence of operations: one slot each,
+  kept until the scope ends, so a loop opens a scope per round
+  (`s.scope(|inner, up| ...)`, `up.lift(v)` for the outer values);
+- a `Global` to keep a value past the scope (`s.persist(v)`,
+  `s.local(&g)`).
+
+A thrown value is a `ScopedLocal` too (`e.thrown()`). The host can't
+register native callbacks yet.
+
 ## Testing
 
 The differential tests run each program in four engine configurations

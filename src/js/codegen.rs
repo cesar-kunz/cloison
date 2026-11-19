@@ -109,35 +109,52 @@ fn generate_from<'p>(
     lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
     src: &super::lex::Source,
 ) -> Result<(Module, Vec<&'p str>), Error> {
-    // (By function, at least how many loops have scope objects: see
-    // `generate_with`. Each function's first refusal, in order.)
-    let mut spilled: HashMap<usize, usize> = HashMap::default();
-    let mut refused: std::collections::BTreeMap<usize, Error> = Default::default();
+    // (By function, how its loops' variables are spilled: see
+    // `generate_with`. Each function's first refusal.)
+    let mut spilled: HashMap<usize, Spill> = HashMap::default();
+    let mut refused: HashMap<usize, Error> = HashMap::default();
     loop {
         let mut pass = Pass::default();
         let r = generate_with(p, lazy, src, &spilled, &mut pass);
         if pass.full.is_empty() {
             return r;
         }
-        // Each function that ran out of registers again with more of its
-        // loops' variables in scope objects: those that leave as many
-        // registers as the others do, and for an expression's
-        // temporaries, at least one more loop than it had. (One with no
-        // loop left to take is refused, as the first of them was.)
+        // Each function that ran out of registers compiled again with its
+        // loops' variables that nested functions use in scope objects,
+        // those that leave as many registers as the others do; one whose
+        // expression ran out of temporaries, or that still doesn't fit,
+        // with all its loops' block-scoped variables so. (A few passes
+        // whatever the number of such functions. One that doesn't fit
+        // even so is refused, as it was at first: the first such.)
+        let mut failed = None;
         for (i, e, expression) in pass.full {
-            let taken = pass.taken.get(&i).copied().unwrap_or(0);
-            match spilled.get(&i) {
-                Some(&want) if taken < want => return Err(refused.into_values().next().unwrap_or(e)),
-                Some(_) => {
-                    spilled.insert(i, taken + 1);
+            let next = match spilled.get(&i) {
+                Some(Spill::All) => {
+                    failed = Some(failed.map_or(i, |f: usize| f.min(i)));
+                    continue;
                 }
-                None => {
-                    spilled.insert(i, usize::from(expression));
-                    refused.insert(i, e);
-                }
-            }
+                Some(Spill::Captured) => Spill::All,
+                None if expression => Spill::All,
+                None => Spill::Captured,
+            };
+            spilled.insert(i, next);
+            refused.entry(i).or_insert(e);
+        }
+        if let Some(i) = failed {
+            return Err(refused.remove(&i).expect("its first refusal"));
         }
     }
+}
+
+/// How a function's loops' block-scoped variables are spilled (see
+/// [`generate_with`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Spill {
+    /// Those nested functions use, of the largest loops, until the rest
+    /// leaves as many registers as a function's past them does.
+    Captured,
+    /// All of them, of every loop.
+    All,
 }
 
 /// Whether function `i` is inside one of the functions in `full` (see
@@ -154,12 +171,10 @@ fn inside(p: &Program, i: usize, full: &[(usize, Error, bool)]) -> bool {
 }
 
 /// What a pass of [`generate_with`] found: the functions that ran out of
-/// registers (their errors, and whether an expression's temporaries did),
-/// and how many loops of the functions spilled have scope objects.
+/// registers (their errors, and whether an expression's temporaries did).
 #[derive(Default)]
 struct Pass {
     full: Vec<(usize, Error, bool)>,
-    taken: HashMap<usize, usize>,
 }
 
 #[cfg(test)]
@@ -168,10 +183,9 @@ thread_local! {
     static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// [`generate_from`], the functions `spilled` with their loops' variables
-/// that nested functions use in the loops' scope objects: the largest
-/// loops', until the rest leaves as many registers as a function's past
-/// them does, and at least so many loops. What has no registers left (a
+/// [`generate_from`], the functions `spilled` with their loops'
+/// variables in the loops' scope objects (see [`Spill`]). What has no
+/// registers left (a
 /// script, a generator, an async function or one with a direct `eval`:
 /// see `generate_from`) goes in `pass`, and the others compile on.
 #[allow(clippy::type_complexity)]
@@ -179,7 +193,7 @@ fn generate_with<'p>(
     p: &'p Program,
     lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
     src: &super::lex::Source,
-    spilled: &HashMap<usize, usize>,
+    spilled: &HashMap<usize, Spill>,
     pass: &mut Pass,
 ) -> Result<(Module, Vec<&'p str>), Error> {
     #[cfg(test)]
@@ -217,11 +231,11 @@ fn generate_with<'p>(
     let mut shared: Vec<Vec<(&str, &str)>> = vec![Vec::new(); p.functions.len()];
     // (The script's own variables are all in registers: if they don't
     // fit, so its loops', see below.)
-    if let Some(&least) = spilled.get(&0) {
+    if let Some(&how) = spilled.get(&0) {
         let regs = decls[0].len();
-        let mut nests = captured_loop_lexicals(p, 0);
-        let over = |_, placed, objects| regs - placed + objects > LOCAL_REGS;
-        pass.taken.insert(0, loop_boxes[0].take(p, &mut nests, false, least, over)?);
+        let mut nests = loop_lexicals(p, 0, how == Spill::Captured);
+        let over = |_, placed, objects| how == Spill::All || regs - placed + objects > LOCAL_REGS;
+        loop_boxes[0].take(p, &mut nests, false, over)?;
         let lb = &loop_boxes[0];
         decls[0].retain(|n| !lb.vars.contains_key(n));
         decls[0].splice(0..0, LOOP_BOXES[..lb.regs].iter().copied());
@@ -255,15 +269,18 @@ fn generate_with<'p>(
             let env_vars: Vec<&str> = rest.iter().copied().filter(|&n| in_env(n)).collect();
             overflow[i] =
                 decls[i][..params].iter().copied().filter(|&n| in_env(n)).chain(env_vars.iter().copied()).collect();
-            // (If they didn't fit in the registers, the variables of its
-            // loops that nested functions use in the loops' scope objects:
-            // the largest loops', until the rest leaves room for
-            // temporaries as a function's past the registers does.)
-            if let Some(&least) = spilled.get(&i) {
+            // (If they didn't fit in the registers, its loops' variables
+            // in the loops' scope objects: see `Spill`. Not those in its
+            // scope object.)
+            if let Some(&how) = spilled.get(&i) {
                 let regs = d.len();
-                let mut nests = captured_loop_lexicals(p, i);
-                let over = |_, placed, objects| regs - placed + objects > LOCAL_REGS;
-                pass.taken.insert(i, loop_boxes[i].take(p, &mut nests, false, least, over)?);
+                let mut nests = loop_lexicals(p, i, how == Spill::Captured);
+                for (_, ns) in &mut nests {
+                    ns.retain(|n| !in_env(n));
+                }
+                nests.retain(|(_, ns)| !ns.is_empty());
+                let over = |_, placed, objects| how == Spill::All || regs - placed + objects > LOCAL_REGS;
+                loop_boxes[i].take(p, &mut nests, false, over)?;
                 let lb = &loop_boxes[i];
                 d.retain(|n| !lb.vars.contains_key(n));
                 d.splice(params + 1..params + 1, LOOP_BOXES[..lb.regs].iter().copied());
@@ -297,7 +314,7 @@ fn generate_with<'p>(
             // in a scope object of its own, a new one for each iteration,
             // and so the loops in it: one register for each such loop,
             // by depth. The largest loops, until the others' fit.)
-            loop_boxes[i].take(p, &mut loops, true, 0, |most, _, objects| fixed + objects + most > LOCAL_REGS)?;
+            loop_boxes[i].take(p, &mut loops, true, |most, _, objects| fixed + objects + most > LOCAL_REGS)?;
             let lb = &loop_boxes[i];
             d.extend(LOOP_BOXES[..lb.regs].iter().copied());
             // (The objects' registers stay registers, whatever the
@@ -1439,6 +1456,12 @@ fn declared_in<'a>(s: &'a Stmt, p: &'a Program, annex_b: bool, out: &mut Vec<&'a
 /// home objects) that `f`'s nested functions use: each iteration's a
 /// binding of its own, which the closures made in it keep.
 fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<(&'a Stmt<'a>, Vec<&'a str>)> {
+    loop_lexicals(p, f, true)
+}
+
+/// [`captured_loop_lexicals`], or with `captured` false, all the loops'
+/// block-scoped variables.
+fn loop_lexicals<'a>(p: &'a Program<'_>, f: usize, captured: bool) -> Vec<(&'a Stmt<'a>, Vec<&'a str>)> {
     fn stmt<'a>(s: &'a Stmt<'a>, p: &'a Program, f: usize, out: &mut Vec<(&'a Stmt<'a>, Vec<&'a str>)>) {
         match &s.kind {
             StmtKind::For { .. }
@@ -1474,7 +1497,7 @@ fn captured_loop_lexicals<'a>(p: &'a Program<'_>, f: usize) -> Vec<(&'a Stmt<'a>
     }
     let mut out = Vec::new();
     p.functions[f].body.iter().for_each(|s| stmt(s, p, f, &mut out));
-    if out.is_empty() {
+    if out.is_empty() || !captured {
         return out;
     }
     let mut used: HashSet<&str> = HashSet::default();
@@ -1607,21 +1630,18 @@ impl<'a> LoopBoxes<'a> {
     /// The loops among `nests` (see [`captured_loop_lexicals`]), largest
     /// first, taken out of them and given scope objects while `over`:
     /// called with the largest left's variables, how many have been
-    /// placed, and the registers of the objects so far; and while fewer
-    /// than `least` have been. One nested too deep for that is refused if
-    /// `must`, else left as it is (its variables may fit in registers).
-    /// How many loops it took.
+    /// placed, and the registers of the objects so far. One nested too
+    /// deep for that is refused if `must`, else left as it is (its
+    /// variables may fit in registers).
     fn take(
         &mut self,
         p: &'a Program<'_>,
         nests: &mut Vec<(&'a Stmt<'a>, Vec<&'a str>)>,
         must: bool,
-        least: usize,
         over: impl Fn(usize, usize, usize) -> bool,
-    ) -> R<usize> {
-        let mut taken = 0;
+    ) -> R<()> {
         while let Some(k) = (0..nests.len()).max_by_key(|&k| nests[k].1.len()) {
-            if taken >= least && !over(nests[k].1.len(), self.vars.len(), self.regs) {
+            if !over(nests[k].1.len(), self.vars.len(), self.regs) {
                 break;
             }
             let (s, names) = nests.swap_remove(k);
@@ -1631,13 +1651,12 @@ impl<'a> LoopBoxes<'a> {
                     self.loops.extend(own.loops);
                     self.vars.extend(own.vars);
                     self.regs = self.regs.max(own.regs);
-                    taken += 1;
                 }
                 Err(e) if must => return Err(e),
                 Err(_) => {}
             }
         }
-        Ok(taken)
+        Ok(())
     }
 }
 
@@ -8038,5 +8057,21 @@ mod tests {
         assert_eq!(passes(&many), 2);
         // (One that fits compiles once.)
         assert_eq!(passes("function* g() { for (let i = 0; i < 2; i++) yield () => i; }"), 1);
+    }
+
+    /// One whose expression runs out of temporaries takes all its loops'
+    /// variables out of registers at once, not a loop more at each pass:
+    /// one pass more, however many loops it has (150 here).
+    #[test]
+    fn an_expression_out_of_registers_takes_all_loops_at_once() {
+        let lets = (0..50).map(|i| format!("x{i} = {i}")).collect::<Vec<_>>().join(", ");
+        let loops: String =
+            (0..150).map(|k| format!("do {{ let c{k} = {k}; fs.push(() => c{k}); }} while (false);\n")).collect();
+        let deep = (0..190).fold("x0".to_string(), |e, i| format!("x{} * 1 + ({e})", i % 50));
+        let pad: String = (0..50).map(|k| format!("function pad{k}(a) {{ return a + {k}; }}\n")).collect();
+        let src = format!("function* g() {{ var fs = []; let {lets};\n{loops}var deep = {deep}; yield deep; }}\n{pad}");
+        let before = super::PASSES.with(|c| c.get());
+        crate::js::compile(&src).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(super::PASSES.with(|c| c.get()) - before, 2);
     }
 }

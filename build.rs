@@ -136,6 +136,14 @@ fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]
     if target.contains("apple") {
         cmd.arg("-Ctarget-cpu=generic");
     }
+    // No red zone on arm64: a runtime call's asm is `nostack` there though
+    // the wrapper it calls pushes (see `rt_call!`), which is sound only
+    // while nothing of a stencil's lives below `sp`. LLVM uses none on
+    // arm64 unless asked to; Apple's ABI allows one. `build/verify.rs`
+    // checks no stencil reads or writes below `sp`.
+    if target.starts_with("aarch64") {
+        cmd.arg("-Cno-redzone=yes");
+    }
     let status = cmd
         .args(extra)
         .args(["--target", target])

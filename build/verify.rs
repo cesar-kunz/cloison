@@ -13,6 +13,8 @@
 //!   not data.
 //! - A runtime call is made as `rt_call!` makes it: around it, what the
 //!   collector relies on to find compiled code's part of the native stack.
+//! - On arm64, nothing is read or written below `sp`: a runtime call's asm
+//!   is `nostack`, and its wrapper pushes.
 //! - An exit leaves before the stencil changed anything: no memory store
 //!   (but to the native stack) on a path to a branch to `cloison_exit`,
 //!   except in [`STORES_BEFORE_EXIT`].
@@ -139,6 +141,12 @@ pub fn check(name: &str, arch: &str, code: &[u8], relocs: &[Reloc]) -> Vec<Strin
         }
     }
     for (k, i) in insns.iter().enumerate() {
+        if i.below_sp {
+            errors.push(format!(
+                "the access at {:#x} is below `sp`: a red zone, which a runtime call's wrapper overwrites",
+                i.at
+            ));
+        }
         if let Some(f) = i.pc_rel_field
             && !relocs.iter().any(|r| r.offset == f)
         {
@@ -209,6 +217,8 @@ pub struct Insn {
     pub pc_rel_field: Option<usize>,
     /// It may write memory, but the native stack.
     pub store: bool,
+    /// arm64: it reads or writes memory below `sp` (a red zone).
+    pub below_sp: bool,
 }
 
 pub mod x86 {
@@ -250,6 +260,7 @@ pub mod x86 {
                 ),
                 pc_rel_field,
                 store,
+                below_sp: false,
             });
         }
         if d.position() != code.len() {
@@ -307,9 +318,25 @@ pub mod arm64 {
                     ends_flow: i & 0xFC00_0000 == 0x1400_0000 || ret_br || trap,
                     pc_rel_field: pc_rel.then_some(at),
                     store: is_store(i) && (i >> 5) & 31 != 31,
+                    below_sp: below_sp(i),
                 }
             })
             .collect())
+    }
+
+    /// Whether `i` reads or writes memory at a negative offset from `sp`,
+    /// without moving `sp` there (a push does, by a pre-index).
+    fn below_sp(i: u32) -> bool {
+        if i & 0x0A00_0000 != 0x0800_0000 || (i >> 5) & 31 != 31 {
+            return false;
+        }
+        match i >> 27 & 7 {
+            // Pairs at a signed offset (and the non-temporal ones).
+            0b101 => i >> 23 & 1 == 0 && i >> 21 & 1 == 1,
+            // Single registers, unscaled (`stur`, `ldur`).
+            0b111 => i >> 24 & 1 == 0 && i >> 21 & 1 == 0 && i >> 10 & 3 == 0 && i >> 20 & 1 == 1,
+            _ => false,
+        }
     }
 
     /// Whether `i` may write memory (its base register aside).

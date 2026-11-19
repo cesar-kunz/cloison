@@ -203,9 +203,12 @@ unsafe extern "C" {
 ///   LLVM kept it across the call where it liked, in a register the
 ///   runtime then saves in a frame of its own: the collector finds the
 ///   compiled code running by the return addresses on compiled code's
-///   part of the stack, `jit::running_words`.) The asm is `nostack`
-///   (the wrapper keeps `sp` aligned itself, and there is no red zone),
-///   so LLVM makes no frame for it. x18, a temporary on Linux,
+///   part of the stack, `jit::running_words`.) The asm is `nostack`,
+///   so LLVM makes no frame for it, though the wrapper pushes: nothing
+///   of the stencil's is below `sp` (the stencils are built without a
+///   red zone, `-Cno-redzone`, and `build/verify.rs` checks none reads
+///   or writes there), and `sp` is 16-byte aligned wherever LLVM moved
+///   it (arm64 faults on an access through one that isn't). x18, a temporary on Linux,
 ///   is clobbered too: C code may use it (not on macOS, where it is
 ///   reserved). Slot registers x24–x28 are
 ///   callee-saved under the C ABI anyway; x0–x6 and v0–v7 are in/out
@@ -1639,7 +1642,7 @@ macro_rules! fp_slot {
         });
 
         // target x86_64 add_f{}: 11 runtime call, `push rax` … `pop rax` for alignment (judged 2026-10-26)
-        // target aarch64 add_f{}: 9 now 10 runtime call: `str x30` / `ldr x30`, not the frame-pointer `stp; mov x29, sp; ldp` (judged 2026-10-26)
+        // target aarch64 add_f{}: 8 runtime call (2026-11-19: the call is `mov x17, x30; bl`, the wrapper saving the link register, no frame; 9 with `str x30` / `ldr x30`, judged 2026-10-26)
         stencil!("add_f", $k; |s| {
             let rhs = s.tag.encode_f64(s.f[$k]);
             s.acc = rt_add!(s, s.acc, rhs);
@@ -2410,7 +2413,7 @@ stencil!("lda_false"; |s| {
 // target x86_64 test_instanceof_m: 25 now 28 `... cmp r11, [rax]; jne e1; cmp rbx, [rax+8]; je hit0; cmp r11, [rax+0x18]; ...`: entries by displacement, the offset by `imm_zext` (judged 2026-10-26)
 // target aarch64 test_instanceof_m: 30 now 34 `... ldp x12, x13, [x8]; cmp; b.ne e1; cmp; b.eq hit0; ldp x12, x13, [x8, #24]; ...` (judged 2026-10-26)
 // target x86_64 test_instanceof_m__slow: 12 now 15 the three arguments pushed, no `mov r11d, 0xA` (judged 2026-10-26)
-// target aarch64 test_instanceof_m__slow: 15 now 16 no `mov w9, #10` (judged 2026-10-26)
+// target aarch64 test_instanceof_m__slow: 13 now 14 no `mov w9, #10` (2026-11-19: the call is `mov x17, x30; bl`, the wrapper saving the link register, no frame; 15 with a frame, judged 2026-10-26)
 stencil_slow!("test_instanceof_m"; |s| {
     let v = load_m(s.regs);
     let c = imm64() as *const InstanceOfEntry;
@@ -3239,7 +3242,7 @@ macro_rules! cmp_fp {
         // target aarch64 teq_jt_f{},jlt_f{}: 9 now 10 `stp x29, x30; fmov; mov; sub; bl; ldp x29, x30; cmn x8, #1; b.eq exit; tbnz w8, #0, L`: no `mov x29, sp` (judged 2026-10-26)
         // target aarch64 teq_jf_f{},tlt_jf_f{}: 9 now 11 as `teq_jt_f{}` with `tbz` (judged 2026-10-26)
         // target x86_64 test_eq_f{}: 12 now 13 runtime call: `and eax, 1; lea r12, [rax+6]` for `and; or; mov` (judged 2026-10-26)
-        // target aarch64 test_eq_f{}: 10 now 11 runtime call: `str x30` / `ldr x30`, not the frame-pointer `stp; mov x29, sp; ldp` (judged 2026-10-26)
+        // target aarch64 test_eq_f{}: 9 runtime call (2026-11-19: the call is `mov x17, x30; bl`, the wrapper saving the link register, no frame; 10 with `str x30` / `ldr x30`, judged 2026-10-26)
         stencil!($name, "_f", $k; |s| {
             let l = s.tag.encode_f64(s.f[$k]);
             let c = rel_rt!($rel, s, l, s.acc);
@@ -4952,7 +4955,7 @@ stencil!("type_of"; |s| {
 // flags (strings) that are the 64-bit immediates; leaves where it would
 // throw (a pattern the engine doesn't support).
 // target x86_64 create_regexp: 10 `push rax; movabs ×2; lea rsp; call; lea rsp; test; je; mov r12, rax; pop rax` (rt_call!'s contract; judged 2026-10-26)
-// target aarch64 create_regexp: 12 `stp; mov x29, sp; movz/movk ×6; bl; cbz; mov x20, x8; ldp` (judged 2026-10-26)
+// target aarch64 create_regexp: 10 `movz/movk ×6; mov x17, x30; bl; cbz; mov x20, x8` (2026-11-19: the call is `mov x17, x30; bl`, the wrapper saving the link register, no frame; 12 with `stp; mov x29, sp; …; ldp`, judged 2026-10-26)
 stencil!("create_regexp"; |s| {
     let r = rt_call!(s, cloison_rt_create_regexp, Value::from_bits(imm64()), Value::from_bits(imm64b()));
     if r == 0 {
@@ -6012,7 +6015,7 @@ macro_rules! property_location {
         // target x86_64 get_keyed_rt_g{}__slow,get_keyed_rt_m__slow: 8 now 10 the call with `lea rsp, [rsp-136]`, no `push`/`pop` (judged 2026-10-26)
         // target aarch64 get_keyed_rt_g{}: 15 now 17 `cmp x20, x22; b.lo slow`, cell (3), bounds (3), `ldrb; cmp #4; b.hs cold`, element (4) (judged 2026-10-26)
         // target aarch64 get_keyed_rt_m: 16 now 19 as `_g{}` with `ldr x8, [x21, #k]` (judged 2026-10-26)
-        // target aarch64 get_keyed_rt_g{}__slow,get_keyed_rt_m__slow: 8 `stp; mov x29, sp; mov x8, x24; mov x9, x20; bl; cbz; mov x20, x8; ldp` (judged 2026-10-26)
+        // target aarch64 get_keyed_rt_g{}__slow,get_keyed_rt_m__slow: 6 `mov x8, x24; mov x9, x20; mov x17, x30; bl; cbz; mov x20, x8` (2026-11-19: the call is `mov x17, x30; bl`, the wrapper saving the link register, no frame; 8 with `stp; mov x29, sp; …; ldp`, judged 2026-10-26)
         stencil_slow!("get_keyed_rt_", loc!($loc); |s| {
             let o = get!($loc, s);
             if is_cell(s.tag, o) && s.tag.is_int32(s.acc) {
@@ -6136,7 +6139,7 @@ macro_rules! property_location {
         // target x86_64 get_keyed_i_nc_rt_g{}__slow,get_keyed_i_nc_rt_m__slow: 9 now 11 `mov r11, r12; or r11, r14; mov rax, rdi`, the call with `lea rsp, [rsp-136]`, no `push`/`pop` (judged 2026-10-26)
         // target aarch64 get_keyed_i_nc_rt_g{}: 7 as `get_keyed_i_nc_g{}` (judged 2026-10-26)
         // target aarch64 get_keyed_i_nc_rt_m: 8 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
-        // target aarch64 get_keyed_i_nc_rt_g{}__slow,get_keyed_i_nc_rt_m__slow: 8 now 9 `orr x9, x22, x20` boxes without `mov w8, w20` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_nc_rt_g{}__slow,get_keyed_i_nc_rt_m__slow: 6 now 7 `orr x9, x22, x20` boxes without `mov w8, w20` (2026-11-19: the call is `mov x17, x30; bl`, the wrapper saving the link register, no frame; 8 with a frame, judged 2026-10-26)
         stencil_slow!("get_keyed_i_nc_rt_", loc!($loc); |s| {
             let p = get!($loc, s).to_bits() as *const u8;
             let i = int(s.acc) as u32;
@@ -6972,7 +6975,7 @@ macro_rules! leave_after_call {
 // VM's code epoch (at `imm64b`) isn't `imm` anymore, the callee changed
 // something the code assumes: leave too, after the call.
 // target x86_64 call: 13 now 14 `... call; lea; mov r12, rax; pop rax; test; je exit; movabs r10, epoch; cmp dword [r10], imm32; jne exit` (judged 2026-10-26)
-// target aarch64 call: 17 now 18 an epoch in 16 bits (`_k16`) saves one, as `call_done` (judged 2026-10-26)
+// target aarch64 call: 15 now 16 an epoch in 16 bits (`_k16`) saves one, as `call_done` (2026-11-19: the call is `mov x17, x30; bl`, the wrapper saving the link register, no frame; 17 with a frame, judged 2026-10-26)
 stencil!("call"; |s| {
     let regs = Value::from_bits(s.regs as u64);
     let r = Value::from_bits(rt_call!(s, cloison_rt_call, regs, Value::from_bits(imm64())));
@@ -7265,7 +7268,7 @@ stencil!("ctor_check"; |s| {
 
 // In an exit: allocate an object scalar replacement left unallocated
 // (`imm64` describes it, `jit::Mat`), from the spilled registers.
-// target aarch64 materialize: 8 a runtime call (docs/arm64-targets.md)
+// target aarch64 materialize: 6 a runtime call (docs/arm64-targets.md; 8 with a frame, before 2026-11-19)
 stencil!("materialize"; |s| {
     rt_call!(s, cloison_rt_materialize, Value::from_bits(s.regs as u64), Value::from_bits(imm64()));
     next!(s)

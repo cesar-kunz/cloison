@@ -58,6 +58,7 @@ mod collections;
 mod date;
 mod dispose;
 mod generator;
+pub mod handles;
 #[cfg(feature = "intl")]
 mod intl;
 mod json;

@@ -3624,7 +3624,7 @@ impl Vm {
     /// kept past a run or an operation that may have collected, whatever
     /// is at its address now (#359).
     #[inline]
-    fn host_value(&self, l: Local, what: &str) -> Value {
+    pub(crate) fn host_value(&self, l: Local, what: &str) -> Value {
         if l.v.is_cell() && l.stamp != self.globals.stamp.get() {
             stale_local(what)
         }
@@ -3633,7 +3633,7 @@ impl Vm {
 
     /// `v`, of this VM's, for the host: tagged as this VM's are now.
     #[inline]
-    fn local(&self, v: Value) -> Local {
+    pub(crate) fn local(&self, v: Value) -> Local {
         self.globals.local(v)
     }
 
@@ -4108,26 +4108,30 @@ impl Vm {
         if e.1.is_some_and(|v| v.is_cell() && self.host_error != Some((v, e.2))) {
             return e.0.clone();
         }
-        if let Some(v) = e.1
-            && crate::props::is_object(v)
-        {
-            // The run is over: its `toString` runs as a host's operation
-            // (a throwing one leaves the error's own message), the value
-            // rooted through it and so still the error's after.
-            let kept = self.host_error;
-            let s = self.host(&[v], &[], |_| Ok(crate::interp::to_string_units(v)));
-            self.host_error = kept;
-            if let Ok(s) = s {
-                return String::from_utf16_lossy(&s);
+        match e.1 {
+            Some(v) => {
+                // (Still the error's after: rooted through the `toString`.)
+                let kept = self.host_error;
+                let s = self.message_of(v, &e.0);
+                self.host_error = kept;
+                s
             }
+            None => e.0.clone(),
         }
-        // (A primitive's message is cut: see `Error::thrown`.)
-        if let Some(v) = e.1
-            && !crate::props::is_object(v)
-        {
+    }
+
+    /// The message of a thrown value `v` of this VM's, live: an object's
+    /// `toString` run, as a host's operation (`own`, the error's own
+    /// message, if it throws), a primitive's text whole (an error's own
+    /// is cut: see `Error::thrown`).
+    pub(crate) fn message_of(&mut self, v: Value, own: &str) -> String {
+        if !crate::props::is_object(v) {
             return display_raw(v);
         }
-        e.0.clone()
+        match self.host(&[v], &[], |_| Ok(crate::interp::to_string_units(v))) {
+            Ok(s) => String::from_utf16_lossy(&s),
+            Err(_) => own.to_string(),
+        }
     }
 
     /// Whether no other realm was made (see `realm_proto`).
@@ -9188,7 +9192,7 @@ pub(crate) fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
 /// `v`'s code units if it is a string, without making it flat: a cons
 /// string's copied out of its pieces. (Bound to no borrow, as
 /// [`string_units`].)
-fn units_in_place<'a>(v: Value) -> Option<std::borrow::Cow<'a, [u16]>> {
+pub(crate) fn units_in_place<'a>(v: Value) -> Option<std::borrow::Cow<'a, [u16]>> {
     let n = string_len(v)?;
     let o = Obj::of(v);
     unsafe {

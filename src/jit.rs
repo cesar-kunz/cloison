@@ -69,9 +69,11 @@ use crate::value::Value;
 /// more: kept for good, with their code and the cells they embed, as one
 /// might be running when its call site is bound to another (sass retired
 /// 2,483 of 2,701 versions, the TypeScript app 3,873 of 5,690). One is
-/// running while one of `words` points into its code (a return address
-/// on compiled code's part of the native stack) or at it (a run entered
-/// it): the words [`running_words`] gives. It is named while another
+/// running while one of `words` points into its code: a return address on
+/// compiled code's part of the native stack, the words [`running_words`]
+/// gives. (A word pointing at its `JitCode` counts too: only where the
+/// collector falls back to every stack word, which may hold one, a
+/// runtime function's local say.) It is named while another
 /// `Rc` holds it (a call site, its function's versions) or a call site
 /// of its snapshot calls it as its own (`CallSite::self_code`). (A
 /// direct call's exit finds the version it left before anything
@@ -189,8 +191,9 @@ impl Drop for JitCode {
 /// site; a call site's caller and the function its inline cache names):
 /// the codes it took, found live with it (#35: they were kept for good).
 /// Compiled code counts while its function (its frame 0) is `live`, or a
-/// frame runs it: one of `words` points into its code or at it (as for
-/// `free_retired`; its function's versions may have changed since). Whether a code was marked: the caller repeats until none is.
+/// frame runs it: one of `words` points into its code (or at it, in the
+/// fallback to every stack word: as for `free_retired`; its function's
+/// versions may have changed since). Whether a code was marked: the caller repeats until none is.
 pub(crate) fn mark_referenced_codes(
     words: &mut dyn FnMut() -> Vec<usize>,
     live: &dyn Fn(*const crate::vm::Code) -> bool,
@@ -271,8 +274,8 @@ pub(crate) struct KeptBy {
 /// VM's codes not freed), for the marking to hold the cells weakly (see
 /// `Vm::weak_kept`). A function is
 /// held while a frame runs a version of it, one of `words` pointing into
-/// its code or at it (as for [`free_retired`]), or its state is
-/// borrowed.
+/// its code (or at it, in the fallback to every stack word: as for
+/// [`free_retired`]), or its state is borrowed.
 pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::Code) -> bool) -> Vec<KeptBy> {
     fn site_addrs(site: &CallSite, out: &mut Vec<usize>) {
         if let Some(d) = &site.dispatch {
@@ -326,7 +329,8 @@ pub(crate) fn kept_by_function(words: &[usize], mine: &dyn Fn(*const crate::vm::
             ranges.push((at, at + std::mem::size_of::<JitCode>(), k));
         }
         ranges.sort_unstable();
-        // (The versions one of the words points into, or at.)
+        // (The versions one of the words points into, or at: see
+        // `free_retired`.)
         let mut on: HashSet<usize> = HashSet::default();
         for &w in words {
             let i = ranges.partition_point(|r| r.0 <= w);

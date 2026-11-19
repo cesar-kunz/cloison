@@ -9032,10 +9032,12 @@ pub(crate) struct Tower {
     /// The exit cell, `ctx` in the code: the record of the exit it left
     /// by, [`NO_EXIT`] while it runs (and if it returned).
     exit: u32,
-    /// The native stack pointer at the call of the code's entry
-    /// ([`cloison_enter`] writes it): the stack below is the code's, then
-    /// the runtime's it called.
+    /// The native stack pointer the code was entered with, past its
+    /// return address ([`cloison_enter`] writes it): the stack below is
+    /// the code's, then the runtime's it called.
     hi: usize,
+    /// The code's entry, where [`cloison_enter`] jumps.
+    entry: *const u8,
     /// The VM's mark (`Frames::lo`) when this run began, the outer run's:
     /// back in place when this one ends.
     outer_lo: usize,
@@ -9286,137 +9288,73 @@ pub(crate) fn check_running(vm: &crate::vm::Vm, words: &[usize], all: &[usize]) 
     vm.jit_frames.stale.set(vm.jit_frames.stale.get() + (by_scan.len() - by_frames.len()) as u64);
 }
 
-/// Enter compiled code at `entry` for the run `tower`, over the VM frame
-/// `regs`, with `acc`: the machine state the stencils expect (`acc`, the
-/// frame, the tag, `ctx` the tower's exit cell; the slots hold
-/// `undefined` and 0.0, the code's entry loads those it uses from the
-/// frame), the C ABI's callee-saved registers kept (the code uses every
-/// register). The code's result. It writes `Tower::hi`: the native stack
-/// below is the code's own from there, each word of which it pushed.
+/// Enter compiled code for the run `ctx` points to (a [`Tower`]'s exit
+/// cell), at the tower's entry, with the machine state as the stencils
+/// take it: its arguments, in the stencils' own convention, so the
+/// registers already hold it (the slots are loaded by the code's entry
+/// from the frame). It writes `Tower::hi` and jumps to the entry, which
+/// returns to the caller: no frame of its own, the native stack below the
+/// caller's is the code's, each word of which it pushed. (A call of an
+/// assembly function in the C convention took more native stack at each
+/// entry, for the registers the code doesn't keep, which the caller's
+/// frame saves here as for any call in this convention. ECharts' force
+/// layout, whose recursion runs up to the native stack's limit, then ran
+/// 12% more instructions, more of it interpreted.)
+#[unsafe(naked)]
+#[rustfmt::skip]
+extern "rust-preserve-none" fn cloison_enter(
+    acc: Value, regs: *mut Value, tag: crate::value::NumberTag, ctx: *mut u32,
+    g0: Value, g1: Value, g2: Value, g3: Value, g4: Value, g5: Value,
+    #[cfg(target_arch = "aarch64")] g6: Value, #[cfg(target_arch = "aarch64")] g7: Value,
+    #[cfg(target_arch = "aarch64")] g8: Value, #[cfg(target_arch = "aarch64")] g9: Value,
+    #[cfg(target_arch = "aarch64")] g10: Value, #[cfg(target_arch = "aarch64")] g11: Value,
+    facc: f64, f0: f64, f1: f64, f2: f64, f3: f64, f4: f64, f5: f64, f6: f64,
+) -> Value {
+    enter_asm!()
+}
+
+/// [`cloison_enter`]'s code: `ctx` is r15, rax a scratch register.
 #[cfg(target_arch = "x86_64")]
 macro_rules! enter_asm {
     () => {
         core::arch::naked_asm!(
-            "push rbp",
-            "push rbx",
-            "push r12",
-            "push r13",
-            "push r14",
-            "push r15",
-            // (Aligned for the call; a word written, as all below.)
-            "push rdi",
-            "mov r15, rdi",
-            "mov rax, rsi",
-            "mov r13, rdx",
-            "mov r12, rcx",
-            "movabs r14, {tag}",
-            "mov [r15 + {hi}], rsp",
-            "mov edi, {undefined}",
-            "mov esi, edi",
-            "mov edx, edi",
-            "mov ecx, edi",
-            "mov r8d, edi",
-            "mov r9d, edi",
-            "xorps xmm0, xmm0",
-            "xorps xmm1, xmm1",
-            "xorps xmm2, xmm2",
-            "xorps xmm3, xmm3",
-            "xorps xmm4, xmm4",
-            "xorps xmm5, xmm5",
-            "xorps xmm6, xmm6",
-            "xorps xmm7, xmm7",
-            "call rax",
-            "add rsp, 8",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop rbx",
-            "pop rbp",
-            "ret",
+            // (The return address stays: a word of the runtime's, harmless.)
+            "lea rax, [rsp + 8]",
+            "mov [r15 + {hi}], rax",
+            "jmp qword ptr [r15 + {entry}]",
             hi = const std::mem::offset_of!(Tower, hi),
-            tag = const Value::NUMBER_TAG,
-            undefined = const Value::UNDEFINED.to_bits(),
+            entry = const std::mem::offset_of!(Tower, entry),
         )
     };
 }
 
-/// The arm64 [`cloison_enter`]: slots x24–x28 and x0–x6, d0–d7.
+/// On arm64: `ctx` is x23, x16 a scratch register; the slots are x24–x28
+/// and x0–x6.
 #[cfg(target_arch = "aarch64")]
 macro_rules! enter_asm {
     () => {
         core::arch::naked_asm!(
-            "stp x29, x30, [sp, #-160]!",
-            "mov x29, sp",
-            "stp x19, x20, [sp, #16]",
-            "stp x21, x22, [sp, #32]",
-            "stp x23, x24, [sp, #48]",
-            "stp x25, x26, [sp, #64]",
-            "stp x27, x28, [sp, #80]",
-            "stp d8, d9, [sp, #96]",
-            "stp d10, d11, [sp, #112]",
-            "stp d12, d13, [sp, #128]",
-            "stp d14, d15, [sp, #144]",
-            "mov x23, x0",
-            "mov x9, x1",
-            "mov x21, x2",
-            "mov x20, x3",
-            "mov x22, #{tag_hi}",
-            "lsl x22, x22, #48",
-            "mov x10, sp",
-            "str x10, [x23, #{hi}]",
-            "mov x24, #{undefined}",
-            "mov x25, x24",
-            "mov x26, x24",
-            "mov x27, x24",
-            "mov x28, x24",
-            "mov x0, x24",
-            "mov x1, x24",
-            "mov x2, x24",
-            "mov x3, x24",
-            "mov x4, x24",
-            "mov x5, x24",
-            "mov x6, x24",
-            "movi d0, #0",
-            "movi d1, #0",
-            "movi d2, #0",
-            "movi d3, #0",
-            "movi d4, #0",
-            "movi d5, #0",
-            "movi d6, #0",
-            "movi d7, #0",
-            "blr x9",
-            "ldp d14, d15, [sp, #144]",
-            "ldp d12, d13, [sp, #128]",
-            "ldp d10, d11, [sp, #112]",
-            "ldp d8, d9, [sp, #96]",
-            "ldp x27, x28, [sp, #80]",
-            "ldp x25, x26, [sp, #64]",
-            "ldp x23, x24, [sp, #48]",
-            "ldp x21, x22, [sp, #32]",
-            "ldp x19, x20, [sp, #16]",
-            "ldp x29, x30, [sp], #160",
-            "ret",
+            "mov x16, sp",
+            "str x16, [x23, #{hi}]",
+            "ldr x16, [x23, #{entry}]",
+            "br x16",
             hi = const std::mem::offset_of!(Tower, hi),
-            tag_hi = const Value::NUMBER_TAG >> 48,
-            undefined = const Value::UNDEFINED.to_bits(),
+            entry = const std::mem::offset_of!(Tower, entry),
         )
     };
 }
-
-#[unsafe(naked)]
-extern "C" fn cloison_enter(tower: *mut Tower, entry: *const u8, regs: *mut Value, acc: Value) -> Value {
-    enter_asm!()
-}
+use enter_asm;
 
 /// Run compiled code from `entry` over the frame `regs` with `acc`, as a
 /// run of `vm`'s (if any: listed for the collector while it lasts) that
 /// entered `code` (if known): its result and the exit record it left
-/// ([`NO_EXIT`] if it returned).
+/// ([`NO_EXIT`] if it returned). The slots start with `undefined` and
+/// 0.0.
 ///
 /// # Safety
 /// `entry` must be a compiled entry for the frame `regs`, of code
 /// compiled for `vm`.
+#[inline(always)]
 unsafe fn enter_tower(
     vm: *mut crate::vm::Vm,
     code: *const JitCode,
@@ -9424,15 +9362,22 @@ unsafe fn enter_tower(
     regs: *mut Value,
     acc: Value,
 ) -> (Value, u32) {
-    let mut tower = Tower { exit: NO_EXIT, hi: 0, outer_lo: 0, outer: std::ptr::null_mut(), code };
+    let mut tower = Tower { exit: NO_EXIT, hi: 0, entry, outer_lo: 0, outer: std::ptr::null_mut(), code };
     let t = &raw mut tower;
+    let (u, tag) = (Value::UNDEFINED, crate::value::NumberTag::new());
     unsafe {
         if !vm.is_null() {
             let f = &raw mut (*vm).jit_frames;
             ((*t).outer_lo, (*t).outer) = ((*f).lo, (*f).towers);
             ((*f).lo, (*f).towers) = (0, t);
         }
-        let acc = cloison_enter(t, entry, regs, acc);
+        #[cfg(target_arch = "x86_64")]
+        let acc = cloison_enter(acc, regs, tag, t.cast(), u, u, u, u, u, u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        #[cfg(target_arch = "aarch64")]
+        #[rustfmt::skip]
+        let acc = cloison_enter(
+            acc, regs, tag, t.cast(), u, u, u, u, u, u, u, u, u, u, u, u, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        );
         if !vm.is_null() {
             let f = &raw mut (*vm).jit_frames;
             ((*f).lo, (*f).towers) = ((*t).outer_lo, (*t).outer);

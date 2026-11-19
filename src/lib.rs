@@ -8,6 +8,7 @@
 
 #![feature(explicit_tail_calls)]
 #![feature(rust_preserve_none_cc)]
+#![feature(naked_functions_rustic_abi)]
 #![feature(fn_align)]
 #![allow(incomplete_features)]
 // Clippy's style lints this code departs from on purpose, so that

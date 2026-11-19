@@ -306,6 +306,7 @@ pub struct HandleScope<'vm, 's> {
 impl Drop for HandleScope<'_, '_> {
     fn drop(&mut self) {
         self.vm.handles.truncate(self.base);
+        self.vm.host_slots = self.base;
     }
 }
 
@@ -335,6 +336,9 @@ impl<'vm, 's> HandleScope<'vm, 's> {
     fn root_value(&mut self, v: Value) -> ScopedLocal<'s> {
         let slot = self.vm.handles.len();
         self.vm.handles.push(v);
+        // (The scopes' slots are a prefix: taken between operations, at
+        // the top. See `Vm::host_slots`.)
+        self.vm.host_slots = slot + 1;
         ScopedLocal { slot, brand: PhantomData }
     }
 

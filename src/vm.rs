@@ -1126,6 +1126,13 @@ pub struct Vm {
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
+    /// How many of `handles` are the slots of the host's open handle
+    /// scopes (`crate::handles`): always a prefix, as the host takes them
+    /// only between runs and operations, which truncate `handles` to no
+    /// less than the depth they found. What scans the runtime's own
+    /// handles starts after them, so that its cost doesn't depend on how
+    /// many a host holds (#371: `join`'s cycle check).
+    pub(crate) host_slots: usize,
     /// The values the host keeps as [`Global`]s: roots.
     pub(crate) globals: std::rc::Rc<Globals>,
     /// The value thrown by the last run or operation, if a cell, for
@@ -1591,6 +1598,7 @@ impl Vm {
             open_upvalues: Vec::new(),
             type_names: [None; 11],
             handles: Vec::new(),
+            host_slots: 0,
             globals: Default::default(),
             host_error: None,
             unmovable: 0,

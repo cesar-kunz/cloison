@@ -414,9 +414,12 @@ fn array_is_array(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `null` empty), separated by `sep` (a comma by default).
 /// Whether `o` is being joined already (an array holding itself): joins
 /// root their arrays as handles marked by a hole before them, apart from
-/// other handles (`apply`'s argument lists, say).
+/// other handles (`apply`'s argument lists, say). Among the runtime's
+/// handles, not the host's handle scopes' slots below them, which may be
+/// millions (#371) and are never a join's.
 fn joining(vm: &Vm, o: Value) -> bool {
-    vm.handles.windows(2).any(|w| w[0] == Value::HOLE && w[1] == o)
+    let (h, from) = (&vm.handles, vm.host_slots);
+    h.len() > from + 1 && h[from..].windows(2).any(|w| w[0] == Value::HOLE && w[1] == o)
 }
 
 pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

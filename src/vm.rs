@@ -8179,6 +8179,13 @@ impl Vm {
         self.heap.gc.running_log.get_or_insert_default().clone()
     }
 
+    /// Have full collections find the compiled versions running by every
+    /// stack word, as they did before #346, not by the frames
+    /// (`CLOISON_JIT_SCAN_ALL`; for tests, and to compare).
+    pub fn set_jit_scan_all(&mut self, on: bool) {
+        self.heap.gc.scan_all = on;
+    }
+
     /// Have every full collection retire every function's compiled code,
     /// whether in use or not (`CLOISON_JIT_RETIRE_ALL`; for tests): the
     /// versions frames run are all that stays, until they leave them.

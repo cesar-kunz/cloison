@@ -1741,13 +1741,15 @@ mod arch {
     }
 
     /// The compiled code entered at rax (`shadow` holds the address of
-    /// the next free word of the VM's list of them, see
-    /// [`super::Marks`]): `movabs r10, shadow; mov rcx, [r10]; mov [rcx],
-    /// rax; add qword ptr [r10], 8`.
+    /// the next free word of the VM's list of them, and after it the
+    /// list's end, see [`super::Marks`]): `movabs r10, shadow; mov rcx,
+    /// [r10]; cmp rcx, [r10 + 8]; jb 1f; ud2; 1: mov [rcx], rax; add
+    /// qword ptr [r10], 8`. (A full list traps before the write.)
     fn shadow_push(c: &mut Vec<u8>, shadow: u64) {
         c.extend([0x49, 0xBA]);
         c.extend(shadow.to_le_bytes());
-        c.extend([0x49, 0x8B, 0x0A, 0x48, 0x89, 0x01, 0x49, 0x83, 0x02, 0x08]);
+        c.extend([0x49, 0x8B, 0x0A, 0x49, 0x3B, 0x4A, 0x08, 0x72, 0x02, 0x0F, 0x0B]);
+        c.extend([0x48, 0x89, 0x01, 0x49, 0x83, 0x02, 0x08]);
     }
 
     /// And left: `movabs r10, shadow; sub qword ptr [r10], 8`.
@@ -2232,12 +2234,17 @@ mod arch {
             c.push(0x5400_0000 | cond); // b.<cond> slow
         });
         // The compiled code entered at x10, in the VM's list of them, and
-        // out of it (see `Marks::shadow`).
+        // out of it (see `Marks::shadow`; a full list traps before the
+        // write).
         let shadow_push = |c: &mut Vec<u32>| {
             if k.marks.shadow != 0 {
                 mov64(c, 16, k.marks.shadow);
                 c.push(0xF940_0211); // ldr x17, [x16]
-                c.push(0xF800_862A); // str x10, [x17], #8
+                c.push(0xF940_060B); // ldr x11, [x16, #8]
+                c.push(0xEB0B_023F); // cmp x17, x11
+                c.push(0x5400_0043); // b.lo 1f
+                c.push(0xD420_0000); // brk #0
+                c.push(0xF800_862A); // 1: str x10, [x17], #8
                 c.push(0xF900_0211); // str x17, [x16]
             }
         };
@@ -2450,7 +2457,11 @@ mod arch {
             lits.push((c.len(), k.marks.shadow));
             c.push(0x5800_000A); // ldr x10, literal
             c.push(0xF940_014B); // ldr x11, [x10]
-            c.push(0xF800_8570); // str x16, [x11], #8
+            c.push(0xF940_054C); // ldr x12, [x10, #8]
+            c.push(0xEB0C_017F); // cmp x11, x12
+            c.push(0x5400_0043); // b.lo 1f
+            c.push(0xD420_0000); // brk #0
+            c.push(0xF800_8570); // 1: str x16, [x11], #8
             c.push(0xF900_014B); // str x11, [x10]
         }
         c.push(0xD63F_0200); // blr x16
@@ -9025,8 +9036,8 @@ const NO_EXIT: u32 = u32::MAX;
 /// the code entered and what it calls directly, down to the call into the
 /// runtime it is in. The VM lists those under way (`Frames::towers`, the
 /// innermost first), for the collector to find the versions running (see
-/// [`running_words`]). Made by [`JitCode::enter`] and [`rt_enter`], in
-/// their frames.
+/// [`running_words`]). Made by [`JitCode::enter`] and `rt_construct`
+/// ([`enter_tower`]), in their frames.
 #[repr(C)]
 pub(crate) struct Tower {
     /// The exit cell, `ctx` in the code: the record of the exit it left
@@ -9043,8 +9054,6 @@ pub(crate) struct Tower {
     outer_lo: usize,
     /// The run this one began in a runtime call of, if any.
     outer: *mut Tower,
-    /// The version entered, if known.
-    code: *const JitCode,
 }
 
 const _: () = assert!(std::mem::offset_of!(Tower, exit) == 0 && std::mem::offset_of!(Tower, hi) == 8);
@@ -9062,9 +9071,10 @@ pub(crate) struct Frames {
     pub(crate) towers: *mut Tower,
     /// `CLOISON_JIT_SHADOW` (a check, see [`check_running`]): the
     /// entries of the code direct calls have entered and not left, in
-    /// order, and the address past the last. Empty when off.
+    /// order; the address past the last, and the list's end (the code
+    /// traps there). Empty when off.
     shadow: Vec<usize>,
-    shadow_top: *mut usize,
+    shadow_top: [*mut usize; 2],
     /// For tests and reports: the versions a scan of every stack word
     /// took for running that no frame runs (counted when checking).
     pub(crate) stale: std::cell::Cell<u64>,
@@ -9072,7 +9082,8 @@ pub(crate) struct Frames {
 
 /// Entries the shadow list has room for: direct calls nest within
 /// `interp::NATIVE_STACK` (and what a run may have of the thread's stack
-/// before its limit is checked), each at least 16 bytes of it.
+/// before its limit is checked), each at least 16 bytes of it. (A call
+/// that found it full would trap.)
 const SHADOW_ROOM: usize = 1 << 18;
 
 impl Default for Frames {
@@ -9081,7 +9092,7 @@ impl Default for Frames {
             lo: 0,
             towers: std::ptr::null_mut(),
             shadow: Vec::new(),
-            shadow_top: std::ptr::null_mut(),
+            shadow_top: [std::ptr::null_mut(); 2],
             stale: Default::default(),
         };
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9098,7 +9109,8 @@ impl Frames {
     pub(crate) fn shadow_on(&mut self) {
         if self.shadow.is_empty() {
             self.shadow = vec![0; SHADOW_ROOM];
-            self.shadow_top = self.shadow.as_mut_ptr();
+            let start = self.shadow.as_mut_ptr();
+            self.shadow_top = [start, start.wrapping_add(SHADOW_ROOM)];
         }
     }
 
@@ -9106,7 +9118,7 @@ impl Frames {
     pub(crate) fn reset(&mut self) {
         (self.lo, self.towers) = (0, std::ptr::null_mut());
         if !self.shadow.is_empty() {
-            self.shadow_top = self.shadow.as_mut_ptr();
+            self.shadow_top[0] = self.shadow.as_mut_ptr();
         }
     }
 
@@ -9121,8 +9133,8 @@ impl Frames {
         if self.shadow.is_empty() {
             return &[];
         }
-        let n = (self.shadow_top as usize - self.shadow.as_ptr() as usize) / 8;
-        assert!(n <= self.shadow.len(), "the shadow list of direct calls overflowed");
+        // (Within the list: the code checks the room before it writes.)
+        let n = (self.shadow_top[0] as usize - self.shadow.as_ptr() as usize) / 8;
         &self.shadow[..n]
     }
 }
@@ -9164,9 +9176,9 @@ const LO_STALE: usize = 1;
 /// running, for a collection whose own frames start at `sp`: the stack
 /// compiled code itself pushed in each run under way (`Frames::towers`),
 /// from the mark its last call into the runtime left (`Frames::lo`) up
-/// to its entry (`Tower::hi`), and the versions entered. A version runs
-/// while one of these words points into its code (a return address) or
-/// at it (as [`free_retired`] and the others read them).
+/// to its entry (`Tower::hi`). A version runs while one of these words
+/// points into its code (a return address; [`free_retired`] and the
+/// others read them).
 ///
 /// A scan of every stack word found those too, and with them the return
 /// addresses that returned calls left in slots nothing wrote since: in
@@ -9181,69 +9193,68 @@ const LO_STALE: usize = 1;
 /// x86-64 the red zone a stencil stepped over before its call isn't
 /// read where the mark tells it (below).
 ///
-/// None if the marks don't fit the stack (the caller then reads every
-/// word, as before; a debug build panics).
+/// None if the marks don't fit the stack, or a run listed has none (the
+/// caller then reads every word, as before; a debug build panics).
 pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>> {
     let base = vm.heap.gc.stack_base;
     let f = &vm.jit_frames;
     let mut out = Vec::new();
     let (mut lo, mut t) = (f.lo, f.towers);
     let mut below = sp;
+    // (The versions' code, by start, once a mark asks: see below.)
+    #[cfg(target_arch = "x86_64")]
+    let mut codes: Option<Vec<(usize, usize)>> = None;
     // (The towers are frames above `sp`, and the words between a mark and
     // its tower's entry are the stack's, once the marks are checked.)
     unsafe {
-        // Whether `w` is a return address into a stencil's runtime call
-        // (in a version alive): the code there puts back the red zone
-        // (`rt_call!`'s `lea rsp, [rsp + 128]`, after its `lea rsp, [rsp
-        // - 128]` and `call`).
-        #[cfg(target_arch = "x86_64")]
-        let after_red_zone = |w: usize| {
-            const BACK: [u8; 8] = [0x48, 0x8D, 0xA4, 0x24, 0x80, 0, 0, 0];
-            const OVER: [u8; 6] = [0x48, 0x8D, 0x64, 0x24, 0x80, 0xE8];
-            ALIVE.with(|a| {
-                a.borrow().1.iter().any(|&c| {
-                    let start = (*c).mem.ptr as usize;
-                    start + OVER.len() + 4 <= w
-                        && w + BACK.len() <= start + (*c).len
-                        && std::slice::from_raw_parts(w as *const u8, BACK.len()) == BACK
-                        && std::slice::from_raw_parts((w - OVER.len() - 4) as *const u8, OVER.len()) == OVER
-                })
-            })
-        };
         while !t.is_null() {
             let tower = &*t;
-            if !tower.code.is_null() {
-                out.push(tower.code as usize);
-            }
             let hi = tower.hi;
-            if lo != 0 && hi != 0 {
-                if !(below <= lo && lo <= hi && hi <= base && lo.is_multiple_of(8) && hi.is_multiple_of(8)) {
-                    debug_assert!(
-                        lo != LO_STALE,
-                        "compiled code called the runtime without marking its stack (the mark is stale)"
-                    );
-                    debug_assert!(false, "compiled code's stack marks don't fit: {below:#x} {lo:#x} {hi:#x} {base:#x}");
-                    return None;
-                }
-                #[allow(unused_mut)]
-                let mut a = lo;
-                // The mark is at a return address. If into a stencil's
-                // runtime call (the wrapper's own return address), the
-                // 128 bytes above are the red zone the stencil stepped
-                // over: not compiled code's pushes, but what earlier
-                // calls left.
-                #[cfg(target_arch = "x86_64")]
-                if a < hi {
-                    let w = *(a as *const usize);
-                    out.push(w);
-                    a += 8;
-                    if after_red_zone(w) {
-                        a = (a + 128).min(hi);
-                    }
-                }
-                out.extend((a..hi).step_by(8).map(|a| *(a as *const usize)));
-                below = hi;
+            // (A run listed is inside a runtime call, which marked the
+            // stack: no mark, or a stale one, and the stack can't be told.)
+            if !(below <= lo && lo <= hi && hi <= base && lo != 0 && lo.is_multiple_of(8) && hi.is_multiple_of(8)) {
+                debug_assert!(
+                    lo != LO_STALE,
+                    "compiled code called the runtime without marking its stack (the mark is stale)"
+                );
+                debug_assert!(false, "compiled code's stack marks don't fit: {below:#x} {lo:#x} {hi:#x} {base:#x}");
+                return None;
             }
+            #[allow(unused_mut)]
+            let mut a = lo;
+            // The mark is at a return address. If into a stencil's runtime
+            // call in a version alive (the wrapper's own return address:
+            // the code there puts back the red zone, `rt_call!`'s `lea
+            // rsp, [rsp + 128]` after its `lea rsp, [rsp - 128]` and
+            // `call`), the 128 bytes above are the red zone the stencil
+            // stepped over: not compiled code's pushes, but what earlier
+            // calls left.
+            #[cfg(target_arch = "x86_64")]
+            if a < hi {
+                const BACK: [u8; 8] = [0x48, 0x8D, 0xA4, 0x24, 0x80, 0, 0, 0];
+                const OVER: [u8; 6] = [0x48, 0x8D, 0x64, 0x24, 0x80, 0xE8];
+                let w = *(a as *const usize);
+                out.push(w);
+                a += 8;
+                let codes = codes.get_or_insert_with(|| {
+                    let mut all: Vec<(usize, usize)> =
+                        ALIVE.with(|a| a.borrow().1.iter().map(|&c| ((*c).mem.ptr as usize, (*c).len)).collect());
+                    all.sort_unstable();
+                    all
+                });
+                let after_red_zone = codes.partition_point(|c| c.0 <= w).checked_sub(1).is_some_and(|i| {
+                    let (start, len) = codes[i];
+                    start + OVER.len() + 4 <= w
+                        && w + BACK.len() <= start + len
+                        && std::slice::from_raw_parts(w as *const u8, BACK.len()) == BACK
+                        && std::slice::from_raw_parts((w - OVER.len() - 4) as *const u8, OVER.len()) == OVER
+                });
+                if after_red_zone {
+                    a = (a + 128).min(hi);
+                }
+            }
+            out.extend((a..hi).step_by(8).map(|a| *(a as *const usize)));
+            below = hi;
             (lo, t) = (tower.outer_lo, tower.outer);
         }
     }
@@ -9255,10 +9266,12 @@ pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>>
 /// versions `words` tells are among those `all` tells (they are words of
 /// the stack); and with `CLOISON_JIT_SHADOW`, every version a direct
 /// call entered and hasn't left (the VM's list of them, which the code
-/// keeps as it calls: see `Frames::shadow`) or a run entered is among
-/// those `words` tells. So a version `all` tells and `words` doesn't is
+/// keeps as it calls: see `Frames::shadow`) is among those `words`
+/// tells. So a version `all` tells and `words` doesn't is
 /// one no call is in: counted (`Frames::stale`).
-pub(crate) fn check_running(vm: &crate::vm::Vm, words: &[usize], all: &[usize]) {
+///
+/// The versions told by `words`, and by `all`.
+pub(crate) fn check_running(vm: &crate::vm::Vm, words: &[usize], all: &[usize]) -> (usize, usize) {
     let told = |words: &[usize]| -> HashSet<*const JitCode> {
         ALIVE.with(|a| {
             let codes = &a.borrow().1;
@@ -9286,6 +9299,7 @@ pub(crate) fn check_running(vm: &crate::vm::Vm, words: &[usize], all: &[usize]) 
         assert!(by_frames.contains(c), "a version a direct call is in isn't told running");
     }
     vm.jit_frames.stale.set(vm.jit_frames.stale.get() + (by_scan.len() - by_frames.len()) as u64);
+    (by_frames.len(), by_scan.len())
 }
 
 /// Enter compiled code for the run `ctx` points to (a [`Tower`]'s exit
@@ -9346,23 +9360,20 @@ macro_rules! enter_asm {
 use enter_asm;
 
 /// Run compiled code from `entry` over the frame `regs` with `acc`, as a
-/// run of `vm`'s (if any: listed for the collector while it lasts) that
-/// entered `code` (if known): its result and the exit record it left
-/// ([`NO_EXIT`] if it returned). The slots start with `undefined` and
-/// 0.0.
+/// run of `vm`'s (if any: listed for the collector while it lasts): its
+/// result and the exit record it left ([`NO_EXIT`] if it returned). The
+/// slots start with `undefined` and 0.0.
+///
+/// (The version entered isn't listed with the run: a collection finds it
+/// as any other, by a return address into it. The run is inside a call it
+/// made: a direct call's is on its stack, a runtime call's is the mark.)
 ///
 /// # Safety
 /// `entry` must be a compiled entry for the frame `regs`, of code
 /// compiled for `vm`.
 #[inline(always)]
-unsafe fn enter_tower(
-    vm: *mut crate::vm::Vm,
-    code: *const JitCode,
-    entry: *const u8,
-    regs: *mut Value,
-    acc: Value,
-) -> (Value, u32) {
-    let mut tower = Tower { exit: NO_EXIT, hi: 0, entry, outer_lo: 0, outer: std::ptr::null_mut(), code };
+unsafe fn enter_tower(vm: *mut crate::vm::Vm, entry: *const u8, regs: *mut Value, acc: Value) -> (Value, u32) {
+    let mut tower = Tower { exit: NO_EXIT, hi: 0, entry, outer_lo: 0, outer: std::ptr::null_mut() };
     let t = &raw mut tower;
     let (u, tag) = (Value::UNDEFINED, crate::value::NumberTag::new());
     unsafe {
@@ -11093,7 +11104,7 @@ impl JitCode {
     ///
     /// `vm`: the VM the code was compiled for, if any, which lists the run.
     unsafe fn enter(&self, vm: *mut crate::vm::Vm, acc: Value, regs: *mut Value) -> Outcome {
-        let (acc, exit) = unsafe { enter_tower(vm, self, self.mem.ptr.add(self.entry), regs, acc) };
+        let (acc, exit) = unsafe { enter_tower(vm, self.mem.ptr.add(self.entry), regs, acc) };
         match exit {
             NO_EXIT => Outcome::Return(acc),
             pc => Outcome::Exit { pc: pc as usize, acc },
@@ -18874,7 +18885,7 @@ fn rt_construct(regs: Value, site: Value) -> Value {
         // otherwise; see `check_tail_callee`): this function makes the
         // result from its own `this`.
         *callee.sub(interp::FLAGS) = Value::from_bits(0);
-        let (acc, exit) = enter_tower((*s).vm, std::ptr::null(), (*s).entry as *const u8, callee, Value::UNDEFINED);
+        let (acc, exit) = enter_tower((*s).vm, (*s).entry as *const u8, callee, Value::UNDEFINED);
         let v = if exit == NO_EXIT { acc } else { direct_exit(&mut *(*s).vm, caller, &mut *s, exit, acc) };
         if v.to_bits() == 0 || crate::props::is_object(v) {
             // An error, or an object: the constructor's, or (through the
@@ -19794,6 +19805,8 @@ mod tests {
             0xA9BF_47F1 | 0xA9BF_27E9 => (d.sp, d.sp_access) = (-16, true),
             // `adr x17, .`
             0x1000_0011 => {}
+            // `brk #0`
+            0xD420_0000 => d.ends = true,
             _ if i & 0xFFFF_FC1F == 0xD63F_0000 => d.call = true, // blr
             _ if i & 0xFC00_0000 == 0x1400_0000 => (d.branch, d.ends) = (Some(4 * sext(i & 0x3FF_FFFF, 26)), true),
             _ if i & 0xFF00_0010 == 0x5400_0000 || i & 0xFF00_0000 == 0xB400_0000 => {

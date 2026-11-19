@@ -269,6 +269,8 @@ pub struct Gc {
     roots_report: bool,
     /// `CLOISON_JIT_RETIRE_ALL`: see `Vm::set_jit_retire_at_gc`.
     pub(crate) retire_all: bool,
+    /// `CLOISON_JIT_SCAN_ALL`: see `Vm::set_jit_scan_all`.
+    pub(crate) scan_all: bool,
     /// See `Vm::jit_running_log`.
     pub(crate) running_log: Option<Vec<String>>,
     /// A full marking holds what compiled code refers to weakly (see
@@ -326,6 +328,7 @@ impl Gc {
             check_barriers: env("CLOISON_GC_CHECK_BARRIER"),
             roots_report: env("CLOISON_GC_ROOTS"),
             retire_all: env("CLOISON_JIT_RETIRE_ALL"),
+            scan_all: env("CLOISON_JIT_SCAN_ALL"),
             running_log: None,
             weak_kept: !env("CLOISON_GC_STRONG_KEPT"),
             weak_now: false,
@@ -3431,11 +3434,14 @@ impl Vm {
     /// Checked against every word in debug builds (`jit::check_running`).
     /// `all` gives every word.
     fn running_words(&self, sp: usize, all: impl Fn() -> Vec<usize>) -> Vec<usize> {
-        let words = crate::jit::running_words(self, sp);
+        let words = crate::jit::running_words(self, sp).filter(|_| !self.heap.gc.scan_all);
         if let Some(w) = &words
             && self.jit_frames.checking()
         {
-            crate::jit::check_running(self, w, &all());
+            let (by_frames, by_scan) = crate::jit::check_running(self, w, &all());
+            if self.heap.gc.roots_report {
+                eprintln!("  running: {by_frames} versions by the frames, {by_scan} by every stack word");
+            }
         }
         words.unwrap_or_else(all)
     }

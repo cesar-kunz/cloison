@@ -1980,8 +1980,10 @@ impl Vm {
     /// (see `held_atoms`).
     ///
     /// The native has the VM as a `&mut Vm`, which safe code can swap with
-    /// another VM's or replace (`std::mem::swap`, `replace`): on its
-    /// return, or its unwinding, the VM here must be the one it was given
+    /// another VM's or replace (`std::mem::swap`, `replace`). Dropped so
+    /// while the native runs, the VM aborts the process at once (see
+    /// `Drop for Vm`). Kept alive, on the native's return, or its
+    /// unwinding, the VM here must be the one it was given
     /// (its `serial`), else the process aborts (see [`Vm::entered`],
     /// #357). Not that some VM entered here is: the native of a VM
     /// swapped in, called by a getter of it that the first native's
@@ -3574,11 +3576,13 @@ impl Vm {
     /// entered there: one running is borrowed, out of safe code's reach).
     /// A native can do either through its `&mut Vm` (#357): the run's
     /// frames, its compiled code and `interp::current_vm` then name the
-    /// wrong VM. Nothing sees it as it happens. The process aborts
-    /// ([`moved_running`]) at the two places that would use them: as the
-    /// native returns or unwinds, if the VM here isn't the one it was
-    /// given ([`Vm::run_native`]), and as a run or an operation enters a
-    /// VM entered elsewhere (`interp::Running`). Until its return the
+    /// wrong VM. Nothing sees the move as it happens. The process aborts
+    /// ([`moved_running`]) at the places that would use them: as the VM
+    /// moved is dropped (its stack and heap, which the native's arguments
+    /// are in, freed: `Drop for Vm`), as the native returns or unwinds,
+    /// if the VM here isn't the one it was given ([`Vm::run_native`]),
+    /// and as a run or an operation enters a VM entered elsewhere
+    /// (`interp::Running`). Until its return the
     /// native may use the VM it put here, which isn't taken for the
     /// running one ([`Vm::running`]), and may swap the first back: then
     /// nothing happened.
@@ -9550,6 +9554,17 @@ pub(crate) fn moved_running(what: &str) -> ! {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // (A VM a run entered, dropped: a native took it out of its
+        // `&mut Vm`, `std::mem::replace` or a swap, and drops it while it
+        // runs, #357. Its VM stack, which the native's arguments are a
+        // slice of, and its heap would be freed under the native, before
+        // `Vm::run_native` checks on its return. A VM running in place is
+        // borrowed by its run, and one moved during a run is still
+        // `entered_at` its entry: whether it moved or not, nothing of it
+        // is torn down.)
+        if !self.entered_at.is_null() {
+            moved_running("its drop")
+        }
         self.unbind_versions();
     }
 }
@@ -10044,11 +10059,32 @@ before + "," + known(ta, P);
         Ok(Value::UNDEFINED)
     }
 
-    /// `replace()`: a new VM put in the running one's place
-    /// (`std::mem::replace`'s short form), which is dropped.
-    fn replace_vm(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    /// What a native that dropped the running VM tells, on the standard
+    /// output, if it goes on past the drop.
+    const AFTER_DROP: &str = "cloison-test: past the drop";
+
+    /// Tell [`AFTER_DROP`], then read `args`, which the VM dropped held.
+    fn past_the_drop(args: &[Value]) -> Result<Value> {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{AFTER_DROP}").and_then(|()| out.flush());
+        Ok(Value::number(args.iter().filter(|v| v.is_cell()).count() as f64))
+    }
+
+    /// `replace(...)`: a new VM put in the running one's place
+    /// (`std::mem::replace`'s short form), the one running dropped, then
+    /// the arguments read (a slice of its VM stack).
+    fn replace_vm(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
         drop(std::mem::take(vm));
-        Ok(Value::UNDEFINED)
+        past_the_drop(args)
+    }
+
+    /// `swapDrop(...)`: the swap, then the VM that was running, now in
+    /// the other's place, dropped, and the arguments read.
+    fn swap_vm_and_drop(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+        swap_with_other(vm);
+        drop(OTHER.with(|o| o.borrow_mut().take()));
+        past_the_drop(args)
     }
 
     /// `swapPanic()`: the swap, then a panic.
@@ -10129,7 +10165,7 @@ before + "," + known(ta, P);
             vm.set_tier_back_edges(i64::MAX);
         }
         let g = vm.global_obj();
-        let natives: [(&str, NativeFn); 7] = [
+        let natives: [(&str, NativeFn); 8] = [
             ("swap", swap_vm),
             ("replace", replace_vm),
             ("swapPanic", swap_vm_and_panic),
@@ -10137,6 +10173,7 @@ before + "," + known(ta, P);
             ("swapUse", swap_vm_and_use),
             ("swapBack", swap_vm_and_back),
             ("swapGetSwap", swap_vm_and_get_swap),
+            ("swapDrop", swap_vm_and_drop),
         ];
         for (n, f) in natives {
             vm.define_native(g, n, f, 0, crate::jit::Ty::Any, false);
@@ -10145,7 +10182,11 @@ before + "," + known(ta, P);
             r#"{GETTER}
             function mk(i) {{ return {{a: i, b: i + 1}}; }}
             function cnt(n) {{ var s = 0; for (var i = 0; i < n; i++) s += mk(i).b; return s; }}
-            function f(k) {{ var r = cnt(1000); if (k == 150) r += {name}() | 0; return r + cnt(1000); }}
+            function f(k) {{
+                var r = cnt(1000);
+                if (k == 150) r += {name}(mk(1), 'a'.repeat(50), [k]) | 0;
+                return r + cnt(1000);
+            }}
             var r = 0; for (var k = 0; k < 300; k++) r += f(k);
             r"#
         );
@@ -10186,6 +10227,7 @@ before + "," + known(ta, P);
             let (err, said) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
             assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{err}");
             assert_eq!(said.contains(PANICKED), panics, "{err}");
+            assert!(!said.contains(AFTER_DROP), "{err}");
         };
         let out = child(None);
         aborted(&out);
@@ -10213,10 +10255,25 @@ before + "," + known(ta, P);
         swapping_aborts("a_native_swapping_the_running_vm_aborts_compiled_code", "swap", true, "a native", false);
     }
 
-    /// The same of a native that replaces the running VM and drops it.
+    /// A native that replaces the running VM and drops it aborts the
+    /// process in the drop: past it, it would read its arguments in the
+    /// VM stack freed (the abort as it returns came too late).
     #[test]
     fn a_native_replacing_the_running_vm_aborts() {
-        swapping_aborts("a_native_replacing_the_running_vm_aborts", "replace", true, "a native", false);
+        swapping_aborts("a_native_replacing_the_running_vm_aborts", "replace", true, "its drop", false);
+    }
+
+    /// The same, interpreted.
+    #[test]
+    fn a_native_replacing_the_running_vm_aborts_interpreted() {
+        swapping_aborts("a_native_replacing_the_running_vm_aborts_interpreted", "replace", false, "its drop", false);
+    }
+
+    /// The same of a native that swaps the running VM with another, then
+    /// drops it where it moved.
+    #[test]
+    fn a_native_dropping_the_running_vm_it_swapped_aborts() {
+        swapping_aborts("a_native_dropping_the_running_vm_it_swapped_aborts", "swapDrop", true, "its drop", false);
     }
 
     /// The same of one that panics after the swap: unwinding would put the

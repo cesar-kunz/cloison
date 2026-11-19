@@ -3670,27 +3670,41 @@ impl Vm {
     /// What `Error.prototype.toString` gives for `v` if it is an error
     /// object (one with [[ErrorData]]) whose `name` and `message` are
     /// found without running JavaScript: data properties, strings or
-    /// missing, through no proxy and no other realm's prototype. Read as
-    /// the error leaves for the host, for the message it keeps.
+    /// missing, through no proxy. Read as the error leaves for the host,
+    /// for the message it keeps, whole (not [`shown`]'s: it is the one
+    /// [`Vm::uncaught_message`] gives later).
+    ///
+    /// Of any realm: an object's own prototype chain is what [`Vm::get`]
+    /// walks for it, which realms change only for a primitive's
+    /// (`Vm::realm_proto`, a string's, a symbol's, a BigInt's), and a
+    /// slotless `name` before the holder (a function's on the chain) is
+    /// read as `Vm::get` reads it.
     fn error_text(&mut self, v: Value) -> Option<String> {
         if !crate::props::is_object(v) || !crate::object::is_error(crate::object::as_object(v)) {
             return None;
         }
         let o = Obj::of(v);
-        if !self.realms.is_empty() || crate::proxy::chain_has_proxy(self, o) {
+        if crate::proxy::chain_has_proxy(self, o) {
             return None;
         }
-        let part = |vm: &Vm, name: Atom, missing: &str| match vm.lookup(o, name) {
-            None => Some(missing.to_string()),
-            Some((h, slot)) if !vm.is_accessor(h, slot) => match h.field(slot) {
-                x if x.is_undefined() => Some(missing.to_string()),
-                x if is_string(x) => Some(shown(x)),
-                _ => None,
-            },
-            Some(_) => None,
+        let part = |vm: &mut Vm, name: Atom, missing: &str| {
+            let x = match vm.lookup(o, name) {
+                Some((h, slot)) => match vm.virtual_before(o, h, name) {
+                    Some(x) => x,
+                    None if vm.is_accessor(h, slot) => return None,
+                    None => h.field(slot),
+                },
+                None => vm.virtual_get(o, name),
+            };
+            match string_len(x) {
+                _ if x.is_undefined() => Some(missing.to_string()),
+                Some(n) => Some(String::from_utf16_lossy(&string_prefix(x, n))),
+                None => None,
+            }
         };
         let message = self.intern("message");
-        let (name, message) = (part(self, self.a_name, "Error")?, part(self, message, "")?);
+        let name = part(self, self.a_name, "Error")?;
+        let message = part(self, message, "")?;
         Some(match (name.is_empty(), message.is_empty()) {
             (_, true) => name,
             (true, false) => message,

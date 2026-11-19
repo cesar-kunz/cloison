@@ -9384,6 +9384,39 @@ fn older_errors_keep_their_messages() {
     }
 }
 
+/// The second review of #359: the message an `Error` keeps is made with
+/// other realms about (it was not, once one existed: `[object Object]`
+/// after the next run), for an error of either realm; and whole, not
+/// cut as an error message shows a long value.
+#[test]
+fn kept_error_messages_with_realms_and_long_strings() {
+    let run_err = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap_err();
+    let mut vm = Vm::new();
+    vm.run(&cloison::js::compile("var other = $262.createRealm(); 0").unwrap()).unwrap();
+    let one = run_err(&mut vm, "throw new Error('one')");
+    let two = run_err(&mut vm, "other.evalScript(\"throw new TypeError('two')\")");
+    let three = run_err(&mut vm, "throw new (other.global.RangeError)('three')");
+    let now = (vm.uncaught_message(&one), vm.uncaught_message(&two), vm.uncaught_message(&three));
+    vm.run(&cloison::js::compile("0").unwrap()).unwrap();
+    assert_eq!(vm.uncaught_message(&one), "Error: one");
+    assert_eq!(vm.uncaught_message(&two), "TypeError: two");
+    assert_eq!(vm.uncaught_message(&three), "RangeError: three");
+    assert_eq!(now.0, "Error: one");
+    // A message past what an error message shows of a value, and a name.
+    for src in [
+        "throw new Error('x'.repeat(1001))",
+        "throw new Error('x'.repeat(600) + 'y'.repeat(600))",
+        "var e = new Error('m'); e.name = 'N'.repeat(1500); throw e",
+    ] {
+        let e = run_err(&mut vm, src);
+        let now = vm.uncaught_message(&e);
+        assert!(now.len() > 1000 && !now.ends_with("..."), "{src}");
+        assert_eq!(e.to_string(), now, "{src}");
+        vm.run(&cloison::js::compile("0").unwrap()).unwrap();
+        assert_eq!(vm.uncaught_message(&e), now, "{src}");
+    }
+}
+
 /// The review of #359: the host reaches the value an error threw
 /// (`Vm::thrown`), a `Local` as any, while the error is the VM's last;
 /// kept as a `Global`, it outlives that.

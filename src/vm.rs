@@ -9842,6 +9842,7 @@ out.join();"#;
                     crate::jit::fail_at(Some((point, nth)));
                     let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
                     let calls = crate::jit::failpoint_calls();
+                    let calls_after = crate::jit::calls_after_failpoint();
                     crate::jit::fail_at(None);
                     let at = format!("case {k} ({point:?}), warm {warm}, call {nth}");
                     assert!(crate::interp::current_vm().is_null() && !crate::jit::panic_pending(), "{at}");
@@ -9860,6 +9861,8 @@ out.join();"#;
                             assert_eq!(msg, format!("failpoint {point:?}"), "{at}");
                             let after: u32 = state.rsplit(',').next().unwrap().parse().unwrap();
                             assert_eq!((state.as_str(), marks), (&*format!("1,0,{after}"), after), "{at}");
+                            // (No runtime call with a failpoint after it.)
+                            assert_eq!(calls_after, 0, "{at}");
                             reached.insert((k, warm, nth));
                         }
                     }
@@ -9871,12 +9874,14 @@ out.join();"#;
         // Every case made its runtime call from the hot tier's code, at
         // its first call and at a late one (but the frame's own
         // `arguments`: its function is inlined by then, its `arguments`
-        // made as `ArgumentsOf`'s cases have them).
+        // made as `ArgumentsOf`'s cases have them), and from the warm
+        // tier's, at its first.
         for (k, &(point, _)) in cases.iter().enumerate() {
             for nth in [1, 2000] {
                 let called = reached.contains(&(k, false, nth)) || (point == CreateArguments && nth != 1);
                 assert!(called, "case {k} ({point:?}): no call {nth} from hot code");
             }
+            assert!(reached.contains(&(k, true, 1)), "case {k} ({point:?}): no call from warm code");
         }
     }
 

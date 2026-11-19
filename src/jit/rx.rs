@@ -38,7 +38,7 @@ impl Piece {
     }
 }
 
-pub(crate) use crate::layout::rx::{BAIL, Class, Ctx, Entry, Head, NOMATCH, NONE, Run};
+pub(crate) use crate::layout::rx::{BAIL, Class, Ctx, Entry, Head, LEAVE, NOMATCH, NONE, Run};
 
 /// Pieces laid out and patched.
 pub(crate) struct Code {

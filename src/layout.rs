@@ -980,7 +980,8 @@ pub mod rx {
         /// The program (`regexp::Program`) the runtime's tests below read.
         pub prog: *const u8,
         /// Whether unit `c`, past ASCII, is in class `k`, case folded (as
-        /// the interpreter's `Program::class_matches`): 0 or 1.
+        /// the interpreter's `Program::class_matches`): 0 or 1, or
+        /// [`LEAVE`], as the two below.
         pub wide: unsafe extern "C" fn(*const Ctx, usize, u64) -> u64,
         /// Whether unit `c`, past ASCII, folds as character `x`: 0 or 1.
         pub fold: unsafe extern "C" fn(*const Ctx, u64, u64) -> u64,
@@ -1036,6 +1037,10 @@ pub mod rx {
     pub const NOMATCH: usize = usize::MAX;
     /// What it returns to leave the attempt to the interpreter.
     pub const BAIL: usize = usize::MAX - 1;
+    /// What `Ctx`'s tests return where they panicked (see
+    /// `jit::unwinding`): the piece leaves the attempt at once, as on a
+    /// bail, nothing more of it matched, for the panic to go on.
+    pub const LEAVE: u64 = 2;
 
     /// Compiled code's entry: `(s, end, pos, bt, regs, ctx)`.
     pub type Entry =

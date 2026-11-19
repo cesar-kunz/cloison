@@ -8002,7 +8002,7 @@ fn rx_fold_has(x: u32, upper: u32, c: u16) -> u64 {
 }
 
 /// [`rx_fold_has`] with `u` or `v` (`_u` pieces): a unit past ASCII by
-/// the runtime's test.
+/// the runtime's test (2, `rx::LEAVE`, if it panicked: the piece bails).
 #[inline(always)]
 unsafe fn rx_fold_has_u(ctx: *const rx::Ctx, x: u32, upper: u32, c: u16) -> u64 {
     match rx_fold_has(x, upper, c) {
@@ -8051,8 +8051,17 @@ rx!(rx_fold; |s, end, pos, bt, regs, ctx| {
 rx!(rx_fold_u; |s, end, pos, bt, regs, ctx| {
     if pos < end {
         let k = imm() as u32;
-        if rx_fold_has_u(ctx, k & 0xFFFF, k >> 16, *s.add(pos)) == 1 {
-            rx_next!(s, end, pos + 1, bt, regs, ctx)
+        let c = *s.add(pos);
+        // (The runtime's result tested on its own path: `rx_fold_has`'s
+        // stays a compare and a branch.)
+        match rx_fold_has(k & 0xFFFF, k >> 16, c) {
+            1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
+            0 => {}
+            _ => match ((*ctx).fold)(ctx, (k & 0xFFFF) as u64, c as u64) {
+                1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
+                0 => {}
+                _ => return rx::BAIL,
+            },
         }
     }
     rx_fail!(s, end, pos, bt, regs, ctx)
@@ -8088,14 +8097,16 @@ rx!(rx_class_u; |s, end, pos, bt, regs, ctx| {
 });
 
 // A surrogate pair whose astral code point is in the program's astral
-// ranges `imm` (the runtime's test).
+// ranges `imm` (the runtime's test; `rx::LEAVE` if it panicked: bail).
 rx!(rx_astral; |s, end, pos, bt, regs, ctx| {
     if pos + 1 < end {
         let (a, b) = (*s.add(pos), *s.add(pos + 1));
         if a & 0xFC00 == 0xD800 && b & 0xFC00 == 0xDC00 {
             let c = 0x10000 + (((a - 0xD800) as u64) << 10) + (b - 0xDC00) as u64;
-            if ((*ctx).astral)(ctx, imm() as u32 as usize, c) == 1 {
-                rx_next!(s, end, pos + 2, bt, regs, ctx)
+            match ((*ctx).astral)(ctx, imm() as u32 as usize, c) {
+                1 => rx_next!(s, end, pos + 2, bt, regs, ctx),
+                0 => {}
+                _ => return rx::BAIL,
             }
         }
     }
@@ -8118,12 +8129,15 @@ rx!(rx_alone; |s, end, pos, bt, regs, ctx| {
             let has = if c < 128 {
                 (if c < 64 { imm64_full() } else { imm64b_full() }) >> (c & 63) & 1
             } else if (*ctx).ic == 2 {
+                // (`rx::LEAVE` if it panicked: bail.)
                 ((*ctx).wide)(ctx, imm() as u32 as usize, c as u64)
             } else {
                 rx_wide_of(ctx, imm() as u32 as usize, c)
             };
-            if has == 1 {
-                rx_next!(s, end, pos + 1, bt, regs, ctx)
+            match has {
+                1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
+                0 => {}
+                _ => return rx::BAIL,
             }
         }
     }

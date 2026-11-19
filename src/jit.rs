@@ -781,9 +781,10 @@ fn rt_add(acc: Value, r: Value) -> u64 {
 /// return already makes). One isn't: `cloison_rt_to_boolean`, which has
 /// nothing to panic in (it reads a cell's header) and no way to leave.
 /// A compiled regular expression's three calls (`regexp::rx_wide_rt` and
-/// the like) are made so too: they answer "no" in a panic's place, and
-/// the attempt's caller resumes it as the code returns, before it reads
-/// the result.
+/// the like) are made so too: they give `rx::LEAVE` in a panic's place,
+/// which their pieces leave the attempt on at once (as on a bail), and
+/// the attempt's caller resumes the panic as the code returns, before it
+/// reads the result.
 #[inline(always)]
 pub(crate) fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -819,6 +820,11 @@ thread_local! {
     /// the next), and how many it had since `fail_at`.
     static FAIL_AT: std::cell::Cell<Option<(Failpoint, u32)>> = const { std::cell::Cell::new(None) };
     static FAIL_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Whether the failpoint fired, and the calls of any (the runtime
+    /// functions with one) since: what compiled code ran after the panic,
+    /// which is to be nothing.
+    static FAIL_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CALLS_AFTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Have the thread's `nth` call of runtime function `point` by compiled
@@ -827,6 +833,15 @@ thread_local! {
 pub(crate) fn fail_at(at: Option<(Failpoint, u32)>) {
     FAIL_AT.with(|f| f.set(at));
     FAIL_CALLS.with(|c| c.set(0));
+    FAIL_FIRED.with(|f| f.set(false));
+    CALLS_AFTER.with(|c| c.set(0));
+}
+
+/// Calls of runtime functions with a failpoint, any, made after the one
+/// set last panicked (until the next `fail_at`).
+#[cfg(test)]
+pub(crate) fn calls_after_failpoint() -> u32 {
+    CALLS_AFTER.with(|c| c.get())
 }
 
 /// How many calls the failpoint set last had (the one that panicked
@@ -838,6 +853,10 @@ pub(crate) fn failpoint_calls() -> u32 {
 
 #[cfg(test)]
 pub(crate) fn hit_failpoint(point: Failpoint) {
+    if FAIL_FIRED.with(|f| f.get()) {
+        CALLS_AFTER.with(|c| c.set(c.get() + 1));
+        return;
+    }
     let Some((p, nth)) = FAIL_AT.with(|f| f.get()) else { return };
     if p != point {
         return;
@@ -845,6 +864,7 @@ pub(crate) fn hit_failpoint(point: Failpoint) {
     let calls = FAIL_CALLS.with(|c| c.replace(c.get() + 1)) + 1;
     if calls == nth {
         FAIL_AT.with(|f| f.set(None));
+        FAIL_FIRED.with(|f| f.set(true));
         panic!("failpoint {point:?}");
     }
 }

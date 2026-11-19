@@ -9234,7 +9234,10 @@ const LO_STALE: usize = 1;
 ///
 /// None if the marks don't fit the stack, or a run listed has none (the
 /// caller then reads every word, as before; a debug build panics).
-pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>> {
+///
+/// `entries` gets the entry of each run listed, for the check
+/// ([`check_running`]): a version runs while a run entered it.
+pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize, entries: &mut Vec<usize>) -> Option<Vec<usize>> {
     let base = vm.heap.gc.stack_base;
     let f = &vm.jit_frames;
     let mut out = Vec::new();
@@ -9250,6 +9253,7 @@ pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>>
         while !t.is_null() {
             let tower = &*t;
             let hi = tower.hi;
+            entries.push(tower.entry as usize);
             // (A run listed is inside a runtime call, which marked the
             // stack: no mark, or a stale one, and the stack can't be told.)
             if !(below <= lo && lo <= hi && hi <= base && lo != 0 && lo.is_multiple_of(8) && hi.is_multiple_of(8)) {
@@ -9307,39 +9311,51 @@ pub(crate) fn running_words(vm: &crate::vm::Vm, sp: usize) -> Option<Vec<usize>>
 /// the stack); and with `CLOISON_JIT_SHADOW`, every version a direct
 /// call entered and hasn't left (the VM's list of them, which the code
 /// keeps as it calls: see `Frames::shadow`) is among those `words`
-/// tells. So a version `all` tells and `words` doesn't is
-/// one no call is in: counted (`Frames::stale`).
+/// tells; and so is the version each run listed entered (`entries`,
+/// which [`running_words`] gives: the run is in it, or in a call it
+/// made). So a version `all` tells and `words` doesn't is one no call is
+/// in: counted (`Frames::stale`).
 ///
 /// The versions told by `words`, and by `all`.
-pub(crate) fn check_running(vm: &crate::vm::Vm, words: &[usize], all: &[usize]) -> (usize, usize) {
-    let told = |words: &[usize]| -> HashSet<*const JitCode> {
-        ALIVE.with(|a| {
-            let codes = &a.borrow().1;
-            let mut ranges: Vec<(usize, usize, *const JitCode)> = Vec::with_capacity(2 * codes.len());
-            for &c in codes.iter() {
-                let code = unsafe { &*c };
-                ranges.push((code.mem.ptr as usize, code.mem.ptr as usize + code.len.max(1), c));
-                ranges.push((c as usize, c as usize + std::mem::size_of::<JitCode>(), c));
-            }
-            ranges.sort_unstable();
-            words
-                .iter()
-                .filter_map(|&w| {
-                    let i = ranges.partition_point(|r| r.0 <= w).checked_sub(1)?;
-                    (w < ranges[i].1).then_some(ranges[i].2)
-                })
-                .collect()
-        })
-    };
-    let (by_frames, by_scan) = (told(words), told(all));
-    assert!(by_frames.is_subset(&by_scan), "a version told running by a word that isn't on the stack");
-    let entered = told(vm.jit_frames.shadowed());
-    assert!(vm.jit_frames.shadowed().is_empty() || !entered.is_empty(), "direct calls under way into no version alive");
-    for c in &entered {
-        assert!(by_frames.contains(c), "a version a direct call is in isn't told running");
-    }
-    vm.jit_frames.stale.set(vm.jit_frames.stale.get() + (by_scan.len() - by_frames.len()) as u64);
-    (by_frames.len(), by_scan.len())
+pub(crate) fn check_running(vm: &crate::vm::Vm, words: &[usize], entries: &[usize], all: &[usize]) -> (usize, usize) {
+    ALIVE.with(|a| {
+        let codes = &a.borrow().1;
+        // (Each version's code, and its `JitCode`, by start.)
+        let mut ranges: Vec<(usize, usize, *const JitCode)> = Vec::with_capacity(2 * codes.len());
+        for &c in codes.iter() {
+            let code = unsafe { &*c };
+            ranges.push((code.mem.ptr as usize, code.mem.ptr as usize + code.len.max(1), c));
+            ranges.push((c as usize, c as usize + std::mem::size_of::<JitCode>(), c));
+        }
+        ranges.sort_unstable();
+        // (The range `w` is in: a version's code, or its `JitCode`.)
+        let range_at = |w: usize| {
+            let i = ranges.partition_point(|r| r.0 <= w).checked_sub(1)?;
+            (w < ranges[i].1).then_some(ranges[i])
+        };
+        let told = |words: &[usize]| -> HashSet<*const JitCode> {
+            words.iter().filter_map(|&w| Some(range_at(w)?.2)).collect()
+        };
+        let (by_frames, by_scan) = (told(words), told(all));
+        assert!(by_frames.is_subset(&by_scan), "a version told running by a word that isn't on the stack");
+        // Each direct call under way, one by one, and each run listed: its
+        // entry is in the code of a version alive, which the frames tell
+        // running. (Every entry, before the versions are told apart: two
+        // calls into one version, or one call into none, aren't one
+        // version found.)
+        let calls = vm.jit_frames.shadowed().iter().map(|&e| ("direct call", e));
+        for (k, (what, entry)) in calls.chain(entries.iter().map(|&e| ("run", e))).enumerate() {
+            let (start, _, c) = range_at(entry)
+                .filter(|r| r.0 != r.2 as usize)
+                .unwrap_or_else(|| panic!("{what} {k} under way entered {entry:#x}, in no version alive"));
+            assert!(
+                by_frames.contains(&c),
+                "{what} {k} under way is in the version at {start:#x} (entered at {entry:#x}), not told running"
+            );
+        }
+        vm.jit_frames.stale.set(vm.jit_frames.stale.get() + (by_scan.len() - by_frames.len()) as u64);
+        (by_frames.len(), by_scan.len())
+    })
 }
 
 /// Enter compiled code for the run `ctx` points to (a [`Tower`]'s exit

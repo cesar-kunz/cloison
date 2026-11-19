@@ -3434,11 +3434,12 @@ impl Vm {
     /// Checked against every word in debug builds (`jit::check_running`).
     /// `all` gives every word.
     fn running_words(&self, sp: usize, all: impl Fn() -> Vec<usize>) -> Vec<usize> {
-        let words = crate::jit::running_words(self, sp).filter(|_| !self.heap.gc.scan_all);
+        let mut entries = Vec::new();
+        let words = crate::jit::running_words(self, sp, &mut entries).filter(|_| !self.heap.gc.scan_all);
         if let Some(w) = &words
             && self.jit_frames.checking()
         {
-            let (by_frames, by_scan) = crate::jit::check_running(self, w, &all());
+            let (by_frames, by_scan) = crate::jit::check_running(self, w, &entries, &all());
             if self.heap.gc.roots_report {
                 eprintln!("  running: {by_frames} versions by the frames, {by_scan} by every stack word");
             }

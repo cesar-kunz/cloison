@@ -7516,7 +7516,8 @@ impl Vm {
     /// stencils have no unwind tables), then unwinds the same: the code
     /// leaves at once, without using what the call would have given (no
     /// store, no call, no return of a value made from it), and no such
-    /// call aborts the process (see `jit::unwinding`).
+    /// call aborts the process, a compiled regular expression's included
+    /// (see `jit::unwinding`).
     ///
     /// The VM may move between runs: the code the JIT made for it where it
     /// was is dropped as the next run starts (see `Vm::rehome`), and its
@@ -9875,6 +9876,43 @@ out.join();"#;
             for nth in [1, 2000] {
                 let called = reached.contains(&(k, false, nth)) || (point == CreateArguments && nth != 1);
                 assert!(called, "case {k} ({point:?}): no call {nth} from hot code");
+            }
+        }
+    }
+
+    /// A panic in a runtime call a compiled regular expression makes (a
+    /// class, a case fold, astral ranges, for what its code doesn't test
+    /// itself) unwinds out of the run too, the match made of the call's
+    /// stand-in answer never seen: nothing is stored after it.
+    #[test]
+    fn a_panic_under_a_compiled_regexp_unwinds_out_of_the_run() {
+        use crate::jit::Failpoint::*;
+        let cases = [
+            (RxWide, "var re = /[\u{e0}-\u{ff}]+z/iu, s = '\u{c9}\u{e9}z';"),
+            (RxFold, "var re = /\u{e9}z/iu, s = 'a\u{c9}z';"),
+            (RxAstral, "var re = /[\u{1F600}-\u{1F64F}]z/u, s = 'a\u{1F601}z';"),
+        ];
+        for (point, decl) in cases {
+            for nth in [1, 2, 500] {
+                let mut vm = Vm::new();
+                let src = format!(
+                    "{decl} var before = 0, after = 0, o = {{v: null}}; \
+                     function f() {{ before++; var m = re.exec(s); o.v = m; after++; return m; }} \
+                     for (var i = 0; i < 5000; i++) f();"
+                );
+                let m = crate::js::compile(&src).unwrap();
+                crate::jit::fail_at(Some((point, nth)));
+                let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+                crate::jit::fail_at(None);
+                let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
+                assert_eq!(msg, Some(format!("failpoint {point:?}")), "call {nth}");
+                assert!(crate::interp::current_vm().is_null() && !crate::jit::panic_pending(), "{point:?} {nth}");
+                assert!(vm.native_top.is_null() && vm.error.is_none() && !vm.poisoned(), "{point:?} {nth}");
+                let state =
+                    crate::js::compile("[before - after, o.v === null || o.v[0].length > 1, re.test(s)].join()");
+                let state = vm.run(&state.unwrap()).map(|v| display(v, &vm));
+                assert_eq!(state.as_deref(), Ok("1,true,true"), "{point:?} {nth}");
+                vm.verify_heap();
             }
         }
     }

@@ -1650,7 +1650,7 @@ mod arch {
             c.extend(marks.lo.to_le_bytes());
             c.extend([0x49, 0x89, 0x22]); // mov [r10], rsp
         }
-        let (save, restore) = saves(gprs, fprs);
+        let (save, restore) = saves(gprs, fprs, false);
         c.extend(save);
         c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
         c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
@@ -1677,7 +1677,7 @@ mod arch {
     /// up, its saves between).
     pub fn enter_wrapper(gprs: &[u8], fprs: &[u8], k: &super::EnterConsts) -> Vec<u8> {
         let disp8 = |d: usize| u8::try_from(d).ok().filter(|&d| d < 0x80).unwrap();
-        let (mut c, restore) = saves(gprs, fprs);
+        let (mut c, restore) = saves(gprs, fprs, true);
         let saved = saved_bytes(gprs, fprs);
         // lea rax, [rsp + saved]; movabs r10, lo; mov [r10], rax
         let mark = |c: &mut Vec<u8>| {
@@ -1992,7 +1992,11 @@ mod arch {
 
     /// A wrapper's saves of GPRs `gprs` and xmm registers `fprs`, leaving
     /// rsp aligned for a call, and the restores and `ret` after it.
-    fn saves(gprs: &[u8], fprs: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    /// `scanned`: its frame may be in the midst of compiled code's stack
+    /// (it calls compiled code), where the collector reads every word (see
+    /// `running_words`), so its padding is written: a word left as it was
+    /// could be a return address into code that has returned.
+    fn saves(gprs: &[u8], fprs: &[u8], scanned: bool) -> (Vec<u8>, Vec<u8>) {
         let mut c = Vec::new();
         let mut r = Vec::new();
         for &g in gprs {
@@ -2003,11 +2007,16 @@ mod arch {
         }
         // Spill area for xmm registers, padded so the call site is aligned.
         let mut frame = 8 * fprs.len();
-        if !(8 + 8 * gprs.len() + frame).is_multiple_of(16) {
+        let pad = !(8 + 8 * gprs.len() + frame).is_multiple_of(16);
+        if pad {
             frame += 8;
         }
         if frame > 0 {
             c.extend([0x48, 0x83, 0xEC, frame as u8]); // sub rsp, frame
+        }
+        if pad && scanned {
+            // mov qword ptr [rsp + 8 * fprs.len()], 0
+            c.extend([0x48, 0xC7, 0x44, 0x24, (8 * fprs.len()) as u8, 0, 0, 0, 0]);
         }
         let movsd = |c: &mut Vec<u8>, op: u8, x: u8, i: usize| {
             // movsd [rsp + 8i], xmm / movsd xmm, [rsp + 8i]

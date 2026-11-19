@@ -3087,6 +3087,47 @@ fn an_expression_out_of_registers_moves_loop_variables_out() {
     assert!(e.contains("unsupported: an expression needing more than 256 registers"), "{e}");
 }
 
+/// A script, a function with a direct `eval` and a generator whose loops'
+/// head variables no closure uses, and an expression that runs out of
+/// temporaries: those variables leave the registers too (in the loops'
+/// scope objects), which frees them for the expression. They were
+/// refused. And one that can't be made to fit is refused by its own
+/// place, not another's that compiled once its loops' variables were out
+/// of registers. The expected values are V8's.
+#[test]
+fn loops_head_variables_leave_registers_for_expressions() {
+    let lets = (0..50).map(|i| format!("x{i} = {i}")).collect::<Vec<_>>().join(", ");
+    let loops: String = (0..150)
+        .map(|k| format!("for (let j{k} = 0; j{k} < 1; j{k}++) {{ let c{k} = j{k} + {k}; fs.push(() => c{k}); }}\n"))
+        .collect();
+    let deep = (0..90).fold("x0".to_string(), |e, i| format!("x{} * 1 + ({e})", i % 50));
+    let body = format!(
+        "var fs = []; let {lets};\n{loops}var deep = {deep}; var out = fs.reduce((a, f) => a + f(), 0) + ' ' + deep;"
+    );
+    for src in [
+        format!("{{ {body} }}\nout;"),
+        format!("(function () {{ eval('0'); {body} return out; }})();"),
+        format!("(function* () {{ {body} yield out; }})().next().value;"),
+    ] {
+        assert_eq!(value(&src), "11175 2005");
+    }
+    let list = |n: usize, f: &dyn Fn(usize) -> String, sep: &str| (0..n).map(f).collect::<Vec<_>>().join(sep);
+    let fixable = format!(
+        "function* fixable() {{ {{ let {}; var keep = () => {}; }} for (let i = 0; i < 2; i++) {{ let {}; yield () => i + {}; }} }}",
+        list(230, &|i| format!("b{i} = {i}"), ", "),
+        list(230, &|i| format!("b{i}"), " + "),
+        list(50, &|i| format!("f{i} = {i}"), ", "),
+        list(50, &|i| format!("f{i}"), " + ")
+    );
+    let unfixable = format!(
+        "function* unfixable() {{ {{ let {}; yield () => {}; }} }}",
+        list(300, &|i| format!("z{i} = {i}"), ", "),
+        list(300, &|i| format!("z{i}"), " + ")
+    );
+    let e = compile_error(&format!("{fixable}\n{unfixable}"));
+    assert!(e.starts_with("2:1: unsupported: more variables than registers"), "{e}");
+}
+
 /// Loops whose block-scoped variables that closures use have no registers
 /// (see `past_the_registers`): each iteration has its own scope object
 /// for them, a `for (let …)` loop's with the head's variables as the

@@ -133,6 +133,45 @@
 //! vm.with_handles(|s| s.display(cloison::value::Value::from_i32(1)));
 //! ```
 //!
+//! A [`Lift`] kept past its inner scope, to be used in another:
+//!
+//! ```compile_fail,E0521
+//! let mut vm = cloison::vm::Vm::new();
+//! vm.with_handles(|s| {
+//!     let mut kept = None;
+//!     s.scope(|_, up| kept = Some(up));
+//! });
+//! ```
+//!
+//! ```
+//! let mut vm = cloison::vm::Vm::new();
+//! vm.with_handles(|s| {
+//!     let x = s.global_object();
+//!     for _ in 0..2 {
+//!         s.scope(|inner, up| inner.display(up.lift(x)));
+//!     }
+//! });
+//! ```
+//!
+//! A value of one inner scope used in its sibling:
+//!
+//! ```compile_fail,E0521
+//! let mut vm = cloison::vm::Vm::new();
+//! vm.with_handles(|s| {
+//!     let mut first = None;
+//!     s.scope(|a, _| first = Some(a.global_object()));
+//!     s.scope(|b, _| b.display(first.unwrap()));
+//! });
+//! ```
+//!
+//! ```
+//! let mut vm = cloison::vm::Vm::new();
+//! vm.with_handles(|s| {
+//!     let first = s.escape_scope(|a, _| Ok(a.global_object())).unwrap();
+//!     s.scope(|b, up| b.display(up.lift(first)));
+//! });
+//! ```
+//!
 //! A string's units borrow the scope: they can't be read past the next
 //! operation, which may move the string:
 //!
@@ -202,7 +241,7 @@ type Brand<'s> = PhantomData<fn(&'s ()) -> &'s ()>;
 /// runs and operations, moved with its cell, of that scope only.
 #[derive(Clone, Copy, Debug)]
 pub struct ScopedLocal<'s> {
-    slot: u32,
+    slot: usize,
     brand: Brand<'s>,
 }
 
@@ -294,7 +333,7 @@ impl<'vm, 's> HandleScope<'vm, 's> {
     /// cycle's marking is under way, paused between runs, is marked by its
     /// final pause, which marks every root anew: `Vm::mark_roots`.)
     fn root_value(&mut self, v: Value) -> ScopedLocal<'s> {
-        let slot = self.vm.handles.len() as u32;
+        let slot = self.vm.handles.len();
         self.vm.handles.push(v);
         ScopedLocal { slot, brand: PhantomData }
     }
@@ -302,7 +341,7 @@ impl<'vm, 's> HandleScope<'vm, 's> {
     /// The value in `l`'s slot now.
     #[inline]
     fn value(&self, l: ScopedLocal<'s>) -> Value {
-        self.vm.handles[l.slot as usize]
+        self.vm.handles[l.slot]
     }
 
     /// `l` as a [`Local`], valid until the next operation.
@@ -523,7 +562,8 @@ impl<'vm, 's> HandleScope<'vm, 's> {
     }
 
     /// `e`'s full message: an object thrown, its `toString` run (as an
-    /// operation), else the error's own (see [`Vm::uncaught_message`]).
+    /// operation: the VM's last error stays its last, as for
+    /// [`Vm::uncaught_message`]), else the error's own.
     pub fn error_message(&mut self, e: &ScopedError<'s>) -> String {
         match e.thrown {
             Some(t) => {
@@ -566,7 +606,7 @@ impl<'vm, 's> HandleScope<'vm, 's> {
             Err(e) => (e.thrown.map(|t| t.slot), Err(e.error)),
         };
         if let Some(from) = from {
-            inner.vm.handles[to.slot as usize] = inner.vm.handles[from as usize];
+            inner.vm.handles[to.slot] = inner.vm.handles[from];
         }
         drop(inner);
         match r {

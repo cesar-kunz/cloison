@@ -4109,13 +4109,8 @@ impl Vm {
             return e.0.clone();
         }
         match e.1 {
-            Some(v) => {
-                // (Still the error's after: rooted through the `toString`.)
-                let kept = self.host_error;
-                let s = self.message_of(v, &e.0);
-                self.host_error = kept;
-                s
-            }
+            // (Still the error's after: rooted through the `toString`.)
+            Some(v) => self.message_of(v, &e.0),
             None => e.0.clone(),
         }
     }
@@ -4123,12 +4118,17 @@ impl Vm {
     /// The message of a thrown value `v` of this VM's, live: an object's
     /// `toString` run, as a host's operation (`own`, the error's own
     /// message, if it throws), a primitive's text whole (an error's own
-    /// is cut: see `Error::thrown`).
+    /// is cut: see `Error::thrown`). The VM's last error stays its last
+    /// ([`Vm::thrown`], [`Vm::uncaught_message`]): the `toString` is a
+    /// diagnostic's, not the host's operation.
     pub(crate) fn message_of(&mut self, v: Value, own: &str) -> String {
         if !crate::props::is_object(v) {
             return display_raw(v);
         }
-        match self.host(&[v], &[], |_| Ok(crate::interp::to_string_units(v))) {
+        let kept = self.host_error;
+        let s = self.host(&[v], &[], |_| Ok(crate::interp::to_string_units(v)));
+        self.host_error = kept;
+        match s {
             Ok(s) => String::from_utf16_lossy(&s),
             Err(_) => own.to_string(),
         }

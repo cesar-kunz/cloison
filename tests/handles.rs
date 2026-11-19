@@ -171,8 +171,8 @@ fn a_scope_ends_its_roots() {
     });
     let left = count(&mut vm);
     // (0 here, under each `CLOISON_GC_*` and with the JIT off: the native
-    // stack is scanned conservatively, so a few may stay.)
-    assert!(left < 25, "{left} of 50 alive");
+    // stack is scanned conservatively, so one or two may stay.)
+    assert!(left <= 2, "{left} of 50 alive");
 }
 
 /// A `Global` is the way out of a scope and back into another; another
@@ -286,4 +286,59 @@ fn scope_operations() {
         let owned = s.run_owned(js("'owned'")).unwrap();
         assert_eq!(s.display(owned), "owned");
     });
+}
+
+/// Scopes nested three and more deep, each lifting the values of the
+/// ones around it, and `escape_scope` giving back a value of an outer
+/// scope's (lifted in): the copy is the outer value, rooted again.
+#[test]
+fn deeply_nested_scopes() {
+    let mut vm = Vm::new();
+    vm.with_handles(|s| {
+        let o = s.run(&js("({n: 1, next: {n: 2, next: {n: 3, next: {n: 4}}}})")).unwrap();
+        let (n, next) = (s.intern("n"), s.intern("next"));
+        let depth = s.vm().handle_depth();
+        let total = s.scope(|s2, up| {
+            let o = up.lift(o);
+            let o2 = s2.get(o, next).unwrap();
+            s2.scope(|s3, up| {
+                let (o, o2) = (up.lift(o), up.lift(o2));
+                let o3 = s3.get(o2, next).unwrap();
+                s3.scope(|s4, up| {
+                    let o4 = s4.get(up.lift(o3), next).unwrap();
+                    s4.run(&js(CHURN)).unwrap();
+                    let mut t = 0.0;
+                    for v in [up.lift(o), up.lift(o2), up.lift(o3), o4] {
+                        let x = s4.get(v, n).unwrap();
+                        t += s4.to_number(x).unwrap();
+                    }
+                    t
+                })
+            })
+        });
+        assert_eq!(total, 10.0);
+        assert_eq!(s.vm().handle_depth(), depth);
+        // The outer value itself, back through an escape.
+        let same = s.escape_scope(|inner, up| {
+            inner.run(&js(CHURN)).unwrap();
+            Ok(up.lift(o))
+        });
+        let same = same.unwrap();
+        assert_eq!(s.vm().handle_depth(), depth + 1);
+        let mark = s.intern("mark");
+        let yes = s.string("yes").unwrap();
+        s.set(same, mark, yes).unwrap();
+        let m = s.get(o, mark).unwrap();
+        assert_eq!(s.display(m), "yes");
+        // Escapes through two scopes.
+        let deep = s
+            .escape_scope(|s2, up| {
+                let o = up.lift(o);
+                s2.escape_scope(|s3, up| s3.get(up.lift(o), next))
+            })
+            .unwrap();
+        let x = s.get(deep, n).unwrap();
+        assert_eq!(s.display(x), "2");
+    });
+    assert_eq!(vm.handle_depth(), 0);
 }

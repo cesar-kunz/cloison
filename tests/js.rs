@@ -12553,3 +12553,83 @@ s;
         assert_eq!(left, (false, 0), "check: {check}, stale versions counted: {}", vm.jit_stale_running());
     }
 }
+
+/// Compiled code reaching compiled code through the runtime, each run
+/// inside a runtime call of the run before: a proxy's trap, `Reflect.apply`,
+/// `call`, `apply`, a bound function, an iterator, `Symbol.hasInstance`,
+/// `toJSON`, derived and plain constructors, callbacks of `reduce`,
+/// `filter`, `replace` and `Array.from`, a template's `toString`, a tag, a
+/// setter and a getter, a recursion, a `finally`, `Function`'s and
+/// `eval`'s code, `new` of a bound function, an `async` function's jobs;
+/// collections at the bottom (`leaf`, every 97th call). The walk takes
+/// every run under way, the outer ones too, through their marks
+/// (`jit::running_words`): with the check on (`Vm::set_jit_shadow`), the
+/// version each run listed entered must be found, and every function's
+/// code is retired at each collection (`Vm::set_jit_retire_at_gc`), the
+/// versions running kept. (A walk that stopped after the innermost run
+/// passed the other tests; here it fails the check, 5 runs of 5. With
+/// 300 steps it didn't: the code retired at each collection wasn't
+/// compiled again by the next.) The results are the plain run's. The
+/// shape is a review's of #366.
+#[test]
+fn runs_inside_runtime_calls_of_runs_are_all_found() {
+    let src = r#"
+var n = 0, t = { v: 1 }, out = 0;
+function gc() { if (++n % 97 == 0) { $262.gc(); t.v = (n % 3) ? 1 : "s"; } }
+function leaf(x) { gc(); return (x + t.v) | 0 ? x : 1; }
+function mid(x) { return leaf(x) + 1; }
+function top(x) { return mid(x) + mid(x + 1); }
+var px = new Proxy({}, { get: function (o, k) { return top(k.length); } });
+var bound = top.bind(null);
+var it = { [Symbol.iterator]() { var i = 0; return { next() { i++; return { done: i > 3, value: top(i) }; } }; } };
+var hi = { [Symbol.hasInstance](v) { return top(v) > 0; } };
+var tj = { toJSON() { return top(2); } };
+class A { constructor(x) { this.a = top(x); } }
+class B extends A { constructor(x) { super(x); this.b = mid(x); } }
+function F(x) { this.f = top(x); }
+function rec(d) { if (d == 0) return top(d); return rec(d - 1) + 1; }
+function tag(s, a) { return top(a); }
+var sobj = { set s(v) { this._s = top(v); }, get g() { return mid(1); } };
+async function as(x) { var y = await x; return top(y); }
+function step(i) {
+  var s = 0;
+  s += px.abc;
+  s += Reflect.apply(top, null, [i]);
+  s += top.call(null, i) + top.apply(null, [i]);
+  s += bound(i);
+  for (var v of it) s += v;
+  s += (i instanceof hi) ? 1 : 0;
+  s += JSON.stringify(tj).length;
+  s += new B(i).b + new F(i).f + new A(i).a;
+  s += [1, 2, 3].reduce(function (a, b) { return a + top(b); }, 0);
+  s += [3, 1, 2].filter(function (x) { return top(x) > 2; }).length;
+  s += "abcabc".replace(/b/g, function (m) { return "" + top(1); }).length;
+  s += Array.from([1, 2], function (x) { return mid(x); })[1];
+  s += `${{ toString() { return "" + top(3); } }}`.length;
+  s += tag`x${i}y`;
+  sobj.s = i; s += sobj._s + sobj.g;
+  s += rec(i % 50);
+  try { s += (function () { try { throw top(i); } finally { s += mid(i); } })(); } catch (e) { s += e | 0; }
+  s += (new Function("x", "return x + 1"))(top(i));
+  s += eval("top(" + i + ")");
+  s += new (top.bind.call(F, null, i))().f;
+  as(i).then(function (v) { out += v; });
+  return s;
+}
+var total = 0;
+for (var i = 0; i < 1000; i++) total += step(i) | 0;
+var result;
+Promise.resolve().then(function () { result = [total, out, n].join(" "); });
+"#;
+    let run = |check: bool| {
+        let mut vm = Vm::new();
+        if check {
+            vm.set_jit_shadow();
+            vm.set_jit_retire_at_gc(true);
+        }
+        vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+        vm.run(&cloison::js::compile("result").unwrap()).map(|v| display(v, &vm)).unwrap()
+    };
+    let plain = run(false);
+    assert_eq!(run(true), plain);
+}

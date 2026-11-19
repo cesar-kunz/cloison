@@ -2685,15 +2685,26 @@ impl Run {
 
 /// `rx::Ctx::wide`: whether unit `c`, past ASCII, is in class `k` of the
 /// program, case folded, as the interpreter tests it.
+///
+/// (0 if it panicked, as the two below: the code has no unwind tables,
+/// see `jit::unwinding`. The attempt goes on as with a unit that isn't in
+/// the class, and its caller, `Native::run`, resumes the panic as the
+/// code returns, the result unread.)
 unsafe extern "C" fn rx_wide_rt(ctx: *const crate::jit::rx::Ctx, k: usize, c: u64) -> u64 {
-    let p = unsafe { &*((*ctx).prog as *const Program) };
-    p.class_matches(k as u32, c as u16) as u64
+    crate::jit::unwinding(0, || {
+        crate::jit::failpoint!(RxWide);
+        let p = unsafe { &*((*ctx).prog as *const Program) };
+        p.class_matches(k as u32, c as u16) as u64
+    })
 }
 
 /// `rx::Ctx::fold`: whether unit `c`, past ASCII, folds as character `x`.
 unsafe extern "C" fn rx_fold_rt(ctx: *const crate::jit::rx::Ctx, x: u64, c: u64) -> u64 {
-    let p = unsafe { &*((*ctx).prog as *const Program) };
-    (p.ic.canon(c as u16) == p.ic.canon(x as u16)) as u64
+    crate::jit::unwinding(0, || {
+        crate::jit::failpoint!(RxFold);
+        let p = unsafe { &*((*ctx).prog as *const Program) };
+        (p.ic.canon(c as u16) == p.ic.canon(x as u16)) as u64
+    })
 }
 
 /// For the native `rx_fold` of character `c` of canonical form `canon`:
@@ -2711,8 +2722,11 @@ fn ascii_upper(ic: Case, canon: u16) -> u32 {
 /// `rx::Ctx::astral`: whether astral code point `c` is in the program's
 /// astral ranges `k`.
 unsafe extern "C" fn rx_astral_rt(ctx: *const crate::jit::rx::Ctx, k: usize, c: u64) -> u64 {
-    let p = unsafe { &*((*ctx).prog as *const Program) };
-    in_points(&p.astral[k], c as u32) as u64
+    crate::jit::unwinding(0, || {
+        crate::jit::failpoint!(RxAstral);
+        let p = unsafe { &*((*ctx).prog as *const Program) };
+        in_points(&p.astral[k], c as u32) as u64
+    })
 }
 
 /// The exec at which a pattern is compiled to native code: `CLOISON_NO_JIT`
@@ -2999,6 +3013,10 @@ impl Native {
         }
         let end =
             unsafe { (self.code.entry())(s.as_ptr(), s.len(), at, bt.as_mut_ptr().add(2), slots.as_mut_ptr(), ctx) };
+        // (A runtime call the code made panicked: on with it, before the
+        // attempt's result, made of a stand-in answer, is read. See
+        // `jit::unwinding`; with `panic = "abort"`, nothing to test.)
+        crate::jit::resume_panic();
         match end {
             rx::NOMATCH => Some(false),
             rx::BAIL => {

@@ -780,8 +780,12 @@ fn rt_add(acc: Value, r: Value) -> u64 {
 /// upvalues and `construct_done` hand `EMPTY` to the test the call's
 /// return already makes). One isn't: `cloison_rt_to_boolean`, which has
 /// nothing to panic in (it reads a cell's header) and no way to leave.
+/// A compiled regular expression's three calls (`regexp::rx_wide_rt` and
+/// the like) are made so too: they answer "no" in a panic's place, and
+/// the attempt's caller resumes it as the code returns, before it reads
+/// the result.
 #[inline(always)]
-fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
+pub(crate) fn unwinding<R>(leave: R, f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
         Err(p) => {
@@ -804,6 +808,9 @@ pub(crate) enum Failpoint {
     CloseUpvalues,
     StrictEq,
     ConstructDone,
+    RxWide,
+    RxFold,
+    RxAstral,
 }
 
 #[cfg(test)]
@@ -830,7 +837,7 @@ pub(crate) fn failpoint_calls() -> u32 {
 }
 
 #[cfg(test)]
-fn hit_failpoint(point: Failpoint) {
+pub(crate) fn hit_failpoint(point: Failpoint) {
     let Some((p, nth)) = FAIL_AT.with(|f| f.get()) else { return };
     if p != point {
         return;
@@ -847,9 +854,10 @@ fn hit_failpoint(point: Failpoint) {
 macro_rules! failpoint {
     ($point:ident) => {
         #[cfg(test)]
-        hit_failpoint(Failpoint::$point);
+        crate::jit::hit_failpoint(crate::jit::Failpoint::$point);
     };
 }
+pub(crate) use failpoint;
 
 thread_local! {
     /// A panic in a runtime call compiled code made, kept till the code
@@ -882,7 +890,7 @@ pub(crate) fn panic_pending() -> bool {
 /// After compiled code returned: the panic a runtime call it made kept, if
 /// any, on its way now (see [`unwinding`]).
 #[inline(always)]
-fn resume_panic() {
+pub(crate) fn resume_panic() {
     if panic_pending() {
         resume_kept();
     }

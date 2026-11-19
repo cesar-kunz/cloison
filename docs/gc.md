@@ -693,6 +693,21 @@ at each function's kept cells:
   any other's, and the function is retired with the running versions
   parked until the frames leave them.
 
+  The walk relies on every way from compiled code into the runtime
+  marking the stack first. A stencil can only call a `cloison_rt_*`
+  function (`build.rs` allows no other symbol, and `build/verify.rs` no
+  call through a register but in a regular expression's stencils, whose
+  helpers run no JavaScript), and those calls go to wrappers the JIT
+  writes, which mark; so do a direct call's and the enter wrapper's
+  calls of the runtime. A path that didn't would leave the previous
+  mark in place, of an earlier call of the same run, below which the
+  stack then held other frames: a release build reads the words there
+  and could miss a version the new call's frames run (the marks still
+  fit the stack, so nothing falls back to every word). Debug builds
+  make the mark stale as each runtime call returns, and panic at a
+  collection that finds it so; `CLOISON_JIT_SHADOW` checks every direct
+  call and every run under way against what the walk found.
+
 **The start pause leaves them unshaded**, so that the concurrent marker
 doesn't make live what only compiled code refers to; the final pause
 decides, once everything else is marked. One that the program takes out

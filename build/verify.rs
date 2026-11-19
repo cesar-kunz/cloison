@@ -15,6 +15,9 @@
 //!   collector relies on to find compiled code's part of the native stack.
 //! - On arm64, nothing is read or written below `sp`: a runtime call's asm
 //!   is `nostack`, and its wrapper pushes.
+//! - No call through a register, but in a regular expression's stencils:
+//!   the runtime calls (`cloison_rt_*`, the only symbols `build.rs`
+//!   allows a call to) are all the stencils' ways into Rust.
 //! - An exit leaves before the stencil changed anything: no memory store
 //!   (but to the native stack) on a path to a branch to `cloison_exit`,
 //!   except in [`STORES_BEFORE_EXIT`].
@@ -141,6 +144,16 @@ pub fn check(name: &str, arch: &str, code: &[u8], relocs: &[Reloc]) -> Vec<Strin
         }
     }
     for (k, i) in insns.iter().enumerate() {
+        // A JavaScript stencil leaves for the runtime only by a call of a
+        // `cloison_rt_*` function, which goes to a wrapper that marks
+        // where compiled code's part of the native stack ends (see
+        // `jit::running_words`; `build.rs` allows no other symbol): no
+        // call through a register. (A regular expression's stencils call
+        // their helpers so, through their context: helpers that run no
+        // JavaScript and collect nothing, under a mark already made.)
+        if i.indirect_call && !name.starts_with("rx_") {
+            errors.push(format!("the call at {:#x} goes through a register: past the runtime calls' marks", i.at));
+        }
         if i.below_sp {
             errors.push(format!(
                 "the access at {:#x} is below `sp`: a red zone, which a runtime call's wrapper overwrites",
@@ -219,6 +232,8 @@ pub struct Insn {
     pub store: bool,
     /// arm64: it reads or writes memory below `sp` (a red zone).
     pub below_sp: bool,
+    /// A call through a register or memory.
+    pub indirect_call: bool,
 }
 
 pub mod x86 {
@@ -261,6 +276,7 @@ pub mod x86 {
                 pc_rel_field,
                 store,
                 below_sp: false,
+                indirect_call: flow == FlowControl::IndirectCall,
             });
         }
         if d.position() != code.len() {
@@ -319,6 +335,7 @@ pub mod arm64 {
                     pc_rel_field: pc_rel.then_some(at),
                     store: is_store(i) && (i >> 5) & 31 != 31,
                     below_sp: below_sp(i),
+                    indirect_call: i & 0xFFFF_FC1F == 0xD63F_0000, // blr
                 }
             })
             .collect())

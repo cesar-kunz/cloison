@@ -994,6 +994,11 @@ pub struct Vm {
     /// Where the VM was as the run going on entered it (`interp::Running`),
     /// null between runs: see [`Vm::entered`].
     pub(crate) entered_at: *const Vm,
+    /// Which VM this is, of all those the process made: what a native's
+    /// return compares, a swap moving it with the VM (see
+    /// [`Vm::run_native`]). Not an address: a VM made where one was
+    /// dropped has the same.
+    pub(crate) serial: u64,
     /// By field cell (its address), the functions whose compiled code took
     /// its type (see `object::FieldCell::relied`).
     pub(crate) field_deps: HashMap<usize, Vec<usize>>,
@@ -1522,6 +1527,10 @@ impl Vm {
             home: std::ptr::null(),
             rehomes: 0,
             entered_at: std::ptr::null(),
+            serial: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             field_deps: HashMap::default(),
             relied_cells: HashMap::default(),
             through_deps: HashMap::default(),
@@ -1972,27 +1981,36 @@ impl Vm {
     ///
     /// The native has the VM as a `&mut Vm`, which safe code can swap with
     /// another VM's or replace (`std::mem::swap`, `replace`): on its
-    /// return, or its unwinding, the VM here must still be the one the run
-    /// entered (see [`Vm::entered`], #357).
+    /// return, or its unwinding, the VM here must be the one it was given
+    /// (its `serial`), else the process aborts (see [`Vm::entered`],
+    /// #357). Not that some VM entered here is: the native of a VM
+    /// swapped in, called by a getter of it that the first native's
+    /// operation ran, can swap the first VM back under its own frames.
+    /// (The VM given was entered here, and is so still if it is here: it
+    /// isn't entered anywhere else, see `interp::Running`.) The natives
+    /// not run through here are the built-in ones `interp::leaf_call`
+    /// calls (`vm::is_leaf`: `Math`'s and the like), which swap nothing.
     #[inline(always)]
     pub(crate) fn run_native<R>(&mut self, f: impl FnOnce(&mut Vm) -> R) -> R {
         /// The check, on unwinding too: what unwinding puts back
         /// (`RunState`, `interp::Running`), it writes to the VM here.
-        struct Entered<'a>(&'a mut Vm);
-        impl Drop for Entered<'_> {
+        struct Given<'a>(&'a mut Vm, u64);
+        impl Drop for Given<'_> {
             #[inline(always)]
             fn drop(&mut self) {
-                if !self.0.entered() {
+                if self.0.serial != self.1 {
                     moved_running("a native")
                 }
+                debug_assert!(self.0.entered());
             }
         }
         let saved = (self.held_atoms.len(), self.holding, self.held_serial);
         self.held_next += 1;
         (self.holding, self.held_serial) = (true, self.held_next);
-        let entered = Entered(self);
-        let r = f(&mut *entered.0);
-        drop(entered);
+        let serial = self.serial;
+        let given = Given(self, serial);
+        let r = f(&mut *given.0);
+        drop(given);
         self.held_atoms.truncate(saved.0);
         (self.holding, self.held_serial) = (saved.1, saved.2);
         r
@@ -3556,9 +3574,14 @@ impl Vm {
     /// entered there: one running is borrowed, out of safe code's reach).
     /// A native can do either through its `&mut Vm` (#357): the run's
     /// frames, its compiled code and `interp::current_vm` then name the
-    /// wrong VM, and the process aborts ([`moved_running`]) before they
-    /// are used, as the native returns ([`Vm::run_native`]) or the VM
-    /// moved is entered again (`interp::Running`).
+    /// wrong VM. Nothing sees it as it happens. The process aborts
+    /// ([`moved_running`]) at the two places that would use them: as the
+    /// native returns or unwinds, if the VM here isn't the one it was
+    /// given ([`Vm::run_native`]), and as a run or an operation enters a
+    /// VM entered elsewhere (`interp::Running`). Until its return the
+    /// native may use the VM it put here, which isn't taken for the
+    /// running one ([`Vm::running`]), and may swap the first back: then
+    /// nothing happened.
     #[inline(always)]
     pub(crate) fn entered(&self) -> bool {
         std::ptr::eq(self.entered_at, self)
@@ -9509,14 +9532,19 @@ impl Drop for RunState {
 }
 
 /// A VM moved, swapped or replaced during its run, found by `what` (see
-/// [`Vm::entered`]). An abort, not a panic: unwinding would put the run's
+/// [`Vm::entered`]). An abort, not a panic, whether or not the message
+/// can be written: unwinding would put the run's
 /// state back in the VM now in its place, and compiled code, which keeps
 /// a panic till it has left, would run on with the addresses of the VM's
 /// fields where it was.
 #[cold]
 #[inline(never)]
 pub(crate) fn moved_running(what: &str) -> ! {
-    eprintln!("cloison: a Vm was moved or replaced during its run (found by {what}): aborting");
+    // (Not `eprintln!`, which panics if the write fails, stderr closed or
+    // full: the unwinding this is here to prevent.)
+    use std::io::Write;
+    let _ =
+        writeln!(std::io::stderr(), "cloison: a Vm was moved or replaced during its run (found by {what}): aborting");
     std::process::abort();
 }
 
@@ -10064,15 +10092,36 @@ before + "," + known(ta, P);
         Ok(Value::number(1.0))
     }
 
+    /// `swapGetSwap()`: the swap, then a getter of the VM now in the
+    /// running one's place which calls that VM's `swap()`: the first VM
+    /// is back in its place, under the getter's frames.
+    fn swap_vm_and_get_swap(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        swap_with_other(vm);
+        let (g, k) = (vm.global_object(), vm.intern("swapsBack"));
+        vm.get(g, k)
+    }
+
     /// A run of hot code calling native `name` (one of the above) midway,
     /// from compiled code if `jit`: its result.
     fn run_swapping(name: &str, jit: bool) -> Result<String> {
+        // (`swapsBack`, after its swap: names and objects the VM it runs
+        // in then, were it another, wouldn't have.)
         const GETTER: &str = r#"
             Object.defineProperty(globalThis, 'got', {get() {
                 var a = []; for (var i = 0; i < 1e5; i++) a.push({i});
                 return a.length;
+            }});
+            Object.defineProperty(globalThis, 'swapsBack', {get() {
+                var o = {}; for (var i = 0; i < 3000; i++) o['only_in_the_other_' + i] = i;
+                var before = Object.keys(o)[2999];
+                swap();
+                var ks = []; for (var k in o) ks.push(k);
+                var b = []; for (var i = 0; i < 1e5; i++) b.push({i, s: 'x' + i, ['q' + i % 100]: o});
+                return before + ks[2999] + b.length;
             }});"#;
         let mut other = Vm::new();
+        let og = other.global_obj();
+        other.define_native(og, "swap", swap_vm, 0, crate::jit::Ty::Any, false);
         other.run(&crate::js::compile(GETTER).unwrap()).unwrap();
         OTHER.with(|o| *o.borrow_mut() = Some(other));
         let mut vm = Box::new(Vm::new());
@@ -10080,13 +10129,14 @@ before + "," + known(ta, P);
             vm.set_tier_back_edges(i64::MAX);
         }
         let g = vm.global_obj();
-        let natives: [(&str, NativeFn); 6] = [
+        let natives: [(&str, NativeFn); 7] = [
             ("swap", swap_vm),
             ("replace", replace_vm),
             ("swapPanic", swap_vm_and_panic),
             ("swapGet", swap_vm_and_get),
             ("swapUse", swap_vm_and_use),
             ("swapBack", swap_vm_and_back),
+            ("swapGetSwap", swap_vm_and_get_swap),
         ];
         for (n, f) in natives {
             vm.define_native(g, n, f, 0, crate::jit::Ty::Any, false);
@@ -10105,12 +10155,46 @@ before + "," + known(ta, P);
     }
 
     /// `run_swapping(name, jit)` in a child process, which must abort
-    /// with `found` as what found the VM moved (test `test`).
-    fn swapping_aborts(test: &str, name: &str, jit: bool, found: &str) {
-        let message = format!("moved or replaced during its run (found by {found})");
-        crate::heap::tests::aborts(&format!("vm::tests::{test}"), &message, || {
+    /// with `found` as what found the VM moved (test `test`), and nothing
+    /// have panicked before (but the native, if `panics`): the run didn't
+    /// go on. And the same with a standard error that can't be written
+    /// (full): reporting mustn't panic, which would unwind through the
+    /// run. (A panic is told on the standard output, by a hook: the run
+    /// that goes on, or unwinds, with the wrong VM may well abort too.)
+    fn swapping_aborts(test: &str, name: &str, jit: bool, found: &str, panics: bool) {
+        use std::io::Write;
+        use std::os::unix::process::ExitStatusExt;
+        const PANICKED: &str = "cloison-test: a panic";
+        if std::env::var_os("CLOISON_TEST_ABORTS").is_some() {
+            std::panic::set_hook(Box::new(|_| {
+                let mut out = std::io::stdout();
+                let _ = writeln!(out, "{PANICKED}").and_then(|()| out.flush());
+            }));
             let _ = run_swapping(name, jit);
-        });
+            return;
+        }
+        let child = |stderr: Option<std::fs::File>| {
+            let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+            c.args([&format!("vm::tests::{test}"), "--exact", "--nocapture", "--test-threads=1"]);
+            c.env("CLOISON_TEST_ABORTS", "1");
+            if let Some(f) = stderr {
+                c.stderr(f);
+            }
+            c.output().unwrap()
+        };
+        let aborted = |out: &std::process::Output| {
+            let (err, said) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+            assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{err}");
+            assert_eq!(said.contains(PANICKED), panics, "{err}");
+        };
+        let out = child(None);
+        aborted(&out);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(&format!("moved or replaced during its run (found by {found})")), "{err}");
+        if cfg!(target_os = "linux") {
+            let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+            aborted(&child(Some(full)));
+        }
     }
 
     /// A native that swaps the running VM with another through its `&mut
@@ -10120,40 +10204,56 @@ before + "," + known(ta, P);
     /// segmentation fault).
     #[test]
     fn a_native_swapping_the_running_vm_aborts() {
-        swapping_aborts("a_native_swapping_the_running_vm_aborts", "swap", false, "a native");
+        swapping_aborts("a_native_swapping_the_running_vm_aborts", "swap", false, "a native", false);
     }
 
     /// The same, the native called from compiled code.
     #[test]
     fn a_native_swapping_the_running_vm_aborts_compiled_code() {
-        swapping_aborts("a_native_swapping_the_running_vm_aborts_compiled_code", "swap", true, "a native");
+        swapping_aborts("a_native_swapping_the_running_vm_aborts_compiled_code", "swap", true, "a native", false);
     }
 
     /// The same of a native that replaces the running VM and drops it.
     #[test]
     fn a_native_replacing_the_running_vm_aborts() {
-        swapping_aborts("a_native_replacing_the_running_vm_aborts", "replace", true, "a native");
+        swapping_aborts("a_native_replacing_the_running_vm_aborts", "replace", true, "a native", false);
     }
 
     /// The same of one that panics after the swap: unwinding would put the
     /// run's state back in the other VM.
     #[test]
     fn a_native_swapping_the_running_vm_aborts_unwinding() {
-        swapping_aborts("a_native_swapping_the_running_vm_aborts_unwinding", "swapPanic", false, "a native");
+        swapping_aborts("a_native_swapping_the_running_vm_aborts_unwinding", "swapPanic", false, "a native", true);
     }
 
     /// Until the native returns, the VM it put in the running one's place
     /// isn't taken for it: its operations enter it, as between runs.
     #[test]
     fn a_vm_swapped_in_is_not_the_running_one() {
-        swapping_aborts("a_vm_swapped_in_is_not_the_running_one", "swapGet", true, "a native");
+        swapping_aborts("a_vm_swapped_in_is_not_the_running_one", "swapGet", true, "a native", false);
     }
 
     /// And the running one, where the native moved it, isn't entered
     /// again: that would drop the code its frames run (`Vm::rehome`).
     #[test]
     fn a_running_vm_moved_is_not_entered_again() {
-        swapping_aborts("a_running_vm_moved_is_not_entered_again", "swapUse", true, "a run entering it");
+        swapping_aborts("a_running_vm_moved_is_not_entered_again", "swapUse", true, "a run entering it", false);
+    }
+
+    /// The VM swapped in can swap the first back, from a native of its
+    /// own, called by its getter that the first VM's native ran: the VM
+    /// in place is then one entered there, but not the one that native
+    /// was given, whose frames would run on with the first VM (an
+    /// out-of-bounds panic in `Vm::atom_name`).
+    #[test]
+    fn a_vm_swapped_in_swapping_back_aborts() {
+        swapping_aborts("a_vm_swapped_in_swapping_back_aborts", "swapGetSwap", false, "a native", false);
+    }
+
+    /// The same, from compiled code.
+    #[test]
+    fn a_vm_swapped_in_swapping_back_aborts_compiled_code() {
+        swapping_aborts("a_vm_swapped_in_swapping_back_aborts_compiled_code", "swapGetSwap", true, "a native", false);
     }
 
     /// A native that swaps the running VM back before it returns did

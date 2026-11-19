@@ -8172,6 +8172,13 @@ impl Vm {
         self.jit_frames.stale.get()
     }
 
+    /// The functions each full collection so far found a frame running a
+    /// compiled version of, once asked for (for tests: what a failure
+    /// tells of).
+    pub fn jit_running_log(&mut self) -> Vec<String> {
+        self.heap.gc.running_log.get_or_insert_default().clone()
+    }
+
     /// Have every full collection retire every function's compiled code,
     /// whether in use or not (`CLOISON_JIT_RETIRE_ALL`; for tests): the
     /// versions frames run are all that stays, until they leave them.

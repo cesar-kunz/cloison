@@ -8989,11 +8989,13 @@ out.push(warm(b, 3000), gcs);
 out.join(" ");
 "#;
     let mut vm = Vm::new();
+    vm.jit_running_log();
     vm.run(&cloison::js::compile(warm).unwrap()).unwrap();
     assert!(vm.jit_stencils("loop").is_some() && vm.jit_stencils("warm").is_some());
     assert_eq!((vm.jit_stats("loop").unwrap().retirements, vm.jit_retired_exits()), (0, 0));
     assert_eq!(below(&mut vm, rest), "102000 002s2s2s2s2s1102s2s2s2s2s11 51000 002s2s2s2s2s1102s2s2s2s2s11 51000 2");
-    assert_eq!(vm.jit_stats("loop").unwrap().retirements, 2, "`loop` is retired at each round");
+    let running = vm.jit_running_log();
+    assert_eq!(vm.jit_stats("loop").unwrap().retirements, 2, "`loop` is retired at each round; running: {running:?}");
     assert!(vm.jit_retired_exits() >= 1, "an exit left the version retired under its frame");
     assert!(vm.jit_stencils("loop").is_some(), "and `loop` is compiled again");
 }

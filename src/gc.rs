@@ -269,6 +269,8 @@ pub struct Gc {
     roots_report: bool,
     /// `CLOISON_JIT_RETIRE_ALL`: see `Vm::set_jit_retire_at_gc`.
     pub(crate) retire_all: bool,
+    /// See `Vm::jit_running_log`.
+    pub(crate) running_log: Option<Vec<String>>,
     /// A full marking holds what compiled code refers to weakly (see
     /// `Vm::weak_kept`); off with `CLOISON_GC_STRONG_KEPT`.
     weak_kept: bool,
@@ -324,6 +326,7 @@ impl Gc {
             check_barriers: env("CLOISON_GC_CHECK_BARRIER"),
             roots_report: env("CLOISON_GC_ROOTS"),
             retire_all: env("CLOISON_JIT_RETIRE_ALL"),
+            running_log: None,
             weak_kept: !env("CLOISON_GC_STRONG_KEPT"),
             weak_now: false,
             frag_report: env("CLOISON_GC_FRAG"),
@@ -2821,6 +2824,10 @@ impl Vm {
                     st.aged = crate::jit::age_functions(self, &st.kept);
                     if self.heap.gc.retire_all {
                         st.aged.extend(st.kept.iter().map(|k| k.code));
+                    }
+                    if let Some(log) = &mut self.heap.gc.running_log {
+                        let run = st.kept.iter().filter(|k| !k.running.is_empty());
+                        log.push(run.map(|k| (*k.code).name.as_str()).collect::<Vec<_>>().join(" "));
                     }
                     self.jit_caches.age();
                     if report {

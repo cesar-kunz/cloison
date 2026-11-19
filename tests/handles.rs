@@ -342,3 +342,54 @@ fn deeply_nested_scopes() {
     });
     assert_eq!(vm.handle_depth(), 0);
 }
+
+/// #371's review: `join`'s cycle check scanned every root, a host scope's
+/// slots with them, so 20,000 joins under a scope of 1,000,000 slots took
+/// seconds (11 ms without). It skips them now. And what a scope roots is
+/// no cycle: an array a scope holds joins as itself.
+#[test]
+fn joins_cost_nothing_more_under_a_deep_scope() {
+    let joins = js(
+        "var a = [1, 2, 3]; var t = 0; for (var i = 0; i < 20000; i++) t += a.join().length + a.toLocaleString().length; t",
+    );
+    let time = |slots: i32| {
+        let mut vm = Vm::new();
+        vm.run(&joins).unwrap();
+        vm.with_handles(|s| {
+            for i in 0..slots {
+                s.root(Local::from(i));
+            }
+            let t = std::time::Instant::now();
+            let r = s.run(&joins).unwrap();
+            assert_eq!(s.display(r), "200000");
+            t.elapsed()
+        })
+    };
+    // (Not where every allocation or so collects, `CLOISON_GC_STRESS` and
+    // `CLOISON_GC_VERIFY`: each collection visits every root, the scope's
+    // million too, as it does a million `Global`s. That is the
+    // collector's cost of the roots, not the join's.)
+    let collecting = ["CLOISON_GC_STRESS", "CLOISON_GC_VERIFY"].iter().any(|v| std::env::var_os(v).is_some());
+    if !collecting {
+        let (none, deep) = (time(0), time(1_000_000));
+        // (Equal here; 1,000 times longer before. Room for a loaded machine.)
+        assert!(deep < none * 20 + std::time::Duration::from_millis(100), "{deep:?} against {none:?}");
+    }
+    let mut vm = Vm::new();
+    vm.with_handles(|s| {
+        let a = s.run(&js("var a = [1, [2, 3]]; a.push(a); a[1].push(a); a")).unwrap();
+        let undefined = s.root(Local::UNDEFINED);
+        let (join, tls) = (s.intern("join"), s.intern("toLocaleString"));
+        for name in [join, tls] {
+            let f = s.get(a, name).unwrap();
+            let r = s.call(f, a, &[]).unwrap();
+            assert_eq!(s.display(r), "1,2,3,,", "the cycles join as empty");
+            let _ = undefined;
+        }
+        // A join that throws leaves no array marked as being joined.
+        let e = s.run(&js("var b = [1, {toString() { throw new Error('in join'); }}]; b.join()")).unwrap_err();
+        assert_eq!(e.message(), "Error: in join");
+        let r = s.run(&js("b[1] = 2; [b.join(), b.toLocaleString(), a.join()].join(' ')")).unwrap();
+        assert_eq!(s.display(r), "1,2 1,2 1,2,3,,");
+    });
+}

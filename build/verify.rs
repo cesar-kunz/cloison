@@ -11,6 +11,9 @@
 //! - Local branches land on an instruction of the stencil.
 //! - No PC-relative reference without a relocation: the JIT copies code,
 //!   not data.
+//! - No call through a register, but in a regular expression's stencils:
+//!   a JavaScript stencil reaches Rust only by a call of a `cloison_rt_*`
+//!   function (the only symbols `build.rs` lets a stencil call).
 //! - An exit leaves before the stencil changed anything: no memory store
 //!   (but to the native stack) on a path to a branch to `cloison_exit`,
 //!   except in [`STORES_BEFORE_EXIT`].
@@ -114,6 +117,16 @@ pub fn check(name: &str, arch: &str, code: &[u8], relocs: &[Reloc]) -> Vec<Strin
         }
     }
     for (k, i) in insns.iter().enumerate() {
+        // A `cloison_rt_*` call goes to a wrapper that saves the slot
+        // registers the region uses, and to a function that catches a
+        // panic, which can't unwind through the copied code (it has no
+        // unwind tables: `jit::unwinding`). A call through a register
+        // would do neither. (A regular expression's stencils call their
+        // helpers so, through their context; the helpers catch panics
+        // themselves, giving `rx::LEAVE`.)
+        if i.indirect_call && !name.starts_with("rx_") {
+            errors.push(format!("the call at {:#x} goes through a register, not to a runtime call's wrapper", i.at));
+        }
         if let Some(f) = i.pc_rel_field
             && !relocs.iter().any(|r| r.offset == f)
         {
@@ -184,6 +197,8 @@ pub struct Insn {
     pub pc_rel_field: Option<usize>,
     /// It may write memory, but the native stack.
     pub store: bool,
+    /// A call through a register or memory.
+    pub indirect_call: bool,
 }
 
 pub mod x86 {
@@ -225,6 +240,7 @@ pub mod x86 {
                 ),
                 pc_rel_field,
                 store,
+                indirect_call: flow == FlowControl::IndirectCall,
             });
         }
         if d.position() != code.len() {
@@ -282,6 +298,7 @@ pub mod arm64 {
                     ends_flow: i & 0xFC00_0000 == 0x1400_0000 || ret_br || trap,
                     pc_rel_field: pc_rel.then_some(at),
                     store: is_store(i) && (i >> 5) & 31 != 31,
+                    indirect_call: i & 0xFFFF_FC1F == 0xD63F_0000, // blr
                 }
             })
             .collect())

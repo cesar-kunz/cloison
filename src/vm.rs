@@ -859,6 +859,12 @@ const STRING_UNITS: usize = crate::layout::slots_offset(Class::String);
 /// Stack size in values (frame headers included).
 const STACK_VALUES: usize = 1 << 18;
 
+/// The VM stack's slots past `Vm::stack_end`, which frames don't reach: a
+/// frame may end at `stack_end`, and `interp::with_top_acc` keeps `acc` in
+/// the slot above its registers (a root there: the collector scans the
+/// stack to its real end, [`Vm::stack_limit`]).
+pub(crate) const STACK_SPARE: usize = 1;
+
 // Shapes (in slabs: `object::ShapeBox`) and code are boxed so their
 // addresses stay put as the vectors grow.
 #[allow(clippy::vec_box)]
@@ -1475,9 +1481,32 @@ pub struct Vm {
     pub(crate) shadow_roots: Vec<Obj>,
 }
 
+impl Vm {
+    /// The VM stack's real end: `stack_end` and its spare slots.
+    pub(crate) fn stack_limit(&self) -> usize {
+        self.stack_end as usize + STACK_SPARE * std::mem::size_of::<Value>()
+    }
+}
+
 impl Default for Vm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Values rooted until it drops (see [`Vm::root_scope`]): `handles` cut
+/// back to where it was. It must not outlive the `Vm`, which it doesn't
+/// borrow (the VM is used meanwhile).
+#[must_use]
+pub(crate) struct RootScope {
+    vm: *mut Vm,
+    depth: usize,
+}
+
+impl Drop for RootScope {
+    #[inline(always)]
+    fn drop(&mut self) {
+        unsafe { (*self.vm).handles.truncate(self.depth) };
     }
 }
 
@@ -1499,7 +1528,9 @@ impl Vm {
         // reach them (a frame sets its registers when pushed); filling it
         // faulted in all 2 MiB at startup.
         let mut stack = vec![Value::from_bits(0); STACK_VALUES].into_boxed_slice();
-        let stack_end = unsafe { stack.as_mut_ptr().add(stack.len()) };
+        // (Frames end by `stack_end`, the slot past them kept: the one
+        // `interp::with_top_acc` puts `acc` in above a frame.)
+        let stack_end = unsafe { stack.as_mut_ptr().add(stack.len() - STACK_SPARE) };
         let mut vm = Vm {
             heap,
             shapes: Vec::new(),
@@ -7904,6 +7935,26 @@ impl Vm {
             self.native_top = saved;
             r?;
         }
+    }
+
+    /// Run `f` with `vs` rooted (in `vm.handles`) while it runs: the Rust
+    /// locals a native holds across a call into JS, kept alive (not
+    /// updated: what moves is pinned by the native stack's words, so no
+    /// `unmovable`). Precise Rust roots, the cheap way.
+    #[inline(always)]
+    pub(crate) fn rooted<T>(&mut self, vs: &[Value], f: impl FnOnce(&mut Vm) -> T) -> T {
+        let _scope = self.root_scope(vs);
+        f(self)
+    }
+
+    /// `vs` rooted (in `vm.handles`, as [`Vm::rooted`]) until the scope
+    /// returned drops: the end of the block holding it, for a native's
+    /// values rooted for the rest of its body.
+    #[inline(always)]
+    pub(crate) fn root_scope(&mut self, vs: &[Value]) -> RootScope {
+        let depth = self.handles.len();
+        self.handles.extend_from_slice(vs);
+        RootScope { vm: self, depth }
     }
 
     /// Run `f` with the values `vm.handles` gets meanwhile rooted: Rust

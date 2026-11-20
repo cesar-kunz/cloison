@@ -3484,7 +3484,7 @@ impl Vm {
     /// its bound (see `vm_top_known`; with nothing known, any).
     unsafe fn vm_stack_top(&self, sp: usize, regs: *mut Value) -> usize {
         let stack = self.stack.as_ptr() as usize;
-        let stack_end = self.stack_end as usize;
+        let stack_end = self.stack_limit();
         let (mut top, bound) = self.vm_top_known(regs);
         for a in (sp..self.heap.gc.stack_base).step_by(8) {
             let w = unsafe { *(a as *const usize) };
@@ -3516,7 +3516,7 @@ impl Vm {
             // The native stack, and the highest VM stack address it holds
             // within the bound of what the VM knows (`vm_top_known`).
             let stack = self.stack.as_ptr() as usize;
-            let stack_end = self.stack_end as usize;
+            let stack_end = self.stack_limit();
             let (mut top, bound) = self.vm_top_known(regs);
             let base = self.heap.gc.stack_base;
             // (Only while nothing compiles: compiled frames' words are roots.)
@@ -4797,7 +4797,7 @@ impl Vm {
         use std::sync::atomic::Ordering::Relaxed;
         unsafe {
             let stack = self.stack.as_ptr() as usize;
-            let stack_end = self.stack_end as usize;
+            let stack_end = self.stack_limit();
             let (mut top, bound) = self.vm_top_known(regs);
             for a in (sp..self.heap.gc.stack_base).step_by(8) {
                 let w = *(a as *const usize);

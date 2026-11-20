@@ -1146,6 +1146,26 @@ fn each(
     let (o, len) = this_object(vm, this)?;
     let f = callback(a, what)?;
     let that = arg(a, 1);
+    // (`o`, and the element `on` gets after the call, which the callback
+    // may have removed: rooted, in a slot of their own.)
+    let depth = vm.handles.len();
+    vm.handles.push(o);
+    vm.handles.push(Value::UNDEFINED);
+    let r = each_rooted(vm, o, len, f, that, depth + 1, &mut on);
+    vm.handles.truncate(depth);
+    r
+}
+
+#[inline(always)]
+fn each_rooted(
+    vm: &mut Vm,
+    o: Value,
+    len: f64,
+    f: Value,
+    that: Value,
+    slot: usize,
+    on: &mut impl FnMut(&mut Vm, f64, Value, Value) -> Result<bool>,
+) -> Result<()> {
     let mut i = 0.0;
     while i < len {
         i = skip(vm, o, i, len);
@@ -1154,6 +1174,7 @@ fn each(
         }
         let (has, v) = element(vm, o, i)?;
         if has {
+            unsafe { *vm.handles.as_mut_ptr().add(slot) = v };
             let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
             if !on(vm, i, v, r)? {
                 break;
@@ -1191,9 +1212,11 @@ fn array_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     callback(a, "map")?;
     let out = species_create(vm, o, len)?;
-    each(vm, o, a, "map", |vm, i, _, r| {
-        create(vm, out, i, r)?;
-        Ok(true)
+    vm.rooted(&[o, out], |vm| {
+        each(vm, o, a, "map", |vm, i, _, r| {
+            create(vm, out, i, r)?;
+            Ok(true)
+        })
     })?;
     Ok(out)
 }
@@ -1203,12 +1226,14 @@ fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     callback(a, "filter")?;
     let out = species_create(vm, o, 0.0)?;
     let mut n = 0.0;
-    each(vm, this, a, "filter", |vm, _, v, r| {
-        if to_boolean(r) {
-            create(vm, out, n, v)?;
-            n += 1.0;
-        }
-        Ok(true)
+    vm.rooted(&[o, out], |vm| {
+        each(vm, this, a, "filter", |vm, _, v, r| {
+            if to_boolean(r) {
+                create(vm, out, n, v)?;
+                n += 1.0;
+            }
+            Ok(true)
+        })
     })?;
     Ok(out)
 }
@@ -1567,30 +1592,44 @@ fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 return Ok(out);
             }
             let mut n = 0.0;
-            crate::symbol::iterate(vm, items, |vm, v| {
-                let v = if mapfn.is_undefined() { v } else { call_function(vm, mapfn, that, &[v, Value::number(n)])? };
-                create(vm, out, n, v)?;
-                n += 1.0;
-                Ok(())
+            vm.rooted(&[out], |vm| {
+                crate::symbol::iterate(vm, items, |vm, v| {
+                    let v =
+                        if mapfn.is_undefined() { v } else { call_function(vm, mapfn, that, &[v, Value::number(n)])? };
+                    create(vm, out, n, v)?;
+                    n += 1.0;
+                    Ok(())
+                })?;
+                set_length_or_throw(vm, out, n)
             })?;
-            set_length_or_throw(vm, out, n)?;
             return Ok(out);
         }
     }
     if custom {
         let (o, len) = this_object(vm, items)?;
-        let out = crate::intrinsics::construct(vm, this, &[Value::number(len)])?;
-        let mut i = 0.0;
-        while i < len {
-            let v = get(vm, o, i)?;
-            let v = if mapfn.is_undefined() { v } else { call_function(vm, mapfn, that, &[v, Value::number(i)])? };
-            create(vm, out, i, v)?;
-            i += 1.0;
-        }
-        set_length_or_throw(vm, out, len)?;
+        let out = vm.rooted(&[o], |vm| crate::intrinsics::construct(vm, this, &[Value::number(len)]))?;
+        vm.rooted(&[o, out], |vm| {
+            let mut i = 0.0;
+            while i < len {
+                let v = get(vm, o, i)?;
+                let v = if mapfn.is_undefined() { v } else { call_function(vm, mapfn, that, &[v, Value::number(i)])? };
+                create(vm, out, i, v)?;
+                i += 1.0;
+            }
+            set_length_or_throw(vm, out, len)
+        })?;
         return Ok(out);
     }
     let out = vm.new_array();
+    let depth = vm.handles.len();
+    vm.handles.push(out);
+    let r = array_from_list(vm, items, out, mapfn, that);
+    vm.handles.truncate(depth);
+    r
+}
+
+/// [`array_from`] of an array-like or string `items`, into `out`.
+fn array_from_list(vm: &mut Vm, items: Value, out: Value, mapfn: Value, that: Value) -> Result<Value> {
     if let Some(u) = string_units(items) {
         let mut n = 0.0;
         let mut i = 0;
@@ -1607,6 +1646,7 @@ fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Ok(out);
     }
     let (o, len) = this_object(vm, items)?;
+    vm.handles.push(o);
     let mut i = 0.0;
     while i < len {
         let v = get(vm, o, i)?;

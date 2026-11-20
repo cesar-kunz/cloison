@@ -384,7 +384,7 @@ macro_rules! handlers {
                     if (*vm).conv_redo {
                         (*vm).conv_redo = false;
                         (*vm).drop_conv_error();
-                        v = with_top($regs, None, |_| $e);
+                        v = with_top_acc($regs, $acc, |_| $e);
                     }
                     if (*vm).conv_thrown {
                         (*vm).error = Some((*vm).take_conv_error());
@@ -1035,7 +1035,7 @@ handlers! {
     fn op_compile_lazy(pc, acc, regs, tag) {
         let code = frame_code(regs);
         let old = code.live().nregs as usize;
-        if let Err(e) = with_top(regs, None, |vm| vm.compile_lazy(code)) {
+        if let Err(e) = with_top_acc(regs, acc, |vm| vm.compile_lazy(code)) {
             (*frame_vm(regs)).error = Some(e);
             tail!(op_unwind, Value::EMPTY)
         }
@@ -1098,12 +1098,12 @@ handlers! {
             }
         }
         // (Where a `prototype` getter can be called.)
-        let r = with_top(regs, None, |vm| vm.instance_of(*reg(pc, 1, regs), acc));
+        let r = with_top_acc(regs, acc, |vm| vm.instance_of(*reg(pc, 1, regs), acc));
         next_or_throw!(Op::TestInstanceOf.size(), r.map(Value::from_bool))
     }
 
     fn op_test_in(pc, acc, regs, tag) {
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             let r = vm.has_property(acc, *reg(pc, 1, regs));
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
         });
@@ -1111,7 +1111,7 @@ handlers! {
     }
 
     fn op_delete_property(pc, acc, regs, tag) {
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             let r = vm.delete_property(*reg(pc, 1, regs), acc);
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
         });
@@ -1131,10 +1131,12 @@ handlers! {
         if vm.global_lexical_slot(name).is_some() || vm.annex_b_undefinable(name) {
             next!(any, Op::InitGlobalAnnexB.size(), acc)
         }
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             let (code, ic) = (&*frame_code(regs), index_at(pc, 1));
             let v = vm.get_global_typeof_miss(code, ic)?;
-            vm.set_global_miss(code, ic, v)
+            // (`v`, maybe a getter's or a trap's only, held across the
+            // store's traps: rooted.)
+            vm.rooted(&[v], |vm| vm.set_global_miss(code, ic, v))
         });
         next_or_throw!(Op::InitGlobalAnnexB.size(), r.map(|()| acc))
     }
@@ -1190,7 +1192,7 @@ handlers! {
         // thrown as a native's caller throws it: see `call_function_on`. As
         // a native, it holds the atoms it takes, a key list across a
         // getter's call: see `Vm::held_atoms`.)
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             let r = vm.run_native(|vm| f(vm, args));
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
         });
@@ -1201,7 +1203,7 @@ handlers! {
         let r = *pc.add(1) as usize;
         // (The iterable read from its register inside: see `op_intrinsic`.)
         // (What a conversion left pending, thrown: see `op_intrinsic`.)
-        let res = with_top(regs, None, |vm| {
+        let res = with_top_acc(regs, acc, |vm| {
             let r = crate::symbol::iterator_open(vm, regs.add(r));
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
         });
@@ -1210,7 +1212,7 @@ handlers! {
 
     fn op_iterator_next(pc, acc, regs, tag) {
         let r = *pc.add(1) as usize;
-        let res = with_top(regs, None, |vm| {
+        let res = with_top_acc(regs, acc, |vm| {
             let r = crate::symbol::iterator_next(vm, regs.add(r));
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
         });
@@ -1221,7 +1223,7 @@ handlers! {
         let k = *pc.add(1) as usize;
         // (The arguments found after `with_top`'s safepoint: copies taken
         // before it are ones no collection moving cells updates.)
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             let mut spread = Vec::new();
             let (args, argc) = frame_args(vm, regs, &mut spread);
             let values: &[Value] = if argc > k { std::slice::from_raw_parts(args.add(k), argc - k) } else { &[] };
@@ -1260,7 +1262,7 @@ handlers! {
 
     fn op_initial_yield(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
-        match with_top(regs, None, |vm| crate::generator::create(vm, Obj::from_ptr(f))) {
+        match with_top_acc(regs, acc, |vm| crate::generator::create(vm, Obj::from_ptr(f))) {
             Ok(g) => {
                 *reg(pc, 1, regs) = g;
                 let code = frame_code(regs);
@@ -1277,7 +1279,7 @@ handlers! {
 
     fn op_async_start(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             let g = crate::generator::create(vm, Obj::from_ptr(f))?;
             *reg(pc, 1, regs) = g;
             let code = frame_code(regs);
@@ -1523,7 +1525,7 @@ handlers! {
         if (*l).shape == (*ic).shape {
             next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(l, (*ic).loc))
         }
-        let r = with_top(regs, None, |vm| vm.get_global_typeof_miss(&*frame_code(regs), index_at(pc, 1)));
+        let r = with_top_acc(regs, acc, |vm| vm.get_global_typeof_miss(&*frame_code(regs), index_at(pc, 1)));
         next_or_throw!(Op::LdaGlobalInsideTypeof.size(), r)
     }
 
@@ -1987,7 +1989,7 @@ handlers! {
 
     fn op_for_in_keys(pc, acc, regs, tag) {
         // (A proxy's traps may run.)
-        let keys = with_top(regs, None, |vm| vm.for_in_key_array(acc));
+        let keys = with_top_acc(regs, acc, |vm| vm.for_in_key_array(acc));
         if (*frame_vm(regs)).conv_failed() {
             let e = (*frame_vm(regs)).take_conv_error();
             next_or_throw!(Op::ForInKeys.size(), Err::<Value, _>(e))
@@ -2138,7 +2140,7 @@ handlers! {
         if (*l).shape == (*ic).shape {
             next!(any, Op::LdaGlobal.size(), *Object::slot(l, (*ic).loc))
         }
-        let r = with_top(regs, None, |vm| vm.get_global_miss(&*frame_code(regs), index_at(pc, 1)));
+        let r = with_top_acc(regs, acc, |vm| vm.get_global_miss(&*frame_code(regs), index_at(pc, 1)));
         next_or_throw!(Op::LdaGlobal.size(), r)
     }
 
@@ -2153,7 +2155,7 @@ handlers! {
             crate::heap::store(l.cast(), at, v);
             next!(any, Op::StaGlobal.size(), acc)
         }
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             vm.store_failed = false;
             let code = &*frame_code(regs);
             let r = vm.set_global_miss(code, index_at(pc, 1), acc);
@@ -2170,7 +2172,7 @@ handlers! {
         if is_cell(tag, obj) && crate::object::Obj::from_ptr(as_object(obj)).class() == Class::TypedArray {
             tail!(typed_get_named, acc)
         }
-        let r = with_top(regs, None, |vm| vm.get_named_miss(&*frame_code(regs), index_at(pc, 2), obj));
+        let r = with_top_acc(regs, acc, |vm| vm.get_named_miss(&*frame_code(regs), index_at(pc, 2), obj));
         next_or_throw!(Op::GetNamed.size(), r)
     }
 
@@ -2196,7 +2198,7 @@ handlers! {
             let n = crate::typed::ta_length(o).unwrap_or(0);
             next!(any, Op::GetNamed.size(), Value::from_i32(n as i32))
         }
-        let r = with_top(regs, None, |vm| vm.get_named_miss(code, index_at(pc, 2), obj));
+        let r = with_top_acc(regs, acc, |vm| vm.get_named_miss(code, index_at(pc, 2), obj));
         next_or_throw!(Op::GetNamed.size(), r)
     }
 
@@ -2204,7 +2206,7 @@ handlers! {
     #[inline(never)]
     fn slow_set_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             vm.store_failed = false;
             let code = &*frame_code(regs);
             let r = vm.set_named_miss(code, index_at(pc, 2), obj, acc);
@@ -2246,7 +2248,7 @@ handlers! {
     #[inline(never)]
     fn slow_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             // An object key converted once, and kept for the `SetKeyed`
             // storing back to it if any (a compound assignment's, an
             // increment's: see `Vm::key_cache`).
@@ -2265,6 +2267,9 @@ handlers! {
             } else {
                 acc
             };
+            // (`key`, a conversion's maybe Rust's alone, held across the
+            // getters and traps: rooted.)
+            let _rooted = vm.root_scope(&[key]);
             let r = vm.get_keyed_miss(&*frame_code(regs), index_at(pc, 2), obj, key);
             // (A key's conversion may have thrown.)
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
@@ -2313,7 +2318,7 @@ handlers! {
                 (*ic).loc = crate::vm::APPEND_LOC;
             }
         }
-        let r = with_top(regs, None, |vm| {
+        let r = with_top_acc(regs, acc, |vm| {
             let mut key = *reg(pc, 2, regs);
             let base = *reg(pc, 1, regs);
             if crate::props::is_object(key) && !base.is_undefined() && !base.is_null() {
@@ -2326,6 +2331,9 @@ handlers! {
                     vm.key_value(k)
                 };
             }
+            // (`key`, a conversion's or the cache's, held across the
+            // setters and traps: rooted.)
+            let _rooted = vm.root_scope(&[key]);
             vm.store_failed = false;
             let r = vm.set_keyed(*reg(pc, 1, regs), key, acc);
             let r = if vm.conv_thrown { Err(vm.take_conv_error()) } else { r };
@@ -2479,7 +2487,7 @@ handlers! {
             enter!(fo, that, w.add(1), argc, 0, Op::Call.size())
         }
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
+        let r = with_top_acc(regs, acc, |vm| { let r = vm.call_own(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Call.size(), r)
     }
 
@@ -2491,7 +2499,7 @@ handlers! {
             enter!(fo, that, reg(pc, 2, regs), *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
+        let r = with_top_acc(regs, acc, |vm| { let r = vm.call_own(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::CallUndefined.size(), r)
     }
 
@@ -2500,7 +2508,7 @@ handlers! {
     fn slow_construct(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| { let r = vm.construct_other(*reg(pc, 1, regs), args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
+        let r = with_top_acc(regs, acc, |vm| { let r = vm.construct_other(*reg(pc, 1, regs), args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Construct.size(), r)
     }
 }
@@ -4897,7 +4905,6 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
         if top.is_null() {
             return Err(Error::unsupported(NO_TOP));
         }
-        vm.safepoint(top);
         let fo = as_object(f);
         let callee = (*fo).code;
         let new = top.add(HEADER);
@@ -4917,6 +4924,8 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
         for i in 1 + k..n {
             *new.add(i) = Value::UNDEFINED;
         }
+        // (After the frame is written: `f` and `this` are its roots.)
+        vm.safepoint(top);
         // (Roots while the callee runs; an outer call's again after.)
         let outer = std::mem::replace(&mut vm.pending_args, (args.as_ptr(), args.len()));
         let saved = vm.native_top;
@@ -4993,6 +5002,29 @@ unsafe fn with_top<T>(regs: *mut Value, top: Option<*mut Value>, f: impl FnOnce(
         vm.safepoint(vm.native_top);
         let r = f(vm);
         (*frame_vm(regs)).native_top = saved;
+        r
+    }
+}
+
+/// [`with_top`] with the interpreter's `acc` kept on the VM stack while
+/// `f` runs (a root of the collections it may reach, not in a Rust local
+/// only).
+#[inline(always)]
+unsafe fn with_top_acc<T>(regs: *mut Value, acc: Value, f: impl FnOnce(&mut Vm) -> T) -> T {
+    unsafe {
+        let vm = &mut *frame_vm(regs);
+        let saved = vm.native_top;
+        let top = regs.add((*frame_code(regs)).nregs as usize);
+        // (In the stack: a frame ends by `stack_end`, the slot past it
+        // spare, `vm::STACK_SPARE`.)
+        debug_assert!((top as usize) < vm.stack_limit());
+        *top = acc;
+        vm.native_top = top.add(1);
+        vm.safepoint(vm.native_top);
+        let r = f(vm);
+        let vm = &mut *frame_vm(regs);
+        *top = Value::UNDEFINED;
+        vm.native_top = saved;
         r
     }
 }
@@ -5483,7 +5515,7 @@ pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -
 pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error> {
     unsafe {
         let n = code.live().nregs as usize;
-        if HEADER + n > vm.stack.len() {
+        if vm.stack.as_mut_ptr().add(HEADER + n) > vm.stack_end {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         let regs = vm.stack.as_mut_ptr().add(HEADER);

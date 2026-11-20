@@ -8659,6 +8659,26 @@ out.join(" ");
     );
 }
 
+/// Recursion to the VM stack's end, each frame doing an `in` (which keeps
+/// `acc` in the slot above its frame meanwhile) before its call, from
+/// bases 1 to 39 slots apart: for some, the last frame ends just at the
+/// stack's end, and `acc` still goes in the stack (a spare slot past
+/// `stack_end`, which a debug build asserts), the call then a RangeError.
+#[test]
+fn a_frame_at_the_stack_end_keeps_acc_in_the_stack() {
+    let src = r#"
+function locals(n, first) { var s = "var a0 = " + first; for (var i = 1; i < n; i++) s += ", a" + i + " = a" + (i - 1); return s; }
+var x = {}, out = 0;
+var g = new Function("x", "return function g(d) { " + locals(6, "d") + "; if (!(\"p\" in x)) g(d + 1); };")(x);
+for (var m = 1; m < 40; m++) {
+  var start = new Function("g", "return function start() { " + locals(m, "0") + "; g(a0); };")(g);
+  try { start(); } catch (e) { if (e instanceof RangeError) out++; }
+}
+out;
+"#;
+    assert_eq!(value(src), "39");
+}
+
 /// A prototype cycle through a proxy without traps (which
 /// OrdinarySetPrototypeOf allows, 10.1.2.1 step 7.b.i) makes a lookup
 /// on it a RangeError, not a loop (issue #336): the forwards in the

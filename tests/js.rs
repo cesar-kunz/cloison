@@ -6340,6 +6340,12 @@ log.push(eval("4; { using c = null; }"));
 /// import each other: its path.
 fn module_dir(test: &str, files: &[(&str, &str)]) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("cloison-{test}-{}", std::process::id()));
+    // A directory an earlier run left under the same process ID goes: its
+    // files (a FIFO `mkfifo` then failed on) are no test's of this run.
+    match std::fs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("{}: {e}", dir.display()),
+        _ => {}
+    }
     std::fs::create_dir_all(&dir).unwrap();
     for (name, text) in files {
         std::fs::write(dir.join(name), text).unwrap();

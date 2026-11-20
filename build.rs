@@ -140,6 +140,13 @@ fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]
         .args(extra)
         .args(["--target", target])
         .arg(format!("--emit=obj={},dep-info={}", obj_path.display(), obj_path.with_extension("d").display()))
+        // rustc writes its temporary object (`cloison_stencils.*.rcgu.o`, a
+        // name fixed by the crate's) in its output directory, else in the
+        // working directory, the checkout: builds into several target
+        // directories at once overwrote each other's and failed ("could not
+        // copy … rcgu.o").
+        .arg("--out-dir")
+        .arg(obj_path.parent().unwrap())
         .arg(SOURCE)
         .status()
         .expect("failed to run rustc for the stencils");

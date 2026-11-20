@@ -138,6 +138,39 @@ impl ShapePhases {
     }
 }
 
+/// `CLOISON_GC_NO_NATIVE_ROOTS`: native stack words as roots (`Off`),
+/// not (`Drop`, any value: a Rust local holding a cell across a safepoint
+/// then dies, found by `CLOISON_GC_STRESS`), or not and reported
+/// (`report`: see `Vm::report_native_roots`). For interpreter-only runs
+/// (`CLOISON_NO_JIT`), whose native stack is Rust frames only.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum NoNative {
+    #[default]
+    Off,
+    Drop,
+    Report,
+}
+
+/// The native stack's frames from here out, innermost first: each one's
+/// instruction pointer (a return address but for the first) and canonical
+/// frame address (its caller's stack pointer before the call).
+fn unwind_frames() -> Vec<(usize, usize)> {
+    use std::ffi::c_void;
+    unsafe extern "C" {
+        fn _Unwind_Backtrace(cb: extern "C" fn(*mut c_void, *mut c_void) -> i32, arg: *mut c_void) -> i32;
+        fn _Unwind_GetIP(c: *mut c_void) -> usize;
+        fn _Unwind_GetCFA(c: *mut c_void) -> usize;
+    }
+    extern "C" fn cb(c: *mut c_void, arg: *mut c_void) -> i32 {
+        let v = unsafe { &mut *(arg as *mut Vec<(usize, usize)>) };
+        unsafe { v.push((_Unwind_GetIP(c), _Unwind_GetCFA(c))) };
+        if v.len() > 100_000 { 5 } else { 0 }
+    }
+    let mut v: Vec<(usize, usize)> = Vec::new();
+    unsafe { _Unwind_Backtrace(cb, (&mut v as *mut Vec<(usize, usize)>).cast()) };
+    v
+}
+
 /// Milliseconds since `t`, and `t` now.
 pub(crate) fn lap(t: &mut std::time::Instant) -> f64 {
     let now = std::time::Instant::now();
@@ -279,6 +312,15 @@ pub struct Gc {
     /// marked is reached from the roots' slots (`CLOISON_GC_SLOTS`, see
     /// `Vm::check_root_slots`).
     slots_check: bool,
+    /// Native stack words are no roots (they still find the VM stack's
+    /// top and running codes): Rust locals that hold cells across a
+    /// safepoint then die, a checker of precise Rust roots for
+    /// interpreter-only runs (`CLOISON_GC_NO_NATIVE_ROOTS`, with
+    /// `CLOISON_GC_STRESS` and `CLOISON_NO_JIT`).
+    pub(crate) no_native_roots: NoNative,
+    /// `NoNative::Report`'s native stack words that point into cells
+    /// (their address, their value), this collection.
+    native_words: Vec<(usize, usize)>,
     /// What full collections move ([`Vm::evacuate`]).
     evacuate: Evacuate,
     /// The stress mode's blocks this time: odd or even ones.
@@ -325,6 +367,12 @@ impl Gc {
             weak_now: false,
             frag_report: env("CLOISON_GC_FRAG"),
             slots_check: env("CLOISON_GC_SLOTS"),
+            no_native_roots: match std::env::var("CLOISON_GC_NO_NATIVE_ROOTS").as_deref() {
+                Err(_) | Ok("0" | "off") => NoNative::Off,
+                Ok("report") => NoNative::Report,
+                Ok(_) => NoNative::Drop,
+            },
+            native_words: Vec::new(),
             evacuate: match std::env::var("CLOISON_GC_EVACUATE").as_deref() {
                 Ok("0" | "off") => Evacuate::Off,
                 Ok("1" | "all") => Evacuate::All,
@@ -2521,6 +2569,9 @@ impl Vm {
             } else {
                 m.drain(&|| false)
             };
+            if self.heap.gc.no_native_roots == NoNative::Report {
+                self.report_native_roots(&mut m, kind);
+            }
             // (The weak collections' entries, once what is live is known:
             // in a full marking, with its live codes and shapes.)
             self.ephemerons(&mut m, sp, regs);
@@ -3076,6 +3127,44 @@ impl Vm {
         self.heap.pause_marker();
     }
 
+    /// `NoNative::Report`: the native stack words that keep a cell the
+    /// precise roots don't, each marked then (the run goes on as with
+    /// conservative roots), and reported once by the Rust frame holding
+    /// it: `NNR <kind> <frame ip> <caller ips...>` on stderr, the ips to
+    /// symbolize (`addr2line`, one less than a return address).
+    #[cold]
+    #[inline(never)]
+    unsafe fn report_native_roots(&mut self, m: &mut Marking, kind: Collection) {
+        use std::collections::HashSet;
+        static SEEN: std::sync::Mutex<Option<HashSet<(usize, usize, usize)>>> = std::sync::Mutex::new(None);
+        let words = std::mem::take(&mut self.heap.gc.native_words);
+        let mut frames: Option<Vec<(usize, usize)>> = None;
+        for &(a, w) in &words {
+            let before = m.marked;
+            unsafe {
+                self.mark_interior(m, w);
+                m.drain(&|| false);
+            }
+            if m.marked == before {
+                continue;
+            }
+            let fr = frames.get_or_insert_with(unwind_frames);
+            let i = fr.iter().position(|&(_, cfa)| a < cfa).unwrap_or(fr.len().saturating_sub(1));
+            let ip = |j: usize| fr.get(j).map_or(0, |f| f.0);
+            let key = (ip(i), ip(i + 1), ip(i + 2));
+            let mut seen = SEEN.lock().unwrap();
+            if seen.get_or_insert_with(HashSet::new).insert(key) {
+                let chain: Vec<String> = (i..(i + 12).min(fr.len())).map(|j| format!("{:x}", ip(j))).collect();
+                let name = match kind {
+                    Collection::Minor => "minor",
+                    Collection::MinorShade | Collection::Start => "shade",
+                    _ => "full",
+                };
+                eprintln!("NNR {name} bytes={} frame={i} {}", m.marked - before, chain.join(" "));
+            }
+        }
+    }
+
     /// Mark the cell that word `w` points into, if any (a native stack
     /// word, a Rust structure's address of a slot).
     unsafe fn mark_interior(&self, m: &mut Marking, w: usize) {
@@ -3430,14 +3519,18 @@ impl Vm {
             let stack_end = self.stack_end as usize;
             let (mut top, bound) = self.vm_top_known(regs);
             let base = self.heap.gc.stack_base;
+            // (Only while nothing compiles: compiled frames' words are roots.)
+            let nn = if self.tier_calls == i32::MAX { self.heap.gc.no_native_roots } else { NoNative::Off };
             for a in (sp..base).step_by(8) {
                 let w = *(a as *const usize);
                 if points_into_vm_stack(w, stack, stack_end) {
                     if w <= bound {
                         top = top.max(w);
                     }
-                } else {
+                } else if nn == NoNative::Off {
                     self.mark_interior(m, w);
+                } else if nn == NoNative::Report && self.heap.cell_containing(w).is_some() {
+                    self.heap.gc.native_words.push((a, w));
                 }
             }
             self.roots_report(m, "native stack");
@@ -4712,6 +4805,7 @@ impl Vm {
                     if w <= bound {
                         top = top.max(w);
                     }
+                } else if self.heap.gc.no_native_roots == NoNative::Drop && self.tier_calls == i32::MAX {
                 } else if let Some(p) = self.heap.cell_containing(w) {
                     f(Root::Pinned(p));
                 }

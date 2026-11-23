@@ -117,6 +117,59 @@ thread_local! {
         Default::default();
     /// Lowerings under way (see [`compiling`]).
     static LOWERING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The innermost compiled run's mark (see [`RunMark`]), 0 if none.
+    static RUN_MARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A mark on the native stack above where Rust enters compiled code
+/// (`JitCode::enter`, `rt_construct`'s `cloison_rt_enter`): the compiled
+/// run, and whatever it calls, is below it. Linked to the run's outer
+/// one, if any; set while the run lasts, unwinding included.
+///
+/// The collector marks what native stack words below the outermost mark
+/// point to (compiled code keeps cells there, in its stack, its
+/// wrappers' saves and the callee-saved registers Rust frames under it
+/// saved), and above it only pins it under `CLOISON_GC_NO_NATIVE_ROOTS`:
+/// the Rust frames there, older than any compiled code on the stack,
+/// hold cells across safepoints only as roots of their own (`Vm::rooted`).
+#[repr(C)]
+struct RunMark {
+    prev: usize,
+}
+
+impl RunMark {
+    /// Run `f` (entering compiled code) under a mark.
+    #[inline(always)]
+    fn run<T>(f: impl FnOnce() -> T) -> T {
+        let mark = RunMark { prev: RUN_MARK.with(|m| m.get()) };
+        RUN_MARK.with(|m| m.set(&raw const mark as usize));
+        let r = f();
+        drop(mark);
+        r
+    }
+}
+
+impl Drop for RunMark {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let prev = self.prev;
+        RUN_MARK.with(|m| m.set(prev));
+    }
+}
+
+/// The address of the outermost compiled run's mark between `sp` and
+/// `base` (the native stack's live part), or 0 if no compiled code is
+/// running there (see [`RunMark`]).
+pub(crate) fn outermost_run(sp: usize, base: usize) -> usize {
+    let mut at = RUN_MARK.with(|m| m.get());
+    let mut out = 0;
+    while at != 0 && at < base {
+        if at >= sp {
+            out = at;
+        }
+        at = unsafe { (*(at as *const RunMark)).prev };
+    }
+    out
 }
 
 impl Snapshot {
@@ -10597,7 +10650,8 @@ impl JitCode {
     /// compiled for the current types of `acc` and `regs`.
     unsafe fn enter(&self, acc: Value, regs: &mut [Value]) -> Outcome {
         let mut exit = NO_EXIT;
-        let acc = unsafe { call_entry(self.mem.ptr.add(self.entry), acc, regs.as_mut_ptr(), &mut exit) };
+        let acc =
+            RunMark::run(|| unsafe { call_entry(self.mem.ptr.add(self.entry), acc, regs.as_mut_ptr(), &mut exit) });
         match exit {
             NO_EXIT => Outcome::Return(acc),
             pc => Outcome::Exit { pc: pc as usize, acc },
@@ -18511,7 +18565,7 @@ fn rt_construct(regs: Value, site: Value) -> Value {
             return cloison_rt_call(regs, site);
         }
         *(regs.to_bits() as *mut Value).add((*s).frame) = this;
-        let v = cloison_rt_enter(regs, site);
+        let v = RunMark::run(|| cloison_rt_enter(regs, site));
         if v.to_bits() == 0 || crate::props::is_object(v) {
             // An error, or an object: the constructor's, or (through the
             // runtime, the native stack being low) `new`'s already. (Not a

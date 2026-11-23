@@ -138,17 +138,31 @@ impl ShapePhases {
     }
 }
 
-/// `CLOISON_GC_NO_NATIVE_ROOTS`: native stack words as roots (`Off`),
-/// not (`Drop`, any value: a Rust local holding a cell across a safepoint
-/// then dies, found by `CLOISON_GC_STRESS`), or not and reported
-/// (`report`: see `Vm::report_native_roots`). For interpreter-only runs
-/// (`CLOISON_NO_JIT`), whose native stack is Rust frames only.
+/// `CLOISON_GC_NO_NATIVE_ROOTS`: the native stack words of Rust frames
+/// older than any compiled code running (above `jit::outermost_run`) as
+/// roots (`Off`), as pins only (`pin`: what they point to stays where it
+/// is, but lives only if something else keeps it: Rust frames precise),
+/// as nothing (`Drop`, any other value: a Rust local holding a cell across
+/// a safepoint then dies or moves, found by `CLOISON_GC_STRESS`), or as
+/// pins reported where they kept a cell (`report`: see
+/// `Vm::report_native_roots`). The words below the outermost run, compiled
+/// code's and the Rust frames' it calls, are roots in any case.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum NoNative {
     #[default]
     Off,
+    Pin,
     Drop,
     Report,
+}
+
+/// The binary's code (`NoNative::Report`'s scan for return addresses).
+fn text_range() -> std::ops::Range<usize> {
+    unsafe extern "C" {
+        static __executable_start: u8;
+        static etext: u8;
+    }
+    (&raw const __executable_start as usize)..(&raw const etext as usize)
 }
 
 /// The native stack's frames from here out, innermost first: each one's
@@ -370,6 +384,7 @@ impl Gc {
             no_native_roots: match std::env::var("CLOISON_GC_NO_NATIVE_ROOTS").as_deref() {
                 Err(_) | Ok("0" | "off") => NoNative::Off,
                 Ok("report") => NoNative::Report,
+                Ok("pin") => NoNative::Pin,
                 Ok(_) => NoNative::Drop,
             },
             native_words: Vec::new(),
@@ -1212,6 +1227,9 @@ pub(crate) enum Root {
     Object(*mut *mut Object),
     Payload(*mut usize),
     Pinned(usize),
+    /// A cell a Rust frame's native stack word points into, pinned but
+    /// no root (`NoNative::Pin`): alive only if something else keeps it.
+    PinOnly(usize),
 }
 
 /// What tracing a cell does with each reference it finds.
@@ -3149,7 +3167,32 @@ impl Vm {
                 continue;
             }
             let fr = frames.get_or_insert_with(unwind_frames);
-            let i = fr.iter().position(|&(_, cfa)| a < cfa).unwrap_or(fr.len().saturating_sub(1));
+            let Some(i) = fr.iter().position(|&(_, cfa)| a < cfa) else {
+                // Past the unwinder's reach (above compiled code, which has
+                // no unwind tables): the nearest return addresses into the
+                // binary below the word (into the frame holding it) and
+                // above it (its callers').
+                let base = self.heap.gc.stack_base;
+                let text = |w: usize| text_range().contains(&w);
+                let below = (0..512)
+                    .map(|k| a - 8 * k)
+                    .map(|x| unsafe { *(x as *const usize) })
+                    .find(|&w| text(w))
+                    .unwrap_or(0);
+                let above: Vec<String> = (a + 8..base)
+                    .step_by(8)
+                    .map(|x| unsafe { *(x as *const usize) })
+                    .filter(|&w| text(w))
+                    .take(8)
+                    .map(|w| format!("{w:x}"))
+                    .collect();
+                let key = (below, above.first().map_or(0, |s| usize::from_str_radix(s, 16).unwrap_or(0)), 1);
+                let mut seen = SEEN.lock().unwrap();
+                if seen.get_or_insert_with(HashSet::new).insert(key) {
+                    eprintln!("NNR scan bytes={} frame=? {below:x} {}", m.marked - before, above.join(" "));
+                }
+                continue;
+            };
             let ip = |j: usize| fr.get(j).map_or(0, |f| f.0);
             let key = (ip(i), ip(i + 1), ip(i + 2));
             let mut seen = SEEN.lock().unwrap();
@@ -3519,15 +3562,16 @@ impl Vm {
             let stack_end = self.stack_limit();
             let (mut top, bound) = self.vm_top_known(regs);
             let base = self.heap.gc.stack_base;
-            // (Only while nothing compiles: compiled frames' words are roots.)
-            let nn = if self.tier_calls == i32::MAX { self.heap.gc.no_native_roots } else { NoNative::Off };
+            let nn = self.heap.gc.no_native_roots;
+            // (Below it, compiled code's words and its callees': roots.)
+            let rust_from = if nn == NoNative::Off { base } else { crate::jit::outermost_run(sp, base).max(sp) };
             for a in (sp..base).step_by(8) {
                 let w = *(a as *const usize);
                 if points_into_vm_stack(w, stack, stack_end) {
                     if w <= bound {
                         top = top.max(w);
                     }
-                } else if nn == NoNative::Off {
+                } else if a < rust_from {
                     self.mark_interior(m, w);
                 } else if nn == NoNative::Report && self.heap.cell_containing(w).is_some() {
                     self.heap.gc.native_words.push((a, w));
@@ -3980,7 +4024,7 @@ impl Vm {
         };
         unsafe {
             self.each_root_slot(sp, regs, &mut |r| {
-                if let Root::Pinned(p) = r
+                if let Root::Pinned(p) | Root::PinOnly(p) = r
                     && cand.has(p)
                 {
                     pin(p);
@@ -4186,7 +4230,7 @@ impl Vm {
                 Root::Value(a) => fw.value(a),
                 Root::Object(a) => fw.object(a),
                 Root::Payload(a) => fw.payload(a),
-                Root::Pinned(_) => {}
+                Root::Pinned(_) | Root::PinOnly(_) => {}
             });
             // The slots into the candidates marking recorded, and the
             // candidates' own cells (moved, or left: pinned), on several
@@ -4332,7 +4376,7 @@ impl Vm {
                 Root::Value(a) => c.slot(a),
                 Root::Object(a) => c.slot(a.cast()),
                 Root::Payload(a) => c.payload_slot(a),
-                Root::Pinned(_) => {}
+                Root::Pinned(_) | Root::PinOnly(_) => {}
             });
             for (start, end) in self.heap.block_ranges() {
                 let mut p = start;
@@ -4579,6 +4623,7 @@ impl Vm {
                     }
                 }
                 Root::Pinned(p) => r.reach(p),
+                Root::PinOnly(_) => {}
             });
             loop {
                 while let Some(p) = r.work.pop() {
@@ -4779,6 +4824,7 @@ impl Vm {
                     }
                 }
                 Root::Pinned(p) => f(p),
+                Root::PinOnly(_) => {}
             });
         }
     }
@@ -4799,15 +4845,18 @@ impl Vm {
             let stack = self.stack.as_ptr() as usize;
             let stack_end = self.stack_limit();
             let (mut top, bound) = self.vm_top_known(regs);
-            for a in (sp..self.heap.gc.stack_base).step_by(8) {
+            let base = self.heap.gc.stack_base;
+            let nn = self.heap.gc.no_native_roots;
+            let rust_from = if nn == NoNative::Off { base } else { crate::jit::outermost_run(sp, base).max(sp) };
+            for a in (sp..base).step_by(8) {
                 let w = *(a as *const usize);
                 if points_into_vm_stack(w, stack, stack_end) {
                     if w <= bound {
                         top = top.max(w);
                     }
-                } else if self.heap.gc.no_native_roots == NoNative::Drop && self.tier_calls == i32::MAX {
+                } else if a >= rust_from && nn == NoNative::Drop {
                 } else if let Some(p) = self.heap.cell_containing(w) {
-                    f(Root::Pinned(p));
+                    f(if a >= rust_from { Root::PinOnly(p) } else { Root::Pinned(p) });
                 }
             }
             let top = (top + 8 * self.max_frame).clamp(stack, stack_end);

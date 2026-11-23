@@ -1177,7 +1177,7 @@ handlers! {
     fn op_intrinsic(pc, acc, regs, tag) {
         let (id, first, n) = (*pc.add(1) as usize, *pc.add(2) as usize, *pc.add(3) as usize);
         // (Its arguments where they are, in the frame's registers: a copy
-        // taken before `with_top`'s safepoint, or before the intrinsic calls
+        // taken before `with_top_acc`'s safepoint, or before the intrinsic calls
         // into JS, is one no collection updates when it moves cells.)
         let args = std::slice::from_raw_parts(regs.add(first), n);
         let f = crate::intrinsics::INTRINSICS[id].1;
@@ -1221,7 +1221,7 @@ handlers! {
 
     fn op_create_rest(pc, acc, regs, tag) {
         let k = *pc.add(1) as usize;
-        // (The arguments found after `with_top`'s safepoint: copies taken
+        // (The arguments found after `with_top_acc`'s safepoint: copies taken
         // before it are ones no collection moving cells updates.)
         let r = with_top_acc(regs, acc, |vm| {
             let mut spread = Vec::new();
@@ -4765,7 +4765,7 @@ unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
 }
 
 /// What [`call_function`] says when it can't call a bytecode function: no
-/// frame top recorded (compiled code's runtime calls, see [`with_top`]).
+/// frame top recorded (compiled code's runtime calls, see [`with_top_acc`]).
 /// Or a native that writes, in a conversion that may be redone
 /// (`Vm::conv_replays`).
 const NO_TOP: &str = "calling a function from here (compiled code)";
@@ -4824,7 +4824,7 @@ fn is_no_top(vm: &Vm, e: &Error) -> bool {
 /// Call `f` with `this` and `args` from the runtime (a native, a getter or
 /// a setter): a native directly; a bytecode function in a new frame at the
 /// VM stack's free top, which the runtime code that may get here records
-/// (`Vm::native_top`, see [`with_top`]), run to completion.
+/// (`Vm::native_top`, see [`with_top_acc`]), run to completion.
 pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate::vm::Result<Value> {
     if !f.is_cell() || !matches!(Obj::of(f).class(), Class::Function | Class::Native) {
         return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(f))));
@@ -4991,24 +4991,9 @@ pub(crate) fn run_script_with(
 }
 
 /// Run `f` with `Vm::native_top` at the free VM stack above the frame
-/// `regs` (at its `top`, its registers' end, if given): what it calls
-/// through [`call_function`] goes there.
-#[inline(always)]
-unsafe fn with_top<T>(regs: *mut Value, top: Option<*mut Value>, f: impl FnOnce(&mut Vm) -> T) -> T {
-    unsafe {
-        let vm = &mut *frame_vm(regs);
-        let saved = vm.native_top;
-        vm.native_top = top.unwrap_or_else(|| regs.add((*frame_code(regs)).nregs as usize));
-        vm.safepoint(vm.native_top);
-        let r = f(vm);
-        (*frame_vm(regs)).native_top = saved;
-        r
-    }
-}
-
-/// [`with_top`] with the interpreter's `acc` kept on the VM stack while
-/// `f` runs (a root of the collections it may reach, not in a Rust local
-/// only).
+/// `regs`, what it calls through [`call_function`] going there, and the
+/// interpreter's `acc` kept on the VM stack meanwhile (a root of the
+/// collections it may reach, not in a Rust local only).
 #[inline(always)]
 unsafe fn with_top_acc<T>(regs: *mut Value, acc: Value, f: impl FnOnce(&mut Vm) -> T) -> T {
     unsafe {

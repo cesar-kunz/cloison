@@ -1036,7 +1036,10 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             }
             (Some(iterate_with(vm, source, m)?), Value::UNDEFINED)
         } else {
-            (None, object_value((vm.to_object(source)?).ptr()))
+            // (A wrapper held across getters: rooted, until the scope ends.)
+            let src = object_value((vm.to_object(source)?).ptr());
+            vm.handles.push(src);
+            (None, src)
         };
         let n = match &values {
             Some(v) => v.len(),
@@ -1067,11 +1070,14 @@ fn typed_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !crate::intrinsics::is_constructor(this) {
         return Err(Error::type_error("TypedArray.of: this is not a constructor"));
     }
-    let o = create_from(vm, this, &[Value::number(a.len() as f64)], Some(a.len()))?;
-    for (i, &v) in a.iter().enumerate() {
-        vm.set_keyed(object_value(o.ptr()), Value::number(i as f64), v)?;
-    }
-    Ok(object_value(o.ptr()))
+    let o = object_value(create_from(vm, this, &[Value::number(a.len() as f64)], Some(a.len()))?.ptr());
+    // (Held across the values' conversions: rooted.)
+    vm.rooted(&[o], |vm| {
+        for (i, &v) in a.iter().enumerate() {
+            vm.set_keyed(o, Value::number(i as f64), v)?;
+        }
+        Ok(o)
+    })
 }
 
 fn typed_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -1215,9 +1221,12 @@ fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     let v = to_element(vm, kind_of(o), arg(a, 0))?;
-    let s = relative(integer(vm, arg(a, 1))?, len);
-    let end = arg(a, 2);
-    let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
+    // (A BigInt held across the conversions: rooted.)
+    let (s, e) = vm.rooted(&[v], |vm| {
+        let s = relative(integer(vm, arg(a, 1))?, len);
+        let end = arg(a, 2);
+        Ok::<_, Error>((s, if end.is_undefined() { len } else { relative(integer(vm, end)?, len) }))
+    })?;
     let Some(len) = ta_length(o) else {
         return Err(Error::type_error("Cannot perform fill on a detached or out of bounds typed array"));
     };
@@ -1455,11 +1464,14 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         });
     }
     let src = object_value((vm.to_object(src)?).ptr());
-    let n = vm.length_of(src)?;
-    if offset == f64::INFINITY || n + offset > len as f64 {
-        return Err(Error::range_error("offset is out of bounds"));
-    }
-    set_from(vm, o, offset as usize, src, n as usize)?;
+    // (A wrapper held across getters: rooted.)
+    vm.rooted(&[src], |vm| {
+        let n = vm.length_of(src)?;
+        if offset == f64::INFINITY || n + offset > len as f64 {
+            return Err(Error::range_error("offset is out of bounds"));
+        }
+        set_from(vm, o, offset as usize, src, n as usize)
+    })?;
     Ok(Value::UNDEFINED)
 }
 

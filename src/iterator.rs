@@ -183,7 +183,9 @@ fn step_value(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
     match r {
         Some(r) => {
             let a_value = vm.a_value;
-            vm.get(r, a_value).map(Some)
+            // (`r`, the call's result only, the receiver after a proxy's
+            // handler ran: rooted.)
+            vm.rooted(&[r], |vm| vm.get(r, a_value)).map(Some)
         }
         None => Ok(None),
     }
@@ -196,7 +198,9 @@ fn step_result(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
     }
     let a_done = vm.intern_name("done");
-    if to_boolean(vm.get(r, a_done)?) {
+    // (`r`, the call's result only, the receiver after a proxy's handler
+    // ran: rooted.)
+    if to_boolean(vm.rooted(&[r], |vm| vm.get(r, a_done))?) {
         return Ok(None);
     }
     Ok(Some(r))
@@ -205,7 +209,8 @@ fn step_result(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
 /// IteratorClose with a throw completion: `it.return()`, its own errors
 /// ignored, then `e`.
 fn close_throw<T>(vm: &mut Vm, it: Value, e: Error) -> Result<T> {
-    let _ = close(vm, it);
+    // (What was thrown, held across `return()`: rooted.)
+    let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| close(vm, it));
     Err(e)
 }
 
@@ -229,12 +234,15 @@ fn flattenable(vm: &mut Vm, v: Value, strings: bool) -> Result<(Value, Value)> {
     if !is_object(v) && !(strings && crate::vm::is_string(v)) {
         return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(v))));
     }
+    // (`v`, maybe a call's result only, held across its `@@iterator`'s
+    // read; `it` across its `next`'s: rooted.)
+    let _rooted = vm.root_scope(&[v]);
     let m = iterator_method(vm, v)?;
     let it = if m.is_undefined() { v } else { call_function(vm, m, v, &[])? };
     if !is_object(it) {
         return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(it))));
     }
-    let next = next_method(vm, it)?;
+    let next = vm.rooted(&[it], |vm| next_method(vm, it))?;
     Ok((it, next))
 }
 
@@ -442,9 +450,13 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 if !is_object(inner) {
                     return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(inner))));
                 }
-                let inner_next = next_method(vm, inner)?;
-                set(vm, state, INNER, inner)?;
-                set(vm, state, INNER_NEXT, inner_next)?;
+                // (`inner`, the call's result only, held across its
+                // `next`'s read: rooted.)
+                vm.rooted(&[inner], |vm| {
+                    let inner_next = next_method(vm, inner)?;
+                    set(vm, state, INNER, inner)?;
+                    set(vm, state, INNER_NEXT, inner_next)
+                })?;
             }
         }
     }
@@ -518,7 +530,8 @@ fn wrap_return(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let (it, next) = flattenable(vm, arg(a, 0), true)?;
     let c = object_value((vm.iterator_roots[CONSTRUCTOR]).ptr());
-    if vm.instance_of(it, c)? {
+    // (A proxy's `getPrototypeOf` may collect: both rooted.)
+    if vm.rooted(&[it, next], |vm| vm.instance_of(it, c))? {
         return Ok(it);
     }
     new_helper(vm, WRAP, it, next, Value::UNDEFINED, Value::UNDEFINED)
@@ -528,6 +541,13 @@ fn from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// iterable object).
 fn concat(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let list = vm.new_array();
+    vm.rooted(&[list], |vm| concat_list(vm, list, a))?;
+    new_helper(vm, CONCAT, Value::UNDEFINED, Value::UNDEFINED, list, Value::from_i32(0))
+}
+
+/// `Iterator.concat`'s items' `@@iterator` methods, each with its item,
+/// into `list`.
+fn concat_list(vm: &mut Vm, list: Value, a: &[Value]) -> Result<()> {
     for &item in a {
         if !is_object(item) {
             return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(item))));
@@ -538,7 +558,7 @@ fn concat(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         }
         crate::vm::array_push(vm, list, &[m, item])?;
     }
-    new_helper(vm, CONCAT, Value::UNDEFINED, Value::UNDEFINED, list, Value::from_i32(0))
+    Ok(())
 }
 
 // ---- Iterator.prototype ----
@@ -622,46 +642,59 @@ fn each(
         callable_arg(vm, it, f)?;
     }
     let next = next_method(vm, it)?;
-    let mut counter = 0.0;
-    while let Some(v) = step_value(vm, it, next)? {
-        match each(vm, v, counter) {
-            Ok(Some(r)) => {
-                close(vm, it)?;
-                return Ok(Some(r));
+    // (`next`, and the result found, held across calls: rooted.)
+    vm.rooted(&[next], |vm| {
+        let mut counter = 0.0;
+        while let Some(v) = step_value(vm, it, next)? {
+            match each(vm, v, counter) {
+                Ok(Some(r)) => {
+                    vm.rooted(&[r], |vm| close(vm, it))?;
+                    return Ok(Some(r));
+                }
+                Ok(None) => {}
+                Err(e) => return close_throw(vm, it, e),
             }
-            Ok(None) => {}
-            Err(e) => return close_throw(vm, it, e),
+            counter += 1.0;
         }
-        counter += 1.0;
-    }
-    Ok(None)
+        Ok(None)
+    })
 }
 
 fn reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let it = this_object(this, "reduce")?;
     let f = callable_arg(vm, it, arg(a, 0))?;
     let next = next_method(vm, it)?;
-    let (mut acc, mut counter) = if a.len() >= 2 {
-        (a[1], 0.0)
-    } else {
-        match step_value(vm, it, next)? {
-            Some(v) => (v, 1.0),
-            None => return Err(Error::type_error("Reduce of empty iterator with no initial value")),
-        }
-    };
-    while let Some(v) = step_value(vm, it, next)? {
-        acc = match call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(counter)]) {
-            Ok(r) => r,
-            Err(e) => return close_throw(vm, it, e),
+    // (`next`, and the accumulator in a slot of its own, held across the
+    // calls: rooted.)
+    vm.rooted(&[next, Value::UNDEFINED], |vm| {
+        let slot = vm.handles.len() - 1;
+        let mut counter = if a.len() >= 2 {
+            vm.handles[slot] = a[1];
+            0.0
+        } else {
+            match step_value(vm, it, next)? {
+                Some(v) => vm.handles[slot] = v,
+                None => return Err(Error::type_error("Reduce of empty iterator with no initial value")),
+            }
+            1.0
         };
-        counter += 1.0;
-    }
-    Ok(acc)
+        while let Some(v) = step_value(vm, it, next)? {
+            let acc = vm.handles[slot];
+            vm.handles[slot] = match call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(counter)]) {
+                Ok(r) => r,
+                Err(e) => return close_throw(vm, it, e),
+            };
+            counter += 1.0;
+        }
+        Ok(vm.handles[slot])
+    })
 }
 
 fn to_array(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let out = vm.new_array();
-    each(vm, this, None, "toArray", |vm, v, _| crate::vm::array_push(vm, out, &[v]).map(|_| None))?;
+    vm.rooted(&[out], |vm| {
+        each(vm, this, None, "toArray", |vm, v, _| crate::vm::array_push(vm, out, &[v]).map(|_| None))
+    })?;
     Ok(out)
 }
 
@@ -913,6 +946,9 @@ fn zip_padding(vm: &mut Vm, option: Value, keys: Option<&[Key]>, iters: &[(Value
         Ok(r) => r,
         Err(e) => return close_list(vm, &its, Err(e)).map(|()| Vec::new()),
     };
+    // (Held across its steps: rooted, with the values, in the caller's
+    // handle scope.)
+    vm.handles.extend([p, next]);
     let mut using = true;
     for _ in 0..n {
         if using {
@@ -944,9 +980,16 @@ fn zip(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Iterator.zip: iterables must be an object"));
     }
     let (mode, padding) = zip_options(vm, arg(a, 1))?;
-    let input = crate::symbol::get_iterator(vm, iterables)?;
-    let input_next = next_method(vm, input)?;
-    vm.handle_scope(|vm| zip_iterables(vm, input, input_next, mode, padding))
+    // (`padding`, the input iterator and its `next`, held across calls:
+    // rooted.)
+    vm.handle_scope(|vm| {
+        vm.handles.push(padding);
+        let input = crate::symbol::get_iterator(vm, iterables)?;
+        vm.handles.push(input);
+        let input_next = next_method(vm, input)?;
+        vm.handles.push(input_next);
+        zip_iterables(vm, input, input_next, mode, padding)
+    })
 }
 
 fn zip_iterables(vm: &mut Vm, input: Value, input_next: Value, mode: i32, padding: Value) -> Result<Value> {
@@ -984,8 +1027,10 @@ fn zip_keyed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Iterator.zipKeyed: iterables must be an object"));
     }
     let (mode, padding) = zip_options(vm, arg(a, 1))?;
-    let all = crate::proxy::own_keys(vm, Obj::of(iterables))?;
     vm.handle_scope(|vm| {
+        // (Held across calls: rooted.)
+        vm.handles.push(padding);
+        let all = crate::proxy::own_keys(vm, Obj::of(iterables))?;
         let mut keys = Vec::new();
         let mut iters: Vec<(Value, Value)> = Vec::new();
         for key in all {

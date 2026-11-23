@@ -121,6 +121,8 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let op = object_value(vm.object_prototype);
         let wrapper = object_value(vm.new_plain(op).ptr());
         let empty = vm.new_string(&[]);
+        // (The holder and key a `toJSON` or replacer gets: rooted.)
+        vm.handles.extend([wrapper, empty]);
         let a_empty = vm.intern_name("");
         vm.create_data_property(wrapper, Key::Name(a_empty), arg(a, 0))?;
         let mut out = Vec::new();
@@ -207,7 +209,11 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
     } else {
         check_native_stack(vm)?;
         if is_object(v) || crate::bigint::is_bigint(v) {
-            let f = vm.get(v, st.a_to_json)?;
+            // (Maybe a getter's new object, the receiver of a proxy's
+            // trap on its prototype chain: rooted across the trap's
+            // lookup.)
+            let a = st.a_to_json;
+            let f = vm.rooted(&[v], |vm| vm.get(v, a))?;
             if is_callable(f) {
                 let k = key.string(vm);
                 v = call_function(vm, f, v, &[k])?;
@@ -520,6 +526,7 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let empty = vm.intern_name("");
         vm.create_data_property(root, Key::Name(empty), v)?;
         let key = vm.new_string(&[]);
+        vm.handles.push(key);
         let a_source = vm.intern_name("source");
         internalize(vm, reviver, root, key, Some(&record), &u, a_source)
     })
@@ -576,8 +583,25 @@ fn internalize(
 ) -> Result<Value> {
     check_native_stack(vm)?;
     let v = vm.get_keyed(holder, name)?;
-    let record = record.filter(|r| crate::props::same_value(r.value, v));
     let context = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
+    // (Both held across the reviver's calls below: rooted.)
+    vm.rooted(&[v, context], |vm| internalize_value(vm, reviver, holder, name, v, context, record, text, a_source))
+}
+
+/// [`internalize`] of `v`, `holder[name]` as read, with its `context`.
+#[allow(clippy::too_many_arguments)]
+fn internalize_value(
+    vm: &mut Vm,
+    reviver: Value,
+    holder: Value,
+    name: Value,
+    v: Value,
+    context: Value,
+    record: Option<&Record>,
+    text: &[u16],
+    a_source: crate::object::Atom,
+) -> Result<Value> {
+    let record = record.filter(|r| crate::props::same_value(r.value, v));
     if let Some(&Record { kind: RecordKind::Source(start, end), .. }) = record
         && !is_object(v)
     {
@@ -602,14 +626,16 @@ fn internalize(
                 (Some(RecordKind::Entries(es)), _) if !array => string_units(ks).and_then(|u| es.get(u)),
                 _ => None,
             };
-            let nv = internalize(vm, reviver, v, ks, child, text, a_source)?;
+            let nv = vm.rooted(&[ks], |vm| internalize(vm, reviver, v, ks, child, text, a_source))?;
             // (A proxy's traps, and what they throw; a property that can't
             // be deleted or defined stays.)
             if nv.is_undefined() {
                 crate::proxy::delete(vm, o, k)?;
             } else {
                 let d = crate::props::Desc::data(nv, true, true, true);
-                crate::proxy::define_property(vm, o, k, &d)?;
+                // (The reviver's new value maybe, held in `d` across a
+                // proxy's trap lookup: rooted.)
+                vm.rooted(&[nv], |vm| crate::proxy::define_property(vm, o, k, &d))?;
             }
         }
     }

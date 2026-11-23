@@ -3373,17 +3373,33 @@ impl Vm {
         self.condemned.extend(dead);
     }
 
+    /// Where the running frame's registers are, as far as the VM knows:
+    /// the deepest of `regs` (every safepoint's, compiled code's runtime
+    /// calls included: see `jit::takes_frame`), compiled code's OSR frame
+    /// and a native's free top (`native_top`); 0 if none is set (between
+    /// runs). And how far past it a native stack word may point into the
+    /// VM stack: into the frame or a callee's being set up after it, one
+    /// frame's span (`max_frame`) at most. A word further on is stale, left
+    /// by an earlier, deeper call: taken for the top, one at 16 bytes short
+    /// of the stack's end had collections scan all 2 MiB of it, and keep
+    /// what the dead frames there held (88% of sass's live bytes).
+    fn vm_top_known(&self, regs: *mut Value) -> (usize, usize) {
+        let known = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+        let bound = if known == 0 { usize::MAX } else { known + 8 * self.max_frame };
+        (known, bound)
+    }
+
     /// The end of the deepest frame there may be on the VM stack, as
-    /// `mark_roots` finds it: past `regs`, `osr_regs`, `native_top` and
-    /// any VM stack address a native stack word holds (with `regs` null, a
-    /// runtime call from compiled code, the frames are known only there).
+    /// `mark_roots` finds it: a frame's span past the deepest of what the
+    /// VM knows and the VM stack addresses native stack words hold within
+    /// its bound (see `vm_top_known`; with nothing known, any).
     unsafe fn vm_stack_top(&self, sp: usize, regs: *mut Value) -> usize {
         let stack = self.stack.as_ptr() as usize;
         let stack_end = self.stack_end as usize;
-        let mut top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+        let (mut top, bound) = self.vm_top_known(regs);
         for a in (sp..self.heap.gc.stack_base).step_by(8) {
             let w = unsafe { *(a as *const usize) };
-            if points_into_vm_stack(w, stack, stack_end) {
+            if points_into_vm_stack(w, stack, stack_end) && w <= bound {
                 top = top.max(w);
             }
         }
@@ -3408,16 +3424,18 @@ impl Vm {
     /// Mark the roots every collection has.
     unsafe fn mark_roots(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
         unsafe {
-            // The native stack, and the highest VM stack address it holds:
-            // the running frame's registers are there or in `regs`.
+            // The native stack, and the highest VM stack address it holds
+            // within the bound of what the VM knows (`vm_top_known`).
             let stack = self.stack.as_ptr() as usize;
             let stack_end = self.stack_end as usize;
-            let mut top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+            let (mut top, bound) = self.vm_top_known(regs);
             let base = self.heap.gc.stack_base;
             for a in (sp..base).step_by(8) {
                 let w = *(a as *const usize);
                 if points_into_vm_stack(w, stack, stack_end) {
-                    top = top.max(w);
+                    if w <= bound {
+                        top = top.max(w);
+                    }
                 } else {
                     self.mark_interior(m, w);
                 }
@@ -4687,11 +4705,13 @@ impl Vm {
         unsafe {
             let stack = self.stack.as_ptr() as usize;
             let stack_end = self.stack_end as usize;
-            let mut top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+            let (mut top, bound) = self.vm_top_known(regs);
             for a in (sp..self.heap.gc.stack_base).step_by(8) {
                 let w = *(a as *const usize);
                 if points_into_vm_stack(w, stack, stack_end) {
-                    top = top.max(w);
+                    if w <= bound {
+                        top = top.max(w);
+                    }
                 } else if let Some(p) = self.heap.cell_containing(w) {
                     f(Root::Pinned(p));
                 }

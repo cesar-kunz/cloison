@@ -393,10 +393,20 @@ measurement says the old generation fills with cells that die soon after.
 
 ### Roots
 
-1. **The VM stack**, from its base to the highest word frames have
-   reached: each word that is a cell by the metadata. A frame's registers
-   are `Value`s; header slots hold Rust addresses (not in the heap) or
-   the running closure (a root).
+1. **The VM stack**, from its base to the end of the deepest frame
+   there may be: each word that is a cell by the metadata. A frame's
+   registers are `Value`s; header slots hold Rust addresses (not in the
+   heap) or the running closure (a root). The end is a frame's span (the
+   most registers a frame has, its inlined frames' included) past the
+   deepest of the running frame's registers, which every safepoint is
+   given (compiled code's runtime calls that may collect get them from
+   their wrapper, `jit::takes_frame`), compiled code's OSR frame and a
+   native's free top. A native stack word pointing into the VM stack
+   within a span of those (a callee's frame being set up) moves it on;
+   one further is stale, left by an earlier, deeper call. Taken for the
+   top, a word 16 bytes short of the stack's end once had collections
+   scan all 2 MiB of it, and keep what the dead frames there held. Only
+   with no frame known, between runs, does every such word count.
 2. **The native stack and registers** (spilled at the collection's
    entry), from the collection's frame to the base recorded when the VM
    started running: each word that points into a cell, its first granule

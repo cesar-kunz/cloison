@@ -83,11 +83,13 @@ impl Slots {
 }
 
 /// The VM's Temporal state: the classes' prototypes and constructors, the
-/// time zones in use, the system's named zones.
+/// options object of an absent options argument, the time zones in use,
+/// the system's named zones.
 #[derive(Default)]
 pub(crate) struct State {
     pub(crate) protos: Vec<*mut Object>,
     pub(crate) ctors: Vec<*mut Object>,
+    no_options: Option<*mut Object>,
     zones: Vec<tz::Zone>,
     zone_ids: HashMap<String, u32>,
     registry: tz::Registry,
@@ -96,13 +98,13 @@ pub(crate) struct State {
 impl State {
     /// [`State::roots`] as slots (see `gc::Root`).
     pub(crate) fn root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
-        for o in self.protos.iter_mut().chain(self.ctors.iter_mut()) {
+        for o in self.protos.iter_mut().chain(self.ctors.iter_mut()).chain(self.no_options.iter_mut()) {
             f(crate::gc::Root::Object(o));
         }
     }
 
     pub(crate) fn roots(&self) -> impl Iterator<Item = Value> + '_ {
-        self.protos.iter().chain(self.ctors.iter()).map(|&o| object_value(o))
+        self.protos.iter().chain(self.ctors.iter()).chain(self.no_options.iter()).map(|&o| object_value(o))
     }
 }
 
@@ -238,9 +240,20 @@ pub(crate) fn bigint_of(vm: &mut Vm, ns: i128) -> Value {
 // ---- Options ----
 
 /// GetOptionsObject.
+/// An absent one's object, empty and with a null prototype, is the same
+/// each time (no code sees it, nor anything adds to it): one made here
+/// would be held by its callers' Rust locals alone while they read
+/// options, which may allocate.
 pub(crate) fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
-        return Ok(object_value(vm.new_plain(Value::NULL).ptr()));
+        let o = match vm.temporal.no_options {
+            Some(o) => o,
+            None => {
+                let o = vm.new_plain(Value::NULL).ptr();
+                *vm.temporal.no_options.insert(o)
+            }
+        };
+        return Ok(object_value(o));
     }
     if is_object(v) {
         return Ok(v);

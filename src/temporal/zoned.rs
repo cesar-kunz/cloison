@@ -121,15 +121,18 @@ fn round_options(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
 fn instant_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let ns = this_instant(this)?;
     let o = round_options(vm, arg(a, 0), "smallestUnit")?;
-    let increment = rounding_increment(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-    let smallest = unit_option(vm, o, "smallestUnit", true)?;
-    validate_unit(smallest, Group::Time, false)?;
-    let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
-    let max = (iso::NS_PER_DAY / unit.nanos()) as i64;
-    validate_increment(increment, max, true)?;
-    let r = iso::round_as_if_positive(ns, unit.nanos() * increment as i128, mode);
-    create_instant(vm, r)
+    // (`o`, maybe made here, rooted while its options are read.)
+    vm.rooted(&[o], |vm| {
+        let increment = rounding_increment(vm, o)?;
+        let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
+        let smallest = unit_option(vm, o, "smallestUnit", true)?;
+        validate_unit(smallest, Group::Time, false)?;
+        let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
+        let max = (iso::NS_PER_DAY / unit.nanos()) as i64;
+        validate_increment(increment, max, true)?;
+        let r = iso::round_as_if_positive(ns, unit.nanos() * increment as i128, mode);
+        create_instant(vm, r)
+    })
 }
 
 fn instant_equals(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -409,42 +412,45 @@ fn zoned_since(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn zoned_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let o = round_options(vm, arg(a, 0), "smallestUnit")?;
-    let increment = rounding_increment(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-    let smallest = unit_option(vm, o, "smallestUnit", true)?;
-    if smallest != UnitOption::Unit(Unit::Day) {
-        validate_unit(smallest, Group::Time, false)?;
-    }
-    let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
-    let max = duration::max_increment(unit).unwrap_or(1);
-    validate_increment(increment, max, max == 1)?;
-    if unit == Unit::Nanosecond && increment == 1 {
-        return create_zoned(vm, ns, z);
-    }
-    let dt = zone(vm, z).date_time_at(ns);
-    let r = if unit == Unit::Day {
-        let start = start_of_day(vm, z, dt.date)?;
-        let end = start_of_day(vm, z, iso::add_days(dt.date, 1))?;
-        let this_ns = if ns >= end { end - 1 } else { ns };
-        let length = end - start;
-        let progress = this_ns - start;
-        start + iso::round_to_increment(progress, length, mode)
-    } else {
-        let rounded = plain::round_date_time(dt, increment, unit, mode);
-        let off = zone(vm, z).offset_ns(ns);
-        interpret_offset(
-            vm,
-            rounded.date,
-            Some(rounded.time),
-            OffsetBehaviour::Option,
-            off,
-            z,
-            Disambiguation::Compatible,
-            OffsetOption::Prefer,
-            false,
-        )?
-    };
-    create_zoned(vm, r, z)
+    // (`o`, maybe made here, rooted while its options are read.)
+    vm.rooted(&[o], |vm| {
+        let increment = rounding_increment(vm, o)?;
+        let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
+        let smallest = unit_option(vm, o, "smallestUnit", true)?;
+        if smallest != UnitOption::Unit(Unit::Day) {
+            validate_unit(smallest, Group::Time, false)?;
+        }
+        let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
+        let max = duration::max_increment(unit).unwrap_or(1);
+        validate_increment(increment, max, max == 1)?;
+        if unit == Unit::Nanosecond && increment == 1 {
+            return create_zoned(vm, ns, z);
+        }
+        let dt = zone(vm, z).date_time_at(ns);
+        let r = if unit == Unit::Day {
+            let start = start_of_day(vm, z, dt.date)?;
+            let end = start_of_day(vm, z, iso::add_days(dt.date, 1))?;
+            let this_ns = if ns >= end { end - 1 } else { ns };
+            let length = end - start;
+            let progress = this_ns - start;
+            start + iso::round_to_increment(progress, length, mode)
+        } else {
+            let rounded = plain::round_date_time(dt, increment, unit, mode);
+            let off = zone(vm, z).offset_ns(ns);
+            interpret_offset(
+                vm,
+                rounded.date,
+                Some(rounded.time),
+                OffsetBehaviour::Option,
+                off,
+                z,
+                Disambiguation::Compatible,
+                OffsetOption::Prefer,
+                false,
+            )?
+        };
+        create_zoned(vm, r, z)
+    })
 }
 
 fn zoned_equals(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -517,13 +523,16 @@ fn zoned_start_of_day(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn zoned_transition(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let o = round_options(vm, arg(a, 0), "direction")?;
-    let next = option(vm, o, "direction", &["next", "previous"], None)? == 0;
-    let zn = zone(vm, z);
-    let t = if next { zn.next_transition(ns) } else { zn.previous_transition(ns) };
-    match t {
-        Some(t) => create_zoned(vm, t, z),
-        None => Ok(Value::NULL),
-    }
+    // (`o`, maybe made here, rooted while its options are read.)
+    vm.rooted(&[o], |vm| {
+        let next = option(vm, o, "direction", &["next", "previous"], None)? == 0;
+        let zn = zone(vm, z);
+        let t = if next { zn.next_transition(ns) } else { zn.previous_transition(ns) };
+        match t {
+            Some(t) => create_zoned(vm, t, z),
+            None => Ok(Value::NULL),
+        }
+    })
 }
 
 fn zoned_to_instant(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

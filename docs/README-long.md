@@ -338,6 +338,7 @@ checking references and poisoning what is freed), `CLOISON_GC_STRESS`
 `CLOISON_GC_STW` (full collections stop the world, no marker thread),
 `CLOISON_GC_EVACUATE` (`0` none, `all` the moving stress mode; the
 policy's knobs are `CLOISON_GC_EVACUATE_*`, see `gc::Policy`),
+`CLOISON_GC_NO_NATIVE_ROOTS` (`pin`, the default: Rust frames older than any compiled code running pin what their native stack words point to but don't keep it; `off` keeps it; `drop` neither, a checker of Rust's roots under `CLOISON_GC_STRESS`; `report` names the frames whose words kept a cell),
 `CLOISON_GC_SLOTS` (check that slots reach every marked cell and none
 refers to a moved one),
 `CLOISON_GC_CYCLES` (major cycles back to back),

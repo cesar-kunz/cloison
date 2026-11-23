@@ -140,8 +140,9 @@ impl ShapePhases {
 
 /// `CLOISON_GC_NO_NATIVE_ROOTS`: the native stack words of Rust frames
 /// older than any compiled code running (above `jit::outermost_run`) as
-/// roots (`Off`), as pins only (`pin`: what they point to stays where it
-/// is, but lives only if something else keeps it: Rust frames precise),
+/// pins only (`Pin`, the default: what they point to stays where it is,
+/// but lives only if something else keeps it: Rust frames precise), as
+/// roots (`off`),
 /// as nothing (`Drop`, any other value: a Rust local holding a cell across
 /// a safepoint then dies or moves, found by `CLOISON_GC_STRESS`), or as
 /// pins reported where they kept a cell (`report`: see
@@ -149,8 +150,8 @@ impl ShapePhases {
 /// code's and the Rust frames' it calls, are roots in any case.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum NoNative {
-    #[default]
     Off,
+    #[default]
     Pin,
     Drop,
     Report,
@@ -326,11 +327,10 @@ pub struct Gc {
     /// marked is reached from the roots' slots (`CLOISON_GC_SLOTS`, see
     /// `Vm::check_root_slots`).
     slots_check: bool,
-    /// Native stack words are no roots (they still find the VM stack's
-    /// top and running codes): Rust locals that hold cells across a
-    /// safepoint then die, a checker of precise Rust roots for
-    /// interpreter-only runs (`CLOISON_GC_NO_NATIVE_ROOTS`, with
-    /// `CLOISON_GC_STRESS` and `CLOISON_NO_JIT`).
+    /// How the native stack words of Rust frames older than any compiled
+    /// code running count (`CLOISON_GC_NO_NATIVE_ROOTS`, see [`NoNative`]):
+    /// pins by default. They still find the VM stack's top and the codes
+    /// running.
     pub(crate) no_native_roots: NoNative,
     /// `NoNative::Report`'s native stack words that point into cells
     /// (their address, their value), this collection.
@@ -382,9 +382,9 @@ impl Gc {
             frag_report: env("CLOISON_GC_FRAG"),
             slots_check: env("CLOISON_GC_SLOTS"),
             no_native_roots: match std::env::var("CLOISON_GC_NO_NATIVE_ROOTS").as_deref() {
-                Err(_) | Ok("0" | "off") => NoNative::Off,
+                Err(_) | Ok("pin") => NoNative::Pin,
+                Ok("0" | "off") => NoNative::Off,
                 Ok("report") => NoNative::Report,
-                Ok("pin") => NoNative::Pin,
                 Ok(_) => NoNative::Drop,
             },
             native_words: Vec::new(),

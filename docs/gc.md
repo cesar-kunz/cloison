@@ -412,7 +412,21 @@ measurement says the old generation fills with cells that die soon after.
    started running: each word that points into a cell, its first granule
    found by walking the metadata back. This covers values compiled code
    keeps in callee-saved registers, the slot registers a runtime-call
-   wrapper pushes, and Rust locals.
+   wrapper pushes, and the Rust frames compiled code calls. Rust frames
+   older than any compiled code running (above the outermost
+   `jit::RunMark`, which Rust entering compiled code leaves) only pin
+   what their words point to: it stays where it is, but lives only if
+   something else keeps it. A Rust local holding a cell across a
+   safepoint roots it in `Vm::handles` (`Vm::rooted`), and the
+   interpreter keeps `acc` on the VM stack around its slow handlers
+   (`with_top_acc`). Stale words there, what earlier calls left in a
+   frame's slots, then keep nothing alive: they had kept 69 MB of
+   TypeScript's (Octane) 137 MB peak live set. `CLOISON_GC_NO_NATIVE_ROOTS`
+   picks how those words count: `pin` (the default), `off` (roots, as
+   compiled code's), `drop` (neither roots nor pins: with
+   `CLOISON_GC_STRESS`, a local not rooted makes its script crash or
+   differ, which CI runs the scripts under), `report` (pins, and the
+   frames whose words kept a cell printed as `NNR` lines).
 3. **The VM's own references**: the global object and the builtins'
    prototypes and functions, the string constant table and
    `single_chars`, `Code::constants`, open upvalues, a pending error's

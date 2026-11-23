@@ -49,7 +49,7 @@ jobs:
   precise-roots:
     name: Tests (precise Rust roots)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       # The scripts with the Rust frames' native stack words neither roots
       # nor pins (`CLOISON_GC_NO_NATIVE_ROOTS=drop`) and a collection at

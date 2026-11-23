@@ -1232,6 +1232,8 @@ fn string_raw(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let a_raw = vm.intern_name("raw");
     let raw = vm.get(cooked, a_raw)?;
     let raw = object_value((vm.to_object(raw)?).ptr());
+    // (Maybe what a getter made, held across the conversions: rooted.)
+    let _rooted = vm.root_scope(&[raw]);
     let n = vm.length_of(raw)?;
     let mut out: Vec<u16> = Vec::new();
     let mut i = 0.0;

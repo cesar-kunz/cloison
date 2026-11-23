@@ -1229,6 +1229,9 @@ fn print_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// between them.
 fn string_raw(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let cooked = object_value((vm.to_object(arg(a, 0))?).ptr());
+    // (A primitive's new wrapper, the receiver of a proxy's trap on its
+    // prototype chain, held across the trap's lookup: rooted.)
+    let _cooked = vm.root_scope(&[cooked]);
     let a_raw = vm.intern_name("raw");
     let raw = vm.get(cooked, a_raw)?;
     let raw = object_value((vm.to_object(raw)?).ptr());
@@ -2686,7 +2689,10 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let a_ctor = vm.a_constructor;
         let c = vm.get(p, a_ctor)?;
         let a_regexp = vm.intern_name("RegExp");
-        if c == vm.get(object_value(vm.global), a_regexp)? {
+        let g = object_value(vm.global);
+        // (Maybe a getter's new object, compared after the global's
+        // getter: rooted, its address not another's meanwhile.)
+        if c == vm.rooted(&[c], |vm| vm.get(g, a_regexp))? {
             return Ok(p);
         }
     }
@@ -3062,8 +3068,8 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = if quiet { re } else { this_regexp(this)? };
     // Borrowed: strings don't change, and `input`, maybe a new string, is
     // rooted (across `lastIndex`'s conversion and the array's making).
-    let s = units(input);
     let _rooted = vm.root_scope(&[input]);
+    let s = units(input);
     with_caps(vm, |vm, caps| {
         if let Some(re) = regexp_match_into(vm, this, re, &s, caps)? {
             note_legacy(vm, this, input, caps);
@@ -3088,10 +3094,10 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // ToString: a symbol throws, Codex on #38.)
     let input = if quiet { x } else { crate::intrinsics::to_string(vm, x)? };
     let re = if quiet { re } else { this_regexp(this)? };
-    let s = units(input);
     // (`input`, maybe a new string, rooted across `lastIndex`'s
     // conversion: `s` is its units.)
     let _rooted = vm.root_scope(&[input]);
+    let s = units(input);
     with_caps(vm, |vm, caps| {
         let found = regexp_match_into(vm, this, re, &s, caps)?.is_some();
         if found {
@@ -4086,7 +4092,9 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
         if res.is_null() {
             return Ok(if n == 0 { Value::NULL } else { out });
         }
-        let m = get_units(vm, res, "0")?;
+        // (Maybe `exec`'s new object, the receiver of a proxy's trap on
+        // its prototype chain: rooted across the trap's lookup.)
+        let m = vm.rooted(&[res], |vm| get_units(vm, res, "0"))?;
         let mv = vm.new_string(&m);
         crate::vm::array_push(vm, out, &[mv])?;
         n += 1;
@@ -4359,7 +4367,9 @@ fn rx_species_of(vm: &mut Vm, r: Value, regexp: Value) -> Result<Value> {
         return Err(Error::type_error("object.constructor is not an object"));
     }
     let a_s = vm.intern_name(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
-    let sp = vm.get(c, a_s)?;
+    // (Maybe a getter's new object, a proxy maybe, held across its
+    // trap's lookup: rooted.)
+    let sp = vm.rooted(&[c], |vm| vm.get(c, a_s))?;
     if sp.is_undefined() || sp.is_null() {
         return Ok(regexp);
     }

@@ -3696,6 +3696,9 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         _ => None,
     };
     let e = make_error(vm, K, message.as_deref());
+    // (New, held across the options' `has` and `get`, a proxy's traps
+    // maybe: rooted.)
+    let _rooted = vm.root_scope(&[e]);
     // `{ cause }` in the options: its own `cause`.
     let options = arg(a, 1);
     if crate::props::is_object(options) {

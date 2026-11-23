@@ -740,18 +740,18 @@ fn has_stencil(name: &str) -> bool {
 /// operands go to the generic runtime in that order. `AddSmi` (`acc + imm`)
 /// shares it, which is fine while `+` is only numeric; strings will need a
 /// helper per order.
-extern "C" fn cloison_rt_add(a: Value, b: Value) -> u64 {
-    unwinding(RT_REDO, || rt_add(a, b))
+extern "C" fn cloison_rt_add(a: Value, b: Value, regs: *mut Value) -> u64 {
+    unwinding(RT_REDO, || rt_add(a, b, regs))
 }
 
-fn rt_add(acc: Value, r: Value) -> u64 {
+fn rt_add(acc: Value, r: Value, regs: *mut Value) -> u64 {
     match (r.as_number(), acc.as_number()) {
         (Some(x), Some(y)) => Value::from_f64_arith(x + y).to_bits(),
         _ => {
             // (A string's concatenation allocates.)
             let vm = crate::interp::current_vm();
             if !vm.is_null() {
-                unsafe { (*vm).safepoint(std::ptr::null_mut()) };
+                unsafe { (*vm).safepoint(regs) };
             }
             converting(|| crate::interp::generic_add(r, acc).to_bits())
         }
@@ -979,31 +979,31 @@ fn rt_less_than(a: Value, b: Value) -> u64 {
 /// `for … in`'s keys of `v` (`for_in_keys`; `vm` is the VM's address); 0
 /// for a proxy's, which its traps, bytecode functions, find: the
 /// interpreter calls them.
-extern "C" fn cloison_rt_for_in_keys(a: Value, b: Value) -> u64 {
-    unwinding(0, || rt_for_in_keys(a, b))
+extern "C" fn cloison_rt_for_in_keys(a: Value, b: Value, regs: *mut Value) -> u64 {
+    unwinding(0, || rt_for_in_keys(a, b, regs))
 }
 
-fn rt_for_in_keys(vm: Value, v: Value) -> u64 {
+fn rt_for_in_keys(vm: Value, v: Value, regs: *mut Value) -> u64 {
     unsafe {
         let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
         if v.is_cell() && crate::proxy::chain_has_proxy(vm, Obj::from_ptr(crate::object::as_object(v))) {
             return 0;
         }
-        vm.safepoint(std::ptr::null_mut());
+        vm.safepoint(regs);
         vm.for_in_key_array(v).to_bits()
     }
 }
 
 /// A new object of shape `shape` (`create_object` and `create_array`,
 /// when the heap's chunk is full).
-extern "C" fn cloison_rt_create_object(a: Value, b: Value) -> u64 {
-    unwinding(0, || rt_create_object(a, b))
+extern "C" fn cloison_rt_create_object(a: Value, b: Value, regs: *mut Value) -> u64 {
+    unwinding(0, || rt_create_object(a, b, regs))
 }
 
-fn rt_create_object(shape: Value, _: Value) -> u64 {
+fn rt_create_object(shape: Value, _: Value, regs: *mut Value) -> u64 {
     unsafe {
         let vm = crate::interp::current_vm();
-        (*vm).safepoint(std::ptr::null_mut());
+        (*vm).safepoint(regs);
         let o = (*vm).heap.alloc_object(&*(shape.to_bits() as *const Shape));
         crate::object::object_value(o).to_bits()
     }
@@ -1314,11 +1314,11 @@ fn rt_create_regexp(p: Value, f: Value) -> u64 {
 /// no epoch says, #333). It may change the elements' type, so the
 /// receiver's shape: `set_keyed_rt` forgets exact shapes (a named
 /// property's transition gives a shape extending the old one).
-extern "C" fn cloison_rt_set_keyed(a: Value, b: Value) -> u64 {
-    unwinding(0, || rt_set_keyed(a, b))
+extern "C" fn cloison_rt_set_keyed(a: Value, b: Value, regs: *mut Value) -> u64 {
+    unwinding(0, || rt_set_keyed(a, b, regs))
 }
 
-fn rt_set_keyed(args: Value, _: Value) -> u64 {
+fn rt_set_keyed(args: Value, _: Value, regs: *mut Value) -> u64 {
     use crate::object::Class;
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
@@ -1384,7 +1384,7 @@ fn rt_set_keyed(args: Value, _: Value) -> u64 {
     // (It may grow the elements: a collection asked for is made first, as
     // compiled code growing an array by index may reach no other
     // safepoint, 1.1 GB of dead elements left for the next one.)
-    vm.safepoint(std::ptr::null_mut());
+    vm.safepoint(regs);
     // (A store that did nothing: the interpreter's again, which throws in
     // strict code. One whose conversion needed a call too.)
     vm.store_failed = false;
@@ -1503,6 +1503,22 @@ extern "C" fn cloison_rt_to_boolean(a: Value, _: Value) -> bool {
     crate::interp::to_boolean(a)
 }
 
+/// Whether runtime function `name` takes the running frame's registers as
+/// its third argument: those that may collect, which the collector then
+/// knows the VM stack's top from (`rt_call_at!` in the stencils holds
+/// `regs` in its register for the wrapper to pass on).
+fn takes_frame(name: &str) -> bool {
+    matches!(
+        name,
+        "cloison_rt_add"
+            | "cloison_rt_for_in_keys"
+            | "cloison_rt_create_object"
+            | "cloison_rt_set_keyed"
+            | "cloison_rt_from_char_code"
+            | "cloison_rt_array_push"
+    )
+}
+
 fn runtime_function(name: &str) -> usize {
     match name {
         "cloison_rt_mod" => cloison_rt_mod as *const () as usize,
@@ -1606,14 +1622,18 @@ mod arch {
 
     /// A runtime-call wrapper (see `rt_call!` in `stencils/stencils.rs`):
     /// called with the arguments in rax and r11, it saves GPRs `gprs` and
-    /// xmm registers `fprs`, calls the C function `target`, restores them
-    /// and returns the result in rax. Position-independent.
+    /// xmm registers `fprs`, calls the C function `target` (with `frame`,
+    /// the frame register r13 as its third argument: see [`super::takes_frame`]),
+    /// restores them and returns the result in rax. Position-independent.
     ///
     /// Entered with rsp ≡ 8 (mod 16), as from any call at an aligned site.
-    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
+    pub fn runtime_wrapper(target: u64, frame: bool, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
         let (mut c, restore) = saves(gprs, fprs);
         c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
         c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+        if frame {
+            c.extend([0x4C, 0x89, 0xEA]); // mov rdx, r13
+        }
         call_abs(&mut c, target);
         c.extend(restore);
         c
@@ -2201,13 +2221,17 @@ mod arch {
 
     /// A runtime-call wrapper (see `rt_call!` in `stencils/stencils.rs`):
     /// called with `bl` and the arguments in x8 and x9, it saves GPRs `gprs`
-    /// and FP registers `fprs` (d0–d7), calls the C function `target`,
-    /// restores them and returns the result in x8. Position-independent; the
-    /// target address is a literal after the code.
-    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
+    /// and FP registers `fprs` (d0–d7), calls the C function `target` (with
+    /// `frame`, the frame register x21 as its third argument: see
+    /// [`super::takes_frame`]), restores them and returns the result in x8.
+    /// Position-independent; the target address is a literal after the code.
+    pub fn runtime_wrapper(target: u64, frame: bool, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
         let (mut c, restore) = saves(gprs, fprs);
         c.push(0xAA08_03E0); // mov x0, x8
         c.push(0xAA09_03E1); // mov x1, x9
+        if frame {
+            c.push(0xAA15_03E2); // mov x2, x21
+        }
         let call = c.len();
         c.push(0); // ldr x16, literal (patched below)
         c.push(0xD63F_0200); // blr x16
@@ -10330,7 +10354,7 @@ impl JitCode {
                         arch::enter_wrapper(&saved_gprs, &saved_fprs, &EnterConsts::new())
                     } else {
                         let target = runtime_function(name) as u64;
-                        arch::runtime_wrapper(target, &saved_gprs, &saved_fprs)
+                        arch::runtime_wrapper(target, takes_frame(name), &saved_gprs, &saved_fprs)
                     };
                     let at = pos;
                     pos += code.len().next_multiple_of(8);
@@ -18576,24 +18600,24 @@ extern "C" fn cloison_rt_pow(x: Value, y: Value) -> u64 {
 /// `String.fromCharCode(c)` for `from_char_code` stencils, `c` an int32 or
 /// (`from_char_code`) any value: the string, or 0 to leave where `c` isn't
 /// a number (converting it may run code).
-extern "C" fn cloison_rt_from_char_code(a: Value, b: Value) -> u64 {
-    unwinding(0, || rt_from_char_code(a, b))
+extern "C" fn cloison_rt_from_char_code(a: Value, b: Value, regs: *mut Value) -> u64 {
+    unwinding(0, || rt_from_char_code(a, b, regs))
 }
 
-fn rt_from_char_code(c: Value, _: Value) -> u64 {
+fn rt_from_char_code(c: Value, _: Value, regs: *mut Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let Some(d) = c.as_number() else { return 0 };
-    vm.safepoint(std::ptr::null_mut());
+    vm.safepoint(regs);
     vm.single_char(crate::interp::to_int32(d) as u16).to_bits()
 }
 
-extern "C" fn cloison_rt_array_push(a: Value, b: Value) -> Value {
-    unwinding(Value::EMPTY, || rt_array_push(a, b))
+extern "C" fn cloison_rt_array_push(a: Value, b: Value, regs: *mut Value) -> Value {
+    unwinding(Value::EMPTY, || rt_array_push(a, b, regs))
 }
 
-fn rt_array_push(a: Value, v: Value) -> Value {
+fn rt_array_push(a: Value, v: Value, regs: *mut Value) -> Value {
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.safepoint(std::ptr::null_mut());
+    vm.safepoint(regs);
     crate::vm::array_push(vm, a, &[v]).expect("a push onto an array")
 }
 
@@ -19334,8 +19358,10 @@ mod tests {
             for fm in 0..1 << xmms.len() {
                 let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&xmms, fm));
                 let what = format!("gprs {gprs:?}, fprs {fprs:?}");
-                let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs);
-                check_x86_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
+                for frame in [false, true] {
+                    let w = arch::runtime_wrapper(0x1234_5678_9abc, frame, &gprs, &fprs);
+                    check_x86_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}, frame {frame}: {e}"));
+                }
                 let w = arch::enter_wrapper(&gprs, &fprs, &enter);
                 check_x86_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
                 for f_off in [None, Some(0x40)] {
@@ -19522,8 +19548,11 @@ mod tests {
             for fm in 0..1 << fp_regs.len() {
                 let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&fp_regs, fm));
                 let what = format!("gprs {gprs:?}, fprs {fprs:?}");
-                let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs);
-                check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
+                for frame in [false, true] {
+                    let w = arch::runtime_wrapper(0x1234_5678_9abc, frame, &gprs, &fprs);
+                    check_arm64_stack(&w, None)
+                        .unwrap_or_else(|e| panic!("runtime wrapper, {what}, frame {frame}: {e}"));
+                }
                 let w = arch::enter_wrapper(&gprs, &fprs, &enter);
                 check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
                 // (Direct calls save the slot registers live after them, FP

@@ -283,6 +283,24 @@ macro_rules! rt_call {
     };
 }
 
+/// `rt_call!` of a runtime function that may collect: `regs` held in its
+/// register (r13, x21) at the call, where the wrapper finds it and passes
+/// it on as the function's third argument (`jit::takes_frame`). With it
+/// the collector knows the running frame and scans the VM stack only to
+/// its end.
+#[cfg(target_arch = "x86_64")]
+macro_rules! rt_call_at {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {
+        rt_call!($s, $f, $a, $b; in("r13") $s.regs)
+    };
+}
+#[cfg(target_arch = "aarch64")]
+macro_rules! rt_call_at {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {
+        rt_call!($s, $f, $a, $b; in("x21") $s.regs)
+    };
+}
+
 /// `jit::RT_REDO`: a runtime call's operation left to the interpreter (a
 /// conversion needed a bytecode `valueOf` or `toString`).
 const RT_REDO: u64 = u64::MAX;
@@ -314,7 +332,7 @@ macro_rules! leave_if_panicked {
 /// `cloison_rt_add(a, b)`.
 macro_rules! rt_add {
     ($s:ident, $a:expr, $b:expr) => {
-        Value::from_bits(rt_redo!($s, rt_call!($s, cloison_rt_add, $a, $b)))
+        Value::from_bits(rt_redo!($s, rt_call_at!($s, cloison_rt_add, $a, $b)))
     };
 }
 /// `cloison_rt_inc(a)`.
@@ -4616,7 +4634,7 @@ with_gprs!(each_gpr! value_test_slot);
 // VM's address is the 64-bit immediate); 0: the interpreter's to find
 // (through a proxy's traps).
 stencil!("for_in_keys"; |s| {
-    let r = rt_call!(s, cloison_rt_for_in_keys, Value::from_bits(imm64()), s.acc);
+    let r = rt_call_at!(s, cloison_rt_for_in_keys, Value::from_bits(imm64()), s.acc);
     if r == 0 {
         exit!(s)
     }
@@ -4796,7 +4814,7 @@ macro_rules! create_object_n {
         }; |s| {
             // Each stencil keeps its own helper (LLVM would merge these).
             core::arch::asm!(concat!("/* create_object_", $n, " */"), options(nomem, nostack, preserves_flags));
-            let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+            let r = rt_call_at!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
             // (0: it panicked, see `jit::unwinding`; the exit never resumes,
             // so its `acc` is any: the fast path needn't keep the one before.)
             if r == 0 {
@@ -4816,7 +4834,7 @@ stencil_slow!("create_object"; |s| {
     s.acc = Value::from_bits(p as u64);
     next!(s)
 }; |s| {
-    let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+    let r = rt_call_at!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
     // (0: it panicked, see `jit::unwinding`; the exit never resumes,
     // so its `acc` is any: the fast path needn't keep the one before.)
     if r == 0 {
@@ -4843,7 +4861,7 @@ stencil_slow!("create_array"; |s| {
 }; |s| {
     // (Its own helper: LLVM would merge it with `create_object`'s.)
     core::arch::asm!("/* create_array */", options(nomem, nostack, preserves_flags));
-    let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+    let r = rt_call_at!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
     // (0: it panicked, see `jit::unwinding`; the exit never resumes,
     // so its `acc` is any: the fast path needn't keep the one before.)
     if r == 0 {
@@ -4902,7 +4920,7 @@ stencil_slow!("create_array_n"; |s| {
     next!(s)
 }; |s| {
     core::arch::asm!("/* create_array_n */", options(nomem, nostack, preserves_flags));
-    let r = rt_call!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
+    let r = rt_call_at!(s, cloison_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED);
     // (0: it panicked, see `jit::unwinding`; the exit never resumes,
     // so its `acc` is any: the fast path needn't keep the one before.)
     if r == 0 {
@@ -5589,7 +5607,7 @@ macro_rules! property_location {
         }; |s| {
             let key = load_imm(s.regs as *mut u8);
             let args = [get!($loc, s), key, s.acc];
-            let r = rt_call!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            let r = rt_call_at!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
                 exit!(s)
             }
@@ -5627,7 +5645,7 @@ macro_rules! property_location {
             core::arch::asm!(concat!("/* set_keyed_ap_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
             let key = load_imm(s.regs as *mut u8);
             let args = [get!($loc, s), key, s.acc];
-            let r = rt_call!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            let r = rt_call_at!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
                 exit!(s)
             }
@@ -5664,7 +5682,7 @@ macro_rules! property_location {
             let key = load_imm(s.regs as *mut u8);
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             let args = [get!($loc, s), key, v];
-            let r = rt_call!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            let r = rt_call_at!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
                 exit!(s)
             }
@@ -5930,7 +5948,7 @@ macro_rules! property_location {
             // Not merged with `set_keyed_`'s identical helper: each stencil
             // must keep its own.
             core::arch::asm!(concat!("/* set_keyed_rt_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
-            let r = rt_call!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            let r = rt_call_at!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
                 exit!(s)
             }
@@ -5950,7 +5968,7 @@ macro_rules! property_location {
             let key = load_imm(s.regs as *mut u8);
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             let args = [get!($loc, s), key, v];
-            let r = rt_call!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            let r = rt_call_at!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
                 exit!(s)
             }
@@ -7458,7 +7476,7 @@ macro_rules! array_methods {
                     next!(s)
                 }
             }
-            let r = rt_call!(s, cloison_rt_array_push, a, v);
+            let r = rt_call_at!(s, cloison_rt_array_push, a, v);
             // (`EMPTY`: it panicked, see `jit::unwinding`.)
             if r == 0 {
                 exit!(s)
@@ -7507,7 +7525,7 @@ macro_rules! array_methods {
                     next!(s)
                 }
             }
-            let r = rt_call!(s, cloison_rt_array_push, a, v);
+            let r = rt_call_at!(s, cloison_rt_array_push, a, v);
             // (`EMPTY`: it panicked, see `jit::unwinding`.)
             if r == 0 {
                 exit!(s)
@@ -7628,7 +7646,7 @@ macro_rules! from_char_code {
         }; |s| {
             core::arch::asm!(concat!("/* ", $name, " */"), options(nomem, nostack, preserves_flags));
             let c = if $name == "from_char_code" { s.acc } else { Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()) };
-            let r = rt_call!(s, cloison_rt_from_char_code, c, Value::UNDEFINED);
+            let r = rt_call_at!(s, cloison_rt_from_char_code, c, Value::UNDEFINED);
             if r == 0 {
                 exit!(s)
             }

@@ -145,6 +145,9 @@ fn wrap(vm: &mut Vm, v: Value) -> Result<Value> {
     }
     let template = root(vm, Root::Wrapped);
     let f = native_closure(vm, template, &[v]);
+    // (The wrapper, and its target, held across the target's `length`
+    // and `name` getters and traps: rooted.)
+    let _rooted = vm.root_scope(&[f, v]);
     copy_name_and_length(vm, f, v)
         .map_err(|e| Error::type_error(format!("wrapping a function: {}", thrown_message(vm, &e))))?;
     Ok(f)
@@ -223,6 +226,9 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("ShadowRealm.prototype.importValue requires a string export name"));
     }
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
+    // (The promise and its functions held across the module's evaluation:
+    // rooted.)
+    let _rooted = vm.root_scope(&[p, resolve, reject]);
     let loaded = crate::realm::run_in(vm, r, |vm| crate::module::import_now(vm, spec));
     match loaded {
         Ok((m, done)) => {

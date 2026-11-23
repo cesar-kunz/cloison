@@ -1,6 +1,7 @@
 # Every pull request and every push to master: the tests on x86-64 Linux,
 # as `cargo test --release` runs them locally, again with debug
-# assertions, and rustfmt and clippy (warnings are errors). The slower
+# assertions, the scripts with Rust frames' roots checked, and rustfmt
+# and clippy (warnings are errors). The slower
 # checks (arm64, the `intl` feature, test262) run nightly (nightly.yml).
 name: CI
 
@@ -44,6 +45,25 @@ jobs:
         with:
           key: debug-assertions
       - run: cargo test --release
+
+  precise-roots:
+    name: Tests (precise Rust roots)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # The scripts with the Rust frames' native stack words neither roots
+      # nor pins (`CLOISON_GC_NO_NATIVE_ROOTS=drop`) and a collection at
+      # every safepoint: a Rust local holding a cell across one that isn't
+      # rooted otherwise (`Vm::rooted`) makes its script crash or differ.
+      # Each script runs interpreted and compiled (see tests/scripts.rs).
+      CLOISON_GC_NO_NATIVE_ROOTS: drop
+      CLOISON_GC_STRESS: "1"
+      CLOISON_GC_STW: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --test scripts
 
   lint:
     name: rustfmt and clippy

@@ -84,7 +84,9 @@ pub(crate) fn reflect_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Res
     let o = target(a, "defineProperty")?;
     let key = to_property_key(vm, arg(a, 1))?;
     let d = vm.to_descriptor(arg(a, 2))?;
-    crate::proxy::define_property(vm, o, key, &d).map(Value::from_bool)
+    // (Its values, maybe getters' only, rooted until defined.)
+    vm.rooted(&crate::proxy::desc_values(Some(&d)), |vm| crate::proxy::define_property(vm, o, key, &d))
+        .map(Value::from_bool)
 }
 
 pub(crate) fn reflect_delete_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -107,7 +109,9 @@ pub(crate) fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Va
     let o = target(a, "getOwnPropertyDescriptor")?;
     let key = to_property_key(vm, arg(a, 1))?;
     Ok(match crate::proxy::get_own_property(vm, o, key)? {
-        Some(d) => vm.from_descriptor(&d),
+        // (Its values, maybe a trap's only, rooted while its object is
+        // made.)
+        Some(d) => vm.rooted(&crate::proxy::desc_values(Some(&d)), |vm| vm.from_descriptor(&d)),
         None => Value::UNDEFINED,
     })
 }

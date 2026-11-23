@@ -567,29 +567,35 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     }
     let pairs = matches!(class, Class::Map | Class::WeakMap);
     let a_adder = vm.intern_name(if pairs { "set" } else { "add" });
-    let adder = vm.get(o, a_adder)?;
-    if !is_callable(adder) {
-        return Err(Error::type_error(format!(
-            "'{}' returned for property '{}' of object '#<{name}>' is not a function",
-            crate::vm::shown(adder),
-            if pairs { "set" } else { "add" }
-        )));
-    }
-    iterate(vm, iterable, |vm, item| {
-        if pairs {
-            if !is_object(item) {
-                return Err(Error::type_error(format!(
-                    "Iterator value {} is not an entry object",
-                    crate::vm::shown(item)
-                )));
-            }
-            let k = vm.get_keyed(item, Value::from_i32(0))?;
-            let v = vm.get_keyed(item, Value::from_i32(1))?;
-            call_function(vm, adder, o, &[k, v])?;
-        } else {
-            call_function(vm, adder, o, &[item])?;
+    // (The collection rooted across the adder's getter and the iteration;
+    // the adder across the iteration.)
+    vm.rooted(&[o], |vm| {
+        let adder = vm.get(o, a_adder)?;
+        if !is_callable(adder) {
+            return Err(Error::type_error(format!(
+                "'{}' returned for property '{}' of object '#<{name}>' is not a function",
+                crate::vm::shown(adder),
+                if pairs { "set" } else { "add" }
+            )));
         }
-        Ok(())
+        vm.rooted(&[adder], |vm| {
+            iterate(vm, iterable, |vm, item| {
+                if pairs {
+                    if !is_object(item) {
+                        return Err(Error::type_error(format!(
+                            "Iterator value {} is not an entry object",
+                            crate::vm::shown(item)
+                        )));
+                    }
+                    let k = vm.get_keyed(item, Value::from_i32(0))?;
+                    let v = vm.rooted(&[k], |vm| vm.get_keyed(item, Value::from_i32(1)))?;
+                    call_function(vm, adder, o, &[k, v])?;
+                } else {
+                    call_function(vm, adder, o, &[item])?;
+                }
+                Ok(())
+            })
+        })
     })?;
     Ok(o)
 }
@@ -681,20 +687,26 @@ fn for_each(vm: &mut Vm, o: Obj, a: &[Value], this: Value) -> Result<Value> {
     let t = arg(a, 1);
     let s = stride(o);
     let (mut e, mut i) = (entries(o), BASE);
-    loop {
-        // (The callback may have compacted or cleared the entries.)
-        e = current(e, &mut i, s);
-        if i >= len(e) {
-            break;
+    // (The entries array rooted, in a slot of its own: the callback may
+    // move the collection to a new one, the old one forwarding to it.)
+    vm.rooted(&[object_value(e.ptr())], |vm| {
+        let at = vm.handles.len() - 1;
+        loop {
+            // (The callback may have compacted or cleared the entries.)
+            e = current(e, &mut i, s);
+            if i >= len(e) {
+                break;
+            }
+            vm.handles[at] = object_value(e.ptr());
+            let k = slot(e, i);
+            if k != Value::EMPTY {
+                let v = if s == 2 { slot(e, i + 1) } else { k };
+                call_function(vm, f, t, &[v, k, this])?;
+            }
+            i += s;
         }
-        let k = slot(e, i);
-        if k != Value::EMPTY {
-            let v = if s == 2 { slot(e, i + 1) } else { k };
-            call_function(vm, f, t, &[v, k, this])?;
-        }
-        i += s;
-    }
-    Ok(Value::UNDEFINED)
+        Ok(Value::UNDEFINED)
+    })
 }
 
 fn map_size(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -1120,17 +1132,19 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 fn map_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let out = object_value((new_collection(vm, Class::Map, Proto::Map)?).ptr());
     // (Its data made directly, as the spec has it: not through `get` and
-    // `set`, which code may have replaced.)
-    crate::props::group_by(vm, a, |vm, key, v| {
-        // (-0 as +0, as `set` keeps it.)
-        let key = if key.is_number() && key.to_number() == 0.0 { Value::from_i32(0) } else { key };
-        let mut group = map_get(vm, out, &[key])?;
-        if group.is_undefined() {
-            group = vm.new_array();
-            map_set(vm, out, &[key, group])?;
-        }
-        array_push(vm, group, &[v])?;
-        Ok(())
+    // `set`, which code may have replaced. Rooted across the callbacks.)
+    vm.rooted(&[out], |vm| {
+        crate::props::group_by(vm, a, |vm, key, v| {
+            // (-0 as +0, as `set` keeps it.)
+            let key = if key.is_number() && key.to_number() == 0.0 { Value::from_i32(0) } else { key };
+            let mut group = map_get(vm, out, &[key])?;
+            if group.is_undefined() {
+                group = vm.new_array();
+                map_set(vm, out, &[key, group])?;
+            }
+            array_push(vm, group, &[v])?;
+            Ok(())
+        })
     })?;
     Ok(out)
 }
@@ -1167,7 +1181,7 @@ fn set_record(vm: &mut Vm, other: Value) -> Result<SetRecord> {
     if !is_callable(has) {
         return Err(Error::type_error("The set-like's has is not a function"));
     }
-    let keys = vm.get(other, a_keys)?;
+    let keys = vm.rooted(&[has], |vm| vm.get(other, a_keys))?;
     if !is_callable(keys) {
         return Err(Error::type_error("The set-like's keys is not a function"));
     }
@@ -1186,7 +1200,7 @@ fn record_iterator(vm: &mut Vm, rec: &SetRecord) -> Result<(Value, Value)> {
         return Err(Error::type_error("The set-like's keys() is not an iterator"));
     }
     let a_next = vm.intern_name("next");
-    let next = vm.get(it, a_next)?;
+    let next = vm.rooted(&[it], |vm| vm.get(it, a_next))?;
     Ok((it, next))
 }
 
@@ -1204,20 +1218,27 @@ fn each_key(
     mut f: impl FnMut(&mut Vm, Value) -> Result<bool>,
 ) -> Result<bool> {
     let (a_done, a_value) = (vm.intern_name("done"), vm.a_value);
-    loop {
-        let r = call_function(vm, next, it, &[])?;
-        if !is_object(r) {
-            return Err(Error::type_error("Iterator result is not an object"));
+    // (The iterator and `next` rooted across the results' getters and
+    // `f`; each result across its own.)
+    vm.rooted(&[it, next], |vm| {
+        loop {
+            let r = call_function(vm, next, it, &[])?;
+            if !is_object(r) {
+                return Err(Error::type_error("Iterator result is not an object"));
+            }
+            let v = vm.rooted(&[r], |vm| {
+                if to_boolean(vm.get(r, a_done)?) {
+                    return Ok(None);
+                }
+                vm.get(r, a_value).map(Some)
+            })?;
+            let Some(v) = v else { return Ok(true) };
+            if !f(vm, normalize(v))? {
+                crate::symbol::close(vm, it)?;
+                return Ok(false);
+            }
         }
-        if to_boolean(vm.get(r, a_done)?) {
-            return Ok(true);
-        }
-        let v = vm.get(r, a_value)?;
-        if !f(vm, normalize(v))? {
-            crate::symbol::close(vm, it)?;
-            return Ok(false);
-        }
-    }
+    })
 }
 
 /// Each value set `o` has (its entries read as the loop goes on, so a
@@ -1226,17 +1247,24 @@ fn each_key(
 fn each_value(vm: &mut Vm, o: Obj, mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
     let mut e = entries(o);
     let mut pos = BASE;
-    loop {
-        e = current(e, &mut pos, 1);
-        if pos >= len(e) {
-            return Ok(true);
+    // (The entries array and the value rooted, in slots of their own: `f`
+    // may move the set to new entries or delete the value.)
+    vm.rooted(&[object_value(e.ptr()), Value::UNDEFINED], |vm| {
+        let at = vm.handles.len() - 2;
+        loop {
+            e = current(e, &mut pos, 1);
+            if pos >= len(e) {
+                return Ok(true);
+            }
+            let v = slot(e, pos);
+            pos += 1;
+            vm.handles[at] = object_value(e.ptr());
+            vm.handles[at + 1] = v;
+            if v != Value::EMPTY && !f(vm, v)? {
+                return Ok(false);
+            }
         }
-        let v = slot(e, pos);
-        pos += 1;
-        if v != Value::EMPTY && !f(vm, v)? {
-            return Ok(false);
-        }
-    }
+    })
 }
 
 /// A new set of set `o`'s values.
@@ -1266,7 +1294,10 @@ fn set_union(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // change this set.)
     let iterator = record_iterator(vm, &rec)?;
     let out = copy_set(vm, o)?;
-    each_key(vm, iterator, |vm, v| set_add_value(vm, out, v).map(|()| true))?;
+    // (The result rooted across the iteration.)
+    vm.rooted(&[object_value(out.ptr())], |vm| {
+        each_key(vm, iterator, |vm, v| set_add_value(vm, out, v).map(|()| true))
+    })?;
     Ok(object_value(out.ptr()))
 }
 
@@ -1274,21 +1305,24 @@ fn set_intersection(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.intersection")?;
     let rec = set_record(vm, arg(a, 0))?;
     let out = new_collection(vm, Class::Set, Proto::Set)?;
-    if live(o) as f64 <= rec.size {
-        each_value(vm, o, |vm, v| {
-            if record_has(vm, &rec, v)? {
-                set_add_value(vm, out, v)?;
-            }
-            Ok(true)
-        })?;
-    } else {
-        record_keys(vm, &rec, |vm, v| {
-            if find(o, v).is_some() {
-                set_add_value(vm, out, v)?;
-            }
-            Ok(true)
-        })?;
-    }
+    // (The result rooted across the calls.)
+    vm.rooted(&[object_value(out.ptr())], |vm| {
+        if live(o) as f64 <= rec.size {
+            each_value(vm, o, |vm, v| {
+                if record_has(vm, &rec, v)? {
+                    set_add_value(vm, out, v)?;
+                }
+                Ok(true)
+            })
+        } else {
+            record_keys(vm, &rec, |vm, v| {
+                if find(o, v).is_some() {
+                    set_add_value(vm, out, v)?;
+                }
+                Ok(true)
+            })
+        }
+    })?;
     Ok(object_value(out.ptr()))
 }
 
@@ -1296,20 +1330,23 @@ fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.difference")?;
     let rec = set_record(vm, arg(a, 0))?;
     let out = copy_set(vm, o)?;
-    if live(o) as f64 <= rec.size {
-        // (The copy's values, which `has` can't change: not this set's.)
-        each_value(vm, out, |vm, v| {
-            if record_has(vm, &rec, v)? {
+    // (The result rooted across the calls.)
+    vm.rooted(&[object_value(out.ptr())], |vm| {
+        if live(o) as f64 <= rec.size {
+            // (The copy's values, which `has` can't change: not this set's.)
+            each_value(vm, out, |vm, v| {
+                if record_has(vm, &rec, v)? {
+                    set_remove_value(out, v);
+                }
+                Ok(true)
+            })
+        } else {
+            record_keys(vm, &rec, |_, v| {
                 set_remove_value(out, v);
-            }
-            Ok(true)
-        })?;
-    } else {
-        record_keys(vm, &rec, |_, v| {
-            set_remove_value(out, v);
-            Ok(true)
-        })?;
-    }
+                Ok(true)
+            })
+        }
+    })?;
     Ok(object_value(out.ptr()))
 }
 
@@ -1318,13 +1355,16 @@ fn set_symmetric_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
     let rec = set_record(vm, arg(a, 0))?;
     let iterator = record_iterator(vm, &rec)?;
     let out = copy_set(vm, o)?;
-    each_key(vm, iterator, |vm, v| {
-        if find(o, v).is_some() {
-            set_remove_value(out, v);
-        } else {
-            set_add_value(vm, out, v)?;
-        }
-        Ok(true)
+    // (The result rooted across the iteration.)
+    vm.rooted(&[object_value(out.ptr())], |vm| {
+        each_key(vm, iterator, |vm, v| {
+            if find(o, v).is_some() {
+                set_remove_value(out, v);
+            } else {
+                set_add_value(vm, out, v)?;
+            }
+            Ok(true)
+        })
     })?;
     Ok(object_value(out.ptr()))
 }

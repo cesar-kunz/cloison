@@ -54,6 +54,17 @@ fn json_stringify(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    // (The replacer's keys rooted in `vm.handles` from the first: left on
+    // every return, errors' too, or a loop of calls would pile them up
+    // until the run ends.)
+    let depth = vm.handles.len();
+    let r = stringify_rooted(vm, a);
+    vm.handles.truncate(depth);
+    r
+}
+
+/// [`json_stringify_`], what it roots left to it.
+fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let replacer = arg(a, 1);
     let mut st = Stringify {
         replacer: None,
@@ -116,8 +127,7 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     } else if let Some(u) = string_units(space) {
         st.gap = u[..u.len().min(10)].to_vec();
     }
-    let depth = vm.handles.len();
-    let r = vm.handle_scope(|vm| {
+    vm.handle_scope(|vm| {
         let op = object_value(vm.object_prototype);
         let wrapper = object_value(vm.new_plain(op).ptr());
         let empty = vm.new_string(&[]);
@@ -130,9 +140,7 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             true => vm.new_string(&out),
             false => Value::UNDEFINED,
         })
-    });
-    vm.handles.truncate(depth);
-    r
+    })
 }
 
 /// A property's key while it is serialized: its string is made only for a
@@ -937,5 +945,35 @@ impl<'a> Parser<'a> {
                 _ => out.push(c),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handles(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        Ok(Value::from_i32(vm.handles.len() as i32))
+    }
+
+    /// A replacer's keys, rooted while it runs, are left when it returns,
+    /// with its result or its error: none piles up in `vm.handles` over a
+    /// run's calls.
+    #[test]
+    fn stringify_leaves_no_handle() {
+        let mut vm = Vm::new();
+        let g = Obj::of(object_value(vm.global));
+        vm.define_natives(g, &[("handles", handles, 0)]);
+        let m = crate::js::compile(
+            r#"var n = new Number(2); n.valueOf = function () { throw 1; };
+            var x = { a: 1, b: 2 }, before = handles();
+            for (var i = 0; i < 100; i++) {
+                JSON.stringify(x, ["a", "b", 3, new String("c")]);
+                try { JSON.stringify(x, ["a", "b"], n); } catch (e) {}
+            }
+            handles() - before"#,
+        )
+        .unwrap();
+        assert_eq!(vm.run_raw(&m).map(|v| v.as_number()), Ok(Some(0.0)));
     }
 }

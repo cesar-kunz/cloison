@@ -1756,7 +1756,9 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
     if !this.is_undefined()
         && !this.is_null()
         && let o = object_value((vm.to_object(this)?).ptr())
-        && let Some(t) = crate::symbol::tag_of(vm, o)?
+        // (A primitive's new wrapper, the receiver of a proxy's trap on
+        // its prototype chain: rooted.)
+        && let Some(t) = vm.rooted(&[o], |vm| crate::symbol::tag_of(vm, o))?
     {
         let mut u: Vec<u16> = "[object ".encode_utf16().collect();
         u.extend_from_slice(&t);

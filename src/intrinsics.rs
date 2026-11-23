@@ -238,7 +238,9 @@ pub(crate) fn construct(vm: &mut Vm, f: Value, args: &[Value]) -> Result<Value> 
 pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result<Value> {
     // (Its arguments on the VM stack before `new.target`'s `prototype` is
     // read, which may run a getter: see `interp::with_args_on_stack`.)
-    crate::interp::with_args_on_stack(vm, args, |vm, args| construct_with_on(vm, f, args, nt))
+    // (`f` and `nt`, which may be Rust's alone, read after code runs:
+    // rooted.)
+    vm.rooted(&[f, nt], |vm| crate::interp::with_args_on_stack(vm, args, |vm, args| construct_with_on(vm, f, args, nt)))
 }
 
 /// [`construct_with`], `args` on the VM stack (or no cell moving).
@@ -286,13 +288,14 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
     // keeps the builtin's if that isn't an object.)
     if nt != f && !taken && crate::props::is_object(r) {
         let a = vm.a_prototype;
-        let proto = vm.get(nt, a)?;
+        // (`r`, held across the getter: rooted.)
+        let proto = vm.rooted(&[r], |vm| vm.get(nt, a))?;
         if crate::props::is_object(proto) {
             vm.set_prototype_of(Obj::of(r), proto);
         } else if !vm.realms.is_empty() {
             // (The builtin's prototype of `nt`'s realm.)
             let own = unsafe { (*Obj::of(r).shape()).proto };
-            let p = crate::realm::default_proto(vm, nt, own)?;
+            let p = vm.rooted(&[r], |vm| crate::realm::default_proto(vm, nt, own))?;
             if p != own {
                 vm.set_prototype_of(Obj::of(r), p);
             }
@@ -617,7 +620,9 @@ fn super_base(home: Value) -> Result<Value> {
 /// `super[key]`: `[home, key, this]`.
 fn super_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let base = super_base(a[0])?;
-    let key = to_property_key(vm, a[1])?;
+    // (The key's conversion may change the home's prototype: `base`
+    // rooted across it.)
+    let key = vm.rooted(&[base], |vm| to_property_key(vm, a[1]))?;
     if base.is_null() {
         return Err(Error::type_error("Cannot read properties of null (reading a super property)"));
     }
@@ -639,7 +644,7 @@ fn super_store(vm: &mut Vm, base: Value, key: Key, v: Value, this: Value) -> Res
 /// `super[key] = v`: `[home, key, v, this]`.
 fn super_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let base = super_base(a[0])?;
-    let key = to_property_key(vm, a[1])?;
+    let key = vm.rooted(&[base], |vm| to_property_key(vm, a[1]))?;
     let (v, this) = (a[2], a[3]);
     if !super_store(vm, base, key, v, this)? {
         return Err(Error::type_error("Cannot assign to a read-only property"));
@@ -650,7 +655,7 @@ fn super_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `super[key] = v` in sloppy code: failing silently.
 fn super_set_sloppy(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let base = super_base(a[0])?;
-    let key = to_property_key(vm, a[1])?;
+    let key = vm.rooted(&[base], |vm| to_property_key(vm, a[1]))?;
     super_store(vm, base, key, a[2], a[3])?;
     Ok(a[2])
 }
@@ -804,13 +809,16 @@ fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // (`IteratorOpen`'s state, stepped on a copy on the native stack,
     // which pins what it holds: the pattern's is done after.)
     let mut st = [a[0], a[1]];
-    loop {
-        let v = unsafe { crate::symbol::iterator_next(vm, st.as_mut_ptr())? };
-        if v == Value::HOLE {
-            return Ok(out);
+    // (`out`, held across the steps: rooted.)
+    vm.rooted(&[out], |vm| {
+        loop {
+            let v = unsafe { crate::symbol::iterator_next(vm, st.as_mut_ptr())? };
+            if v == Value::HOLE {
+                return Ok(out);
+            }
+            crate::vm::array_push(vm, out, &[v])?;
         }
-        crate::vm::array_push(vm, out, &[v])?;
-    }
+    })
 }
 
 /// An object pattern's source: `[v]`, not `null` or `undefined`.
@@ -829,8 +837,15 @@ fn require_coercible(_: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `source`'s own enumerable properties but those keys.
 fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let src = vm.to_object(a[0])?;
+    // (A wrapper `src`, and `out`, held across conversions and getters:
+    // rooted.)
+    vm.rooted(&[object_value(src.ptr())], |vm| object_rest_of(vm, src, a[1]))
+}
+
+/// [`object_rest`] of `src`, but the keys in array `keys`.
+fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
     let excluded: Vec<Key> = {
-        let ks = elements(vm, a[1])?;
+        let ks = elements(vm, keys)?;
         let mut out = Vec::new();
         for k in ks {
             out.push(to_property_key(vm, k)?);
@@ -838,16 +853,18 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         out
     };
     let out = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
-    for key in crate::proxy::own_keys(vm, src)? {
-        if excluded.contains(&key)
-            || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
-        {
-            continue;
+    vm.rooted(&[out], |vm| {
+        for key in crate::proxy::own_keys(vm, src)? {
+            if excluded.contains(&key)
+                || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
+            {
+                continue;
+            }
+            let v = vm.get_key(object_value(src.ptr()), key)?;
+            vm.create_data_property(out, key, v)?;
         }
-        let v = vm.get_key(object_value(src.ptr()), key)?;
-        vm.create_data_property(out, key, v)?;
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// A direct `eval(source)`: `[eval, source, shape, this, flags
@@ -1197,6 +1214,8 @@ fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) 
         }
     }
     let r = direct_eval_in(vm, &da, chain.with_scopes(&places).ok_or_else(too_many_scopes)?)?;
+    // (`r` held across the flushes' setters: rooted.)
+    vm.handles.push(r);
     let keys: Vec<Key> = bindings.iter().map(|b| Key::Name(vm.intern_name(&b.0))).collect();
     for s in made {
         flush_scope(vm, s, a[6], &keys)?;
@@ -1292,6 +1311,8 @@ fn with_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let au = vm.intern_name(&format!("{}Symbol.unscopables", crate::symbol::SYMBOL_MARK));
     let u = vm.get(o, au)?;
     if crate::props::is_object(u) {
+        // (`u`, a getter's maybe, held across its proxy traps: rooted.)
+        let _rooted = vm.root_scope(&[u]);
         let blocked = vm.get_keyed(u, k)?;
         return Ok(Value::from_bool(!crate::interp::to_boolean(blocked)));
     }
@@ -1425,6 +1446,8 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
         if !crate::props::is_object(r) {
             return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
         }
+        // (`r`, the step's result, held across its getters: rooted.)
+        let _rooted = vm.root_scope(&[r]);
         let a_done = vm.a_done;
         let done = crate::interp::to_boolean(vm.get(r, a_done)?);
         let a_value = vm.a_value;
@@ -1555,16 +1578,19 @@ fn copy_data_properties(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if crate::props::is_object(target) && vm.copy_plain_properties(Obj::of(target), src)? {
         return Ok(target);
     }
-    let keys = crate::proxy::own_keys(vm, src)?;
-    for key in keys {
-        // (Enumerable when reached: a getter may change that.)
-        if !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
-            continue;
+    // (A wrapper `src` held across getters: rooted.)
+    vm.rooted(&[object_value(src.ptr())], |vm| {
+        let keys = crate::proxy::own_keys(vm, src)?;
+        for key in keys {
+            // (Enumerable when reached: a getter may change that.)
+            if !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+                continue;
+            }
+            let v = vm.get_key(object_value(src.ptr()), key)?;
+            vm.create_data_property(target, key, v)?;
         }
-        let v = vm.get_key(object_value(src.ptr()), key)?;
-        vm.create_data_property(target, key, v)?;
-    }
-    Ok(target)
+        Ok(target)
+    })
 }
 
 /// A class's private name `[#x]`: a new private symbol.
@@ -1752,7 +1778,8 @@ fn async_gen_yield(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
     let a = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     let o = object_value((vm.to_object(v)?).ptr());
-    let m = vm.get(o, a)?;
+    // (A wrapper `o`, the receiver of its prototypes' traps: rooted.)
+    let m = vm.rooted(&[o], |vm| vm.get(o, a))?;
     Ok((!m.is_undefined() && !m.is_null()).then_some(m))
 }
 
@@ -2145,7 +2172,9 @@ fn flush_scope(vm: &mut Vm, scope: Value, target: Value, bindings: &[Key]) -> Re
         if let Some(d) = vm.own_property(Obj::of(scope), key)
             && let Some(v) = d.value
         {
-            vm.put_key(target, key, v)?;
+            // (`v`, the scope object's only, which JS may change, held
+            // across the store's traps: rooted.)
+            vm.rooted(&[v], |vm| vm.put_key(target, key, v))?;
         }
     }
     Ok(())

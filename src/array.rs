@@ -362,25 +362,23 @@ fn flatten(
 
 fn array_flat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let depth = if arg(a, 0).is_undefined() { 1.0 } else { to_integer(arg(a, 0)).max(0.0) };
-        let out = species_create(vm, o, 0.0)?;
-        // (Rooted with `o`, until the scope ends.)
-        vm.handles.push(out);
-        flatten(vm, out, o, len, 0.0, depth, None)?;
-        Ok(out)
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let depth = if arg(a, 0).is_undefined() { 1.0 } else { to_integer(arg(a, 0)).max(0.0) };
+    let out = species_create(vm, o, 0.0)?;
+    // (Rooted with `o`, until the scope ends.)
+    vm.handles.push(out);
+    flatten(vm, out, o, len, 0.0, depth, None)?;
+    Ok(out)
 }
 
 fn array_flat_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let f = callback(a, "flatMap")?;
-        let out = species_create(vm, o, 0.0)?;
-        vm.handles.push(out);
-        flatten(vm, out, o, len, 0.0, 1.0, Some((f, arg(a, 1))))?;
-        Ok(out)
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let f = callback(a, "flatMap")?;
+    let out = species_create(vm, o, 0.0)?;
+    vm.handles.push(out);
+    flatten(vm, out, o, len, 0.0, 1.0, Some((f, arg(a, 1))))?;
+    Ok(out)
 }
 
 /// A new array of `values`.
@@ -511,14 +509,13 @@ pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
     let o = object_value((vm.to_object(this)?).ptr());
     let a_join = vm.intern_name("join");
     // (A wrapper `o` held across the getter: rooted.)
-    vm.rooted(&[o], |vm| {
-        let f = vm.get(o, a_join)?;
-        if is_callable(f) {
-            return call_function(vm, f, o, &[]);
-        }
-        // (The intrinsic, not whatever `Object.prototype.toString` is now.)
-        crate::builtins::object_to_string(vm, o, &[])
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let f = vm.get(o, a_join)?;
+    if is_callable(f) {
+        return call_function(vm, f, o, &[]);
+    }
+    // (The intrinsic, not whatever `Object.prototype.toString` is now.)
+    crate::builtins::object_to_string(vm, o, &[])
 }
 
 /// `Array.prototype.toLocaleString()`: each element's `toLocaleString()`,
@@ -650,340 +647,330 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
         return Ok(if v == Value::EMPTY { Value::UNDEFINED } else { v });
     }
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        if len == 0.0 {
-            set_length(vm, o, 0.0)?;
-            return Ok(Value::UNDEFINED);
-        }
-        let v = get(vm, o, len - 1.0)?;
-        vm.rooted(&[v], |vm| {
-            delete(vm, o, len - 1.0)?;
-            set_length(vm, o, len - 1.0)
-        })?;
-        Ok(v)
-    })
+    let _rooted = vm.root_scope(&[o]);
+    if len == 0.0 {
+        set_length(vm, o, 0.0)?;
+        return Ok(Value::UNDEFINED);
+    }
+    let v = get(vm, o, len - 1.0)?;
+    vm.rooted(&[v], |vm| {
+        delete(vm, o, len - 1.0)?;
+        set_length(vm, o, len - 1.0)
+    })?;
+    Ok(v)
 }
 
 /// `Array.prototype.reverse()`, in place.
 pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        if dense(vm, Obj::of(o)) {
-            let obj = Obj::of(o);
-            unsafe {
-                let n = obj.elems_len() as usize;
-                // (Word by word while a marking runs, not a slice's `reverse`:
-                // the marker may be reading the slots, see `Heap::move_values`.)
-                let e = obj.elems();
-                if vm.heap.gc.marking {
-                    for i in 0..n / 2 {
-                        swap_words(e.add(i), e.add(n - 1 - i));
-                    }
-                } else if n > 1 {
-                    // (`elems` is null where none were allocated: no slice.)
-                    std::slice::from_raw_parts_mut(e, n).reverse();
+    let _rooted = vm.root_scope(&[o]);
+    if dense(vm, Obj::of(o)) {
+        let obj = Obj::of(o);
+        unsafe {
+            let n = obj.elems_len() as usize;
+            // (Word by word while a marking runs, not a slice's `reverse`:
+            // the marker may be reading the slots, see `Heap::move_values`.)
+            let e = obj.elems();
+            if vm.heap.gc.marking {
+                for i in 0..n / 2 {
+                    swap_words(e.add(i), e.add(n - 1 - i));
                 }
-                // (Every slot may now hold what was elsewhere: barriered.)
-                for i in 0..n {
-                    let v = obj.elem(i);
-                    crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
-                }
+            } else if n > 1 {
+                // (`elems` is null where none were allocated: no slice.)
+                std::slice::from_raw_parts_mut(e, n).reverse();
             }
-            return Ok(o);
+            // (Every slot may now hold what was elsewhere: barriered.)
+            for i in 0..n {
+                let v = obj.elem(i);
+                crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
+            }
         }
-        let mut lower = 0.0;
-        while lower < (len / 2.0).floor() {
-            let upper = len - lower - 1.0;
-            let (lower_has, lower_v) = element(vm, o, lower)?;
-            // (Each value held across the other's read and the stores.)
-            vm.rooted(&[lower_v], |vm| {
-                let (upper_has, upper_v) = element(vm, o, upper)?;
-                vm.rooted(&[upper_v], |vm| {
-                    match (lower_has, upper_has) {
-                        (true, true) => {
-                            put(vm, o, lower, upper_v)?;
-                            put(vm, o, upper, lower_v)?;
-                        }
-                        (false, true) => {
-                            put(vm, o, lower, upper_v)?;
-                            delete(vm, o, upper)?;
-                        }
-                        (true, false) => {
-                            delete(vm, o, lower)?;
-                            put(vm, o, upper, lower_v)?;
-                        }
-                        (false, false) => {}
+        return Ok(o);
+    }
+    let mut lower = 0.0;
+    while lower < (len / 2.0).floor() {
+        let upper = len - lower - 1.0;
+        let (lower_has, lower_v) = element(vm, o, lower)?;
+        // (Each value held across the other's read and the stores.)
+        vm.rooted(&[lower_v], |vm| {
+            let (upper_has, upper_v) = element(vm, o, upper)?;
+            vm.rooted(&[upper_v], |vm| {
+                match (lower_has, upper_has) {
+                    (true, true) => {
+                        put(vm, o, lower, upper_v)?;
+                        put(vm, o, upper, lower_v)?;
                     }
-                    Ok(())
-                })
-            })?;
-            lower += 1.0;
-        }
-        Ok(o)
-    })
+                    (false, true) => {
+                        put(vm, o, lower, upper_v)?;
+                        delete(vm, o, upper)?;
+                    }
+                    (true, false) => {
+                        delete(vm, o, lower)?;
+                        put(vm, o, upper, lower_v)?;
+                    }
+                    (false, false) => {}
+                }
+                Ok(())
+            })
+        })?;
+        lower += 1.0;
+    }
+    Ok(o)
 }
 
 /// `Array.prototype.shift()`: the first element, the rest moved down.
 fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        if len == 0.0 {
-            set_length(vm, o, 0.0)?;
-            return Ok(Value::UNDEFINED);
-        }
-        if dense(vm, Obj::of(o)) {
-            let obj = Obj::of(o);
-            unsafe {
-                let n = obj.elems_len() as usize;
-                let first = obj.elem(0);
-                vm.heap.move_values(obj.elems().add(1), obj.elems(), n - 1);
-                obj.clear_elem(n - 1);
-                obj.set_elems_len((n - 1) as u32);
-                for i in 0..n - 1 {
-                    let v = obj.elem(i);
-                    crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
-                }
-                return Ok(if first == Value::EMPTY { Value::UNDEFINED } else { first });
+    let _rooted = vm.root_scope(&[o]);
+    if len == 0.0 {
+        set_length(vm, o, 0.0)?;
+        return Ok(Value::UNDEFINED);
+    }
+    if dense(vm, Obj::of(o)) {
+        let obj = Obj::of(o);
+        unsafe {
+            let n = obj.elems_len() as usize;
+            let first = obj.elem(0);
+            vm.heap.move_values(obj.elems().add(1), obj.elems(), n - 1);
+            obj.clear_elem(n - 1);
+            obj.set_elems_len((n - 1) as u32);
+            for i in 0..n - 1 {
+                let v = obj.elem(i);
+                crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
             }
+            return Ok(if first == Value::EMPTY { Value::UNDEFINED } else { first });
         }
-        let first = get(vm, o, 0.0)?;
-        // (Held across the moves: rooted with `o`, until the scope ends.)
-        vm.handles.push(first);
-        let mut k = 1.0;
-        while k < len {
-            let (has, v) = element(vm, o, k)?;
-            if has {
-                put(vm, o, k - 1.0, v)?;
-            } else {
-                delete(vm, o, k - 1.0)?;
-            }
-            k += 1.0;
+    }
+    let first = get(vm, o, 0.0)?;
+    // (Held across the moves: rooted with `o`, until the scope ends.)
+    vm.handles.push(first);
+    let mut k = 1.0;
+    while k < len {
+        let (has, v) = element(vm, o, k)?;
+        if has {
+            put(vm, o, k - 1.0, v)?;
+        } else {
+            delete(vm, o, k - 1.0)?;
         }
-        delete(vm, o, len - 1.0)?;
-        set_length(vm, o, len - 1.0)?;
-        Ok(first)
-    })
+        k += 1.0;
+    }
+    delete(vm, o, len - 1.0)?;
+    set_length(vm, o, len - 1.0)?;
+    Ok(first)
 }
 
 /// `Array.prototype.unshift(…items)`: the items prepended; the length.
 fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let n = a.len() as f64;
-        if n > 0.0 {
-            if len + n > 9007199254740991.0 {
-                return Err(Error::type_error("Array length exceeds the maximum"));
-            }
-            if dense(vm, Obj::of(o)) {
-                let obj = Obj::of(o);
-                unsafe {
-                    let m = obj.elems_len() as usize;
-                    vm.reserve_elems(obj, m + a.len());
-                    vm.heap.move_values(obj.elems(), obj.elems().add(a.len()), m);
-                    for (i, &v) in a.iter().enumerate() {
-                        obj.clear_elem(i);
-                        vm.store_element(obj, i, v);
-                    }
-                    obj.set_elems_len((m + a.len()) as u32);
-                    // (Moved elements keep the shape's elements type.)
-                    for i in a.len()..m + a.len() {
-                        let v = obj.elem(i);
-                        crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
-                    }
-                }
-                return Ok(Value::number(len + n));
-            }
-            let mut k = len;
-            while k > 0.0 {
-                let (has, v) = element(vm, o, k - 1.0)?;
-                if has {
-                    put(vm, o, k + n - 1.0, v)?;
-                } else {
-                    delete(vm, o, k + n - 1.0)?;
-                }
-                k -= 1.0;
-            }
-            for (j, &v) in a.iter().enumerate() {
-                put(vm, o, j as f64, v)?;
-            }
+    let _rooted = vm.root_scope(&[o]);
+    let n = a.len() as f64;
+    if n > 0.0 {
+        if len + n > 9007199254740991.0 {
+            return Err(Error::type_error("Array length exceeds the maximum"));
         }
-        set_length(vm, o, len + n)?;
-        Ok(Value::number(len + n))
-    })
+        if dense(vm, Obj::of(o)) {
+            let obj = Obj::of(o);
+            unsafe {
+                let m = obj.elems_len() as usize;
+                vm.reserve_elems(obj, m + a.len());
+                vm.heap.move_values(obj.elems(), obj.elems().add(a.len()), m);
+                for (i, &v) in a.iter().enumerate() {
+                    obj.clear_elem(i);
+                    vm.store_element(obj, i, v);
+                }
+                obj.set_elems_len((m + a.len()) as u32);
+                // (Moved elements keep the shape's elements type.)
+                for i in a.len()..m + a.len() {
+                    let v = obj.elem(i);
+                    crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
+                }
+            }
+            return Ok(Value::number(len + n));
+        }
+        let mut k = len;
+        while k > 0.0 {
+            let (has, v) = element(vm, o, k - 1.0)?;
+            if has {
+                put(vm, o, k + n - 1.0, v)?;
+            } else {
+                delete(vm, o, k + n - 1.0)?;
+            }
+            k -= 1.0;
+        }
+        for (j, &v) in a.iter().enumerate() {
+            put(vm, o, j as f64, v)?;
+        }
+    }
+    set_length(vm, o, len + n)?;
+    Ok(Value::number(len + n))
 }
 
 /// `Array.prototype.slice(start, end)`.
 fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let k = relative(arg(a, 0), len, 0.0);
-        let end = relative(arg(a, 1), len, len);
-        let count = (end - k).max(0.0);
-        // (A plain array's result isn't given its length, of holes, to have
-        // every one written over: the copy below sets it, or the loop's end.)
-        let out = if species_pristine(vm, o) { vm.new_array() } else { species_create(vm, o, count)? };
-        // (Rooted with `o`, until the scope ends.)
-        vm.handles.push(out);
-        // (The arguments' conversions and the species lookup may have run
-        // code that changed the length: the fast path only over the one
-        // measured. A species may return `o` itself: the copy then overlaps.)
-        if out != o
-            && (dense(vm, Obj::of(o)) || plain_arguments(vm, Obj::of(o)))
-            && dense(vm, Obj::of(out))
-            && Obj::of(o).elems_len() as f64 == len
-        {
-            let obj = Obj::of(o);
-            let oo = Obj::of(out);
-            unsafe {
-                let (k, count) = (k as usize, count as usize);
-                vm.reserve_elems(oo, count);
-                // The result takes the source's elements' type at once, which
-                // all the values fit: copied, not checked and stored one by one
-                // (PdfJS's `decrypt`, `decryptedString.slice(n)`, spent more there
-                // than in its loop).
-                let want = oo.shape().live().elems.join(obj.shape().live().elems);
-                if want != oo.shape().live().elems {
-                    crate::object::set_shape(oo.ptr(), vm.elements_transition(oo.shape(), want));
-                }
-                // (Numbers alone, no cells: nothing for the barrier to note.)
-                if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
-                    vm.heap.move_values(obj.elems().add(k), oo.elems(), count);
-                } else {
-                    vm.store_elements(oo, 0, obj.elems().add(k), count);
-                }
-                oo.set_elems_len(count as u32);
+    let _rooted = vm.root_scope(&[o]);
+    let k = relative(arg(a, 0), len, 0.0);
+    let end = relative(arg(a, 1), len, len);
+    let count = (end - k).max(0.0);
+    // (A plain array's result isn't given its length, of holes, to have
+    // every one written over: the copy below sets it, or the loop's end.)
+    let out = if species_pristine(vm, o) { vm.new_array() } else { species_create(vm, o, count)? };
+    // (Rooted with `o`, until the scope ends.)
+    vm.handles.push(out);
+    // (The arguments' conversions and the species lookup may have run
+    // code that changed the length: the fast path only over the one
+    // measured. A species may return `o` itself: the copy then overlaps.)
+    if out != o
+        && (dense(vm, Obj::of(o)) || plain_arguments(vm, Obj::of(o)))
+        && dense(vm, Obj::of(out))
+        && Obj::of(o).elems_len() as f64 == len
+    {
+        let obj = Obj::of(o);
+        let oo = Obj::of(out);
+        unsafe {
+            let (k, count) = (k as usize, count as usize);
+            vm.reserve_elems(oo, count);
+            // The result takes the source's elements' type at once, which
+            // all the values fit: copied, not checked and stored one by one
+            // (PdfJS's `decrypt`, `decryptedString.slice(n)`, spent more there
+            // than in its loop).
+            let want = oo.shape().live().elems.join(obj.shape().live().elems);
+            if want != oo.shape().live().elems {
+                crate::object::set_shape(oo.ptr(), vm.elements_transition(oo.shape(), want));
             }
-            return Ok(out);
+            // (Numbers alone, no cells: nothing for the barrier to note.)
+            if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
+                vm.heap.move_values(obj.elems().add(k), oo.elems(), count);
+            } else {
+                vm.store_elements(oo, 0, obj.elems().add(k), count);
+            }
+            oo.set_elems_len(count as u32);
         }
-        let mut n = 0.0;
-        let mut i = k;
-        while i < end {
-            let j = skip(vm, o, i, end);
-            n += j - i;
-            i = j;
-            if i >= end {
-                break;
-            }
-            let (has, v) = element(vm, o, i)?;
-            if has {
-                create(vm, out, n, v)?;
-            }
-            i += 1.0;
-            n += 1.0;
+        return Ok(out);
+    }
+    let mut n = 0.0;
+    let mut i = k;
+    while i < end {
+        let j = skip(vm, o, i, end);
+        n += j - i;
+        i = j;
+        if i >= end {
+            break;
         }
-        set_length(vm, out, n)?;
-        Ok(out)
-    })
+        let (has, v) = element(vm, o, i)?;
+        if has {
+            create(vm, out, n, v)?;
+        }
+        i += 1.0;
+        n += 1.0;
+    }
+    set_length(vm, out, n)?;
+    Ok(out)
 }
 
 /// `Array.prototype.splice(start, deleteCount, …items)`: the removed
 /// elements, as an array.
 fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let start = relative(arg(a, 0), len, 0.0);
-        let (del, items): (f64, &[Value]) = match a.len() {
-            0 => (0.0, &[]),
-            1 => (len - start, &[]),
-            _ => ((to_integer(a[1])).clamp(0.0, len - start), &a[2..]),
-        };
-        let n = items.len() as f64;
-        if len + n - del > 9007199254740991.0 {
-            return Err(Error::type_error("Array length exceeds the maximum"));
-        }
-        // (ArraySpeciesCreate: a subclass's `splice` gives one of its own.)
-        let removed = species_create(vm, o, del)?;
-        // (Rooted with `o`, until the scope ends.)
-        vm.handles.push(removed);
-        // (As in `slice`: `start` and `deleteCount`'s conversions may have
-        // changed the length. The fast path writes `removed`'s elements: an
-        // array's of its own, not `o`, which a species may return and whose
-        // `length` set would then truncate it before the shift.)
-        if removed != o
-            && dense(vm, Obj::of(o))
-            && Obj::of(o).elems_len() as f64 == len
-            && is_object(removed)
-            && dense(vm, Obj::of(removed))
-        {
-            let obj = Obj::of(o);
-            let ro = Obj::of(removed);
-            // (Raw in the loops: a dense array, its length checked above.)
-            unsafe {
-                let (start, del) = (start as usize, del as usize);
-                let m = obj.elems_len() as usize;
-                vm.reserve_elems(ro, del);
-                for i in 0..del {
-                    let v = *obj.elems().add(start + i);
-                    if v == Value::EMPTY {
-                        crate::layout::store_word(ro.elems().add(i), Value::EMPTY);
-                    } else {
-                        vm.store_element(ro, i, v);
-                    }
-                }
-                ro.set_elems_len(del as u32);
-                let new_len = m - del + items.len();
-                vm.reserve_elems(obj, new_len);
-                vm.heap.move_values(
-                    obj.elems().add(start + del),
-                    obj.elems().add(start + items.len()),
-                    m - start - del,
-                );
-                for (i, &v) in items.iter().enumerate() {
-                    crate::layout::store_word(obj.elems().add(start + i), Value::EMPTY);
-                    vm.store_element(obj, start + i, v);
-                }
-                vm.heap.fill_values(obj.elems().add(new_len), m.saturating_sub(new_len), Value::EMPTY);
-                obj.set_elems_len(new_len as u32);
-                for i in start + items.len()..new_len {
-                    let v = *obj.elems().add(i);
-                    crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
+    let _rooted = vm.root_scope(&[o]);
+    let start = relative(arg(a, 0), len, 0.0);
+    let (del, items): (f64, &[Value]) = match a.len() {
+        0 => (0.0, &[]),
+        1 => (len - start, &[]),
+        _ => ((to_integer(a[1])).clamp(0.0, len - start), &a[2..]),
+    };
+    let n = items.len() as f64;
+    if len + n - del > 9007199254740991.0 {
+        return Err(Error::type_error("Array length exceeds the maximum"));
+    }
+    // (ArraySpeciesCreate: a subclass's `splice` gives one of its own.)
+    let removed = species_create(vm, o, del)?;
+    // (Rooted with `o`, until the scope ends.)
+    vm.handles.push(removed);
+    // (As in `slice`: `start` and `deleteCount`'s conversions may have
+    // changed the length. The fast path writes `removed`'s elements: an
+    // array's of its own, not `o`, which a species may return and whose
+    // `length` set would then truncate it before the shift.)
+    if removed != o
+        && dense(vm, Obj::of(o))
+        && Obj::of(o).elems_len() as f64 == len
+        && is_object(removed)
+        && dense(vm, Obj::of(removed))
+    {
+        let obj = Obj::of(o);
+        let ro = Obj::of(removed);
+        // (Raw in the loops: a dense array, its length checked above.)
+        unsafe {
+            let (start, del) = (start as usize, del as usize);
+            let m = obj.elems_len() as usize;
+            vm.reserve_elems(ro, del);
+            for i in 0..del {
+                let v = *obj.elems().add(start + i);
+                if v == Value::EMPTY {
+                    crate::layout::store_word(ro.elems().add(i), Value::EMPTY);
+                } else {
+                    vm.store_element(ro, i, v);
                 }
             }
-            return Ok(removed);
+            ro.set_elems_len(del as u32);
+            let new_len = m - del + items.len();
+            vm.reserve_elems(obj, new_len);
+            vm.heap.move_values(obj.elems().add(start + del), obj.elems().add(start + items.len()), m - start - del);
+            for (i, &v) in items.iter().enumerate() {
+                crate::layout::store_word(obj.elems().add(start + i), Value::EMPTY);
+                vm.store_element(obj, start + i, v);
+            }
+            vm.heap.fill_values(obj.elems().add(new_len), m.saturating_sub(new_len), Value::EMPTY);
+            obj.set_elems_len(new_len as u32);
+            for i in start + items.len()..new_len {
+                let v = *obj.elems().add(i);
+                crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
+            }
         }
-        let mut k = 0.0;
-        while k < del {
-            let (has, v) = element(vm, o, start + k)?;
+        return Ok(removed);
+    }
+    let mut k = 0.0;
+    while k < del {
+        let (has, v) = element(vm, o, start + k)?;
+        if has {
+            create(vm, removed, k, v)?;
+        }
+        k += 1.0;
+    }
+    set_length(vm, removed, del)?;
+    if n < del {
+        let mut k = start;
+        while k < len - del {
+            let (has, v) = element(vm, o, k + del)?;
             if has {
-                create(vm, removed, k, v)?;
+                put(vm, o, k + n, v)?;
+            } else {
+                delete(vm, o, k + n)?;
             }
             k += 1.0;
         }
-        set_length(vm, removed, del)?;
-        if n < del {
-            let mut k = start;
-            while k < len - del {
-                let (has, v) = element(vm, o, k + del)?;
-                if has {
-                    put(vm, o, k + n, v)?;
-                } else {
-                    delete(vm, o, k + n)?;
-                }
-                k += 1.0;
-            }
-            let mut k = len;
-            while k > len - del + n {
-                delete(vm, o, k - 1.0)?;
-                k -= 1.0;
-            }
-        } else if n > del {
-            let mut k = len - del;
-            while k > start {
-                let (has, v) = element(vm, o, k + del - 1.0)?;
-                if has {
-                    put(vm, o, k + n - 1.0, v)?;
-                } else {
-                    delete(vm, o, k + n - 1.0)?;
-                }
-                k -= 1.0;
-            }
+        let mut k = len;
+        while k > len - del + n {
+            delete(vm, o, k - 1.0)?;
+            k -= 1.0;
         }
-        for (i, &v) in items.iter().enumerate() {
-            put(vm, o, start + i as f64, v)?;
+    } else if n > del {
+        let mut k = len - del;
+        while k > start {
+            let (has, v) = element(vm, o, k + del - 1.0)?;
+            if has {
+                put(vm, o, k + n - 1.0, v)?;
+            } else {
+                delete(vm, o, k + n - 1.0)?;
+            }
+            k -= 1.0;
         }
-        set_length(vm, o, len - del + n)?;
-        Ok(removed)
-    })
+    }
+    for (i, &v) in items.iter().enumerate() {
+        put(vm, o, start + i as f64, v)?;
+    }
+    set_length(vm, o, len - del + n)?;
+    Ok(removed)
 }
 
 /// `Array.prototype.sort(compare)`: stable; `undefined`s last, holes
@@ -1100,100 +1087,97 @@ fn merge_sort(vm: &mut Vm, v: &mut [Value], after: &mut dyn FnMut(&mut Vm, Value
 /// `Array.prototype.indexOf(x, from)`.
 pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let x = arg(a, 0);
-        if len == 0.0 {
-            return Ok(Value::from_i32(-1));
-        }
-        let n = if a.len() > 1 { to_integer(a[1]) } else { 0.0 };
-        if n >= len {
-            return Ok(Value::from_i32(-1));
-        }
-        let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
-        if dense(vm, Obj::of(o)) {
-            let obj = Obj::of(o);
-            // (Not past the length it had: `fromIndex`'s conversion may have
-            // pushed more.)
-            let m = (obj.elems_len() as usize).min(len as usize);
-            for i in k as usize..m {
-                let e = obj.elem(i);
-                if e != Value::EMPTY && strict_equals(e, x) {
-                    return Ok(Value::from_i32(i as i32));
-                }
+    let _rooted = vm.root_scope(&[o]);
+    let x = arg(a, 0);
+    if len == 0.0 {
+        return Ok(Value::from_i32(-1));
+    }
+    let n = if a.len() > 1 { to_integer(a[1]) } else { 0.0 };
+    if n >= len {
+        return Ok(Value::from_i32(-1));
+    }
+    let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
+    if dense(vm, Obj::of(o)) {
+        let obj = Obj::of(o);
+        // (Not past the length it had: `fromIndex`'s conversion may have
+        // pushed more.)
+        let m = (obj.elems_len() as usize).min(len as usize);
+        for i in k as usize..m {
+            let e = obj.elem(i);
+            if e != Value::EMPTY && strict_equals(e, x) {
+                return Ok(Value::from_i32(i as i32));
             }
-            return Ok(Value::from_i32(-1));
         }
-        while k < len {
-            k = skip(vm, o, k, len);
-            if k >= len {
-                break;
-            }
-            let (has, v) = element(vm, o, k)?;
-            if has && strict_equals(v, x) {
-                return Ok(Value::number(k));
-            }
-            k += 1.0;
+        return Ok(Value::from_i32(-1));
+    }
+    while k < len {
+        k = skip(vm, o, k, len);
+        if k >= len {
+            break;
         }
-        Ok(Value::from_i32(-1))
-    })
+        let (has, v) = element(vm, o, k)?;
+        if has && strict_equals(v, x) {
+            return Ok(Value::number(k));
+        }
+        k += 1.0;
+    }
+    Ok(Value::from_i32(-1))
 }
 
 /// `Array.prototype.lastIndexOf(x, from)`.
 pub(crate) fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let x = arg(a, 0);
-        if len == 0.0 {
-            return Ok(Value::from_i32(-1));
+    let _rooted = vm.root_scope(&[o]);
+    let x = arg(a, 0);
+    if len == 0.0 {
+        return Ok(Value::from_i32(-1));
+    }
+    let n = if a.len() > 1 { to_integer(a[1]) } else { len - 1.0 };
+    let mut k = if n >= 0.0 { n.min(len - 1.0) } else { len + n };
+    while k >= 0.0 {
+        k = skip_back(vm, o, k);
+        if k < 0.0 {
+            break;
         }
-        let n = if a.len() > 1 { to_integer(a[1]) } else { len - 1.0 };
-        let mut k = if n >= 0.0 { n.min(len - 1.0) } else { len + n };
-        while k >= 0.0 {
-            k = skip_back(vm, o, k);
-            if k < 0.0 {
-                break;
-            }
-            let (has, v) = element(vm, o, k)?;
-            if has && strict_equals(v, x) {
-                // (`-0` as `+0`.)
-                return Ok(Value::number(k + 0.0));
-            }
-            k -= 1.0;
+        let (has, v) = element(vm, o, k)?;
+        if has && strict_equals(v, x) {
+            // (`-0` as `+0`.)
+            return Ok(Value::number(k + 0.0));
         }
-        Ok(Value::from_i32(-1))
-    })
+        k -= 1.0;
+    }
+    Ok(Value::from_i32(-1))
 }
 
 /// `Array.prototype.includes(x, from)`: SameValueZero, holes as
 /// `undefined`.
 pub(crate) fn array_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let x = arg(a, 0);
-        if len == 0.0 {
-            return Ok(Value::FALSE);
+    let _rooted = vm.root_scope(&[o]);
+    let x = arg(a, 0);
+    if len == 0.0 {
+        return Ok(Value::FALSE);
+    }
+    let n = if a.len() > 1 { to_integer(a[1]) } else { 0.0 };
+    let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
+    while k < len {
+        // (Past missing indices, each `undefined`.)
+        let j = skip(vm, o, k, len);
+        if j > k && x.is_undefined() {
+            return Ok(Value::TRUE);
         }
-        let n = if a.len() > 1 { to_integer(a[1]) } else { 0.0 };
-        let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
-        while k < len {
-            // (Past missing indices, each `undefined`.)
-            let j = skip(vm, o, k, len);
-            if j > k && x.is_undefined() {
-                return Ok(Value::TRUE);
-            }
-            k = j;
-            if k >= len {
-                break;
-            }
-            let v = get(vm, o, k)?;
-            let same = same_value(v, x) || v.as_number().is_some_and(|d| d == 0.0 && x.as_number() == Some(0.0));
-            if same {
-                return Ok(Value::TRUE);
-            }
-            k += 1.0;
+        k = j;
+        if k >= len {
+            break;
         }
-        Ok(Value::FALSE)
-    })
+        let v = get(vm, o, k)?;
+        let same = same_value(v, x) || v.as_number().is_some_and(|d| d == 0.0 && x.as_number() == Some(0.0));
+        if same {
+            return Ok(Value::TRUE);
+        }
+        k += 1.0;
+    }
+    Ok(Value::FALSE)
 }
 
 /// The iteration `Array.prototype.every` and the like share: `on(i, v, r)`
@@ -1303,85 +1287,82 @@ fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 pub(crate) fn array_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let f = callback(a, "find")?;
-        let that = arg(a, 1);
-        let mut i = 0.0;
-        while i < len {
-            let v = get(vm, o, i)?;
-            let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
-            if to_boolean(r) {
-                return Ok(v);
-            }
-            i += 1.0;
+    let _rooted = vm.root_scope(&[o]);
+    let f = callback(a, "find")?;
+    let that = arg(a, 1);
+    let mut i = 0.0;
+    while i < len {
+        let v = get(vm, o, i)?;
+        let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
+        if to_boolean(r) {
+            return Ok(v);
         }
-        Ok(Value::UNDEFINED)
-    })
+        i += 1.0;
+    }
+    Ok(Value::UNDEFINED)
 }
 
 pub(crate) fn array_find_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let f = callback(a, "findIndex")?;
-        let that = arg(a, 1);
-        let mut i = 0.0;
-        while i < len {
-            let v = get(vm, o, i)?;
-            let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
-            if to_boolean(r) {
-                return Ok(Value::number(i));
-            }
-            i += 1.0;
+    let _rooted = vm.root_scope(&[o]);
+    let f = callback(a, "findIndex")?;
+    let that = arg(a, 1);
+    let mut i = 0.0;
+    while i < len {
+        let v = get(vm, o, i)?;
+        let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
+        if to_boolean(r) {
+            return Ok(Value::number(i));
         }
-        Ok(Value::from_i32(-1))
-    })
+        i += 1.0;
+    }
+    Ok(Value::from_i32(-1))
 }
 
 /// `reduce` (`right`: `reduceRight`).
 fn reduce(vm: &mut Vm, this: Value, a: &[Value], right: bool) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let f = callback(a, if right { "reduceRight" } else { "reduce" })?;
-        let mut k = if right { len - 1.0 } else { 0.0 };
-        let step = if right { -1.0 } else { 1.0 };
-        let in_range = |k: f64| if right { k >= 0.0 } else { k < len };
-        let skip_to = |vm: &mut Vm, k: f64| if right { skip_back(vm, o, k) } else { skip(vm, o, k, len) };
-        let acc = if a.len() > 1 {
-            a[1]
-        } else {
-            let mut found = None;
-            while in_range(k) {
-                k = skip_to(vm, k);
-                if !in_range(k) {
-                    break;
-                }
-                let (has, v) = element(vm, o, k)?;
-                k += step;
-                if has {
-                    found = Some(v);
-                    break;
-                }
-            }
-            found.ok_or_else(|| Error::type_error("Reduce of empty array with no initial value"))?
-        };
-        // (The accumulator, held across the reads' getters: in a slot of
-        // its own, rooted with `o` until the scope ends.)
-        let slot = vm.handles.len();
-        vm.handles.push(acc);
+    let _rooted = vm.root_scope(&[o]);
+    let f = callback(a, if right { "reduceRight" } else { "reduce" })?;
+    let mut k = if right { len - 1.0 } else { 0.0 };
+    let step = if right { -1.0 } else { 1.0 };
+    let in_range = |k: f64| if right { k >= 0.0 } else { k < len };
+    let skip_to = |vm: &mut Vm, k: f64| if right { skip_back(vm, o, k) } else { skip(vm, o, k, len) };
+    let acc = if a.len() > 1 {
+        a[1]
+    } else {
+        let mut found = None;
         while in_range(k) {
             k = skip_to(vm, k);
             if !in_range(k) {
                 break;
             }
             let (has, v) = element(vm, o, k)?;
-            if has {
-                let acc = vm.handles[slot];
-                vm.handles[slot] = call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(k), o])?;
-            }
             k += step;
+            if has {
+                found = Some(v);
+                break;
+            }
         }
-        Ok(vm.handles[slot])
-    })
+        found.ok_or_else(|| Error::type_error("Reduce of empty array with no initial value"))?
+    };
+    // (The accumulator, held across the reads' getters: in a slot of
+    // its own, rooted with `o` until the scope ends.)
+    let slot = vm.handles.len();
+    vm.handles.push(acc);
+    while in_range(k) {
+        k = skip_to(vm, k);
+        if !in_range(k) {
+            break;
+        }
+        let (has, v) = element(vm, o, k)?;
+        if has {
+            let acc = vm.handles[slot];
+            vm.handles[slot] = call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(k), o])?;
+        }
+        k += step;
+    }
+    Ok(vm.handles[slot])
 }
 
 pub(crate) fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1395,64 +1376,62 @@ pub(crate) fn array_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
 /// `Array.prototype.fill(v, start, end)`.
 fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let mut k = relative(arg(a, 1), len, 0.0);
-        let end = relative(arg(a, 2), len, len);
-        let v = arg(a, 0);
-        // A plain array's elements, holes too (nothing indexed above it to
-        // see a store), written in place: the first takes the elements to a
-        // type the value fits, the rest are it again.
-        let obj = Obj::of(o);
-        if dense(vm, obj) && k < end && end <= obj.elems_len() as f64 {
-            let (from, to) = (k as usize, end as usize);
-            vm.store_element(obj, from, v);
-            unsafe {
-                let e = obj.elems();
-                if !v.is_cell() {
-                    // (No reference: nothing for the barrier.)
-                    (from + 1..to).for_each(|i| crate::layout::store_word(e.add(i), v));
-                } else {
-                    (from + 1..to).for_each(|i| crate::heap::store(e.cast::<u8>().sub(8), e.add(i), v));
-                }
+    let _rooted = vm.root_scope(&[o]);
+    let mut k = relative(arg(a, 1), len, 0.0);
+    let end = relative(arg(a, 2), len, len);
+    let v = arg(a, 0);
+    // A plain array's elements, holes too (nothing indexed above it to
+    // see a store), written in place: the first takes the elements to a
+    // type the value fits, the rest are it again.
+    let obj = Obj::of(o);
+    if dense(vm, obj) && k < end && end <= obj.elems_len() as f64 {
+        let (from, to) = (k as usize, end as usize);
+        vm.store_element(obj, from, v);
+        unsafe {
+            let e = obj.elems();
+            if !v.is_cell() {
+                // (No reference: nothing for the barrier.)
+                (from + 1..to).for_each(|i| crate::layout::store_word(e.add(i), v));
+            } else {
+                (from + 1..to).for_each(|i| crate::heap::store(e.cast::<u8>().sub(8), e.add(i), v));
             }
-            return Ok(o);
         }
-        while k < end {
-            put(vm, o, k, v)?;
-            k += 1.0;
-        }
-        Ok(o)
-    })
+        return Ok(o);
+    }
+    while k < end {
+        put(vm, o, k, v)?;
+        k += 1.0;
+    }
+    Ok(o)
 }
 
 /// `Array.prototype.copyWithin(target, start, end)`.
 pub(crate) fn array_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let mut to = relative(arg(a, 0), len, 0.0);
-        let mut from = relative(arg(a, 1), len, 0.0);
-        let end = relative(arg(a, 2), len, len);
-        let mut count = (end - from).min(len - to);
-        let dir = if from < to && to < from + count {
-            from += count - 1.0;
-            to += count - 1.0;
-            -1.0
+    let _rooted = vm.root_scope(&[o]);
+    let mut to = relative(arg(a, 0), len, 0.0);
+    let mut from = relative(arg(a, 1), len, 0.0);
+    let end = relative(arg(a, 2), len, len);
+    let mut count = (end - from).min(len - to);
+    let dir = if from < to && to < from + count {
+        from += count - 1.0;
+        to += count - 1.0;
+        -1.0
+    } else {
+        1.0
+    };
+    while count > 0.0 {
+        let (has, v) = element(vm, o, from)?;
+        if has {
+            put(vm, o, to, v)?;
         } else {
-            1.0
-        };
-        while count > 0.0 {
-            let (has, v) = element(vm, o, from)?;
-            if has {
-                put(vm, o, to, v)?;
-            } else {
-                delete(vm, o, to)?;
-            }
-            from += dir;
-            to += dir;
-            count -= 1.0;
+            delete(vm, o, to)?;
         }
-        Ok(o)
-    })
+        from += dir;
+        to += dir;
+        count -= 1.0;
+    }
+    Ok(o)
 }
 
 /// `Array.of(…items)`.
@@ -1769,34 +1748,32 @@ pub(crate) fn apply_list(vm: &mut Vm, list: Value) -> Result<Vec<Value>> {
 /// `at(i)`: element `i`, counted from the end if negative.
 pub(crate) fn array_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let n = to_integer(arg(a, 0));
-        let k = if n < 0.0 { len + n } else { n };
-        if k < 0.0 || k >= len {
-            return Ok(Value::UNDEFINED);
-        }
-        get(vm, o, k)
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let n = to_integer(arg(a, 0));
+    let k = if n < 0.0 { len + n } else { n };
+    if k < 0.0 || k >= len {
+        return Ok(Value::UNDEFINED);
+    }
+    get(vm, o, k)
 }
 
 /// `findLast` (`index`: `findLastIndex`): the last element the callback
 /// accepts, or its index.
 fn find_last(vm: &mut Vm, this: Value, a: &[Value], index: bool) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let f = callback(a, if index { "findLastIndex" } else { "findLast" })?;
-        let that = arg(a, 1);
-        let mut i = len - 1.0;
-        while i >= 0.0 {
-            let v = get(vm, o, i)?;
-            let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
-            if to_boolean(r) {
-                return Ok(if index { Value::number(i) } else { v });
-            }
-            i -= 1.0;
+    let _rooted = vm.root_scope(&[o]);
+    let f = callback(a, if index { "findLastIndex" } else { "findLast" })?;
+    let that = arg(a, 1);
+    let mut i = len - 1.0;
+    while i >= 0.0 {
+        let v = get(vm, o, i)?;
+        let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
+        if to_boolean(r) {
+            return Ok(if index { Value::number(i) } else { v });
         }
-        Ok(if index { Value::from_i32(-1) } else { Value::UNDEFINED })
-    })
+        i -= 1.0;
+    }
+    Ok(if index { Value::from_i32(-1) } else { Value::UNDEFINED })
 }
 
 pub(crate) fn array_find_last(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1839,38 +1816,36 @@ fn array_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("The comparison function must be either a function or undefined"));
     }
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let out = array_from_fn(vm, len, |vm, i| get(vm, o, i))?;
-        // (`this` to `array_sort`, held by Rust alone: rooted.)
-        vm.rooted(&[out], |vm| array_sort(vm, out, &[cmp]))
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let out = array_from_fn(vm, len, |vm, i| get(vm, o, i))?;
+    // (`this` to `array_sort`, held by Rust alone: rooted.)
+    vm.rooted(&[out], |vm| array_sort(vm, out, &[cmp]))
 }
 
 /// `toSpliced(start, skipCount, ...items)`: a copy with the elements
 /// `splice` would remove replaced by the items.
 fn array_to_spliced(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let start = relative(arg(a, 0), len, 0.0);
-        let skip = match a.len() {
-            0 => 0.0,
-            1 => len - start,
-            _ => to_integer(a[1]).clamp(0.0, len - start),
-        };
-        let items = a.get(2..).unwrap_or(&[]);
-        let n = len + items.len() as f64 - skip;
-        if n > 9007199254740991.0 {
-            return Err(Error::type_error("Invalid array length"));
+    let _rooted = vm.root_scope(&[o]);
+    let start = relative(arg(a, 0), len, 0.0);
+    let skip = match a.len() {
+        0 => 0.0,
+        1 => len - start,
+        _ => to_integer(a[1]).clamp(0.0, len - start),
+    };
+    let items = a.get(2..).unwrap_or(&[]);
+    let n = len + items.len() as f64 - skip;
+    if n > 9007199254740991.0 {
+        return Err(Error::type_error("Invalid array length"));
+    }
+    array_from_fn(vm, n, |vm, i| {
+        if i < start {
+            get(vm, o, i)
+        } else if i < start + items.len() as f64 {
+            Ok(items[(i - start) as usize])
+        } else {
+            get(vm, o, i - items.len() as f64 + skip)
         }
-        array_from_fn(vm, n, |vm, i| {
-            if i < start {
-                get(vm, o, i)
-            } else if i < start + items.len() as f64 {
-                Ok(items[(i - start) as usize])
-            } else {
-                get(vm, o, i - items.len() as f64 + skip)
-            }
-        })
     })
 }
 
@@ -1878,13 +1853,12 @@ fn array_to_spliced(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// negative) `v`.
 fn array_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    vm.rooted(&[o], |vm| {
-        let n = to_integer(arg(a, 0));
-        let k = if n < 0.0 { len + n } else { n };
-        if k < 0.0 || k >= len {
-            return Err(Error::range_error("Invalid index"));
-        }
-        let v = arg(a, 1);
-        array_from_fn(vm, len, |vm, i| if i == k { Ok(v) } else { get(vm, o, i) })
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let n = to_integer(arg(a, 0));
+    let k = if n < 0.0 { len + n } else { n };
+    if k < 0.0 || k >= len {
+        return Err(Error::range_error("Invalid index"));
+    }
+    let v = arg(a, 1);
+    array_from_fn(vm, len, |vm, i| if i == k { Ok(v) } else { get(vm, o, i) })
 }

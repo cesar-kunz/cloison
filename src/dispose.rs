@@ -200,20 +200,19 @@ pub(crate) fn add_resource(vm: &mut Vm, state: Value, v: Value, async_: bool) ->
         return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
     }
     // (`v` rooted across the getters, its method across the push.)
-    vm.rooted(&[v], |vm| {
-        let (method, kind) = if async_ {
-            match get_method(vm, v, "asyncDispose")? {
-                m if m.is_undefined() => (get_method(vm, v, "dispose")?, ASYNC_FROM_SYNC),
-                m => (m, ASYNC),
-            }
-        } else {
-            (get_method(vm, v, "dispose")?, SYNC)
-        };
-        if method.is_undefined() {
-            return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
+    let _rooted = vm.root_scope(&[v]);
+    let (method, kind) = if async_ {
+        match get_method(vm, v, "asyncDispose")? {
+            m if m.is_undefined() => (get_method(vm, v, "dispose")?, ASYNC_FROM_SYNC),
+            m => (m, ASYNC),
         }
-        vm.rooted(&[method], |vm| push(vm, state, v, method, kind))
-    })
+    } else {
+        (get_method(vm, v, "dispose")?, SYNC)
+    };
+    if method.is_undefined() {
+        return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
+    }
+    vm.rooted(&[method], |vm| push(vm, state, v, method, kind))
 }
 
 fn push(vm: &mut Vm, state: Value, v: Value, method: Value, kind: i32) -> Result<()> {
@@ -252,33 +251,32 @@ pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Va
         Ok(v) => *v,
         Err(e) => e.1.unwrap_or(Value::UNDEFINED),
     };
-    vm.rooted(&[resources, kept], |vm| {
-        let at = vm.handles.len() - 1;
-        let empty = vm.new_array();
-        put(state, RESOURCES, empty);
-        let mut completion = completion;
-        let n = len(resources) / 3;
-        for k in (0..n).rev() {
-            let (v, method, kind) = (elem(resources, 3 * k), elem(resources, 3 * k + 1), elem(resources, 3 * k + 2));
-            let r = match kind.as_i32_unchecked() {
-                ADOPT_SYNC => call_function(vm, method, Value::UNDEFINED, &[v]),
-                _ => call_function(vm, method, v, &[]),
+    let _rooted = vm.root_scope(&[resources, kept]);
+    let at = vm.handles.len() - 1;
+    let empty = vm.new_array();
+    put(state, RESOURCES, empty);
+    let mut completion = completion;
+    let n = len(resources) / 3;
+    for k in (0..n).rev() {
+        let (v, method, kind) = (elem(resources, 3 * k), elem(resources, 3 * k + 1), elem(resources, 3 * k + 2));
+        let r = match kind.as_i32_unchecked() {
+            ADOPT_SYNC => call_function(vm, method, Value::UNDEFINED, &[v]),
+            _ => call_function(vm, method, v, &[]),
+        };
+        if let Err(e) = r {
+            let e = thrown(vm, e)?;
+            let next = match completion {
+                Err(prev) => {
+                    let prev = vm.rooted(&[e], |vm| thrown(vm, prev))?;
+                    suppressed_error(vm, e, prev)
+                }
+                Ok(_) => e,
             };
-            if let Err(e) = r {
-                let e = thrown(vm, e)?;
-                let next = match completion {
-                    Err(prev) => {
-                        let prev = vm.rooted(&[e], |vm| thrown(vm, prev))?;
-                        suppressed_error(vm, e, prev)
-                    }
-                    Ok(_) => e,
-                };
-                vm.handles[at] = next;
-                completion = Err(Error::thrown(next));
-            }
+            vm.handles[at] = next;
+            completion = Err(Error::thrown(next));
         }
-        completion
-    })
+    }
+    completion
 }
 
 /// The async disposal helper: `(resources, hasError, error)` to a promise

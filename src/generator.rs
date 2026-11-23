@@ -273,26 +273,25 @@ pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     }
     let (mut mode, mut v) = (mode, v);
     // (`g` rooted: a promise job's handler, only in Rust's copy.)
-    vm.rooted(&[g], |vm| {
-        loop {
-            match resume_raw(vm, g, v, mode, "an async function") {
-                Ok((out, true)) => {
-                    let p = get(vm, st, 5);
-                    return crate::promise::resolve_own(vm, p, out);
-                }
-                Ok((awaited, false)) => match crate::promise::await_coroutine(vm, awaited, g) {
-                    Ok(()) => return Ok(()),
-                    // (PromiseResolve threw: the `await` throws it, now.)
-                    Err(e) => (mode, v) = (THROW, thrown(vm, e)),
-                },
-                Err(e) => {
-                    let reason = thrown(vm, e);
-                    let p = get(vm, st, 5);
-                    return crate::promise::reject_own(vm, p, reason);
-                }
+    let _rooted = vm.root_scope(&[g]);
+    loop {
+        match resume_raw(vm, g, v, mode, "an async function") {
+            Ok((out, true)) => {
+                let p = get(vm, st, 5);
+                return crate::promise::resolve_own(vm, p, out);
+            }
+            Ok((awaited, false)) => match crate::promise::await_coroutine(vm, awaited, g) {
+                Ok(()) => return Ok(()),
+                // (PromiseResolve threw: the `await` throws it, now.)
+                Err(e) => (mode, v) = (THROW, thrown(vm, e)),
+            },
+            Err(e) => {
+                let reason = thrown(vm, e);
+                let p = get(vm, st, 5);
+                return crate::promise::reject_own(vm, p, reason);
             }
         }
-    })
+    }
 }
 
 /// What error `e` throws, as a value.

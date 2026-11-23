@@ -810,15 +810,14 @@ fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // which pins what it holds: the pattern's is done after.)
     let mut st = [a[0], a[1]];
     // (`out`, held across the steps: rooted.)
-    vm.rooted(&[out], |vm| {
-        loop {
-            let v = unsafe { crate::symbol::iterator_next(vm, st.as_mut_ptr())? };
-            if v == Value::HOLE {
-                return Ok(out);
-            }
-            crate::vm::array_push(vm, out, &[v])?;
+    let _rooted = vm.root_scope(&[out]);
+    loop {
+        let v = unsafe { crate::symbol::iterator_next(vm, st.as_mut_ptr())? };
+        if v == Value::HOLE {
+            return Ok(out);
         }
-    })
+        crate::vm::array_push(vm, out, &[v])?;
+    }
 }
 
 /// An object pattern's source: `[v]`, not `null` or `undefined`.
@@ -853,18 +852,17 @@ fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
         out
     };
     let out = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
-    vm.rooted(&[out], |vm| {
-        for key in crate::proxy::own_keys(vm, src)? {
-            if excluded.contains(&key)
-                || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
-            {
-                continue;
-            }
-            let v = vm.get_key(object_value(src.ptr()), key)?;
-            vm.create_data_property(out, key, v)?;
+    let _rooted = vm.root_scope(&[out]);
+    for key in crate::proxy::own_keys(vm, src)? {
+        if excluded.contains(&key)
+            || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
+        {
+            continue;
         }
-        Ok(out)
-    })
+        let v = vm.get_key(object_value(src.ptr()), key)?;
+        vm.create_data_property(out, key, v)?;
+    }
+    Ok(out)
 }
 
 /// A direct `eval(source)`: `[eval, source, shape, this, flags
@@ -1579,18 +1577,17 @@ fn copy_data_properties(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(target);
     }
     // (A wrapper `src` held across getters: rooted.)
-    vm.rooted(&[object_value(src.ptr())], |vm| {
-        let keys = crate::proxy::own_keys(vm, src)?;
-        for key in keys {
-            // (Enumerable when reached: a getter may change that.)
-            if !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
-                continue;
-            }
-            let v = vm.get_key(object_value(src.ptr()), key)?;
-            vm.create_data_property(target, key, v)?;
+    let _rooted = vm.root_scope(&[object_value(src.ptr())]);
+    let keys = crate::proxy::own_keys(vm, src)?;
+    for key in keys {
+        // (Enumerable when reached: a getter may change that.)
+        if !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+            continue;
         }
-        Ok(target)
-    })
+        let v = vm.get_key(object_value(src.ptr()), key)?;
+        vm.create_data_property(target, key, v)?;
+    }
+    Ok(target)
 }
 
 /// A class's private name `[#x]`: a new private symbol.

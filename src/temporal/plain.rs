@@ -446,16 +446,15 @@ fn time_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let t = this_time(this)?;
     let o = round_options(vm, arg(a, 0))?;
     // (`o`, maybe made here, rooted while its options are read.)
-    vm.rooted(&[o], |vm| {
-        let increment = rounding_increment(vm, o)?;
-        let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-        let smallest = unit_option(vm, o, "smallestUnit", true)?;
-        validate_unit(smallest, Group::Time, false)?;
-        let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
-        validate_increment(increment, duration::max_increment(unit).unwrap(), false)?;
-        let (_, r) = round_time(t, increment, unit, mode);
-        Ok(create_time(vm, r))
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let increment = rounding_increment(vm, o)?;
+    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
+    let smallest = unit_option(vm, o, "smallestUnit", true)?;
+    validate_unit(smallest, Group::Time, false)?;
+    let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
+    validate_increment(increment, duration::max_increment(unit).unwrap(), false)?;
+    let (_, r) = round_time(t, increment, unit, mode);
+    Ok(create_time(vm, r))
 }
 
 fn time_equals(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -636,22 +635,21 @@ fn date_time_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let dt = this_date_time(this)?;
     let o = round_options(vm, arg(a, 0))?;
     // (`o`, maybe made here, rooted while its options are read.)
-    vm.rooted(&[o], |vm| {
-        let increment = rounding_increment(vm, o)?;
-        let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-        let smallest = unit_option(vm, o, "smallestUnit", true)?;
-        if smallest != UnitOption::Unit(Unit::Day) {
-            validate_unit(smallest, Group::Time, false)?;
-        }
-        let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
-        let max = duration::max_increment(unit).unwrap_or(1);
-        validate_increment(increment, max, max == 1)?;
-        if increment == 1 && unit == Unit::Nanosecond {
-            return create_date_time(vm, dt);
-        }
-        let r = round_date_time(dt, increment, unit, mode);
-        create_date_time(vm, r)
-    })
+    let _rooted = vm.root_scope(&[o]);
+    let increment = rounding_increment(vm, o)?;
+    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
+    let smallest = unit_option(vm, o, "smallestUnit", true)?;
+    if smallest != UnitOption::Unit(Unit::Day) {
+        validate_unit(smallest, Group::Time, false)?;
+    }
+    let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
+    let max = duration::max_increment(unit).unwrap_or(1);
+    validate_increment(increment, max, max == 1)?;
+    if increment == 1 && unit == Unit::Nanosecond {
+        return create_date_time(vm, dt);
+    }
+    let r = round_date_time(dt, increment, unit, mode);
+    create_date_time(vm, r)
 }
 
 fn date_time_equals(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

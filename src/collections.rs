@@ -689,24 +689,23 @@ fn for_each(vm: &mut Vm, o: Obj, a: &[Value], this: Value) -> Result<Value> {
     let (mut e, mut i) = (entries(o), BASE);
     // (The entries array rooted, in a slot of its own: the callback may
     // move the collection to a new one, the old one forwarding to it.)
-    vm.rooted(&[object_value(e.ptr())], |vm| {
-        let at = vm.handles.len() - 1;
-        loop {
-            // (The callback may have compacted or cleared the entries.)
-            e = current(e, &mut i, s);
-            if i >= len(e) {
-                break;
-            }
-            vm.handles[at] = object_value(e.ptr());
-            let k = slot(e, i);
-            if k != Value::EMPTY {
-                let v = if s == 2 { slot(e, i + 1) } else { k };
-                call_function(vm, f, t, &[v, k, this])?;
-            }
-            i += s;
+    let _rooted = vm.root_scope(&[object_value(e.ptr())]);
+    let at = vm.handles.len() - 1;
+    loop {
+        // (The callback may have compacted or cleared the entries.)
+        e = current(e, &mut i, s);
+        if i >= len(e) {
+            break;
         }
-        Ok(Value::UNDEFINED)
-    })
+        vm.handles[at] = object_value(e.ptr());
+        let k = slot(e, i);
+        if k != Value::EMPTY {
+            let v = if s == 2 { slot(e, i + 1) } else { k };
+            call_function(vm, f, t, &[v, k, this])?;
+        }
+        i += s;
+    }
+    Ok(Value::UNDEFINED)
 }
 
 fn map_size(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -1220,25 +1219,24 @@ fn each_key(
     let (a_done, a_value) = (vm.intern_name("done"), vm.a_value);
     // (The iterator and `next` rooted across the results' getters and
     // `f`; each result across its own.)
-    vm.rooted(&[it, next], |vm| {
-        loop {
-            let r = call_function(vm, next, it, &[])?;
-            if !is_object(r) {
-                return Err(Error::type_error("Iterator result is not an object"));
-            }
-            let v = vm.rooted(&[r], |vm| {
-                if to_boolean(vm.get(r, a_done)?) {
-                    return Ok(None);
-                }
-                vm.get(r, a_value).map(Some)
-            })?;
-            let Some(v) = v else { return Ok(true) };
-            if !f(vm, normalize(v))? {
-                crate::symbol::close(vm, it)?;
-                return Ok(false);
-            }
+    let _rooted = vm.root_scope(&[it, next]);
+    loop {
+        let r = call_function(vm, next, it, &[])?;
+        if !is_object(r) {
+            return Err(Error::type_error("Iterator result is not an object"));
         }
-    })
+        let v = vm.rooted(&[r], |vm| {
+            if to_boolean(vm.get(r, a_done)?) {
+                return Ok(None);
+            }
+            vm.get(r, a_value).map(Some)
+        })?;
+        let Some(v) = v else { return Ok(true) };
+        if !f(vm, normalize(v))? {
+            crate::symbol::close(vm, it)?;
+            return Ok(false);
+        }
+    }
 }
 
 /// Each value set `o` has (its entries read as the loop goes on, so a
@@ -1249,22 +1247,21 @@ fn each_value(vm: &mut Vm, o: Obj, mut f: impl FnMut(&mut Vm, Value) -> Result<b
     let mut pos = BASE;
     // (The entries array and the value rooted, in slots of their own: `f`
     // may move the set to new entries or delete the value.)
-    vm.rooted(&[object_value(e.ptr()), Value::UNDEFINED], |vm| {
-        let at = vm.handles.len() - 2;
-        loop {
-            e = current(e, &mut pos, 1);
-            if pos >= len(e) {
-                return Ok(true);
-            }
-            let v = slot(e, pos);
-            pos += 1;
-            vm.handles[at] = object_value(e.ptr());
-            vm.handles[at + 1] = v;
-            if v != Value::EMPTY && !f(vm, v)? {
-                return Ok(false);
-            }
+    let _rooted = vm.root_scope(&[object_value(e.ptr()), Value::UNDEFINED]);
+    let at = vm.handles.len() - 2;
+    loop {
+        e = current(e, &mut pos, 1);
+        if pos >= len(e) {
+            return Ok(true);
         }
-    })
+        let v = slot(e, pos);
+        pos += 1;
+        vm.handles[at] = object_value(e.ptr());
+        vm.handles[at + 1] = v;
+        if v != Value::EMPTY && !f(vm, v)? {
+            return Ok(false);
+        }
+    }
 }
 
 /// A new set of set `o`'s values.

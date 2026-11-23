@@ -299,72 +299,71 @@ pub(crate) fn relative_to(vm: &mut Vm, options: Value) -> Result<Relative> {
         return Ok(Relative::None);
     }
     // (`v`, maybe a getter's only, rooted while it is read.)
-    vm.rooted(&[v], |vm| {
-        let (date, time, z, behaviour, offset_ns, match_minutes);
-        if is_object(v) {
-            match slots(v) {
-                Some(Slots::Zoned(ns, zz)) => return Ok(Relative::Zoned(ns, zz)),
-                Some(Slots::Date(d)) => return Ok(Relative::Plain(d)),
-                Some(Slots::DateTime(dt)) => return Ok(Relative::Plain(dt.date)),
-                _ => {}
-            }
-            calendar_with_iso_default(vm, v)?;
-            let which: Vec<Field> = fields::DATE_FIELDS
-                .iter()
-                .chain(fields::TIME_FIELDS)
-                .copied()
-                .chain([Field::Offset, Field::TimeZone])
-                .collect();
-            let f = fields::prepare(vm, v, &which, fields::Required::Some(&[]))?;
-            date = fields::date_from_fields(&f, Overflow::Constrain)?;
-            time = Some(fields::time_from_fields(&f, Overflow::Constrain)?);
-            z = f.time_zone;
-            behaviour = if f.offset.is_some() { OffsetBehaviour::Option } else { OffsetBehaviour::Wall };
-            offset_ns = f.offset.as_deref().map_or(0, |s| parse::parse_offset(s).unwrap().ns);
-            match_minutes = false;
-        } else {
-            let s = require_string(v)?;
-            let r = parse::parse_date_time(&s).map_err(parse_err)?;
-            let mut b = OffsetBehaviour::Option;
-            let mut mm = false;
-            z = match &r.tz {
-                Some(t) => {
-                    let zz = time_zone_from_identifier(vm, t)?;
-                    if r.z {
-                        b = OffsetBehaviour::Exact;
-                    } else if r.offset.is_none() {
-                        b = OffsetBehaviour::Wall;
-                    }
-                    mm = !r.offset.is_some_and(|o| o.sub_minute);
-                    Some(zz)
-                }
-                None if r.z => return Err(range("Z designator not supported for PlainDate relativeTo")),
-                None => None,
-            };
-            canonicalize_calendar(r.calendar.as_deref().unwrap_or("iso8601"))?;
-            date = r.date();
-            time = r.time;
-            behaviour = b;
-            offset_ns = r.offset.map_or(0, |o| o.ns);
-            match_minutes = mm;
+    let _rooted = vm.root_scope(&[v]);
+    let (date, time, z, behaviour, offset_ns, match_minutes);
+    if is_object(v) {
+        match slots(v) {
+            Some(Slots::Zoned(ns, zz)) => return Ok(Relative::Zoned(ns, zz)),
+            Some(Slots::Date(d)) => return Ok(Relative::Plain(d)),
+            Some(Slots::DateTime(dt)) => return Ok(Relative::Plain(dt.date)),
+            _ => {}
         }
-        let Some(z) = z else {
-            return Ok(Relative::Plain(check_date(date)?));
+        calendar_with_iso_default(vm, v)?;
+        let which: Vec<Field> = fields::DATE_FIELDS
+            .iter()
+            .chain(fields::TIME_FIELDS)
+            .copied()
+            .chain([Field::Offset, Field::TimeZone])
+            .collect();
+        let f = fields::prepare(vm, v, &which, fields::Required::Some(&[]))?;
+        date = fields::date_from_fields(&f, Overflow::Constrain)?;
+        time = Some(fields::time_from_fields(&f, Overflow::Constrain)?);
+        z = f.time_zone;
+        behaviour = if f.offset.is_some() { OffsetBehaviour::Option } else { OffsetBehaviour::Wall };
+        offset_ns = f.offset.as_deref().map_or(0, |s| parse::parse_offset(s).unwrap().ns);
+        match_minutes = false;
+    } else {
+        let s = require_string(v)?;
+        let r = parse::parse_date_time(&s).map_err(parse_err)?;
+        let mut b = OffsetBehaviour::Option;
+        let mut mm = false;
+        z = match &r.tz {
+            Some(t) => {
+                let zz = time_zone_from_identifier(vm, t)?;
+                if r.z {
+                    b = OffsetBehaviour::Exact;
+                } else if r.offset.is_none() {
+                    b = OffsetBehaviour::Wall;
+                }
+                mm = !r.offset.is_some_and(|o| o.sub_minute);
+                Some(zz)
+            }
+            None if r.z => return Err(range("Z designator not supported for PlainDate relativeTo")),
+            None => None,
         };
-        let offset_ns = if behaviour == OffsetBehaviour::Option { offset_ns } else { 0 };
-        let ns = interpret_offset(
-            vm,
-            date,
-            time,
-            behaviour,
-            offset_ns,
-            z,
-            Disambiguation::Compatible,
-            OffsetOption::Reject,
-            match_minutes,
-        )?;
-        Ok(Relative::Zoned(ns, z))
-    })
+        canonicalize_calendar(r.calendar.as_deref().unwrap_or("iso8601"))?;
+        date = r.date();
+        time = r.time;
+        behaviour = b;
+        offset_ns = r.offset.map_or(0, |o| o.ns);
+        match_minutes = mm;
+    }
+    let Some(z) = z else {
+        return Ok(Relative::Plain(check_date(date)?));
+    };
+    let offset_ns = if behaviour == OffsetBehaviour::Option { offset_ns } else { 0 };
+    let ns = interpret_offset(
+        vm,
+        date,
+        time,
+        behaviour,
+        offset_ns,
+        z,
+        Disambiguation::Compatible,
+        OffsetOption::Reject,
+        match_minutes,
+    )?;
+    Ok(Relative::Zoned(ns, z))
 }
 
 /// AddInstant.
@@ -1007,120 +1006,113 @@ fn duration_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let existing = default_largest_unit(&d);
     let o = options_or_string(vm, arg(a, 0), "smallestUnit")?;
     // (`o`, maybe made here, rooted while its options are read.)
-    vm.rooted(&[o], |vm| {
-        let largest_opt = unit_option(vm, o, "largestUnit", false)?;
-        let relative = relative_to(vm, o)?;
-        let increment = rounding_increment(vm, o)?;
-        let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-        let smallest_opt = unit_option(vm, o, "smallestUnit", false)?;
-        validate_unit(smallest_opt, Group::DateTime, false)?;
-        let smallest = match smallest_opt {
-            UnitOption::Unit(u) => u,
-            _ => Unit::Nanosecond,
-        };
-        let default = existing.larger(smallest);
-        let mut largest = match largest_opt {
-            UnitOption::Unit(u) => u,
-            _ => default,
-        };
-        if smallest_opt == UnitOption::Unset && largest_opt == UnitOption::Unset {
-            return Err(range("at least one of smallestUnit or largestUnit is required"));
-        }
-        if largest.larger(smallest) != largest {
-            return Err(range(format!(
-                "largestUnit {} cannot be smaller than smallestUnit {}",
-                largest.name(),
-                smallest.name()
-            )));
-        }
-        if let Some(max) = max_increment(smallest) {
-            validate_increment(increment, max, false)?;
-        }
-        if increment > 1 && smallest.is_date() && largest != smallest {
-            return Err(range("for calendar units with roundingIncrement > 1, use largestUnit = smallestUnit"));
-        }
-        let r = match relative {
-            Relative::Zoned(ns, z) => {
-                let i = to_internal(&d);
-                let target = add_zoned(vm, ns, z, &i, Overflow::Constrain)?;
-                let diff = difference_zoned_rounded(vm, ns, target, z, largest, increment, smallest, mode)?;
-                if largest.is_date() {
-                    largest = Unit::Hour;
-                }
-                from_internal(&diff, largest)?
+    let _rooted = vm.root_scope(&[o]);
+    let largest_opt = unit_option(vm, o, "largestUnit", false)?;
+    let relative = relative_to(vm, o)?;
+    let increment = rounding_increment(vm, o)?;
+    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
+    let smallest_opt = unit_option(vm, o, "smallestUnit", false)?;
+    validate_unit(smallest_opt, Group::DateTime, false)?;
+    let smallest = match smallest_opt {
+        UnitOption::Unit(u) => u,
+        _ => Unit::Nanosecond,
+    };
+    let default = existing.larger(smallest);
+    let mut largest = match largest_opt {
+        UnitOption::Unit(u) => u,
+        _ => default,
+    };
+    if smallest_opt == UnitOption::Unset && largest_opt == UnitOption::Unset {
+        return Err(range("at least one of smallestUnit or largestUnit is required"));
+    }
+    if largest.larger(smallest) != largest {
+        return Err(range(format!(
+            "largestUnit {} cannot be smaller than smallestUnit {}",
+            largest.name(),
+            smallest.name()
+        )));
+    }
+    if let Some(max) = max_increment(smallest) {
+        validate_increment(increment, max, false)?;
+    }
+    if increment > 1 && smallest.is_date() && largest != smallest {
+        return Err(range("for calendar units with roundingIncrement > 1, use largestUnit = smallestUnit"));
+    }
+    let r = match relative {
+        Relative::Zoned(ns, z) => {
+            let i = to_internal(&d);
+            let target = add_zoned(vm, ns, z, &i, Overflow::Constrain)?;
+            let diff = difference_zoned_rounded(vm, ns, target, z, largest, increment, smallest, mode)?;
+            if largest.is_date() {
+                largest = Unit::Hour;
             }
-            Relative::Plain(date) => {
-                let i = to_internal_24h(&d);
-                let (days, time) = iso::balance_time(i.time);
-                let dd = adjust(&i.date, days as f64, None, None)?;
-                let target = fields::date_add(date, &dd, Overflow::Constrain)?;
-                let start = DateTime { date, time: Time::MIDNIGHT };
-                let diff = difference_plain_rounded(
-                    vm,
-                    start,
-                    DateTime { date: target, time },
-                    largest,
-                    increment,
-                    smallest,
-                    mode,
-                )?;
-                from_internal(&diff, largest)?
+            from_internal(&diff, largest)?
+        }
+        Relative::Plain(date) => {
+            let i = to_internal_24h(&d);
+            let (days, time) = iso::balance_time(i.time);
+            let dd = adjust(&i.date, days as f64, None, None)?;
+            let target = fields::date_add(date, &dd, Overflow::Constrain)?;
+            let start = DateTime { date, time: Time::MIDNIGHT };
+            let diff = difference_plain_rounded(
+                vm,
+                start,
+                DateTime { date: target, time },
+                largest,
+                increment,
+                smallest,
+                mode,
+            )?;
+            from_internal(&diff, largest)?
+        }
+        Relative::None => {
+            if existing.is_calendar() || largest.is_calendar() {
+                return Err(range("a starting point is required for years, months, or weeks balancing"));
             }
-            Relative::None => {
-                if existing.is_calendar() || largest.is_calendar() {
-                    return Err(range("a starting point is required for years, months, or weeks balancing"));
-                }
-                let i = to_internal_24h(&d);
-                let t = round_time_duration(i.time, increment, smallest, mode)?;
-                let internal = if smallest == Unit::Day {
-                    combine([0.0, 0.0, 0.0, (t / iso::NS_PER_DAY) as f64], 0)
-                } else {
-                    combine(ZERO_DATE, t)
-                };
-                from_internal(&internal, largest)?
-            }
-        };
-        Ok(create_duration(vm, r))
-    })
+            let i = to_internal_24h(&d);
+            let t = round_time_duration(i.time, increment, smallest, mode)?;
+            let internal = if smallest == Unit::Day {
+                combine([0.0, 0.0, 0.0, (t / iso::NS_PER_DAY) as f64], 0)
+            } else {
+                combine(ZERO_DATE, t)
+            };
+            from_internal(&internal, largest)?
+        }
+    };
+    Ok(create_duration(vm, r))
 }
 
 fn duration_total(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let d = this_duration(this)?;
     let o = options_or_string(vm, arg(a, 0), "unit")?;
     // (`o`, maybe made here, rooted while its options are read.)
-    vm.rooted(&[o], |vm| {
-        let relative = relative_to(vm, o)?;
-        let unit = match unit_option(vm, o, "unit", true)? {
-            UnitOption::Unit(u) => u,
-            _ => return Err(range("unit must be a unit")),
-        };
-        let total = match relative {
-            Relative::Zoned(ns, z) => {
-                let target = add_zoned(vm, ns, z, &to_internal(&d), Overflow::Constrain)?;
-                difference_zoned_total(vm, ns, target, z, unit)?
+    let _rooted = vm.root_scope(&[o]);
+    let relative = relative_to(vm, o)?;
+    let unit = match unit_option(vm, o, "unit", true)? {
+        UnitOption::Unit(u) => u,
+        _ => return Err(range("unit must be a unit")),
+    };
+    let total = match relative {
+        Relative::Zoned(ns, z) => {
+            let target = add_zoned(vm, ns, z, &to_internal(&d), Overflow::Constrain)?;
+            difference_zoned_total(vm, ns, target, z, unit)?
+        }
+        Relative::Plain(date) => {
+            let i = to_internal_24h(&d);
+            let (days, time) = iso::balance_time(i.time);
+            let dd = adjust(&i.date, days as f64, None, None)?;
+            let target = fields::date_add(date, &dd, Overflow::Constrain)?;
+            difference_plain_total(vm, DateTime { date, time: Time::MIDNIGHT }, DateTime { date: target, time }, unit)?
+        }
+        Relative::None => {
+            let largest = default_largest_unit(&d);
+            if largest.is_calendar() || unit.is_calendar() {
+                return Err(range("a starting point is required for years, months, or weeks totals"));
             }
-            Relative::Plain(date) => {
-                let i = to_internal_24h(&d);
-                let (days, time) = iso::balance_time(i.time);
-                let dd = adjust(&i.date, days as f64, None, None)?;
-                let target = fields::date_add(date, &dd, Overflow::Constrain)?;
-                difference_plain_total(
-                    vm,
-                    DateTime { date, time: Time::MIDNIGHT },
-                    DateTime { date: target, time },
-                    unit,
-                )?
-            }
-            Relative::None => {
-                let largest = default_largest_unit(&d);
-                if largest.is_calendar() || unit.is_calendar() {
-                    return Err(range("a starting point is required for years, months, or weeks totals"));
-                }
-                iso::fdiv(to_internal_24h(&d).time, unit.nanos())
-            }
-        };
-        Ok(Value::number(total))
-    })
+            iso::fdiv(to_internal_24h(&d).time, unit.nanos())
+        }
+    };
+    Ok(Value::number(total))
 }
 
 fn duration_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

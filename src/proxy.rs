@@ -242,10 +242,9 @@ fn trampoline(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     let (t, h) = parts(p)?;
     // (The target and handler, which a trap's lookup may revoke,
     // `new.target`, taken from the VM, and the arguments' list rooted.)
-    vm.rooted(&[t, h, nt], |vm| {
-        let list = crate::array::new_array_of(vm, args)?;
-        vm.rooted(&[list], |vm| trampoline_with(vm, constructing, p, t, h, nt, this, args, list))
-    })
+    let _rooted = vm.root_scope(&[t, h, nt]);
+    let list = crate::array::new_array_of(vm, args)?;
+    vm.rooted(&[list], |vm| trampoline_with(vm, constructing, p, t, h, nt, this, args, list))
 }
 
 /// [`trampoline`] with its arguments' array `list`.
@@ -283,12 +282,11 @@ fn trampoline_with(
 /// A proxy's `[[Get]]` by its handler `h`'s `get` trap `f`, its target
 /// `t` (one without the trap forwards in `generic_get`'s loop).
 fn get(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, receiver: Value) -> Result<Value> {
-    vm.rooted(&[t, h, f], |vm| {
-        let k = trap_key(vm, key);
-        let v = call_function(vm, f, h, &[t, k, receiver])?;
-        // (Read after the target's traps.)
-        vm.rooted(&[v], |vm| get_checked(vm, t, key, v))
-    })
+    let _rooted = vm.root_scope(&[t, h, f]);
+    let k = trap_key(vm, key);
+    let v = call_function(vm, f, h, &[t, k, receiver])?;
+    // (Read after the target's traps.)
+    vm.rooted(&[v], |vm| get_checked(vm, t, key, v))
 }
 
 /// [`get`]'s check of the trap's result `v` against the target's property.
@@ -912,40 +910,39 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: Obj) -> Result<Vec<Vec<u16>>> {
     // This follows the same shadowing rule as the ordinary path in
     // `Vm::for_in_key_array`; proxy traps must not turn it quadratic.
     // (The object the walk is at, a trap's result maybe, rooted.)
-    vm.rooted(&[object_value(o.ptr())], |vm| {
-        let slot = vm.handles.len() - 1;
-        let mut seen: HashSet<Key> = HashSet::default();
-        let mut out = Vec::new();
-        let mut cur = o;
-        let mut hops = 0;
-        loop {
-            for key in own_keys(vm, cur)? {
-                if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) || seen.contains(&key) {
-                    continue;
-                }
-                // (A key a trap lists without a property hides nothing: only
-                // one with a descriptor joins VisitedKeys, 14.7.5.10.2.1.)
-                let Some(d) = get_own_property(vm, cur, key)? else {
-                    continue;
-                };
-                seen.insert(key);
-                if d.enumerable == Some(true) {
-                    let mut u = Vec::new();
-                    match key {
-                        Key::Index(i) => u.extend(i.to_string().encode_utf16()),
-                        Key::Name(a) => crate::js::lex::string_units(vm.atom_name(a), &mut u),
-                    }
-                    out.push(u);
-                }
+    let _rooted = vm.root_scope(&[object_value(o.ptr())]);
+    let slot = vm.handles.len() - 1;
+    let mut seen: HashSet<Key> = HashSet::default();
+    let mut out = Vec::new();
+    let mut cur = o;
+    let mut hops = 0;
+    loop {
+        for key in own_keys(vm, cur)? {
+            if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) || seen.contains(&key) {
+                continue;
             }
-            let p = walk_prototype(vm, cur, &mut hops)?;
-            if !p.is_cell() {
-                return Ok(out);
+            // (A key a trap lists without a property hides nothing: only
+            // one with a descriptor joins VisitedKeys, 14.7.5.10.2.1.)
+            let Some(d) = get_own_property(vm, cur, key)? else {
+                continue;
+            };
+            seen.insert(key);
+            if d.enumerable == Some(true) {
+                let mut u = Vec::new();
+                match key {
+                    Key::Index(i) => u.extend(i.to_string().encode_utf16()),
+                    Key::Name(a) => crate::js::lex::string_units(vm.atom_name(a), &mut u),
+                }
+                out.push(u);
             }
-            cur = Obj::of(p);
-            vm.handles[slot] = p;
         }
-    })
+        let p = walk_prototype(vm, cur, &mut hops)?;
+        if !p.is_cell() {
+            return Ok(out);
+        }
+        cur = Obj::of(p);
+        vm.handles[slot] = p;
+    }
 }
 
 /// IsArray(`v`): an array, or a proxy for one (a TypeError once revoked).

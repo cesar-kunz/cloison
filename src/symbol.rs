@@ -764,12 +764,11 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     }
     let (a_done, a_value) = (vm.a_done, vm.a_value);
     // (The result rooted across `done`'s getter.)
-    vm.rooted(&[r], |vm| {
-        if to_boolean(vm.get(r, a_done)?) {
-            return Ok(None);
-        }
-        vm.get(r, a_value).map(Some)
-    })
+    let _rooted = vm.root_scope(&[r]);
+    if to_boolean(vm.get(r, a_done)?) {
+        return Ok(None);
+    }
+    vm.get(r, a_value).map(Some)
 }
 
 /// IteratorClose after an early exit: `it.return()`, if it has one.
@@ -820,17 +819,16 @@ pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -
     let it = get_iterator(vm, v)?;
     let a_next = vm.a_next;
     let next = vm.rooted(&[it], |vm| vm.get(it, a_next))?;
-    vm.rooted(&[it, next, Value::UNDEFINED], |vm| {
-        let at = vm.handles.len() - 1;
-        while let Some(x) = step_with(vm, it, next)? {
-            vm.handles[at] = x;
-            if let Err(e) = f(vm, x) {
-                let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| close(vm, it));
-                return Err(e);
-            }
+    let _rooted = vm.root_scope(&[it, next, Value::UNDEFINED]);
+    let at = vm.handles.len() - 1;
+    while let Some(x) = step_with(vm, it, next)? {
+        vm.handles[at] = x;
+        if let Err(e) = f(vm, x) {
+            let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| close(vm, it));
+            return Err(e);
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// `Object.prototype.toString`'s tag for `o` from `@@toStringTag`, if a

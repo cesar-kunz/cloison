@@ -899,17 +899,16 @@ fn thrower(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 fn promise_resolve_with(vm: &mut Vm, c: Value, x: Value) -> Result<Value> {
     // (`x` rooted across a `constructor` getter and `C`'s executor; the
     // promise across `resolve`.)
-    vm.rooted(&[c, x], |vm| {
-        if is_class(x, Class::Promise) {
-            let a_constructor = vm.intern_name("constructor");
-            if vm.get(x, a_constructor)? == c {
-                return Ok(x);
-            }
+    let _rooted = vm.root_scope(&[c, x]);
+    if is_class(x, Class::Promise) {
+        let a_constructor = vm.intern_name("constructor");
+        if vm.get(x, a_constructor)? == c {
+            return Ok(x);
         }
-        let cap = new_capability(vm, c)?;
-        vm.rooted(&[cap.promise], |vm| cap_resolve(vm, &cap, x))?;
-        Ok(cap.promise)
-    })
+    }
+    let cap = new_capability(vm, c)?;
+    vm.rooted(&[cap.promise], |vm| cap_resolve(vm, &cap, x))?;
+    Ok(cap.promise)
 }
 
 fn this_constructor(this: Value, what: &str) -> Result<Value> {
@@ -949,24 +948,23 @@ fn promise_try(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let cap = new_capability(vm, c)?;
     // (The capability rooted across the call; its result across a
     // `constructor` getter.)
-    vm.rooted(&[cap.promise, cap.resolve, cap.reject], |vm| {
-        match call_function(vm, arg(a, 0), Value::UNDEFINED, a.get(1..).unwrap_or(&[])) {
-            Ok(v)
-                if is_class(v, Class::Promise) && {
-                    let a_constructor = vm.intern_name("constructor");
-                    vm.rooted(&[v], |vm| vm.get(v, a_constructor))? == c
-                } =>
-            {
-                return Ok(v);
-            }
-            Ok(v) => cap_resolve(vm, &cap, v)?,
-            Err(e) => {
-                let v = thrown(vm, e)?;
-                cap_reject(vm, &cap, v)?;
-            }
+    let _rooted = vm.root_scope(&[cap.promise, cap.resolve, cap.reject]);
+    match call_function(vm, arg(a, 0), Value::UNDEFINED, a.get(1..).unwrap_or(&[])) {
+        Ok(v)
+            if is_class(v, Class::Promise) && {
+                let a_constructor = vm.intern_name("constructor");
+                vm.rooted(&[v], |vm| vm.get(v, a_constructor))? == c
+            } =>
+        {
+            return Ok(v);
         }
-        Ok(cap.promise)
-    })
+        Ok(v) => cap_resolve(vm, &cap, v)?,
+        Err(e) => {
+            let v = thrown(vm, e)?;
+            cap_reject(vm, &cap, v)?;
+        }
+    }
+    Ok(cap.promise)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -983,13 +981,12 @@ fn combine(vm: &mut Vm, this: Value, a: &[Value], kind: Combinator) -> Result<Va
     let mut cap = new_capability(vm, this)?;
     materialize(vm, &mut cap);
     // (The capability rooted while the iteration runs JS.)
-    vm.rooted(&[cap.promise, cap.resolve, cap.reject], |vm| {
-        if let Err(e) = perform_combine(vm, this, &cap, arg(a, 0), kind) {
-            let v = thrown(vm, e)?;
-            cap_reject(vm, &cap, v)?;
-        }
-        Ok(cap.promise)
-    })
+    let _rooted = vm.root_scope(&[cap.promise, cap.resolve, cap.reject]);
+    if let Err(e) = perform_combine(vm, this, &cap, arg(a, 0), kind) {
+        let v = thrown(vm, e)?;
+        cap_reject(vm, &cap, v)?;
+    }
+    Ok(cap.promise)
 }
 
 /// PerformPromiseAll and the others: each value iterated, through
@@ -1008,65 +1005,57 @@ fn perform_combine(vm: &mut Vm, c: Value, cap: &Cap, iterable: Value, kind: Comb
     let state = vm.new_array();
     array_push(vm, state, &[Value::from_i32(1)])?;
     // (Rooted across the iteration, which runs JS.)
-    vm.rooted(&[promise_resolve, values, state], |vm| {
-        let mut index = 0;
-        iterate(vm, iterable, |vm, next| {
-            let next_promise = call_function(vm, promise_resolve, c, &[next])?;
-            let (on_fulfilled, on_rejected) = match kind {
-                Combinator::Race => (cap.resolve, cap.reject),
-                Combinator::All => {
-                    array_push(vm, values, &[Value::UNDEFINED])?;
-                    let data = [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE];
-                    (closure(vm, Root::AllElement, &data), cap.reject)
-                }
-                Combinator::AllSettled => {
-                    array_push(vm, values, &[Value::UNDEFINED])?;
-                    let data = [
-                        values,
-                        state,
-                        cap.promise,
-                        cap.resolve,
-                        Value::from_i32(index),
-                        Value::FALSE,
-                        Value::UNDEFINED,
-                    ];
-                    let f = closure(vm, Root::SettledFulfill, &data);
-                    let mut data = data;
-                    data[6] = f;
-                    let r = closure(vm, Root::SettledReject, &data);
-                    set_slot(Obj::of(f), 6, r);
-                    (f, r)
-                }
-                Combinator::Any => {
-                    array_push(vm, values, &[Value::UNDEFINED])?;
-                    let data = [values, state, cap.promise, cap.reject, Value::from_i32(index), Value::FALSE];
-                    (cap.resolve, closure(vm, Root::AnyElement, &data))
-                }
-            };
-            if kind != Combinator::Race {
-                let s = Obj::of(state);
-                put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
+    let _rooted = vm.root_scope(&[promise_resolve, values, state]);
+    let mut index = 0;
+    iterate(vm, iterable, |vm, next| {
+        let next_promise = call_function(vm, promise_resolve, c, &[next])?;
+        let (on_fulfilled, on_rejected) = match kind {
+            Combinator::Race => (cap.resolve, cap.reject),
+            Combinator::All => {
+                array_push(vm, values, &[Value::UNDEFINED])?;
+                let data = [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE];
+                (closure(vm, Root::AllElement, &data), cap.reject)
             }
-            let then = vm.rooted(&[next_promise, on_fulfilled, on_rejected], |vm| vm.get(next_promise, a_then))?;
-            call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
-            index += 1;
-            Ok(())
-        })?;
+            Combinator::AllSettled => {
+                array_push(vm, values, &[Value::UNDEFINED])?;
+                let data =
+                    [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED];
+                let f = closure(vm, Root::SettledFulfill, &data);
+                let mut data = data;
+                data[6] = f;
+                let r = closure(vm, Root::SettledReject, &data);
+                set_slot(Obj::of(f), 6, r);
+                (f, r)
+            }
+            Combinator::Any => {
+                array_push(vm, values, &[Value::UNDEFINED])?;
+                let data = [values, state, cap.promise, cap.reject, Value::from_i32(index), Value::FALSE];
+                (cap.resolve, closure(vm, Root::AnyElement, &data))
+            }
+        };
         if kind != Combinator::Race {
             let s = Obj::of(state);
-            let remaining = elem(s, 0).as_i32_unchecked() - 1;
-            put(s, 0, Value::from_i32(remaining));
-            if remaining == 0 {
-                if kind == Combinator::Any {
-                    let e = aggregate_error(vm, values);
-                    cap_reject(vm, cap, e)?;
-                } else {
-                    cap_resolve(vm, cap, values)?;
-                }
+            put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
+        }
+        let then = vm.rooted(&[next_promise, on_fulfilled, on_rejected], |vm| vm.get(next_promise, a_then))?;
+        call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
+        index += 1;
+        Ok(())
+    })?;
+    if kind != Combinator::Race {
+        let s = Obj::of(state);
+        let remaining = elem(s, 0).as_i32_unchecked() - 1;
+        put(s, 0, Value::from_i32(remaining));
+        if remaining == 0 {
+            if kind == Combinator::Any {
+                let e = aggregate_error(vm, values);
+                cap_reject(vm, cap, e)?;
+            } else {
+                cap_resolve(vm, cap, values)?;
             }
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 fn promise_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1092,13 +1081,12 @@ fn combine_keyed(vm: &mut Vm, this: Value, a: &[Value], settled: bool) -> Result
     let mut cap = new_capability(vm, this)?;
     materialize(vm, &mut cap);
     // (The capability rooted while the properties' reads run JS.)
-    vm.rooted(&[cap.promise, cap.resolve, cap.reject], |vm| {
-        if let Err(e) = perform_keyed(vm, this, &cap, arg(a, 0), settled) {
-            let v = thrown(vm, e)?;
-            cap_reject(vm, &cap, v)?;
-        }
-        Ok(cap.promise)
-    })
+    let _rooted = vm.root_scope(&[cap.promise, cap.resolve, cap.reject]);
+    if let Err(e) = perform_keyed(vm, this, &cap, arg(a, 0), settled) {
+        let v = thrown(vm, e)?;
+        cap_reject(vm, &cap, v)?;
+    }
+    Ok(cap.promise)
 }
 
 /// PerformPromiseAllKeyed.
@@ -1118,44 +1106,43 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
     let state = vm.new_array();
     array_push(vm, state, &[Value::from_i32(1)])?;
     // (Rooted across the properties' reads and the calls, which run JS.)
-    vm.rooted(&[promise_resolve, keys, values, state], |vm| {
-        let mut index = 0;
-        for key in crate::proxy::own_keys(vm, o)? {
-            if !crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true)) {
-                continue;
-            }
-            let k = vm.key_value(key);
-            let value = vm.rooted(&[k], |vm| vm.get_keyed(promises, k))?;
-            array_push(vm, keys, &[k])?;
-            array_push(vm, values, &[Value::UNDEFINED])?;
-            let next_promise = call_function(vm, promise_resolve, c, &[value])?;
-            let data =
-                [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED, keys];
-            let (on_fulfilled, on_rejected) = if settled {
-                let f = closure(vm, Root::SettledFulfill, &data);
-                let mut data = data;
-                data[PARTNER] = f;
-                let r = closure(vm, Root::SettledReject, &data);
-                set_slot(Obj::of(f), PARTNER, r);
-                (f, r)
-            } else {
-                (closure(vm, Root::AllElement, &data), cap.reject)
-            };
-            let s = Obj::of(state);
-            put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
-            let then = vm.rooted(&[next_promise, on_fulfilled, on_rejected], |vm| vm.get(next_promise, a_then))?;
-            call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
-            index += 1;
+    let _rooted = vm.root_scope(&[promise_resolve, keys, values, state]);
+    let mut index = 0;
+    for key in crate::proxy::own_keys(vm, o)? {
+        if !crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+            continue;
         }
+        let k = vm.key_value(key);
+        let value = vm.rooted(&[k], |vm| vm.get_keyed(promises, k))?;
+        array_push(vm, keys, &[k])?;
+        array_push(vm, values, &[Value::UNDEFINED])?;
+        let next_promise = call_function(vm, promise_resolve, c, &[value])?;
+        let data =
+            [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED, keys];
+        let (on_fulfilled, on_rejected) = if settled {
+            let f = closure(vm, Root::SettledFulfill, &data);
+            let mut data = data;
+            data[PARTNER] = f;
+            let r = closure(vm, Root::SettledReject, &data);
+            set_slot(Obj::of(f), PARTNER, r);
+            (f, r)
+        } else {
+            (closure(vm, Root::AllElement, &data), cap.reject)
+        };
         let s = Obj::of(state);
-        let remaining = elem(s, 0).as_i32_unchecked() - 1;
-        put(s, 0, Value::from_i32(remaining));
-        if remaining == 0 {
-            let r = keyed_result(vm, keys, values)?;
-            cap_resolve(vm, cap, r)?;
-        }
-        Ok(())
-    })
+        put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
+        let then = vm.rooted(&[next_promise, on_fulfilled, on_rejected], |vm| vm.get(next_promise, a_then))?;
+        call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
+        index += 1;
+    }
+    let s = Obj::of(state);
+    let remaining = elem(s, 0).as_i32_unchecked() - 1;
+    put(s, 0, Value::from_i32(remaining));
+    if remaining == 0 {
+        let r = keyed_result(vm, keys, values)?;
+        cap_resolve(vm, cap, r)?;
+    }
+    Ok(())
 }
 
 /// CreateKeyedPromiseCombinatorResultObject: a null-prototype object of

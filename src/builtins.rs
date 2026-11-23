@@ -3061,15 +3061,14 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // Borrowed: strings don't change, and `input`, maybe a new string, is
     // rooted (across `lastIndex`'s conversion and the array's making).
     let s = units(input);
-    vm.rooted(&[input], |vm| {
-        with_caps(vm, |vm, caps| {
-            if let Some(re) = regexp_match_into(vm, this, re, &s, caps)? {
-                note_legacy(vm, this, input, caps);
-                match_array(vm, re, caps, &s, input)
-            } else {
-                Ok(Value::NULL)
-            }
-        })
+    let _rooted = vm.root_scope(&[input]);
+    with_caps(vm, |vm, caps| {
+        if let Some(re) = regexp_match_into(vm, this, re, &s, caps)? {
+            note_legacy(vm, this, input, caps);
+            match_array(vm, re, caps, &s, input)
+        } else {
+            Ok(Value::NULL)
+        }
     })
 }
 
@@ -3090,15 +3089,14 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = units(input);
     // (`input`, maybe a new string, rooted across `lastIndex`'s
     // conversion: `s` is its units.)
-    vm.rooted(&[input], |vm| {
-        with_caps(vm, |vm, caps| {
-            let found = regexp_match_into(vm, this, re, &s, caps)?.is_some();
-            if found {
-                let input = if is_string(input) { input } else { string(vm, &s) };
-                note_legacy(vm, this, input, caps);
-            }
-            Ok(Value::from_bool(found))
-        })
+    let _rooted = vm.root_scope(&[input]);
+    with_caps(vm, |vm, caps| {
+        let found = regexp_match_into(vm, this, re, &s, caps)?.is_some();
+        if found {
+            let input = if is_string(input) { input } else { string(vm, &s) };
+            note_legacy(vm, this, input, caps);
+        }
+        Ok(Value::from_bool(found))
     })
 }
 
@@ -3266,15 +3264,14 @@ fn match_all(vm: &mut Vm, this: Value, s: &[u16], rv: Value) -> Result<Value> {
     let a_source = vm.a_regexp_source;
     // (`input`, maybe a new string, and then `source` and the matcher
     // rooted: `lastIndex`'s conversion may run user code.)
-    vm.rooted(&[input], |vm| {
-        let source = vm.get(rv, a_source)?;
-        crate::gc::mark_regexp(re);
-        let matcher = vm.rooted(&[source], |vm| regexp_object(vm, re, source));
-        vm.rooted(&[matcher], |vm| {
-            let li = get_length(vm, rv, "lastIndex")?;
-            set_last_index(vm, matcher, li)?;
-            regexp_string_iterator(vm, matcher, input, global, unicode)
-        })
+    let _rooted = vm.root_scope(&[input]);
+    let source = vm.get(rv, a_source)?;
+    crate::gc::mark_regexp(re);
+    let matcher = vm.rooted(&[source], |vm| regexp_object(vm, re, source));
+    vm.rooted(&[matcher], |vm| {
+        let li = get_length(vm, rv, "lastIndex")?;
+        set_last_index(vm, matcher, li)?;
+        regexp_string_iterator(vm, matcher, input, global, unicode)
     })
 }
 
@@ -3477,50 +3474,49 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
         note_legacy(vm, pattern, input, &flat[flat.len() - stride..]);
     }
     // (`input`, maybe a new string, rooted across the replacer's calls.)
-    vm.rooted(&[input], |vm| {
-        let mut out = Vec::with_capacity(s.len());
-        let mut last = 0;
-        for caps in flat.chunks(stride) {
-            let (x, y) = caps[0].unwrap();
-            out.extend_from_slice(&s[last..x]);
-            if func {
-                // (The captures are only in `args`: each in the handles as it is
-                // made, roots while the next is and for the call.)
-                let r = vm.handle_scope(|vm| {
-                    let mut args: Vec<Value> = Vec::with_capacity(caps.len() + 3);
-                    for c in caps {
-                        let v = match c {
-                            Some((p, q)) => string(vm, &s[*p..*q]),
-                            None => Value::UNDEFINED,
-                        };
-                        vm.handles.push(v);
-                        args.push(v);
-                    }
-                    args.push(Value::from_i32(x as i32));
-                    args.push(input);
-                    // (With named groups, their object last.)
-                    if let Some(re) = regexp_of(pattern).filter(|re| !re.names.is_empty()) {
-                        let g = named_groups(vm, re, caps, &s)?;
-                        args.push(g);
-                    }
-                    crate::interp::call_function(vm, replacement, Value::UNDEFINED, &args)
-                })?;
-                // (A string's length checked before its units are read.)
-                check_string_len(out.len() + string_len(r).unwrap_or(0))?;
-                out.extend_from_slice(&units(r));
-                if vm.conv_failed() {
-                    return Err(vm.take_conv_error());
+    let _rooted = vm.root_scope(&[input]);
+    let mut out = Vec::with_capacity(s.len());
+    let mut last = 0;
+    for caps in flat.chunks(stride) {
+        let (x, y) = caps[0].unwrap();
+        out.extend_from_slice(&s[last..x]);
+        if func {
+            // (The captures are only in `args`: each in the handles as it is
+            // made, roots while the next is and for the call.)
+            let r = vm.handle_scope(|vm| {
+                let mut args: Vec<Value> = Vec::with_capacity(caps.len() + 3);
+                for c in caps {
+                    let v = match c {
+                        Some((p, q)) => string(vm, &s[*p..*q]),
+                        None => Value::UNDEFINED,
+                    };
+                    vm.handles.push(v);
+                    args.push(v);
                 }
-            } else {
-                let names = regexp_of(pattern).map_or(&[][..], |re| &re.names[..]);
-                expand(&template, &s, caps, names, &mut out)?;
+                args.push(Value::from_i32(x as i32));
+                args.push(input);
+                // (With named groups, their object last.)
+                if let Some(re) = regexp_of(pattern).filter(|re| !re.names.is_empty()) {
+                    let g = named_groups(vm, re, caps, &s)?;
+                    args.push(g);
+                }
+                crate::interp::call_function(vm, replacement, Value::UNDEFINED, &args)
+            })?;
+            // (A string's length checked before its units are read.)
+            check_string_len(out.len() + string_len(r).unwrap_or(0))?;
+            out.extend_from_slice(&units(r));
+            if vm.conv_failed() {
+                return Err(vm.take_conv_error());
             }
-            last = y;
-            check_string_len(out.len())?;
+        } else {
+            let names = regexp_of(pattern).map_or(&[][..], |re| &re.names[..]);
+            expand(&template, &s, caps, names, &mut out)?;
         }
-        out.extend_from_slice(&s[last..]);
-        vm.try_new_string(&out)
-    })
+        last = y;
+        check_string_len(out.len())?;
+    }
+    out.extend_from_slice(&s[last..]);
+    vm.try_new_string(&out)
 }
 
 /// A replacement template's `$` patterns expanded for one match.
@@ -4082,22 +4078,21 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     let out = vm.new_array();
     let mut n = 0;
     // (`out` rooted across `exec`'s calls.)
-    vm.rooted(&[out], |vm| {
-        loop {
-            let res = rx_exec(vm, r, s)?;
-            if res.is_null() {
-                return Ok(if n == 0 { Value::NULL } else { out });
-            }
-            let m = get_units(vm, res, "0")?;
-            let mv = vm.new_string(&m);
-            crate::vm::array_push(vm, out, &[mv])?;
-            n += 1;
-            if m.is_empty() {
-                let i = get_length(vm, r, "lastIndex")?;
-                set_last_index(vm, r, advance(&su, i, unicode))?;
-            }
+    let _rooted = vm.root_scope(&[out]);
+    loop {
+        let res = rx_exec(vm, r, s)?;
+        if res.is_null() {
+            return Ok(if n == 0 { Value::NULL } else { out });
         }
-    })
+        let m = get_units(vm, res, "0")?;
+        let mv = vm.new_string(&m);
+        crate::vm::array_push(vm, out, &[mv])?;
+        n += 1;
+        if m.is_empty() {
+            let i = get_length(vm, r, "lastIndex")?;
+            set_last_index(vm, r, advance(&su, i, unicode))?;
+        }
+    }
 }
 
 /// `RegExp.prototype[Symbol.search]` generically.
@@ -4117,22 +4112,21 @@ fn rx_search(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     };
     // (`prev`, maybe a getter's only, then `exec`'s result rooted across
     // the calls after.)
-    vm.rooted(&[prev], |vm| {
-        if !same(prev, Value::from_i32(0)) {
-            set_last_index(vm, r, 0.0)?;
+    let _rooted = vm.root_scope(&[prev]);
+    if !same(prev, Value::from_i32(0)) {
+        set_last_index(vm, r, 0.0)?;
+    }
+    let res = rx_exec(vm, r, s)?;
+    vm.rooted(&[res], |vm| {
+        let cur = vm.get(r, a)?;
+        if !same(cur, prev) {
+            vm.put_key(r, crate::vm::Key::Name(a), prev)?;
         }
-        let res = rx_exec(vm, r, s)?;
-        vm.rooted(&[res], |vm| {
-            let cur = vm.get(r, a)?;
-            if !same(cur, prev) {
-                vm.put_key(r, crate::vm::Key::Name(a), prev)?;
-            }
-            if res.is_null() {
-                return Ok(Value::from_i32(-1));
-            }
-            let ai = vm.intern_name("index");
-            vm.get(res, ai)
-        })
+        if res.is_null() {
+            return Ok(Value::from_i32(-1));
+        }
+        let ai = vm.intern_name("index");
+        vm.get(res, ai)
     })
 }
 
@@ -4550,13 +4544,12 @@ fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
         let fv = vm.new_string(&flags);
         Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv])?, flags))
     })?;
-    vm.rooted(&[matcher], |vm| {
-        let li = get_length(vm, r, "lastIndex")?;
-        set_last_index(vm, matcher, li)?;
-        let global = flags_have(&flags, b'g');
-        let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
-        regexp_string_iterator(vm, matcher, s, global, unicode)
-    })
+    let _rooted = vm.root_scope(&[matcher]);
+    let li = get_length(vm, r, "lastIndex")?;
+    set_last_index(vm, matcher, li)?;
+    let global = flags_have(&flags, b'g');
+    let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
+    regexp_string_iterator(vm, matcher, s, global, unicode)
 }
 
 // A RegExp String Iterator's state's cells: the matcher (`undefined` once
@@ -4569,11 +4562,10 @@ const RSI_UNICODE: usize = 3;
 /// CreateRegExpStringIterator(R, S, global, fullUnicode) (22.2.9.1).
 fn regexp_string_iterator(vm: &mut Vm, matcher: Value, s: Value, global: bool, unicode: bool) -> Result<Value> {
     // (Each rooted while the next cell is made.)
-    vm.rooted(&[matcher, s], |vm| {
-        let state = crate::array::new_array_of(vm, &[matcher, s, Value::from_bool(global), Value::from_bool(unicode)])?;
-        let proto = crate::symbol::Root::RegExpStringIteratorPrototype;
-        Ok(vm.rooted(&[state], |vm| crate::symbol::iterator_with_state(vm, Class::RegExpStringIterator, proto, state)))
-    })
+    let _rooted = vm.root_scope(&[matcher, s]);
+    let state = crate::array::new_array_of(vm, &[matcher, s, Value::from_bool(global), Value::from_bool(unicode)])?;
+    let proto = crate::symbol::Root::RegExpStringIteratorPrototype;
+    Ok(vm.rooted(&[state], |vm| crate::symbol::iterator_with_state(vm, Class::RegExpStringIterator, proto, state)))
 }
 
 /// `%RegExpStringIteratorPrototype%.next()` (22.2.9.2.1): one RegExpExec

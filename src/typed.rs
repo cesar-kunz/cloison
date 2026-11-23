@@ -1072,12 +1072,11 @@ fn typed_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
     let o = object_value(create_from(vm, this, &[Value::number(a.len() as f64)], Some(a.len()))?.ptr());
     // (Held across the values' conversions: rooted.)
-    vm.rooted(&[o], |vm| {
-        for (i, &v) in a.iter().enumerate() {
-            vm.set_keyed(o, Value::number(i as f64), v)?;
-        }
-        Ok(o)
-    })
+    let _rooted = vm.root_scope(&[o]);
+    for (i, &v) in a.iter().enumerate() {
+        vm.set_keyed(o, Value::number(i as f64), v)?;
+    }
+    Ok(o)
 }
 
 fn typed_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

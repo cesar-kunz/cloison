@@ -643,21 +643,20 @@ fn each(
     }
     let next = next_method(vm, it)?;
     // (`next`, and the result found, held across calls: rooted.)
-    vm.rooted(&[next], |vm| {
-        let mut counter = 0.0;
-        while let Some(v) = step_value(vm, it, next)? {
-            match each(vm, v, counter) {
-                Ok(Some(r)) => {
-                    vm.rooted(&[r], |vm| close(vm, it))?;
-                    return Ok(Some(r));
-                }
-                Ok(None) => {}
-                Err(e) => return close_throw(vm, it, e),
+    let _rooted = vm.root_scope(&[next]);
+    let mut counter = 0.0;
+    while let Some(v) = step_value(vm, it, next)? {
+        match each(vm, v, counter) {
+            Ok(Some(r)) => {
+                vm.rooted(&[r], |vm| close(vm, it))?;
+                return Ok(Some(r));
             }
-            counter += 1.0;
+            Ok(None) => {}
+            Err(e) => return close_throw(vm, it, e),
         }
-        Ok(None)
-    })
+        counter += 1.0;
+    }
+    Ok(None)
 }
 
 fn reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -666,28 +665,27 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let next = next_method(vm, it)?;
     // (`next`, and the accumulator in a slot of its own, held across the
     // calls: rooted.)
-    vm.rooted(&[next, Value::UNDEFINED], |vm| {
-        let slot = vm.handles.len() - 1;
-        let mut counter = if a.len() >= 2 {
-            vm.handles[slot] = a[1];
-            0.0
-        } else {
-            match step_value(vm, it, next)? {
-                Some(v) => vm.handles[slot] = v,
-                None => return Err(Error::type_error("Reduce of empty iterator with no initial value")),
-            }
-            1.0
-        };
-        while let Some(v) = step_value(vm, it, next)? {
-            let acc = vm.handles[slot];
-            vm.handles[slot] = match call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(counter)]) {
-                Ok(r) => r,
-                Err(e) => return close_throw(vm, it, e),
-            };
-            counter += 1.0;
+    let _rooted = vm.root_scope(&[next, Value::UNDEFINED]);
+    let slot = vm.handles.len() - 1;
+    let mut counter = if a.len() >= 2 {
+        vm.handles[slot] = a[1];
+        0.0
+    } else {
+        match step_value(vm, it, next)? {
+            Some(v) => vm.handles[slot] = v,
+            None => return Err(Error::type_error("Reduce of empty iterator with no initial value")),
         }
-        Ok(vm.handles[slot])
-    })
+        1.0
+    };
+    while let Some(v) = step_value(vm, it, next)? {
+        let acc = vm.handles[slot];
+        vm.handles[slot] = match call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(counter)]) {
+            Ok(r) => r,
+            Err(e) => return close_throw(vm, it, e),
+        };
+        counter += 1.0;
+    }
+    Ok(vm.handles[slot])
 }
 
 fn to_array(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

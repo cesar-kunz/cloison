@@ -684,19 +684,25 @@ fn ns_delete(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// [[DefineOwnProperty]]: true only if the descriptor is the export's
 /// (writable, enumerable, not configurable, its value).
-fn ns_define(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+///
+/// It gets the record as the object the proxy made of it, and reads its
+/// own fields only: a namespace's [[DefineOwnProperty]] reads no property,
+/// so no getter of `Object.prototype` runs (nor makes an inherited `get`
+/// a field).
+fn ns_define(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let Some(key) = ns_key(vm, arg(a, 1))? else {
-        return crate::reflect::reflect_define_property(vm, this, a);
+        // (A symbol, or a deferred namespace's `then`: the target's own,
+        // OrdinaryDefineOwnProperty.)
+        let k = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
+        let d = vm.own_descriptor(arg(a, 2));
+        return vm.define_own_property(Obj::of(arg(a, 0)), k, &d).map(Value::from_bool);
     };
     let m = ns_module(vm)?;
     let Some(res) = ns_binding(vm, m, &key) else {
         return Ok(Value::FALSE);
     };
     let current = binding_value(vm, &res, &key)?;
-    // (The value, which a getter the descriptor's conversion runs may
-    // replace in its binding, held across it: rooted.)
-    let _rooted = vm.root_scope(&[current]);
-    let d = vm.to_descriptor(arg(a, 2))?;
+    let d = vm.own_descriptor(arg(a, 2));
     let ok = d.configurable != Some(true)
         && d.enumerable != Some(false)
         && !d.is_accessor()
@@ -706,16 +712,21 @@ fn ns_define(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// [[GetOwnProperty]]: an export's value, writable, enumerable, not
-/// configurable.
-fn ns_get_own(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+/// configurable. As a record (`descriptor_record`): the proxy reads it
+/// back, and must find no `Object.prototype` field.
+fn ns_get_own(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let Some(key) = ns_key(vm, arg(a, 1))? else {
-        return crate::reflect::reflect_get_own_property_descriptor(vm, this, a);
+        let k = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
+        return Ok(match vm.own_property(Obj::of(arg(a, 0)), k) {
+            Some(d) => vm.descriptor_record(&d),
+            None => Value::UNDEFINED,
+        });
     };
     let m = ns_module(vm)?;
     match ns_binding(vm, m, &key) {
         Some(res) => {
             let v = binding_value(vm, &res, &key)?;
-            Ok(vm.from_descriptor(&Desc::data(v, true, true, false)))
+            Ok(vm.descriptor_record(&Desc::data(v, true, true, false)))
         }
         None => Ok(Value::UNDEFINED),
     }

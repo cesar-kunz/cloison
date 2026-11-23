@@ -1325,7 +1325,41 @@ impl Vm {
     /// FromPropertyDescriptor: `d` as an object.
     pub(crate) fn from_descriptor(&mut self, d: &Desc) -> Value {
         let op = object_value(self.object_prototype);
-        let o = self.new_plain(op);
+        self.descriptor_object(d, op)
+    }
+
+    /// A descriptor record as a native proxy trap passes it (a module
+    /// namespace's, whose [[GetOwnProperty]] returns a record): its fields
+    /// as own properties of an object with no prototype, so that reading
+    /// it back (ToPropertyDescriptor) finds no inherited `get` or `value`,
+    /// nor runs a getter of `Object.prototype`.
+    pub(crate) fn descriptor_record(&mut self, d: &Desc) -> Value {
+        self.descriptor_object(d, Value::NULL)
+    }
+
+    /// The fields of the descriptor object a proxy made of a record
+    /// (FromPropertyDescriptor) and passed to a native trap: its own data
+    /// properties only, as the record was (ToPropertyDescriptor would
+    /// read `Object.prototype`'s too, and run their getters).
+    pub(crate) fn own_descriptor(&mut self, o: Value) -> Desc {
+        let field = |vm: &mut Vm, a: Atom| {
+            if !is_object(o) {
+                return None;
+            }
+            vm.own_property(Obj::of(o), Key::Name(a)).filter(|d| !d.is_accessor()).and_then(|d| d.value)
+        };
+        Desc {
+            value: field(self, self.a_value),
+            writable: field(self, self.a_writable).map(to_boolean),
+            get: field(self, self.a_get),
+            set: field(self, self.a_set),
+            enumerable: field(self, self.a_enumerable).map(to_boolean),
+            configurable: field(self, self.a_configurable).map(to_boolean),
+        }
+    }
+
+    fn descriptor_object(&mut self, d: &Desc, proto: Value) -> Value {
+        let o = self.new_plain(proto);
         let fields: [(Atom, Option<Value>); 6] = [
             (self.a_value, d.value),
             (self.a_writable, d.writable.map(Value::from_bool)),

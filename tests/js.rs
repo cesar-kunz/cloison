@@ -6669,6 +6669,46 @@ fn modules_import_many_names() {
     }
 }
 
+/// A namespace's [[DefineOwnProperty]] and [[GetOwnProperty]] take and
+/// give descriptor records, reading no property: getters on
+/// `Object.prototype` named as a descriptor's fields neither run nor
+/// become fields (they made defining an export a TypeError), and the
+/// results are what SpiderMonkey, JSC, QuickJS and V8 give.
+#[test]
+fn modules_namespace_descriptors_read_no_inherited_field() {
+    let dir = module_dir(
+        "nsdesc",
+        &[
+            (
+                "main.mjs",
+                "import * as ns from './m.mjs';\n\
+                 const nd = o => Object.assign(Object.create(null), o);\n\
+                 const out = [Reflect.defineProperty(ns, 'x', { value: 1, writable: true, enumerable: true, configurable: false }),\n\
+                   Reflect.defineProperty(ns, 'x', { value: 2 }), Reflect.defineProperty(ns, 'x', { get() {} }),\n\
+                   Reflect.defineProperty(ns, 'y', { value: 1 }), Reflect.defineProperty(ns, Symbol.toStringTag, { value: 'X' }),\n\
+                   JSON.stringify(Object.getOwnPropertyDescriptor(ns, Symbol.toStringTag))];\n\
+                 const log = [];\n\
+                 for (const k of ['get', 'set', 'value', 'writable', 'enumerable', 'configurable'])\n\
+                   Object.defineProperty(Object.prototype, k, nd({ get() { log.push(k); }, configurable: true }));\n\
+                 out.push(Reflect.defineProperty(ns, 'x', nd({ value: 1, writable: true, enumerable: true, configurable: false })));\n\
+                 const d = Object.getOwnPropertyDescriptor(ns, 'x');\n\
+                 out.push(Object.getOwnPropertyNames(d).join('+'), log.length);\n\
+                 globalThis.result = out.join();",
+            ),
+            ("m.mjs", "export var x = 1;"),
+        ],
+    );
+    let mut vm = Vm::new();
+    let r = vm.run_module(dir.join("main.mjs").to_str().unwrap());
+    assert!(r.is_ok(), "{:?}", r.err());
+    let a = vm.intern("result");
+    let g = vm.global_object();
+    assert_eq!(
+        display(g.get(&mut vm, a).unwrap(), &vm),
+        "true,false,false,false,false,{\"value\":\"Module\",\"writable\":false,\"enumerable\":false,\"configurable\":false},true,value+writable+enumerable+configurable,0"
+    );
+}
+
 /// A module's early errors: before any of the graph runs.
 #[test]
 fn module_early_errors() {

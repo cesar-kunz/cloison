@@ -5066,14 +5066,12 @@ impl Vm {
         if !crate::props::is_object(p) {
             return Err(Error::type_error("Function has non-object prototype in instanceof check"));
         }
+        if self.proxies_exist {
+            return self.rooted(&[p, v], |vm| vm.has_instance_through_proxies(v, p));
+        }
         let mut o = as_object(v);
-        let mut hops = 0;
         loop {
-            let proto = if self.proxies_exist {
-                crate::proxy::walk_prototype(self, unsafe { Obj::from_ptr(o) }, &mut hops)?
-            } else {
-                unsafe { Obj::from_ptr(o) }.shape().live().proto
-            };
+            let proto = unsafe { Obj::from_ptr(o) }.shape().live().proto;
             if !proto.is_cell() {
                 return Ok(false);
             }
@@ -5081,6 +5079,29 @@ impl Vm {
                 return Ok(true);
             }
             o = as_object(proto);
+        }
+    }
+
+    /// [`ordinary_has_instance`](Self::ordinary_has_instance)'s walk from
+    /// `v` for prototype `p` through proxies' traps: `p`, maybe a getter's
+    /// only, and the object the walk is at, maybe a trap's only, in the
+    /// two handles last pushed.
+    #[cold]
+    #[inline(never)]
+    fn has_instance_through_proxies(&mut self, v: Value, p: Value) -> Result<bool> {
+        let slot = self.handles.len() - 1;
+        let mut o = Obj::of(v);
+        let mut hops = 0;
+        loop {
+            let proto = crate::proxy::walk_prototype(self, o, &mut hops)?;
+            if !proto.is_cell() {
+                return Ok(false);
+            }
+            if proto == p {
+                return Ok(true);
+            }
+            self.handles[slot] = proto;
+            o = Obj::of(proto);
         }
     }
 
@@ -7791,7 +7812,9 @@ impl Vm {
         let r = unsafe { crate::interp::run_script(vm, code) };
         // The script done, the promise jobs it queued run (and theirs),
         // and the outermost's event loop until no async waiter is left.
-        let r = r.and_then(|v| if outer { vm.run_event_loop() } else { vm.run_jobs() }.map(|()| v));
+        // (The completion value rooted while they run.)
+        let r =
+            r.and_then(|v| vm.rooted(&[v], |vm| if outer { vm.run_event_loop() } else { vm.run_jobs() }).map(|()| v));
         vm.no_pending_error(r)
     }
 
@@ -9042,7 +9065,16 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
 /// `this[length++] = v` for each argument (a failed store throws), as
 /// `push` does on an array-like object.
 fn array_push_generic(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
-    let this = object_value((vm.to_object(this)?).ptr());
+    // (`args`, maybe a Rust caller's only, and `this`'s object rooted
+    // across the getters and setters.)
+    vm.rooted(args, |vm| {
+        let this = object_value((vm.to_object(this)?).ptr());
+        vm.rooted(&[this], |vm| array_push_generic_of(vm, this, args))
+    })
+}
+
+/// [`array_push_generic`] onto the object `this`.
+fn array_push_generic_of(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     let a_length = vm.a_length;
     let n = crate::interp::to_number(vm.get(this, a_length)?);
     let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc().min(9007199254740991.0) };
@@ -9079,7 +9111,11 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
         return array_push_flagged(vm, this, args);
     }
     let len = o.elems_len() as usize;
-    vm.reserve_elems(o, len + args.len());
+    if len + args.len() > unsafe { Object::elems_cap(o.ptr().cast_const()) } as usize {
+        // (`args`, maybe a Rust caller's only (a new string), rooted
+        // across the growth.)
+        vm.rooted(args, |vm| vm.reserve_elems(o, len + args.len()));
+    }
     for (i, &v) in args.iter().enumerate() {
         vm.store_element(o, len + i, v);
     }
@@ -9099,10 +9135,14 @@ fn array_push_flagged(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value>
     if crate::far::array_length(o) as u64 + args.len() as u64 > u32::MAX as u64 {
         return array_push_generic(vm, this, args);
     }
-    for &v in args {
-        let n = crate::far::array_length(o);
-        vm.put_key(this, Key::Index(n), v)?;
-    }
+    // (`args` rooted across the setters.)
+    vm.rooted(args, |vm| {
+        for &v in args {
+            let n = crate::far::array_length(o);
+            vm.put_key(this, Key::Index(n), v)?;
+        }
+        Ok::<_, Error>(())
+    })?;
     let n = crate::far::array_length(o);
     let a_length = vm.a_length;
     let len = Value::number(n as f64);

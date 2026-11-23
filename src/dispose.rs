@@ -199,18 +199,21 @@ pub(crate) fn add_resource(vm: &mut Vm, state: Value, v: Value, async_: bool) ->
     if !is_object(v) {
         return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
     }
-    let (method, kind) = if async_ {
-        match get_method(vm, v, "asyncDispose")? {
-            m if m.is_undefined() => (get_method(vm, v, "dispose")?, ASYNC_FROM_SYNC),
-            m => (m, ASYNC),
+    // (`v` rooted across the getters, its method across the push.)
+    vm.rooted(&[v], |vm| {
+        let (method, kind) = if async_ {
+            match get_method(vm, v, "asyncDispose")? {
+                m if m.is_undefined() => (get_method(vm, v, "dispose")?, ASYNC_FROM_SYNC),
+                m => (m, ASYNC),
+            }
+        } else {
+            (get_method(vm, v, "dispose")?, SYNC)
+        };
+        if method.is_undefined() {
+            return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
         }
-    } else {
-        (get_method(vm, v, "dispose")?, SYNC)
-    };
-    if method.is_undefined() {
-        return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
-    }
-    push(vm, state, v, method, kind)
+        vm.rooted(&[method], |vm| push(vm, state, v, method, kind))
+    })
 }
 
 fn push(vm: &mut Vm, state: Value, v: Value, method: Value, kind: i32) -> Result<()> {
@@ -241,29 +244,41 @@ fn suppressed_error(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
 /// DisposeResources, synchronously, of capability `state`'s resources
 /// after `completion`: each disposed of, last first, what one throws
 /// suppressing what was thrown before (a `SuppressedError`).
-pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, mut completion: Result<Value>) -> Result<Value> {
+pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Value>) -> Result<Value> {
     let resources = elem(state, RESOURCES);
-    let empty = vm.new_array();
-    put(state, RESOURCES, empty);
-    let n = len(resources) / 3;
-    for k in (0..n).rev() {
-        let (v, method, kind) = (elem(resources, 3 * k), elem(resources, 3 * k + 1), elem(resources, 3 * k + 2));
-        let r = match kind.as_i32_unchecked() {
-            ADOPT_SYNC => call_function(vm, method, Value::UNDEFINED, &[v]),
-            _ => call_function(vm, method, v, &[]),
-        };
-        if let Err(e) = r {
-            let e = thrown(vm, e)?;
-            completion = Err(match completion {
-                Err(prev) => {
-                    let prev = thrown(vm, prev)?;
-                    Error::thrown(suppressed_error(vm, e, prev))
-                }
-                Ok(_) => Error::thrown(e),
-            });
+    // (The resources, taken off the state, and the completion's value,
+    // rooted in slots of their own: the disposers may collect.)
+    let kept = match &completion {
+        Ok(v) => *v,
+        Err(e) => e.1.unwrap_or(Value::UNDEFINED),
+    };
+    vm.rooted(&[resources, kept], |vm| {
+        let at = vm.handles.len() - 1;
+        let empty = vm.new_array();
+        put(state, RESOURCES, empty);
+        let mut completion = completion;
+        let n = len(resources) / 3;
+        for k in (0..n).rev() {
+            let (v, method, kind) = (elem(resources, 3 * k), elem(resources, 3 * k + 1), elem(resources, 3 * k + 2));
+            let r = match kind.as_i32_unchecked() {
+                ADOPT_SYNC => call_function(vm, method, Value::UNDEFINED, &[v]),
+                _ => call_function(vm, method, v, &[]),
+            };
+            if let Err(e) = r {
+                let e = thrown(vm, e)?;
+                let next = match completion {
+                    Err(prev) => {
+                        let prev = vm.rooted(&[e], |vm| thrown(vm, prev))?;
+                        suppressed_error(vm, e, prev)
+                    }
+                    Ok(_) => e,
+                };
+                vm.handles[at] = next;
+                completion = Err(Error::thrown(next));
+            }
         }
-    }
-    completion
+        completion
+    })
 }
 
 /// The async disposal helper: `(resources, hasError, error)` to a promise
@@ -513,7 +528,9 @@ fn async_iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
         Err(e) => rejected(vm, e),
         // (PromiseResolve of the result, then to undefined.)
         Ok(v) => {
-            let h = async_helper_await(vm)?;
+            // (`return()`'s result held across the helper's first making:
+            // rooted.)
+            let h = vm.rooted(&[v], async_helper_await)?;
             call_function(vm, h, Value::UNDEFINED, &[v])
         }
     }

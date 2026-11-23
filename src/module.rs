@@ -693,6 +693,9 @@ fn ns_define(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Ok(Value::FALSE);
     };
     let current = binding_value(vm, &res, &key)?;
+    // (The value, which a getter the descriptor's conversion runs may
+    // replace in its binding, held across it: rooted.)
+    let _rooted = vm.root_scope(&[current]);
     let d = vm.to_descriptor(arg(a, 2))?;
     let ok = d.configurable != Some(true)
         && d.enumerable != Some(false)
@@ -1099,9 +1102,13 @@ fn with_budget<T>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> Result<T>) -> Result<T
 fn execute_async(vm: &mut Vm, m: usize) -> Result<()> {
     let g = rec(vm, m).generator;
     let p = with_budget(vm, |vm| crate::generator::async_start(vm, g))?;
-    let on_fulfilled = closure(vm, Template::Fulfilled, &[Value::from_i32(m as i32)]);
-    let on_rejected = closure(vm, Template::Rejected, &[Value::from_i32(m as i32)]);
-    crate::promise::await_then(vm, p, on_fulfilled, on_rejected)
+    // (The promise, then the first closure, rooted while the next is made.)
+    vm.rooted(&[p], |vm| {
+        let on_fulfilled = closure(vm, Template::Fulfilled, &[Value::from_i32(m as i32)]);
+        let on_rejected =
+            vm.rooted(&[on_fulfilled], |vm| closure(vm, Template::Rejected, &[Value::from_i32(m as i32)]));
+        crate::promise::await_then(vm, p, on_fulfilled, on_rejected)
+    })
 }
 
 /// GatherAvailableAncestors (§16.2.1.5.3.3).
@@ -1245,17 +1252,24 @@ pub(crate) fn dynamic_import(
     phase: Value,
 ) -> Result<Value> {
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
-    match import_request(vm, specifier, options) {
-        Ok((spec, ty)) => {
-            let job = closure(vm, Template::ImportJob, &[spec, ty, referrer, resolve, reject, phase]);
-            crate::promise::await_then(vm, Value::UNDEFINED, job, Value::UNDEFINED)?;
+    // (The promise and its functions rooted across the specifier's and the
+    // options' conversions and getters, then the specifier and the type
+    // while the job is made.)
+    vm.rooted(&[p, resolve, reject], |vm| {
+        match import_request(vm, specifier, options) {
+            Ok((spec, ty)) => {
+                let job = vm.rooted(&[spec, ty], |vm| {
+                    closure(vm, Template::ImportJob, &[spec, ty, referrer, resolve, reject, phase])
+                });
+                crate::promise::await_then(vm, Value::UNDEFINED, job, Value::UNDEFINED)?;
+            }
+            Err(e) => {
+                let v = thrown(vm, e)?;
+                call_function(vm, reject, Value::UNDEFINED, &[v])?;
+            }
         }
-        Err(e) => {
-            let v = thrown(vm, e)?;
-            call_function(vm, reject, Value::UNDEFINED, &[v])?;
-        }
-    }
-    Ok(p)
+        Ok(p)
+    })
 }
 
 /// `import()`'s specifier, a string, and its `type` attribute (or
@@ -1263,6 +1277,14 @@ pub(crate) fn dynamic_import(
 /// attribute a string).
 fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Value, Value)> {
     let spec = crate::intrinsics::to_string(vm, specifier)?;
+    // (`spec`, a new string maybe, `attrs`, maybe a getter's only, and the
+    // type found rooted across the getters and traps.)
+    vm.rooted(&[spec, Value::UNDEFINED, Value::UNDEFINED], |vm| import_attributes(vm, spec, options))
+}
+
+/// [`import_request`] of the string `spec`, the two handles after it free.
+fn import_attributes(vm: &mut Vm, spec: Value, options: Value) -> Result<(Value, Value)> {
+    let slot = vm.handles.len() - 2;
     let mut ty = Value::UNDEFINED;
     if !options.is_undefined() {
         if !crate::props::is_object(options) {
@@ -1270,6 +1292,7 @@ fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Valu
         }
         let a_with = vm.intern_name("with");
         let attrs = vm.get(options, a_with)?;
+        vm.handles[slot] = attrs;
         if !attrs.is_undefined() {
             if !crate::props::is_object(attrs) {
                 return Err(Error::type_error("The 'with' option of import() must be an object"));
@@ -1290,6 +1313,7 @@ fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Valu
                 let k = vm.key_string(key);
                 if string_units(k) == Some(&"type".encode_utf16().collect::<Vec<u16>>()[..]) {
                     ty = v;
+                    vm.handles[slot + 1] = v;
                 }
             }
         }
@@ -1327,16 +1351,23 @@ fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
             // `then` called.)
             let deps = async_dependencies(vm, m, &mut Vec::new());
             let count = vm.new_array();
-            crate::vm::array_push(vm, count, &[Value::from_i32(deps.len() as i32 + 1)])?;
-            let done = closure(vm, Template::DeferDone, &[Value::from_i32(m as i32), resolve, count]);
-            for k in deps {
-                let p = evaluate(vm, k)?;
-                crate::promise::await_then(vm, p, done, reject)?;
-            }
-            return call_function(vm, done, Value::UNDEFINED, &[]).map(drop);
+            // (`count`, then `done`, rooted across the evaluations, which
+            // run the modules.)
+            let done = vm.rooted(&[count], |vm| {
+                crate::vm::array_push(vm, count, &[Value::from_i32(deps.len() as i32 + 1)])?;
+                Ok::<_, Error>(closure(vm, Template::DeferDone, &[Value::from_i32(m as i32), resolve, count]))
+            })?;
+            return vm.rooted(&[done], |vm| {
+                for k in deps {
+                    let p = evaluate(vm, k)?;
+                    crate::promise::await_then(vm, p, done, reject)?;
+                }
+                call_function(vm, done, Value::UNDEFINED, &[]).map(drop)
+            });
         }
         let p = evaluate(vm, m)?;
-        let done = closure(vm, Template::ImportDone, &[Value::from_i32(m as i32), resolve]);
+        // (Rooted while the closure is made.)
+        let done = vm.rooted(&[p], |vm| closure(vm, Template::ImportDone, &[Value::from_i32(m as i32), resolve]));
         crate::promise::await_then(vm, p, done, reject)
     })();
     if let Err(e) = r {

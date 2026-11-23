@@ -194,7 +194,9 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     set(vm, st, MODE, Value::from_i32(mode));
     let f = get(vm, st, FUNCTION);
     let pc = get(vm, st, PC).as_i32_unchecked() as usize;
-    let r = unsafe { run(vm, Obj::of(f), regs_at(st, Obj::of(f).code()), pc, v) };
+    // (`g` rooted, its state read after the run; `v` across the safepoint
+    // before its frame holds it.)
+    let r = vm.rooted(&[g, v], |vm| unsafe { run(vm, Obj::of(f), regs_at(st, Obj::of(f).code()), pc, v) });
     match r {
         Ok(out) => {
             let yielded = get(vm, st, STATE).as_i32_unchecked() == SUSPENDED_YIELD;
@@ -257,7 +259,7 @@ pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Value> {
     let p = crate::promise::new_promise(vm);
     let st = state_of(g).unwrap();
     set(vm, st, 5, p);
-    async_step(vm, g, NEXT, Value::UNDEFINED)?;
+    vm.rooted(&[p], |vm| async_step(vm, g, NEXT, Value::UNDEFINED))?;
     Ok(p)
 }
 
@@ -270,24 +272,27 @@ pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
         return async_gen_step(vm, g, mode, v);
     }
     let (mut mode, mut v) = (mode, v);
-    loop {
-        match resume_raw(vm, g, v, mode, "an async function") {
-            Ok((out, true)) => {
-                let p = get(vm, st, 5);
-                return crate::promise::resolve_own(vm, p, out);
-            }
-            Ok((awaited, false)) => match crate::promise::await_coroutine(vm, awaited, g) {
-                Ok(()) => return Ok(()),
-                // (PromiseResolve threw: the `await` throws it, now.)
-                Err(e) => (mode, v) = (THROW, thrown(vm, e)),
-            },
-            Err(e) => {
-                let reason = thrown(vm, e);
-                let p = get(vm, st, 5);
-                return crate::promise::reject_own(vm, p, reason);
+    // (`g` rooted: a promise job's handler, only in Rust's copy.)
+    vm.rooted(&[g], |vm| {
+        loop {
+            match resume_raw(vm, g, v, mode, "an async function") {
+                Ok((out, true)) => {
+                    let p = get(vm, st, 5);
+                    return crate::promise::resolve_own(vm, p, out);
+                }
+                Ok((awaited, false)) => match crate::promise::await_coroutine(vm, awaited, g) {
+                    Ok(()) => return Ok(()),
+                    // (PromiseResolve threw: the `await` throws it, now.)
+                    Err(e) => (mode, v) = (THROW, thrown(vm, e)),
+                },
+                Err(e) => {
+                    let reason = thrown(vm, e);
+                    let p = get(vm, st, 5);
+                    return crate::promise::reject_own(vm, p, reason);
+                }
             }
         }
-    }
+    })
 }
 
 /// What error `e` throws, as a value.
@@ -322,7 +327,7 @@ fn async_gen_enqueue(vm: &mut Vm, g: Value, v: Value, mode: i32) -> Result<Value
     let q = get(vm, st, AG_QUEUE);
     crate::vm::array_push(vm, q, &[Value::from_i32(mode), v, resolve, reject])?;
     if get(vm, st, AG_BUSY) != Value::TRUE {
-        async_gen_run(vm, g)?;
+        vm.rooted(&[p], |vm| async_gen_run(vm, g))?;
     }
     Ok(p)
 }
@@ -346,6 +351,12 @@ fn async_gen_run(vm: &mut Vm, g: Value) -> Result<()> {
 /// request, by a `yield`, its end or its exception; the next request runs
 /// then.
 fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
+    // (`g` rooted: a promise job's handler, only in Rust's copy.)
+    vm.rooted(&[g], |vm| async_gen_step_rooted(vm, g, mode, v))
+}
+
+/// [`async_gen_step`], `g` rooted.
+fn async_gen_step_rooted(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
     let st = state_of(g).unwrap();
     let state = get(vm, st, STATE).as_i32_unchecked();
     let settled = if get(vm, st, AG_YIELD) == AWAITING_RETURN {

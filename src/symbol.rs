@@ -596,6 +596,9 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     if target.is_undefined() {
         return Ok(None);
     }
+    // (`target`, which a `next()` its `length`'s getter calls may drop
+    // from the state, held across its reads: rooted.)
+    let _rooted = vm.root_scope(&[target]);
     let i = vm.get_keyed(state, Value::from_i32(1))?.as_number().unwrap_or(0.0);
     let kind = vm.get_keyed(state, Value::from_i32(2))?.as_number().unwrap_or(1.0) as i32;
     let o = Obj::of(target);
@@ -657,7 +660,8 @@ pub(crate) fn get_iterator(vm: &mut Vm, v: Value) -> Result<Value> {
         return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(v))));
     }
     let a = vm.a_sym_iterator;
-    let m = vm.get(v, a)?;
+    // (`v` rooted across a getter: the method's receiver after.)
+    let m = vm.rooted(&[v], |vm| vm.get(v, a))?;
     if !is_callable(m) {
         return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(v))));
     }
@@ -692,7 +696,7 @@ pub(crate) fn async_record(vm: &mut Vm, it: Value) -> Result<Value> {
 
 fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     let a_next = vm.a_next;
-    let next = vm.get(it, a_next)?;
+    let next = vm.rooted(&[it], |vm| vm.get(it, a_next))?;
     let o = vm.new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32);
     for (i, v) in [it, next].into_iter().chain(done).enumerate() {
         unsafe {
@@ -758,12 +762,14 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     if !is_object(r) {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
     }
-    let a_done = vm.a_done;
-    if to_boolean(vm.get(r, a_done)?) {
-        return Ok(None);
-    }
-    let a_value = vm.a_value;
-    vm.get(r, a_value).map(Some)
+    let (a_done, a_value) = (vm.a_done, vm.a_value);
+    // (The result rooted across `done`'s getter.)
+    vm.rooted(&[r], |vm| {
+        if to_boolean(vm.get(r, a_done)?) {
+            return Ok(None);
+        }
+        vm.get(r, a_value).map(Some)
+    })
 }
 
 /// IteratorClose after an early exit: `it.return()`, if it has one.
@@ -772,7 +778,7 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
         return Ok(());
     }
     let a_return = vm.a_return;
-    let m = vm.get(it, a_return)?;
+    let m = vm.rooted(&[it], |vm| vm.get(it, a_return))?;
     if m.is_undefined() || m.is_null() {
         return Ok(());
     }
@@ -791,31 +797,40 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
 pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
     // An iteration by the builtins: its values as `next()` gives them,
     // with no result objects (see `IteratorOpen`). (The state on the
-    // native stack, which pins what it holds.)
+    // native stack, which pins what it holds; rooted, with each value
+    // while `f` runs, in slots of their own.)
     let mut st = [v, Value::UNDEFINED];
     if unsafe { fast_open(vm, st.as_mut_ptr()) } {
-        loop {
-            let x = unsafe { iterator_next(vm, st.as_mut_ptr())? };
-            if x == Value::HOLE {
-                return Ok(());
+        return vm.rooted(&[st[0], Value::UNDEFINED], |vm| {
+            let at = vm.handles.len() - 2;
+            loop {
+                let x = unsafe { iterator_next(vm, st.as_mut_ptr())? };
+                if x == Value::HOLE {
+                    return Ok(());
+                }
+                vm.handles[at + 1] = x;
+                if let Err(e) = f(vm, x) {
+                    // (What `f` threw rooted across `return`.)
+                    let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| open_state_close(vm, &st));
+                    return Err(e);
+                }
             }
+        });
+    }
+    let it = get_iterator(vm, v)?;
+    let a_next = vm.a_next;
+    let next = vm.rooted(&[it], |vm| vm.get(it, a_next))?;
+    vm.rooted(&[it, next, Value::UNDEFINED], |vm| {
+        let at = vm.handles.len() - 1;
+        while let Some(x) = step_with(vm, it, next)? {
+            vm.handles[at] = x;
             if let Err(e) = f(vm, x) {
-                let _ = open_state_close(vm, &st);
+                let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| close(vm, it));
                 return Err(e);
             }
         }
-    }
-    // (`it` and `next` are rooted on the native stack.)
-    let it = get_iterator(vm, v)?;
-    let a_next = vm.a_next;
-    let next = vm.get(it, a_next)?;
-    while let Some(x) = step_with(vm, it, next)? {
-        if let Err(e) = f(vm, x) {
-            let _ = close(vm, it);
-            return Err(e);
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `Object.prototype.toString`'s tag for `o` from `@@toStringTag`, if a

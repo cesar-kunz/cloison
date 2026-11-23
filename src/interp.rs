@@ -2647,7 +2647,7 @@ pub(crate) fn generic_arith(op: Op, a: Value, b: Value) -> Value {
     let (x, y) = match both_numbers(a, b) {
         Some(p) => p,
         None if a.is_cell() || b.is_cell() => {
-            let (p, q) = (to_numeric(a), to_numeric(b));
+            let (p, q) = to_numerics(a, b);
             if is_bigint(p) || is_bigint(q) {
                 let op = match op {
                     Op::Sub | Op::SubSmi => BigOp::Sub,
@@ -2661,6 +2661,28 @@ pub(crate) fn generic_arith(op: Op, a: Value, b: Value) -> Value {
         None => (to_number(a), to_number(b)),
     };
     Value::from_f64_arith(arith_f64(op, x, y))
+}
+
+/// `f` with `vs` rooted ([`Vm::rooted`]) when there is a VM (a test may
+/// convert values with none): the conversions' Rust locals across the
+/// next one's user code.
+#[inline(always)]
+fn rooted<T>(vs: &[Value], f: impl FnOnce() -> T) -> T {
+    let vm = current_vm();
+    if vm.is_null() {
+        return f();
+    }
+    unsafe { (*vm).rooted(vs, |_| f()) }
+}
+
+/// ToNumeric of `a`, then of `b` (`a`'s, maybe a new BigInt, rooted
+/// meanwhile).
+fn to_numerics(a: Value, b: Value) -> (Value, Value) {
+    let p = to_numeric(a);
+    if !p.is_cell() || !b.is_cell() {
+        return (p, to_numeric(b));
+    }
+    (p, rooted(&[p], || to_numeric(b)))
 }
 
 /// ToNumeric: a number, or a BigInt (an object's primitive's).
@@ -2681,7 +2703,7 @@ fn is_bigint(v: Value) -> bool {
 #[cold]
 #[inline(never)]
 pub(crate) fn generic_bitwise(op: Op, a: Value, b: Value) -> Value {
-    let (p, q) = (to_numeric(a), to_numeric(b));
+    let (p, q) = to_numerics(a, b);
     if is_bigint(p) || is_bigint(q) {
         let op = match op {
             Op::Mod => BigOp::Mod,
@@ -2757,18 +2779,20 @@ pub(crate) fn generic_compare_ordered(le: bool, a: Value, b: Value, b_first: boo
                 let vm = current_vm();
                 !vm.is_null() && std::ptr::read_volatile(&raw const (*vm).conv_thrown)
             };
+            // (The first's primitive, maybe a new string, rooted across
+            // the other's conversion.)
             let (a, b) = if b_first {
                 let pb = to_primitive(b);
                 if thrown() {
                     return false;
                 }
-                (to_primitive(a), pb)
+                (rooted(&[pb], || to_primitive(a)), pb)
             } else {
                 let pa = to_primitive(a);
                 if thrown() {
                     return false;
                 }
-                (pa, to_primitive(b))
+                (pa, rooted(&[pa], || to_primitive(b)))
             };
             // Two strings compare by code units.
             if let (Some(p), Some(q)) = (string_units(a), string_units(b)) {
@@ -3698,8 +3722,11 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     {
         return concat(p, q);
     }
-    // ToPrimitive, hint "default" (a date's string).
-    let (a, b) = (to_primitive_default(a), to_primitive_default(b));
+    // ToPrimitive, hint "default" (a date's string). (`a`'s, maybe a new
+    // string, rooted across `b`'s conversion; both, and then their
+    // strings, across the strings made below.)
+    let a = to_primitive_default(a);
+    let b = if a.is_cell() { rooted(&[a], || to_primitive_default(b)) } else { to_primitive_default(b) };
     if is_string(a) || is_string(b) {
         // The other side's string (short: a number's, a boolean's, ...),
         // then the two joined as strings are, so that a long one isn't
@@ -3724,16 +3751,21 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
                 })
             }
         };
-        let (a, b) = (string_of(vm, a), string_of(vm, b));
-        if let Some(v) = concat_fast(a, b) {
-            return v;
-        }
-        if let (Some(p), Some(q)) = (Piece::of(a), Piece::of(b)) {
-            return concat(p, q);
-        }
-        let mut units = to_string_units(a);
-        units.extend(to_string_units(b));
-        return vm.new_string(&units);
+        let (a, b) = vm.rooted(&[a, b], |vm| {
+            let a = string_of(vm, a);
+            (a, vm.rooted(&[a], |vm| string_of(vm, b)))
+        });
+        return vm.rooted(&[a, b], |vm| {
+            if let Some(v) = concat_fast(a, b) {
+                return v;
+            }
+            if let (Some(p), Some(q)) = (Piece::of(a), Piece::of(b)) {
+                return concat(p, q);
+            }
+            let mut units = to_string_units(a);
+            units.extend(to_string_units(b));
+            vm.new_string(&units)
+        });
     }
     if is_bigint(a) || is_bigint(b) {
         return crate::bigint::binary(BigOp::Add, a, b);
@@ -4149,8 +4181,13 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
     if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) || is_bigint(v) {
         return v;
     }
+    // (`v` read again after each getter and method: rooted.)
+    unsafe { (*current_vm()).rooted(&[v], |vm| to_primitive_object(vm, v, hint)) }
+}
+
+/// [`to_primitive_hint`] of an object `v`.
+unsafe fn to_primitive_object(vm: &mut Vm, v: Value, hint: u8) -> Value {
     unsafe {
-        let vm = &mut *current_vm();
         // An earlier conversion threw, its error not taken yet: no more of
         // the operation's runs user code (`Math.atan2(x, y)` with `x`'s
         // `valueOf` throwing doesn't call `y`'s), as it would have stopped.
@@ -4182,7 +4219,8 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                     return Value::UNDEFINED;
                 }
                 let name = ["number", "string", "default"][hint as usize];
-                let h = vm.new_string(&name.encode_utf16().collect::<Vec<u16>>());
+                // (`m`, maybe a getter's or a trap's only: rooted.)
+                let h = vm.rooted(&[m], |vm| vm.new_string(&name.encode_utf16().collect::<Vec<u16>>()));
                 return match call_function(vm, m, v, &[h]) {
                     Ok(r) if !crate::props::is_object(r) => r,
                     Ok(_) => fail(vm, Error::type_error("Cannot convert object to primitive value")),
@@ -4225,12 +4263,13 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                     return Value::UNDEFINED;
                 }
                 // (Another realm's: run there.)
-                Class::Native if !vm.realms.is_empty() => vm.call_other(m, v, &[]),
-                Class::Native => {
+                // (`m`, maybe a getter's only, rooted while it runs.)
+                Class::Native if !vm.realms.is_empty() => vm.rooted(&[m], |vm| vm.call_other(m, v, &[])),
+                Class::Native => vm.rooted(&[m], |vm| {
                     vm.callee = as_object(m);
                     let native = (*Obj::of(m).code()).native.unwrap();
                     vm.run_native(|vm| native(vm, v, &[]))
-                }
+                }),
                 Class::Function => call_function(vm, m, v, &[]),
                 _ => continue,
             };
@@ -4892,7 +4931,9 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
                 debug_assert!(vm.native_top.is_null());
                 return Err(Error::unsupported(NO_TOP));
             }
-            let r = vm.call_other(f, this, args);
+            // (`f` and `this`, maybe a Rust caller's only, rooted while it
+            // runs: no frame holds them.)
+            let r = vm.rooted(&[f, this], |vm| vm.call_other(f, this, args));
             // (Its conversion's exception thrown to its caller, a native
             // maybe: not left for it to go on. The interpreter's calls
             // check after `call_other` themselves.)

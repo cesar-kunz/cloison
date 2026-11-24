@@ -5,6 +5,7 @@
 3 src/bigint.rs
 4 src/bin/cloison.rs
 2 src/bin/dispatch_bench.rs
+4 src/brand.rs
 30 src/builtins.rs
 14 src/collections.rs
 11 src/date.rs

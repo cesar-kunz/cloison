@@ -1228,29 +1228,24 @@ fn print_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `String.raw(strings, …subs)`: `strings.raw`'s pieces, the substitutions
 /// between them.
 fn string_raw(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let cooked = object_value((vm.to_object(arg(a, 0))?).ptr());
-    // (A primitive's new wrapper, the receiver of a proxy's trap on its
-    // prototype chain, held across the trap's lookup: rooted.)
-    let _cooked = vm.root_scope(&[cooked]);
-    let a_raw = vm.intern_name("raw");
-    let raw = vm.get(cooked, a_raw)?;
-    let raw = object_value((vm.to_object(raw)?).ptr());
-    // (Maybe what a getter made, held across the conversions: rooted.)
-    let _rooted = vm.root_scope(&[raw]);
-    let n = vm.length_of(raw)?;
+    // (What the calls below return, held across the next: rooted in `s`,
+    // or the code doesn't compile; see `brand`.)
+    let s = crate::brand::Scope::new(vm);
+    let cooked = vm.to_object_b(arg(a, 0))?.root(&s);
+    let raw = vm.get_b(cooked.v(), "raw")?.take();
+    let raw = vm.to_object_b(raw)?.root(&s);
+    let n = vm.length_of_b(raw.v())?;
     let mut out: Vec<u16> = Vec::new();
     let mut i = 0.0;
     while i < n {
-        let piece = vm.get_keyed(raw, Value::number(i))?;
-        let s = crate::intrinsics::to_string(vm, piece)?;
-        push_string(&mut out, s)?;
+        let piece = vm.get_keyed_b(raw.v(), Value::number(i))?.take();
+        push_string(&mut out, vm.to_string_b(piece)?.gc().v())?;
         i += 1.0;
         if i < n && (i as usize) < a.len() {
-            let s = crate::intrinsics::to_string(vm, a[i as usize])?;
-            push_string(&mut out, s)?;
+            push_string(&mut out, vm.to_string_b(a[i as usize])?.gc().v())?;
         }
     }
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 /// `read(file)`: reading files isn't supported.

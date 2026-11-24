@@ -8982,7 +8982,7 @@ pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> 
 fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     vm.is_construct();
     match args.first() {
-        Some(&v) if !v.is_undefined() && !v.is_null() => Ok(object_value((vm.to_object(v)?).ptr())),
+        Some(&v) if !v.is_undefined() && !v.is_null() => Ok(object_value(vm.to_obj_b(v)?.take().ptr())),
         _ => {
             let op = object_value(vm.object_prototype);
             Ok(object_value(vm.new_plain(op).ptr()))
@@ -9059,7 +9059,7 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(this) {
         return Err(Error::type_error("Function.prototype.call called on a non-function"));
     }
-    crate::interp::call_function(vm, this, that, rest)
+    vm.call_b(this, that, rest).map(crate::brand::Fresh::take)
 }
 
 /// `this[length++] = v` for each argument (a failed store throws), as
@@ -9068,7 +9068,7 @@ fn array_push_generic(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value>
     // (`args`, maybe a Rust caller's only, and `this`'s object rooted
     // across the getters and setters.)
     vm.rooted(args, |vm| {
-        let this = object_value((vm.to_object(this)?).ptr());
+        let this = object_value(vm.to_obj_b(this)?.take().ptr());
         vm.rooted(&[this], |vm| array_push_generic_of(vm, this, args))
     })
 }
@@ -9076,7 +9076,7 @@ fn array_push_generic(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value>
 /// [`array_push_generic`] onto the object `this`.
 fn array_push_generic_of(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     let a_length = vm.a_length;
-    let n = crate::interp::to_number(vm.get(this, a_length)?);
+    let n = crate::interp::to_number(vm.get_atom_b(this, a_length)?.take());
     let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc().min(9007199254740991.0) };
     if n + args.len() as f64 > 9007199254740991.0 {
         return Err(Error::type_error("Pushing past the largest array-like length"));

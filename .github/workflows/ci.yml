@@ -1,7 +1,8 @@
 # Every pull request and every push to master: the tests on x86-64 Linux,
 # as `cargo test --release` runs them locally, again with debug
-# assertions, the scripts with Rust frames' roots checked, and rustfmt
-# and clippy (warnings are errors). The slower
+# assertions, the scripts with Rust frames' roots checked, the GC hazard
+# analysis (scripts/gc-hazards.sh), and rustfmt and clippy (warnings are
+# errors). The slower
 # checks (arm64, the `intl` feature, test262) run nightly (nightly.yml).
 name: CI
 
@@ -68,6 +69,24 @@ jobs:
       - run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --features gc-check --test scripts
+
+  gc-hazards:
+    name: GC hazards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install || rustup show
+      # (A rustc driver: the compiler's own crates.)
+      - run: rustup component add rustc-dev llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gc-hazards
+          workspaces: |
+            . -> target/gc-hazards
+      # A cell held in a Rust local across a call that may collect, rooted
+      # nowhere else: on every path (the job above, on the scripts' paths).
+      - run: scripts/gc-hazards.sh
 
   lint:
     name: rustfmt and clippy

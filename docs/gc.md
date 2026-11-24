@@ -426,7 +426,17 @@ measurement says the old generation fills with cells that die soon after.
    compiled code's), `drop` (neither roots nor pins: with
    `CLOISON_GC_STRESS`, a local not rooted makes its script crash or
    differ, which CI runs the scripts under), `report` (pins, and the
-   frames whose words kept a cell printed as `NNR` lines).
+   frames whose words kept a cell printed as `NNR` lines). The scripts
+   find the locals their paths reach; `scripts/gc-hazards.sh` looks on
+   every path, statically: a rustc driver (tools/gc-hazards) that follows
+   each Rust local holding a cell, from where it came (an allocation, a
+   call's result, a parameter) to where it is rooted (`Vm::rooted`,
+   `root_scope`, `vm.handles`, a store into the VM stack or a rooted
+   object), and reports the ones live across a call that may collect,
+   passed to a callee that holds them across one, or captured by a
+   closure that may collect. What it can't see (realm setup runs no JS,
+   say) is in its `annotations.txt`; the hazards not fixed yet, in its
+   `baseline.txt`, and CI fails on a new one.
 3. **The VM's own references**: the global object and the builtins'
    prototypes and functions, the string constant table and
    `single_chars`, `Code::constants`, open upvalues, a pending error's

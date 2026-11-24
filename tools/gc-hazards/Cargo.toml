@@ -1,0 +1,13 @@
+[package]
+name = "gc-hazards"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[[bin]]
+name = "gc-hazards"
+path = "src/main.rs"

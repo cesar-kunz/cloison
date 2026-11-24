@@ -1,0 +1,3 @@
+# The GC hazards scripts/gc-hazards.sh found and that are not fixed yet: each
+# to be fixed (rooted: Vm::rooted, Vm::root_scope) or, if safe, explained
+# in annotations.txt. Function, then the hazard. (--update rewrites it.)

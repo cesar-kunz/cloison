@@ -1,0 +1,105 @@
+# What the GC hazard analysis (tools/gc-hazards) takes as given: facts
+# about functions it can't see itself. Each line: a directive, a function
+# (its path as rustc prints it), maybe an argument index (0 the first,
+# `self` included); `#` comments. Each wants its reason.
+
+# --- Functions that don't collect ---
+# `no-gc <function>` (or `<prefix>*`): taken not to collect, and not
+# checked. Realm setup: it defines the builtins on the new realm's own
+# objects, which no JS has seen yet, so no getter, setter or proxy runs.
+no-gc builtins::install
+no-gc builtins::install_legacy
+no-gc dispose::install
+no-gc generator::install
+no-gc iterator::install
+no-gc module::install
+no-gc module::install_symbols
+no-gc props::install
+no-gc shadow::install
+no-gc symbol::install
+no-gc temporal::install
+no-gc temporal::zoned::install_now
+no-gc typed::install
+no-gc typed::install_symbols
+# An iterator helper's state is an array its `new_helper` makes with all
+# its elements, own and writable: reading or writing one runs no getter or
+# setter.
+no-gc iterator::get
+no-gc iterator::set
+
+# --- What holds a result ---
+# `holds <function> <argument>`: its result is held by that argument (a
+# slot of it no JS can change), as rooted as it is.
+holds iterator::get 1
+
+# --- New ordinary objects ---
+# `plain <function>`: its result is a new ordinary object (or array).
+plain vm::Vm::new_object_with
+plain vm::Vm::new_plain
+plain vm::Vm::new_array
+plain array::new_array_of
+# `exotic-gc <function> <argument>`: collects only through that argument
+# being exotic (a proxy's traps, an array's `length` converted): not when
+# it is a new ordinary object. Defining a property on an ordinary object
+# runs no JS; nor does pushing onto an array no property was defined on.
+exotic-gc props::<impl vm::Vm>::define_own_property 1
+exotic-gc props::<impl vm::Vm>::create_data_property 1
+exotic-gc vm::Vm::define_accessor 1
+exotic-gc vm::array_push 1
+exotic-gc array::create 1
+# A collection's entries and the job queue are arrays no JS sees: never
+# given a property, so `array_push` onto them takes its fast path.
+no-gc collections::append
+no-gc promise::enqueue
+
+# --- Objects no JS sees ---
+# `internal <function>`: its result is an object JS never sees, every
+# element of which is an own data property (an iterator's hidden state
+# array, made by `new_array_of` with all its elements and kept in its
+# iterator's `code` slot).
+internal symbol::iterator_state
+internal iterator::state_of
+# `internal-gc <function> <argument>`: collects only through that argument
+# being an object JS may see (a getter, a setter, a proxy), and
+# `internal-holds`: what it returns from one JS doesn't see, that object
+# holds.
+internal-gc vm::Vm::get_keyed 1
+internal-gc vm::Vm::set_keyed 1
+internal-holds vm::Vm::get_keyed 1
+
+# --- From the triage (2026-11-23) ---
+# A code emitter: its `dyn FnMut` is a closure that pushes bytes.
+no-gc jit::arch::direct_call
+# The front end (parse, codegen) has no Vm: no safepoint.
+no-gc js::compile_lazy
+# Walks a shape tree through a `dyn FnMut` that reads or sets capacities.
+no-gc vm::shrink_root
+# Copies only between Class::Plain objects (no proxy, no array): its
+# defines run no JS.
+no-gc props::<impl vm::Vm>::copy_plain_properties
+# A promise's reaction list is an array only it holds, never given a
+# property (array_push takes its fast path), or a job is enqueued.
+no-gc promise::perform_reaction
+# Realm setup's helper (only symbol::install calls it): a getter defined on
+# the new realm's own prototypes and constructors, which no JS has seen.
+no-gc symbol::define_getter
+# The regex engine takes no Vm: its calls through pointers are its
+# matcher's continuations and its compiled code's (jit::rx) helpers.
+no-gc regexp::*
+# A key's string: the string itself, a number's (no conversion runs JS)
+# or an atom's.
+no-gc json::PKey::string
+# A module's namespace (and its source object) is kept in its record, a GC
+# root no JS can change once set.
+holds module::namespace 0
+holds module::namespace_of 0
+holds module::module_source 0
+# `no-cell <function>`: its result is never a cell.
+no-cell value::Value::number
+no-cell value::Value::from_i32
+no-cell value::Value::from_f64
+no-cell value::Value::from_f64_arith
+no-cell value::Value::from_bool
+# Writes only the map's entries array, which no JS sees (as
+# `collections::append`), at an existing entry's value slot: no setter runs.
+no-gc collections::map_set

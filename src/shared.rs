@@ -573,7 +573,7 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
     let default = object_value(vm.shared.constructor);
-    let c = species_constructor(vm, this, default)?;
+    let c = species_constructor(vm, this, default)?.take();
     let out = crate::intrinsics::construct(vm, c, &[Value::number(n as f64)])?;
     if !is_class(out, Class::SharedArrayBuffer) {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the species made no SharedArrayBuffer"));

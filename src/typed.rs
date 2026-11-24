@@ -32,8 +32,9 @@
 //! does a typed array longer than `i32::MAX`: its length is no int32,
 //! which compiled code would box it as (#226).
 
+use crate::brand::{Fresh, Scope};
 use crate::builtins::{getter, is_class, link_constructor};
-use crate::interp::{call_function, to_boolean, to_number};
+use crate::interp::{to_boolean, to_number};
 use crate::object::Obj;
 use crate::object::{
     Class, DETACHED, DONT_DELETE, DONT_ENUM, IMMUTABLE_VIEW, Object, READ_ONLY, RUNTIME_LENGTH, TypedKind, as_object,
@@ -96,17 +97,24 @@ pub(crate) fn relative(d: f64, len: usize) -> usize {
 }
 
 /// SpeciesConstructor(o, default).
-pub(crate) fn species_constructor(vm: &mut Vm, o: Value, default: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn species_constructor(vm: &mut Vm, o: Value, default: Value) -> Result<Fresh<'_>> {
+    species_constructor_raw(vm, o, default).map(Fresh::new)
+}
+
+fn species_constructor_raw(vm: &mut Vm, o: Value, default: Value) -> Result<Value> {
     let a_constructor = vm.a_constructor;
-    let c = vm.get(o, a_constructor)?;
-    if c.is_undefined() {
+    // (The constructor, maybe a getter's only, held across its species'.)
+    let sc = Scope::new(vm);
+    let c = vm.get_atom_b(o, a_constructor)?.root(&sc);
+    if c.v().is_undefined() {
         return Ok(default);
     }
-    if !is_object(c) {
+    if !is_object(c.v()) {
         return Err(Error::type_error("object.constructor is not an object"));
     }
     let a_species = vm.a_sym_species;
-    let s = vm.get(c, a_species)?;
+    let s = vm.get_atom_b(c.v(), a_species)?.take();
     if s.is_undefined() || s.is_null() {
         return Ok(default);
     }
@@ -426,7 +434,7 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut max = None;
     if is_object(options) {
         let a_max = vm.intern_name("maxByteLength");
-        let m = vm.get(options, a_max)?;
+        let m = vm.get_atom_b(options, a_max)?.take();
         if !m.is_undefined() {
             max = Some(to_index(vm, m)?);
         }
@@ -505,8 +513,9 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
     let default = object_value((vm.typed_constructors[TypedKind::ALL.len()]).ptr());
-    let c = species_constructor(vm, this, default)?;
-    let out = crate::intrinsics::construct(vm, c, &[Value::number(n as f64)])?;
+    let c = species_constructor(vm, this, default)?.take();
+    // (What follows runs no JS: the new buffer held raw.)
+    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c, &[Value::number(n as f64)]))?.take();
     if !is_class(out, Class::ArrayBuffer) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the species made no ArrayBuffer"));
     }
@@ -730,7 +739,7 @@ fn set_from(vm: &mut Vm, o: Obj, at: usize, src: Value, n: usize) -> Result<()> 
                 continue;
             }
         }
-        let v = vm.get_keyed(src, Value::number(i as f64))?;
+        let v = vm.get_keyed_b(src, Value::number(i as f64))?.take();
         set(vm, o, at + i, v)?;
         direct = !k.is_big() && plain(s);
         len = ta_length(o).unwrap_or(0);
@@ -830,8 +839,14 @@ fn constructor_of(vm: &mut Vm, k: TypedKind) -> Result<Value> {
 
 /// TypedArrayCreateFromConstructor(c, args): a typed array in bounds
 /// (with `n`, at least that long).
-fn create_from(vm: &mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Result<Obj> {
-    let out = crate::intrinsics::construct(vm, c, args)?;
+#[inline(always)]
+fn create_from<'a>(vm: &'a mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Result<Fresh<'a, Obj>> {
+    create_from_raw(vm, c, args, n).map(Fresh::new)
+}
+
+fn create_from_raw(vm: &mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Result<Obj> {
+    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c, args))?.take();
+    // (Validated where nothing collects.)
     let (o, len) = validate(vm, out)?;
     // (With `n`, the caller writes into it.)
     if n.is_some() {
@@ -844,11 +859,16 @@ fn create_from(vm: &mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Resul
 }
 
 /// TypedArraySpeciesCreate(exemplar, args).
-fn species_create(vm: &mut Vm, exemplar: Obj, args: &[Value], n: Option<usize>) -> Result<Obj> {
+#[inline(always)]
+fn species_create<'a>(vm: &'a mut Vm, exemplar: Obj, args: &[Value], n: Option<usize>) -> Result<Fresh<'a, Obj>> {
+    species_create_raw(vm, exemplar, args, n).map(Fresh::new)
+}
+
+fn species_create_raw(vm: &mut Vm, exemplar: Obj, args: &[Value], n: Option<usize>) -> Result<Obj> {
     let k = kind_of(exemplar);
     let default = constructor_of(vm, k)?;
-    let c = species_constructor(vm, object_value(exemplar.ptr()), default)?;
-    let o = create_from(vm, c, args, n)?;
+    let c = species_constructor(vm, object_value(exemplar.ptr()), default)?.take();
+    let o = create_from(vm, c, args, n)?.take();
     if kind_of(o).is_big() != k.is_big() {
         return Err(Error::type_error("The species typed array's content type differs"));
     }
@@ -856,7 +876,7 @@ fn species_create(vm: &mut Vm, exemplar: Obj, args: &[Value], n: Option<usize>) 
 }
 
 /// TypedArrayCreateSameType(exemplar, n).
-fn create_same(vm: &mut Vm, exemplar: Obj, n: usize) -> Result<Obj> {
+fn create_same(vm: &mut Vm, exemplar: Obj, n: usize) -> Result<Fresh<'_, Obj>> {
     let c = constructor_of(vm, kind_of(exemplar))?;
     create_from(vm, c, &[Value::number(n as f64)], Some(n))
 }
@@ -904,13 +924,11 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
                 unsafe { crate::racy::copy_if(shares(fo), from, to, n * k.size()) };
                 return Ok(out);
             }
-            vm.handle_scope(|vm| {
-                vm.handles.push(out);
-                for i in 0..n {
-                    let v = unsafe { sk.load(fo.elems().cast(), i) };
-                    unsafe { k.store_value(o.elems().cast(), i, v) };
-                }
-            });
+            // (Converted and stored where nothing collects.)
+            for i in 0..n {
+                let v = unsafe { sk.load(fo.elems().cast(), i) };
+                unsafe { k.store_value(o.elems().cast(), i, v) };
+            }
             Ok(out)
         }
         Class::ArrayBuffer | Class::SharedArrayBuffer => {
@@ -928,26 +946,26 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         }
         _ => {
             let a_iter = vm.a_sym_iterator;
-            let m = vm.get(first, a_iter)?;
+            let m = vm.get_atom_b(first, a_iter)?.take();
             if !m.is_undefined() && !m.is_null() {
                 if !is_callable(m) {
                     return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m))));
                 }
+                // (`iterate_with`'s values in `vm.handles`, the `Vec`'s copies
+                // valid in this handle scope, where no cell moves.)
                 return vm.handle_scope(|vm| {
-                    let values = iterate_with(vm, first, m)?;
-                    let out = allocate(vm, k, values.len())?;
-                    vm.handles.push(out);
+                    let values = iterate_with(vm, first, m)?.take();
+                    let sc = Scope::new(vm);
+                    let out = vm.fresh(|vm| allocate(vm, k, values.len()))?.root(&sc).v();
                     set_all(vm, Obj::of(out), 0, &values)?;
                     Ok(out)
                 });
             }
-            let n = vm.length_of(first)? as usize;
-            let out = allocate(vm, k, n)?;
-            vm.handle_scope(|vm| {
-                vm.handles.push(out);
-                set_from(vm, Obj::of(out), 0, first, n)?;
-                Ok(out)
-            })
+            let n = vm.length_of_b(first)? as usize;
+            let sc = Scope::new(vm);
+            let out = vm.fresh(|vm| allocate(vm, k, n))?.root(&sc).v();
+            set_from(vm, Obj::of(out), 0, first, n)?;
+            Ok(out)
         }
     }
 }
@@ -991,22 +1009,29 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, n: Option<usize>)
 
 /// The values of iterating `v` with its `@@iterator` method `m` (rooted
 /// in `Vm::handles`: the caller's in a handle scope).
-fn iterate_with(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
+#[inline(always)]
+fn iterate_with(vm: &mut Vm, v: Value, m: Value) -> Result<Fresh<'_, Vec<Value>>> {
+    iterate_with_raw(vm, v, m).map(Fresh::new)
+}
+
+fn iterate_with_raw(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
     // (An array or a typed array the builtins iterate: its elements.)
     if let Some(values) = crate::symbol::dense_values(vm, v, m) {
         vm.handles.extend_from_slice(&values);
         return Ok(values);
     }
-    let it = call_function(vm, m, v, &[])?;
+    // (Pushed into `vm.handles`, the caller's handle scope's: the values
+    // outlive this function, read from the `Vec` while no cell moves.)
+    let it = vm.call_b(m, v, &[])?.take();
     if !is_object(it) {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
     }
     vm.handles.push(it);
     let a_next = vm.intern_name("next");
-    let next = vm.get(it, a_next)?;
+    let next = vm.get_atom_b(it, a_next)?.take();
     vm.handles.push(next);
     let mut out = Vec::new();
-    while let Some(x) = crate::symbol::step_with(vm, it, next)? {
+    while let Some(x) = vm.step_b(it, next)?.take() {
         vm.handles.push(x);
         out.push(x);
     }
@@ -1028,25 +1053,25 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("TypedArray.from: the mapping function is not callable"));
     }
     let a_iter = vm.a_sym_iterator;
-    let m = vm.get(source, a_iter)?;
+    let m = vm.get_atom_b(source, a_iter)?.take();
+    // (`iterate_with`'s values in `vm.handles`, the `Vec`'s copies valid in
+    // this handle scope, where no cell moves.)
     vm.handle_scope(|vm| {
+        let sc = Scope::new(vm);
         let (values, src) = if !m.is_undefined() && !m.is_null() {
             if !is_callable(m) {
                 return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m))));
             }
-            (Some(iterate_with(vm, source, m)?), Value::UNDEFINED)
+            (Some(iterate_with(vm, source, m)?.take()), Value::UNDEFINED)
         } else {
             // (A wrapper held across getters: rooted, until the scope ends.)
-            let src = object_value((vm.to_object(source)?).ptr());
-            vm.handles.push(src);
-            (None, src)
+            (None, vm.to_object_b(source)?.root(&sc).v())
         };
         let n = match &values {
             Some(v) => v.len(),
             None => vm.length_of(src)? as usize,
         };
-        let o = create_from(vm, this, &[Value::number(n as f64)], Some(n))?;
-        vm.handles.push(object_value(o.ptr()));
+        let o = Obj::of(create_from(vm, this, &[Value::number(n as f64)], Some(n))?.root(&sc).v());
         // (`Set(o, i, v, true)` of a typed array's index is
         // TypedArraySetElement.)
         if let (Some(v), true) = (&values, f.is_undefined()) {
@@ -1056,9 +1081,9 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         for i in 0..n {
             let v = match &values {
                 Some(v) => v[i],
-                None => vm.get_keyed(src, Value::number(i as f64))?,
+                None => vm.get_keyed_b(src, Value::number(i as f64))?.take(),
             };
-            let v = if f.is_undefined() { v } else { call_function(vm, f, this_arg, &[v, Value::number(i as f64)])? };
+            let v = if f.is_undefined() { v } else { vm.call_b(f, this_arg, &[v, Value::number(i as f64)])?.take() };
             vm.set_keyed(object_value(o.ptr()), Value::number(i as f64), v)?;
         }
         Ok(object_value(o.ptr()))
@@ -1070,9 +1095,9 @@ fn typed_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !crate::intrinsics::is_constructor(this) {
         return Err(Error::type_error("TypedArray.of: this is not a constructor"));
     }
-    let o = object_value(create_from(vm, this, &[Value::number(a.len() as f64)], Some(a.len()))?.ptr());
     // (Held across the values' conversions: rooted.)
-    let _rooted = vm.root_scope(&[o]);
+    let sc = Scope::new(vm);
+    let o = create_from(vm, this, &[Value::number(a.len() as f64)], Some(a.len()))?.root(&sc).v();
     for (i, &v) in a.iter().enumerate() {
         vm.set_keyed(o, Value::number(i as f64), v)?;
     }
@@ -1172,8 +1197,10 @@ fn search(vm: &mut Vm, this: Value, a: &[Value], what: &str, back: bool, stop: b
     let this_arg = arg(a, 1);
     for j in 0..len {
         let i = if back { len - 1 - j } else { j };
+        // (`v`, a BigInt maybe new, the callback's argument: on the VM
+        // stack while it runs, nothing collecting after.)
         let v = get(o, i);
-        let r = call_function(vm, f, this_arg, &[v, Value::number(i as f64), this])?;
+        let r = vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?.take();
         if to_boolean(r) == stop {
             return Ok(Some((i, v)));
         }
@@ -1211,7 +1238,7 @@ fn typed_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let this_arg = arg(a, 1);
     for i in 0..len {
         let v = get(o, i);
-        call_function(vm, f, this_arg, &[v, Value::number(i as f64), this])?;
+        vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?.take();
     }
     Ok(Value::UNDEFINED)
 }
@@ -1219,13 +1246,13 @@ fn typed_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     writable_view(o)?;
-    let v = to_element(vm, kind_of(o), arg(a, 0))?;
     // (A BigInt held across the conversions: rooted.)
-    let (s, e) = vm.rooted(&[v], |vm| {
-        let s = relative(integer(vm, arg(a, 1))?, len);
-        let end = arg(a, 2);
-        Ok::<_, Error>((s, if end.is_undefined() { len } else { relative(integer(vm, end)?, len) }))
-    })?;
+    let sc = Scope::new(vm);
+    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(a, 0)))?.root(&sc);
+    let s = relative(integer(vm, arg(a, 1))?, len);
+    let end = arg(a, 2);
+    let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
+    let v = v.v();
     let Some(len) = ta_length(o) else {
         return Err(Error::type_error("Cannot perform fill on a detached or out of bounds typed array"));
     };
@@ -1245,11 +1272,12 @@ fn typed_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         for i in 0..len {
             let v = get(o, i);
             vm.handles.push(v);
-            if to_boolean(call_function(vm, f, this_arg, &[v, Value::number(i as f64), this])?) {
+            if to_boolean(vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?.take()) {
                 kept.push(v);
             }
         }
-        let out = species_create(vm, o, &[Value::number(kept.len() as f64)], Some(kept.len()))?;
+        let sc = Scope::new(vm);
+        let out = Obj::of(species_create(vm, o, &[Value::number(kept.len() as f64)], Some(kept.len()))?.root(&sc).v());
         for (i, &v) in kept.iter().enumerate() {
             set(vm, out, i, v)?;
         }
@@ -1317,7 +1345,7 @@ pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
     let sep: Vec<u16> = match arg(a, 0) {
         s if s.is_undefined() => vec![b',' as u16],
         s => {
-            let s = crate::intrinsics::to_string(vm, s)?;
+            let s = vm.to_string_b(s)?.take();
             // (Its separators alone past the longest string: thrown before
             // a long one is read, as `Array.prototype.join` does.)
             let n = crate::vm::string_len(s).unwrap_or(0);
@@ -1345,16 +1373,14 @@ fn typed_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     let f = callback(a, "map")?;
     let this_arg = arg(a, 1);
-    let out = species_create(vm, o, &[Value::number(len as f64)], Some(len))?;
-    vm.handle_scope(|vm| {
-        vm.handles.push(object_value(out.ptr()));
-        for i in 0..len {
-            let v = get(o, i);
-            let r = call_function(vm, f, this_arg, &[v, Value::number(i as f64), this])?;
-            vm.set_keyed(object_value(out.ptr()), Value::number(i as f64), r)?;
-        }
-        Ok(object_value(out.ptr()))
-    })
+    let sc = Scope::new(vm);
+    let out = species_create(vm, o, &[Value::number(len as f64)], Some(len))?.root(&sc).v();
+    for i in 0..len {
+        let v = get(o, i);
+        let r = vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?.take();
+        vm.set_keyed(out, Value::number(i as f64), r)?;
+    }
+    Ok(out)
 }
 
 /// `reduce` (`back`: `reduceRight`).
@@ -1372,7 +1398,7 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], back: bool) -> Result<Value> {
     };
     for i in order {
         let v = get(o, i);
-        acc = call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(i as f64), this])?;
+        acc = vm.call_b(f, Value::UNDEFINED, &[acc, v, Value::number(i as f64), this])?.take();
     }
     Ok(acc)
 }
@@ -1462,15 +1488,14 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             Ok(Value::UNDEFINED)
         });
     }
-    let src = object_value((vm.to_object(src)?).ptr());
     // (A wrapper held across getters: rooted.)
-    vm.rooted(&[src], |vm| {
-        let n = vm.length_of(src)?;
-        if offset == f64::INFINITY || n + offset > len as f64 {
-            return Err(Error::range_error("offset is out of bounds"));
-        }
-        set_from(vm, o, offset as usize, src, n as usize)
-    })?;
+    let sc = Scope::new(vm);
+    let src = vm.to_object_b(src)?.root(&sc).v();
+    let n = vm.length_of_b(src)?;
+    if offset == f64::INFINITY || n + offset > len as f64 {
+        return Err(Error::range_error("offset is out of bounds"));
+    }
+    set_from(vm, o, offset as usize, src, n as usize)?;
     Ok(Value::UNDEFINED)
 }
 
@@ -1480,7 +1505,8 @@ fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let end = arg(a, 1);
     let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let count = e.saturating_sub(s);
-    let out = species_create(vm, o, &[Value::number(count as f64)], Some(count))?;
+    let sc = Scope::new(vm);
+    let out = Obj::of(species_create(vm, o, &[Value::number(count as f64)], Some(count))?.root(&sc).v());
     if count > 0 {
         let Some(len) = ta_length(o) else {
             return Err(Error::type_error("Cannot perform slice on a detached or out of bounds typed array"));
@@ -1500,14 +1526,10 @@ fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 }
             }
         } else {
-            vm.handle_scope(|vm| {
-                vm.handles.push(object_value(out.ptr()));
-                for (n, i) in (s..e).enumerate() {
-                    let v = get(o, i);
-                    set(vm, out, n, v)?;
-                }
-                Ok::<(), Error>(())
-            })?;
+            for (n, i) in (s..e).enumerate() {
+                let v = get(o, i);
+                set(vm, out, n, v)?;
+            }
         }
     }
     Ok(object_value(out.ptr()))
@@ -1529,7 +1551,7 @@ fn sort_numbers(vm: &mut Vm, values: &mut Vec<Value>, cmp: Value) -> Result<()> 
                 _ => x > y || (x == 0.0 && y == 0.0 && x.is_sign_positive() && y.is_sign_negative()),
             });
         }
-        let r = call_function(vm, cmp, Value::UNDEFINED, &[x, y])?;
+        let r = vm.call_b(cmp, Value::UNDEFINED, &[x, y])?.take();
         Ok(number(vm, r)? > 0.0)
     };
     // A merge sort: a comparator that isn't consistent still ends.
@@ -1598,9 +1620,10 @@ fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let cmp = comparator(a)?;
     let (o, len) = validate(vm, this)?;
-    let out = create_same(vm, o, len)?;
+    let sc = Scope::new(vm);
+    let out = Obj::of(create_same(vm, o, len)?.root(&sc).v());
+    // (`values`' copies valid in this handle scope, where no cell moves.)
     vm.handle_scope(|vm| {
-        vm.handles.push(object_value(out.ptr()));
         let mut values = values(vm, o, len);
         sort_numbers(vm, &mut values, cmp)?;
         for (i, e) in values.into_iter().enumerate() {
@@ -1612,7 +1635,8 @@ fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let out = create_same(vm, o, len)?;
+    // (Its values stored where nothing collects.)
+    let out = create_same(vm, o, len)?.take();
     for i in 0..len {
         put(out, i, get(o, len - 1 - i));
     }
@@ -1623,18 +1647,17 @@ fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     let r = integer(vm, arg(a, 0))?;
     let i = if r >= 0.0 { r } else { len as f64 + r };
-    let v = to_element(vm, kind_of(o), arg(a, 1))?;
+    // (The value, maybe a new BigInt, held across the new array's making.)
+    let sc = Scope::new(vm);
+    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(a, 1)))?.root(&sc);
     if !(i >= 0.0 && ta_length(o).is_some_and(|n| i < n as f64)) {
         return Err(Error::range_error("Invalid typed array index"));
     }
-    vm.handle_scope(|vm| {
-        vm.handles.push(v);
-        let out = create_same(vm, o, len)?;
-        for k in 0..len {
-            put(out, k, if k == i as usize { v } else { get(o, k) });
-        }
-        Ok(object_value(out.ptr()))
-    })
+    let out = create_same(vm, o, len)?.take();
+    for k in 0..len {
+        put(out, k, if k == i as usize { v.v() } else { get(o, k) });
+    }
+    Ok(object_value(out.ptr()))
 }
 
 fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1653,13 +1676,13 @@ fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     };
     // (The species the kind's own constructor: its view at once.)
     let default = constructor_of(vm, k)?;
-    let c = species_constructor(vm, this, default)?;
+    let c = species_constructor(vm, this, default)?.take();
     if c == default {
         return on_buffer(vm, k, b, begin, n);
     }
     let mut args = vec![object_value(b.ptr()), Value::number(begin as f64)];
     args.extend(n.map(|n| Value::number(n as f64)));
-    let out = create_from(vm, c, &args, None)?;
+    let out = create_from(vm, c, &args, None)?.take();
     if kind_of(out).is_big() != k.is_big() {
         return Err(Error::type_error("The species typed array's content type differs"));
     }
@@ -1674,13 +1697,15 @@ fn typed_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
         if i > 0 {
             out.push(b',' as u16);
         }
-        let v = get(o, i);
-        if v.is_undefined() || v.is_null() {
+        // (`v`, a BigInt maybe new, held across its getter: rooted.)
+        let step = Scope::new(vm);
+        let v = step.root(get(o, i));
+        if v.v().is_undefined() || v.v().is_null() {
             continue;
         }
-        let f = vm.get(v, a_tls)?;
-        let s = call_function(vm, f, v, &[])?;
-        let s = crate::intrinsics::to_string(vm, s)?;
+        let f = vm.get_atom_b(v.v(), a_tls)?.take();
+        let s = vm.call_b(f, v.v(), &[])?.take();
+        let s = vm.to_string_b(s)?.take();
         out.extend_from_slice(string_units(s).unwrap_or(&[]));
     }
     Ok(vm.new_string(&out))

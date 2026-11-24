@@ -174,6 +174,14 @@ impl Rootable for Vec<Value> {
     }
 }
 
+/// An object, rooted as its value.
+impl Rootable for Obj {
+    type Rooted<'s> = Handle<'s>;
+    fn root_in(self, s: &Scope) -> Handle<'_> {
+        s.root(object_value(self.ptr()))
+    }
+}
+
 /// An element's read: whether it was there, and its value.
 impl Rootable for (bool, Value) {
     type Rooted<'s> = (bool, Handle<'s>);

@@ -3,7 +3,8 @@
 //! `JSON.rawJSON` and `isRawJSON`, as the spec has them. Installed by
 //! [`install`].
 
-use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
+use crate::brand::{Fresh, Scope};
+use crate::interp::{check_native_stack, to_number, to_string_units};
 use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, RAW_JSON, object_value};
 use crate::props::{is_callable, is_object};
 use crate::raw::{Live, ObjectPtr};
@@ -57,8 +58,11 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // (The replacer's keys rooted in `vm.handles` from the first: left on
     // every return, errors' too, or a loop of calls would pile them up
     // until the run ends.)
+    // (And all of it in a handle scope, where no cell moves: the
+    // replacer's keys are copied into a `Vec` as its getters run, which
+    // may collect.)
     let depth = vm.handles.len();
-    let r = stringify_rooted(vm, a);
+    let r = vm.handle_scope(|vm| stringify_rooted(vm, a));
     vm.handles.truncate(depth);
     r
 }
@@ -81,7 +85,7 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         let mut keys: Vec<Value> = Vec::new();
         let mut i = 0.0;
         while i < len {
-            let v = vm.get_keyed(replacer, Value::number(i))?;
+            let v = vm.get_keyed_b(replacer, Value::number(i))?.take();
             let item = if is_string(v) {
                 Some(v)
             } else if v.is_number() {
@@ -129,10 +133,10 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     }
     vm.handle_scope(|vm| {
         let op = object_value(vm.object_prototype);
-        let wrapper = object_value(vm.new_plain(op).ptr());
-        let empty = vm.new_string(&[]);
         // (The holder and key a `toJSON` or replacer gets: rooted.)
-        vm.handles.extend([wrapper, empty]);
+        let sc = Scope::new(vm);
+        let wrapper = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+        let empty = vm.mu().new_string(&[]).root(&sc).v();
         let a_empty = vm.intern_name("");
         vm.create_data_property(wrapper, Key::Name(a_empty), arg(a, 0))?;
         let mut out = Vec::new();
@@ -162,11 +166,11 @@ impl PKey {
         }
     }
 
-    fn get(self, vm: &mut Vm, holder: Value) -> Result<Value> {
+    fn get(self, vm: &mut Vm, holder: Value) -> Result<Fresh<'_>> {
         match self {
-            PKey::Str(s) => vm.get_keyed(holder, s),
-            PKey::Num(i) => vm.get_keyed(holder, Value::number(i)),
-            PKey::Name(a) => vm.get(holder, a),
+            PKey::Str(s) => vm.get_keyed_b(holder, s),
+            PKey::Num(i) => vm.get_keyed_b(holder, Value::number(i)),
+            PKey::Name(a) => vm.get_atom_b(holder, a),
         }
     }
 }
@@ -178,7 +182,7 @@ fn push_ascii(out: &mut Vec<u16>, s: &str) {
 /// SerializeJSONProperty: `holder[key]` as JSON appended to `out`; false
 /// if it has none (`undefined`, a function).
 fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mut Vec<u16>) -> Result<bool> {
-    let v = vm.get_keyed(holder, key)?;
+    let v = vm.get_keyed_b(holder, key)?.take();
     value(vm, st, PKey::Str(key), holder, v, out)
 }
 
@@ -187,31 +191,107 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
 /// are, and everything is written to `out` as it comes (a 1 MiB array of
 /// small integers made a key string, a part and its copy for each: 19
 /// times V8's time).
-fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value, out: &mut Vec<u16>) -> Result<bool> {
+#[inline]
+fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, v: Value, out: &mut Vec<u16>) -> Result<bool> {
+    // (A primitive with no replacer, no `toJSON` to look up: written, no
+    // JS run, nothing to root.)
+    if st.replacer.is_none() {
+        if v.is_int32() {
+            push_int(out, v.as_i32_unchecked());
+            return Ok(true);
+        }
+        if !v.is_cell() || string_len(v).is_some() {
+            if let Some(r) = primitive(v, out) {
+                return r;
+            }
+            // (`undefined`: not written.)
+            if v.is_undefined() {
+                return Ok(false);
+            }
+        }
+    }
+    value_rooted(vm, st, key, holder, v, out)
+}
+
+/// A null, boolean, string or number `v` written to `out` (`None` for
+/// anything else).
+#[inline(always)]
+fn primitive(v: Value, out: &mut Vec<u16>) -> Option<Result<bool>> {
+    if v.is_null() {
+        push_ascii(out, "null");
+        return Some(Ok(true));
+    }
+    if v.is_bool() {
+        push_ascii(out, if v == Value::TRUE { "true" } else { "false" });
+        return Some(Ok(true));
+    }
+    if let Some(n) = string_len(v) {
+        // (Past the longest string: thrown before a long string's units are
+        // read.)
+        if let Err(e) = check_string_len(out.len() + n + 2) {
+            return Some(Err(e));
+        }
+        if let Err(e) = quote(string_units(v).unwrap(), out) {
+            return Some(Err(e));
+        }
+        return Some(Ok(true));
+    }
+    if let Some(d) = v.as_number() {
+        if v.is_int32() {
+            push_ascii(out, &crate::vm::display_raw(v));
+        } else if d.is_finite() {
+            push_ascii(out, crate::vm::number_ascii(d).as_str());
+        } else {
+            push_ascii(out, "null");
+        }
+        return Some(Ok(true));
+    }
+    None
+}
+
+/// An int32's digits appended to `out`.
+#[inline(always)]
+fn push_int(out: &mut Vec<u16>, n: i32) {
+    let mut b = [0u8; 11];
+    let mut n = n as i64;
+    let neg = n < 0;
+    n = n.abs();
+    let mut i = b.len();
+    loop {
+        i -= 1;
+        b[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if neg {
+        i -= 1;
+        b[i] = b'-';
+    }
+    out.extend(b[i..].iter().map(|&c| c as u16));
+}
+
+/// [`value`] of anything else: the value, maybe a getter's or a call's
+/// only, rooted while it is serialized, and what is pushed for it then.
+fn value_rooted(
+    vm: &mut Vm,
+    st: &mut Stringify,
+    key: PKey,
+    holder: Value,
+    mut v: Value,
+    out: &mut Vec<u16>,
+) -> Result<bool> {
+    let sc = Scope::new(vm);
+    // (What `sc` roots already: not rooted again below.)
+    let mut rooted = Value::UNDEFINED;
     if v.is_int32() {
         if let Some(r) = st.replacer {
             let k = key.string(vm);
-            v = call_function(vm, r, holder, &[k, v])?;
+            v = vm.call_b(r, holder, &[k, v])?.take();
         }
         if v.is_int32() {
-            let mut b = [0u8; 11];
-            let mut n = v.as_i32_unchecked() as i64;
-            let neg = n < 0;
-            n = n.abs();
-            let mut i = b.len();
-            loop {
-                i -= 1;
-                b[i] = b'0' + (n % 10) as u8;
-                n /= 10;
-                if n == 0 {
-                    break;
-                }
-            }
-            if neg {
-                i -= 1;
-                b[i] = b'-';
-            }
-            out.extend(b[i..].iter().map(|&c| c as u16));
+            push_int(out, v.as_i32_unchecked());
             return Ok(true);
         }
     } else {
@@ -221,15 +301,17 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
             // trap on its prototype chain: rooted across the trap's
             // lookup.)
             let a = st.a_to_json;
-            let f = vm.rooted(&[v], |vm| vm.get(v, a))?;
+            let held = sc.root(v);
+            rooted = v;
+            let f = vm.get_atom_b(held.v(), a)?.take();
             if is_callable(f) {
                 let k = key.string(vm);
-                v = call_function(vm, f, v, &[k])?;
+                v = vm.call_b(f, held.v(), &[k])?.take();
             }
         }
         if let Some(r) = st.replacer {
             let k = key.string(vm);
-            v = call_function(vm, r, holder, &[k, v])?;
+            v = vm.call_b(r, holder, &[k, v])?.take();
         }
     }
     if let Some(p) = wrapped(v) {
@@ -248,7 +330,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
     }
     if is_raw_json(v) {
         let a_raw = vm.intern_name("rawJSON");
-        let raw = vm.get(v, a_raw)?;
+        let raw = vm.get_atom_b(v, a_raw)?.take();
         // (Past the longest string: thrown before a long text is read.)
         check_string_len(out.len() + string_len(raw).unwrap_or(0))?;
         out.extend_from_slice(&to_string_units(raw));
@@ -258,30 +340,8 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
         check_string_len(out.len())?;
         return Ok(true);
     }
-    if v.is_null() {
-        push_ascii(out, "null");
-        return Ok(true);
-    }
-    if v.is_bool() {
-        push_ascii(out, if v == Value::TRUE { "true" } else { "false" });
-        return Ok(true);
-    }
-    if let Some(n) = string_len(v) {
-        // (Past the longest string: thrown before a long string's units are
-        // read.)
-        check_string_len(out.len() + n + 2)?;
-        quote(string_units(v).unwrap(), out)?;
-        return Ok(true);
-    }
-    if let Some(d) = v.as_number() {
-        if v.is_int32() {
-            push_ascii(out, &crate::vm::display_raw(v));
-        } else if d.is_finite() {
-            push_ascii(out, crate::vm::number_ascii(d).as_str());
-        } else {
-            push_ascii(out, "null");
-        }
-        return Ok(true);
+    if let Some(r) = primitive(v, out) {
+        return r;
     }
     if crate::bigint::is_bigint(v) {
         return Err(Error::type_error("Do not know how to serialize a BigInt"));
@@ -293,7 +353,9 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
         return Err(Error::type_error("Converting circular structure to JSON"));
     }
     st.stack.push(v.to_bits());
-    vm.handles.push(v);
+    if v != rooted {
+        sc.root(v);
+    }
     let stepback = st.indent.len();
     let gap = !st.gap.is_empty();
     if gap {
@@ -332,7 +394,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
             };
             let e = match own {
                 Some(e) => e,
-                None => vm.get_keyed(v, Value::number(i))?,
+                None => vm.get_keyed_b(v, Value::number(i))?.take(),
             };
             if !value(vm, st, PKey::Num(i), v, e, out)? {
                 push_ascii(out, "null");
@@ -348,8 +410,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
             None if vm.proxies_exist && crate::proxy::is_proxy(vm, o) => {
                 let mut ks = Vec::new();
                 for key in crate::proxy::enumerable_own_keys(vm, o)? {
-                    let s = vm.key_string(key);
-                    vm.handles.push(s);
+                    let s = vm.mu().key_string(key).root(&sc).v();
                     ks.push((PKey::Str(s), u32::MAX));
                 }
                 ks
@@ -422,7 +483,7 @@ fn value(vm: &mut Vm, st: &mut Stringify, key: PKey, holder: Value, mut v: Value
             };
             let pv = match own {
                 Some(pv) => pv,
-                None => k.get(vm, v)?,
+                None => k.get(vm, v)?.take(),
             };
             if value(vm, st, k, v, pv, out)? {
                 any = true;
@@ -527,14 +588,15 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return parse_text(vm, &u, false).map(|(v, _)| v);
     }
     vm.handle_scope(|vm| {
+        // (The records' values in `vm.handles`, their copies valid in this
+        // handle scope, where no cell moves.)
         let (v, record) = parse_text(vm, &u, true)?;
+        let sc = Scope::new(vm);
         let op = object_value(vm.object_prototype);
-        let root = object_value(vm.new_plain(op).ptr());
-        vm.handles.push(root);
+        let root = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
         let empty = vm.intern_name("");
         vm.create_data_property(root, Key::Name(empty), v)?;
-        let key = vm.new_string(&[]);
-        vm.handles.push(key);
+        let key = vm.mu().new_string(&[]).root(&sc).v();
         let a_source = vm.intern_name("source");
         internalize(vm, reviver, root, key, Some(&record), &u, a_source)
     })
@@ -590,10 +652,12 @@ fn internalize(
     a_source: crate::object::Atom,
 ) -> Result<Value> {
     check_native_stack(vm)?;
-    let v = vm.get_keyed(holder, name)?;
-    let context = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     // (Both held across the reviver's calls below: rooted.)
-    vm.rooted(&[v, context], |vm| internalize_value(vm, reviver, holder, name, v, context, record, text, a_source))
+    let sc = Scope::new(vm);
+    let v = vm.get_keyed_b(holder, name)?.root(&sc).v();
+    let op = object_value(vm.object_prototype);
+    let context = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+    internalize_value(vm, reviver, holder, name, v, context, record, text, a_source)
 }
 
 /// [`internalize`] of `v`, `holder[name]` as read, with its `context`.
@@ -634,20 +698,22 @@ fn internalize_value(
                 (Some(RecordKind::Entries(es)), _) if !array => string_units(ks).and_then(|u| es.get(u)),
                 _ => None,
             };
-            let nv = vm.rooted(&[ks], |vm| internalize(vm, reviver, v, ks, child, text, a_source))?;
+            // (The key across its value's revival; the reviver's new value
+            // maybe, held in `d` across a proxy's trap lookup.)
+            let step = Scope::new(vm);
+            let ks = step.root(ks);
+            let nv = vm.fresh(|vm| internalize(vm, reviver, v, ks.v(), child, text, a_source))?.root(&step).v();
             // (A proxy's traps, and what they throw; a property that can't
             // be deleted or defined stays.)
             if nv.is_undefined() {
                 crate::proxy::delete(vm, o, k)?;
             } else {
                 let d = crate::props::Desc::data(nv, true, true, true);
-                // (The reviver's new value maybe, held in `d` across a
-                // proxy's trap lookup: rooted.)
-                vm.rooted(&[nv], |vm| crate::proxy::define_property(vm, o, k, &d))?;
+                crate::proxy::define_property(vm, o, k, &d)?;
             }
         }
     }
-    call_function(vm, reviver, holder, &[name, v, context])
+    vm.call_b(reviver, holder, &[name, v, context]).map(Fresh::take)
 }
 
 /// Whether `v` is a `JSON.rawJSON` object.

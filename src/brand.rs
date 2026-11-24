@@ -131,6 +131,13 @@ impl<'a, T: Rootable> Fresh<'a, T> {
 }
 
 impl<'a> Fresh<'a> {
+    /// The value, the fresh one still unrooted: it keeps borrowing the VM
+    /// while it is used, so no call that may collect comes between.
+    #[inline(always)]
+    pub fn peek(&self) -> Value {
+        self.v
+    }
+
     /// The value as a `Gc`, while nothing collects.
     pub fn gc(self) -> Gc<'a> {
         Gc { v: self.v, _vm: PhantomData }
@@ -378,6 +385,13 @@ impl Handle<'_> {
         unsafe { *(&(*self.vm).handles).get_unchecked(self.slot) }
     }
 
+    /// The value now (as [`Fresh::peek`]: a binding read either way,
+    /// rooted or not).
+    #[inline(always)]
+    pub fn peek(self) -> Value {
+        self.v()
+    }
+
     /// Root `v` in this slot instead (a loop's current value).
     #[inline(always)]
     pub fn set(self, v: Value) {
@@ -418,6 +432,18 @@ impl Vm {
     #[inline(always)]
     pub fn get_keyed_b(&mut self, o: Value, key: Value) -> Result<Fresh<'_>> {
         self.get_keyed(o, key).map(Fresh::new)
+    }
+
+    /// ToObject, as the object.
+    #[inline(always)]
+    pub(crate) fn to_obj_b(&mut self, v: Value) -> Result<Fresh<'_, Obj>> {
+        self.to_object(v).map(Fresh::new)
+    }
+
+    /// `o[key]`.
+    #[inline(always)]
+    pub(crate) fn get_key_b(&mut self, o: Value, key: Key) -> Result<Fresh<'_>> {
+        self.get_key(o, key).map(Fresh::new)
     }
 
     /// ToObject.

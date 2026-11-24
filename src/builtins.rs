@@ -6,6 +6,7 @@
 use crate::raw::{Live, ObjectPtr};
 use std::borrow::Cow;
 
+use crate::brand::{Fresh, Scope};
 use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, Object, READ_ONLY, as_object, object_value};
@@ -92,8 +93,10 @@ pub(crate) fn install(vm: &mut Vm) {
     let a_trim_right = vm.intern_name("trimRight");
     let a_trim_start = vm.intern_name("trimStart");
     let a_trim_end = vm.intern_name("trimEnd");
-    let (ts, te) =
-        (vm.get(object_value(sp.ptr()), a_trim_start).unwrap(), vm.get(object_value(sp.ptr()), a_trim_end).unwrap());
+    let (ts, te) = (
+        vm.get_atom_b(object_value(sp.ptr()), a_trim_start).unwrap().take(),
+        vm.get_atom_b(object_value(sp.ptr()), a_trim_end).unwrap().take(),
+    );
     vm.add_property_with(sp, a_trim_left, ts, DONT_ENUM);
     vm.add_property_with(sp, a_trim_right, te, DONT_ENUM);
 
@@ -160,7 +163,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // More of `Math`.
     let a_math = vm.intern_name("Math");
-    let math = vm.get(object_value(g.ptr()), a_math).unwrap();
+    let math = vm.get_atom_b(object_value(g.ptr()), a_math).unwrap().take();
     let math = Obj::of(math);
     vm.define_natives(
         math,
@@ -217,7 +220,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // `Number.parseInt` and `parseFloat` are the globals themselves.
     for name in ["parseInt", "parseFloat"] {
         let a = vm.intern_name(name);
-        let f = vm.get(object_value(g.ptr()), a).unwrap();
+        let f = vm.get_atom_b(object_value(g.ptr()), a).unwrap().take();
         vm.add_property_with(number, a, f, DONT_ENUM);
     }
     // A function's `caller` and `arguments`: accessors that throw (as
@@ -974,7 +977,11 @@ fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         _ => {
             let arr = vm.new_array();
             if limit > 0 {
-                let v = vm.rooted(&[arr], |vm| this_string(vm, this, &u));
+                let v = {
+                    let sc = Scope::new(vm);
+                    let _held = sc.roots([arr]);
+                    this_string(vm, this, &u)
+                };
                 append(vm, arr, v);
             }
             Ok(arr)
@@ -990,7 +997,11 @@ fn append(vm: &mut Vm, arr: Value, v: Value) {
     let len = o.elems_len() as usize;
     if len + 1 > unsafe { Object::elems_cap(o.ptr().cast_const()) } as usize {
         // (`v`, a new string maybe, rooted across the growth.)
-        vm.rooted(&[v], |vm| vm.reserve_elems(o, len + 1));
+        {
+            let sc = Scope::new(vm);
+            let _held = sc.roots([v]);
+            vm.reserve_elems(o, len + 1)
+        };
     }
     vm.store_element(o, len, v);
     // SAFETY: within the capacity `reserve_elems` made above.
@@ -1067,12 +1078,12 @@ fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // A plain array's elements as they are (`String.fromCharCode.apply`
     // of a chunk's 60,000 codes read each through the generic lookup).
     if let Some(list) = apply_list_fast(arg(a, 1)).filter(|l| l.len() <= crate::array::APPLY_MAX) {
-        return crate::interp::call_function(vm, this, arg(a, 0), &list);
+        return vm.call_b(this, arg(a, 0), &list).map(Fresh::take);
     }
     // (The list rooted while it is made, a getter maybe running; the call
     // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
-    let list = vm.handle_scope(|vm| crate::array::apply_list(vm, arg(a, 1)))?;
-    crate::interp::call_function(vm, this, arg(a, 0), &list)
+    let list = vm.list_b(arg(a, 1))?.take();
+    vm.call_b(this, arg(a, 0), &list).map(Fresh::take)
 }
 
 /// `Function(p1, …, body)` / `new Function(…)`: the function
@@ -1318,8 +1329,8 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         (code.length as f64 - args.len() as f64).max(0.0)
     } else {
         let len = if vm.own_property(target, crate::vm::Key::Name(a_length)).is_some() {
-            let l = vm.get(this, a_length)?;
-            match l.as_number() {
+            let l = vm.get_atom_b(this, a_length)?;
+            match l.peek().as_number() {
                 Some(n) if n == f64::INFINITY => n,
                 Some(n) if n.is_finite() => (n.trunc() - args.len() as f64).max(0.0),
                 _ => 0.0,
@@ -1327,9 +1338,9 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         } else {
             0.0
         };
-        let name = vm.get(this, a_name)?;
+        let name = vm.get_atom_b(this, a_name)?;
         // (Past the longest string: thrown before a long name is read.)
-        push_string(&mut units, name)?;
+        push_string(&mut units, name.peek())?;
         len
     };
     // (A constructor only if `this` is one.)
@@ -1418,7 +1429,7 @@ fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
         if constructing {
             crate::intrinsics::construct_with(vm, target, all, nt)
         } else {
-            crate::interp::call_function(vm, target, this, all)
+            vm.call_b(target, this, all).map(Fresh::take)
         }
     };
     if bound == 0 {
@@ -1761,11 +1772,14 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
     // primitive's comes from its prototype with the wrapper as receiver.
     if !this.is_undefined()
         && !this.is_null()
-        && let o = object_value((vm.to_object(this)?).ptr())
+        && let o = object_value(vm.to_obj_b(this)?.take().ptr())
         // (A primitive's new wrapper, the receiver of a proxy's trap on
         // its prototype chain: rooted.)
-        && let Some(t) = vm.rooted(&[o], |vm| crate::symbol::tag_of(vm, o))?
-    {
+        && let Some(t) = {
+        let sc = Scope::new(vm);
+        let _held = sc.roots([o]);
+        crate::symbol::tag_of(vm, o)
+    }? {
         let mut u: Vec<u16> = "[object ".encode_utf16().collect();
         u.extend_from_slice(&t);
         u.push(b']' as u16);
@@ -1775,7 +1789,7 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
 }
 
 pub(crate) fn object_value_of(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(object_value((vm.to_object(this)?).ptr()))
+    Ok(object_value(vm.to_obj_b(this)?.take().ptr()))
 }
 
 pub(crate) fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -2396,7 +2410,7 @@ fn install_regexps(vm: &mut Vm) {
         &[("exec", regexp_exec as NativeFn, 1), ("test", regexp_test, 1), ("toString", regexp_to_string, 0)],
     );
     vm.regexp_atoms[0] = vm.intern_name("exec");
-    vm.regexp_fns[0] = as_object(vm.get(object_value(rp.ptr()), vm.regexp_atoms[0]).unwrap());
+    vm.regexp_fns[0] = as_object(vm.get_atom_b(object_value(rp.ptr()), vm.regexp_atoms[0]).unwrap().take());
     // `[Symbol.match]` and the others: the String methods', the RegExp
     // the pattern.
     let symbols: [(&str, NativeFn, u32); 5] = [
@@ -2454,7 +2468,7 @@ pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) 
     Ok(match K {
         0 => {
             let a = vm.a_regexp_source;
-            vm.get(this, a)?
+            vm.get_atom_b(this, a)?.take()
         }
         1 => str_value(vm, &regexp_flags(re)),
         2 => Value::from_bool(re.global),
@@ -2630,19 +2644,19 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         // (Its [[OriginalSource]], not the observable `source`.)
         let a_source = vm.a_regexp_source;
-        let src = vm.get(pattern, a_source)?;
-        let src = string_units(src).unwrap_or(&[]).to_vec();
+        let src = vm.get_atom_b(pattern, a_source)?;
+        let src = string_units(src.peek()).unwrap_or(&[]).to_vec();
         (if src == EMPTY_SOURCE { Vec::new() } else { src }, regexp_flags(re))
     } else {
         let p = if pattern.is_undefined() {
             Vec::new()
         } else {
-            string_units(crate::intrinsics::to_string(vm, pattern)?).unwrap_or(&[]).to_vec()
+            string_units(vm.to_string_b(pattern)?.take()).unwrap_or(&[]).to_vec()
         };
         let f = if flags.is_undefined() {
             String::new()
         } else {
-            String::from_utf16_lossy(string_units(crate::intrinsics::to_string(vm, flags)?).unwrap_or(&[]))
+            String::from_utf16_lossy(string_units(vm.to_string_b(flags)?.take()).unwrap_or(&[]))
         };
         (p, f)
     };
@@ -2663,7 +2677,7 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // (Its hidden source, the new one's (escaped), read-only to
     // `defineProperty` and `freeze`.)
     let a = vm.a_regexp_source;
-    let source = vm.get(made, a)?;
+    let source = vm.get_atom_b(made, a)?.take();
     if let Some(k) = o.shape().live().lookup(a) {
         vm.store_field(o, k, source);
     }
@@ -2682,12 +2696,13 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // `RegExp(re)`, called: `re` itself if a regexp of `RegExp`'s.
     if !construct && arg(a, 1).is_undefined() && is_re {
         let a_ctor = vm.a_constructor;
-        let c = vm.get(p, a_ctor)?;
+        let sc = Scope::new(vm);
+        let c = vm.get_atom_b(p, a_ctor)?.root(&sc);
         let a_regexp = vm.intern_name("RegExp");
         let g = object_value(vm.global);
         // (Maybe a getter's new object, compared after the global's
         // getter: rooted, its address not another's meanwhile.)
-        if c == vm.rooted(&[c], |vm| vm.get(g, a_regexp))? {
+        if c.peek() == vm.get_atom_b(g, a_regexp)?.take() {
             return Ok(p);
         }
     }
@@ -2696,16 +2711,16 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         // (Its [[OriginalSource]] and [[OriginalFlags]], not the
         // observable `source` and `flags`.)
         let a_source = vm.a_regexp_source;
-        pattern = units(vm.get(p, a_source)?).into_owned();
+        pattern = units(vm.get_atom_b(p, a_source)?.take()).into_owned();
         flags = regexp_flags(re);
     } else if is_re {
         let a_source = vm.a_source;
         // (A RegExp-like object: its `source`, and its `flags` unless
         // given.)
-        pattern = units(vm.get(p, a_source)?).into_owned();
+        pattern = units(vm.get_atom_b(p, a_source)?.take()).into_owned();
         if arg(a, 1).is_undefined() {
             let a_flags = vm.intern_name("flags");
-            flags = String::from_utf16_lossy(&units(vm.get(p, a_flags)?));
+            flags = String::from_utf16_lossy(&units(vm.get_atom_b(p, a_flags)?.take()));
         }
     } else if !p.is_undefined() {
         pattern = units(p).into_owned();
@@ -2770,7 +2785,7 @@ fn regexp_match_into<'a>(
     // (`lastIndex` read and converted even when not used.)
     let li = match plain {
         Some(o) => o.field(0),
-        None => vm.get(this, a_last)?,
+        None => vm.get_atom_b(this, a_last)?.take(),
     };
     // (Read and converted with no user code run: a data property holding
     // a number.)
@@ -2856,7 +2871,7 @@ fn legacy_input_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if this != object_value(vm.regexp_constructor) {
         return Err(Error::type_error("RegExp legacy static property set on another receiver"));
     }
-    vm.legacy_input = crate::intrinsics::to_string(vm, arg(a, 0))?;
+    vm.legacy_input = vm.to_string_b(arg(a, 0))?.take();
     Ok(Value::UNDEFINED)
 }
 
@@ -3059,11 +3074,12 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let x = arg(a, 0);
     let quiet = is_string(x);
     // (ToString: no argument is "undefined", a symbol throws.)
-    let input = if quiet { x } else { crate::intrinsics::to_string(vm, x)? };
+    let input = if quiet { x } else { vm.to_string_b(x)?.take() };
     let re = if quiet { re } else { this_regexp(this)? };
     // Borrowed: strings don't change, and `input`, maybe a new string, is
     // rooted (across `lastIndex`'s conversion and the array's making).
-    let _rooted = vm.root_scope(&[input]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([input]);
     let s = units(input);
     with_caps(vm, |vm, caps| {
         if let Some(re) = regexp_match_into(vm, this, re, &s, caps)? {
@@ -3080,18 +3096,26 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if crate::props::is_object(this) && !pristine(vm, this)? {
         let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
         // (`s`, maybe a new string, rooted across `exec`'s getter.)
-        return Ok(Value::from_bool(!vm.rooted(&[s], |vm| rx_exec(vm, this, s))?.is_null()));
+        return Ok(Value::from_bool(
+            !{
+                let sc = Scope::new(vm);
+                let _held = sc.roots([s]);
+                rx_exec(vm, this, s)
+            }?
+            .is_null(),
+        ));
     }
     let re = this_regexp(this)?;
     let x = arg(a, 0);
     let quiet = is_string(x);
     // (Its pattern once the input is converted, if that ran user code;
     // ToString: a symbol throws, Codex on #38.)
-    let input = if quiet { x } else { crate::intrinsics::to_string(vm, x)? };
+    let input = if quiet { x } else { vm.to_string_b(x)?.take() };
     let re = if quiet { re } else { this_regexp(this)? };
     // (`input`, maybe a new string, rooted across `lastIndex`'s
     // conversion: `s` is its units.)
-    let _rooted = vm.root_scope(&[input]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([input]);
     let s = units(input);
     with_caps(vm, |vm, caps| {
         let found = regexp_match_into(vm, this, re, &s, caps)?.is_some();
@@ -3111,11 +3135,11 @@ pub(crate) fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
     let mut u = vec![b'/' as u16];
     for (i, name) in ["source", "flags"].into_iter().enumerate() {
         let a = vm.intern_name(name);
-        let v = vm.get(this, a)?;
+        let v = vm.get_atom_b(this, a)?.take();
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
         }
-        let v = crate::intrinsics::to_string(vm, v)?;
+        let v = vm.to_string_b(v)?.take();
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
         }
@@ -3151,7 +3175,11 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     }
     let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
     // (`s`, maybe a new string, rooted: read after `this`'s getters run.)
-    vm.rooted(&[s], |vm| regexp_symbol_of::<K>(vm, this, s, a))
+    {
+        let sc = Scope::new(vm);
+        let _held = sc.roots([s]);
+        regexp_symbol_of::<K>(vm, this, s, a)
+    }
 }
 
 /// [`regexp_symbol`] of the string `s`.
@@ -3209,7 +3237,7 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
         return Ok(None);
     }
     let atom = vm.regexp_atoms[1 + k];
-    let m = vm.get(pattern, atom)?;
+    let m = vm.get_atom_b(pattern, atom)?.take();
     if m.is_undefined() || m.is_null() {
         if regexp_of(pattern).is_none() {
             return Ok(None);
@@ -3226,7 +3254,7 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
     }
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
-    crate::interp::call_function(vm, m, pattern, &args).map(Some)
+    vm.call_b(m, pattern, &args).map(|v| Some(v.take()))
 }
 
 fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -3267,15 +3295,14 @@ fn match_all(vm: &mut Vm, this: Value, s: &[u16], rv: Value) -> Result<Value> {
     let a_source = vm.a_regexp_source;
     // (`input`, maybe a new string, and then `source` and the matcher
     // rooted: `lastIndex`'s conversion may run user code.)
-    let _rooted = vm.root_scope(&[input]);
-    let source = vm.get(rv, a_source)?;
+    let sc = Scope::new(vm);
+    let input = sc.root(input).v();
+    let source = vm.get_atom_b(rv, a_source)?.root(&sc);
     crate::gc::mark_regexp(re);
-    let matcher = vm.rooted(&[source], |vm| regexp_object(vm, re, source));
-    vm.rooted(&[matcher], |vm| {
-        let li = get_length(vm, rv, "lastIndex")?;
-        set_last_index(vm, matcher, li)?;
-        regexp_string_iterator(vm, matcher, input, global, unicode)
-    })
+    let matcher = vm.mu().make(|vm| regexp_object(vm, re, source.peek())).root(&sc).v();
+    let li = get_length(vm, rv, "lastIndex")?;
+    set_last_index(vm, matcher, li)?;
+    regexp_string_iterator(vm, matcher, input, global, unicode)
 }
 
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
@@ -3294,8 +3321,16 @@ fn match_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let rv = as_regexp(vm, arg(a, 0))?;
     // (The RegExp, maybe made here, then the input, rooted; and each match
     // in the handles as it is made.)
-    let input = vm.rooted(&[rv], |vm| this_string(vm, this, &s));
-    vm.rooted(&[rv, input], |vm| match_with(vm, &s, rv, input))
+    let input = {
+        let sc = Scope::new(vm);
+        let _held = sc.roots([rv]);
+        this_string(vm, this, &s)
+    };
+    {
+        let sc = Scope::new(vm);
+        let _held = sc.roots([rv, input]);
+        match_with(vm, &s, rv, input)
+    }
 }
 
 /// [`match_fast`] of `s` (as the string `input`) by RegExp `rv`, both
@@ -3351,7 +3386,11 @@ fn search_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = regexp_of(rv).unwrap();
     let Some(caps) = re.exec(&s, 0) else { return Ok(Value::from_i32(-1)) };
     // (The RegExp, maybe made here, rooted while the input's string is.)
-    let input = vm.rooted(&[rv], |vm| this_string(vm, this, &s));
+    let input = {
+        let sc = Scope::new(vm);
+        let _held = sc.roots([rv]);
+        this_string(vm, this, &s)
+    };
     note_legacy(vm, rv, input, &caps);
     Ok(Value::from_i32(caps[0].unwrap().0 as i32))
 }
@@ -3390,13 +3429,13 @@ fn require_global(vm: &mut Vm, pattern: Value, method: &str) -> Result<()> {
     }
     if !fast && is_regexp(vm, pattern)? {
         let a_flags = vm.intern_name("flags");
-        let flags = vm.get(pattern, a_flags)?;
-        if flags.is_undefined() || flags.is_null() {
+        let flags = vm.get_atom_b(pattern, a_flags)?;
+        if flags.peek().is_undefined() || flags.peek().is_null() {
             return Err(Error::type_error(format!(
                 "String.prototype.{method} called with a RegExp whose flags are undefined"
             )));
         }
-        let f = crate::interp::to_string_units(flags);
+        let f = crate::interp::to_string_units(flags.peek());
         if vm.conv_thrown {
             return Err(vm.take_conv_error());
         }
@@ -3414,9 +3453,9 @@ fn is_regexp(vm: &mut Vm, v: Value) -> Result<bool> {
     if !crate::props::is_object(v) {
         return Ok(false);
     }
-    let m = vm.get(v, vm.regexp_atoms[1])?;
-    if !m.is_undefined() {
-        return Ok(crate::interp::to_boolean(m));
+    let m = vm.get_atom_b(v, vm.regexp_atoms[1])?;
+    if !m.peek().is_undefined() {
+        return Ok(crate::interp::to_boolean(m.peek()));
     }
     Ok(is_class(v, Class::RegExp))
 }
@@ -3477,7 +3516,8 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
         note_legacy(vm, pattern, input, &flat[flat.len() - stride..]);
     }
     // (`input`, maybe a new string, rooted across the replacer's calls.)
-    let _rooted = vm.root_scope(&[input]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([input]);
     let mut out = Vec::with_capacity(s.len());
     let mut last = 0;
     for caps in flat.chunks(stride) {
@@ -3503,7 +3543,7 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
                     let g = named_groups(vm, re, caps, &s)?;
                     args.push(g);
                 }
-                crate::interp::call_function(vm, replacement, Value::UNDEFINED, &args)
+                vm.call_b(replacement, Value::UNDEFINED, &args).map(Fresh::take)
             })?;
             // (A string's length checked before its units are read.)
             check_string_len(out.len() + string_len(r).unwrap_or(0))?;
@@ -3693,13 +3733,14 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
     let e = make_error(vm, K, message.as_deref());
     // (New, held across the options' `has` and `get`, a proxy's traps
     // maybe: rooted.)
-    let _rooted = vm.root_scope(&[e]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([e]);
     // `{ cause }` in the options: its own `cause`.
     let options = arg(a, 1);
     if crate::props::is_object(options) {
         let a_cause = vm.intern_name("cause");
         if vm.has_key(options, crate::vm::Key::Name(a_cause))? {
-            let cause = vm.get(options, a_cause)?;
+            let cause = vm.get_atom_b(options, a_cause)?.take();
             vm.add_property_with(Obj::of(e), a_cause, cause, DONT_ENUM);
         }
     }
@@ -3803,17 +3844,18 @@ pub(crate) fn error_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
         return Err(Error::type_error("Error.prototype.toString called on a non-object"));
     }
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
-    let name = vm.get(this, a_name)?;
-    let name = if name.is_undefined() { "Error".encode_utf16().collect() } else { units(name).into_owned() };
+    let name = vm.get_atom_b(this, a_name)?;
+    let name =
+        if name.peek().is_undefined() { "Error".encode_utf16().collect() } else { units(name.peek()).into_owned() };
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
     // (`name` converted before `message` is read.)
-    let message = vm.get(this, a_message)?;
+    let message = vm.get_atom_b(this, a_message)?;
     // (Its length checked before a long message is read.)
-    let n = if message.is_undefined() { 0 } else { string_len(message).unwrap_or(0) };
+    let n = if message.peek().is_undefined() { 0 } else { string_len(message.peek()).unwrap_or(0) };
     check_string_len(name.len() + n + if name.is_empty() || n == 0 { 0 } else { 2 })?;
-    let message = if message.is_undefined() { Vec::new() } else { units(message).into_owned() };
+    let message = if message.peek().is_undefined() { Vec::new() } else { units(message.peek()).into_owned() };
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
@@ -3994,9 +4036,9 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
 #[inline(never)]
 fn rx_exec(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     let a = vm.intern_name("exec");
-    let exec = vm.get(r, a)?;
+    let exec = vm.get_atom_b(r, a)?.take();
     if crate::props::is_callable(exec) {
-        let res = crate::interp::call_function(vm, exec, r, &[s])?;
+        let res = vm.call_b(exec, r, &[s])?.take();
         if !crate::props::is_object(res) && !res.is_null() {
             return Err(Error::type_error("exec result must be an object or null"));
         }
@@ -4013,8 +4055,8 @@ fn rx_exec(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
 #[inline(never)]
 fn get_units(vm: &mut Vm, o: Value, name: &str) -> Result<Vec<u16>> {
     let v = get_named(vm, o, name)?;
-    let s = crate::intrinsics::to_string(vm, v)?;
-    Ok(string_units(s).unwrap_or(&[]).to_vec())
+    let s = vm.to_string_b(v)?;
+    Ok(string_units(s.peek()).unwrap_or(&[]).to_vec())
 }
 
 /// Get(o, name), `name` an index (`"0"`) or a name.
@@ -4022,10 +4064,10 @@ fn get_units(vm: &mut Vm, o: Value, name: &str) -> Result<Vec<u16>> {
 #[inline(never)]
 fn get_named(vm: &mut Vm, o: Value, name: &str) -> Result<Value> {
     match name.parse::<i32>() {
-        Ok(i) => vm.get_keyed(o, Value::from_i32(i)),
+        Ok(i) => vm.get_keyed_b(o, Value::from_i32(i)).map(Fresh::take),
         Err(_) => {
             let a = vm.intern_name(name);
-            vm.get(o, a)
+            vm.get_atom_b(o, a).map(Fresh::take)
         }
     }
 }
@@ -4084,7 +4126,8 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     let out = vm.new_array();
     let mut n = 0;
     // (`out` rooted across `exec`'s calls.)
-    let _rooted = vm.root_scope(&[out]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([out]);
     loop {
         let res = rx_exec(vm, r, s)?;
         if res.is_null() {
@@ -4092,7 +4135,11 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
         }
         // (Maybe `exec`'s new object, the receiver of a proxy's trap on
         // its prototype chain: rooted across the trap's lookup.)
-        let m = vm.rooted(&[res], |vm| get_units(vm, res, "0"))?;
+        let m = {
+            let sc = Scope::new(vm);
+            let _held = sc.roots([res]);
+            get_units(vm, res, "0")
+        }?;
         let mv = vm.new_string(&m);
         crate::vm::array_push(vm, out, &[mv])?;
         n += 1;
@@ -4108,7 +4155,10 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
 #[inline(never)]
 fn rx_search(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     let a = vm.a_last_index;
-    let prev = vm.get(r, a)?;
+    // (`prev`, maybe a getter's only, then `exec`'s result rooted across
+    // the calls after.)
+    let sc = Scope::new(vm);
+    let prev = vm.get_atom_b(r, a)?.root(&sc);
     // (SameValue by bits: a number that is 0 is the int32 0 or ±0.0;
     // keeping `same_value` to its callers keeps it inlined there.)
     let same = |x: Value, y: Value| {
@@ -4118,24 +4168,19 @@ fn rx_search(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
                 && x.to_number() == y.to_number()
                 && x.to_number().is_sign_negative() == y.to_number().is_sign_negative()
     };
-    // (`prev`, maybe a getter's only, then `exec`'s result rooted across
-    // the calls after.)
-    let _rooted = vm.root_scope(&[prev]);
-    if !same(prev, Value::from_i32(0)) {
+    if !same(prev.peek(), Value::from_i32(0)) {
         set_last_index(vm, r, 0.0)?;
     }
-    let res = rx_exec(vm, r, s)?;
-    vm.rooted(&[res], |vm| {
-        let cur = vm.get(r, a)?;
-        if !same(cur, prev) {
-            vm.put_key(r, crate::vm::Key::Name(a), prev)?;
-        }
-        if res.is_null() {
-            return Ok(Value::from_i32(-1));
-        }
-        let ai = vm.intern_name("index");
-        vm.get(res, ai)
-    })
+    let res = vm.fresh(|vm| rx_exec(vm, r, s))?.root(&sc);
+    let cur = vm.get_atom_b(r, a)?.take();
+    if !same(cur, prev.peek()) {
+        vm.put_key(r, crate::vm::Key::Name(a), prev.peek())?;
+    }
+    if res.peek().is_null() {
+        return Ok(Value::from_i32(-1));
+    }
+    let ai = vm.intern_name("index");
+    vm.get_atom_b(res.peek(), ai).map(Fresh::take)
 }
 
 /// GetSubstitution of `template` for match `matched` at `position` in
@@ -4204,9 +4249,9 @@ fn substitution(
                 Some(k) => {
                     let name = vm.new_string(&t[i + 2..i + 2 + k]);
                     let key = crate::intrinsics::to_property_key(vm, name)?;
-                    let v = vm.get_key(named, key)?;
+                    let v = vm.get_key_b(named, key)?.take();
                     if !v.is_undefined() {
-                        let sv = crate::intrinsics::to_string(vm, v)?;
+                        let sv = vm.to_string_b(v)?.take();
                         push_string(&mut out, sv)?;
                     }
                     i += k + 3;
@@ -4234,8 +4279,8 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
     let template = if functional {
         Vec::new()
     } else {
-        let t = crate::intrinsics::to_string(vm, replace)?;
-        string_units(t).unwrap_or(&[]).to_vec()
+        let t = vm.to_string_b(replace)?;
+        string_units(t.peek()).unwrap_or(&[]).to_vec()
     };
     let flags = get_units(vm, r, "flags")?;
     let global = flags_have(&flags, b'g');
@@ -4274,23 +4319,24 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
             let ncaps = (n - 1.0).max(0.0) as usize;
             let matched = get_units(vm, res, "0")?;
             let ai = vm.intern_name("index");
-            let pv = vm.get(res, ai)?;
+            let pv = vm.get_atom_b(res, ai)?.take();
             let p = to_number(pv);
             let position = if p.is_nan() { 0 } else { p.max(0.0).min(su.len() as f64) as usize };
             let mut caps = Vec::with_capacity(ncaps);
             for k in 1..=ncaps {
-                let v = vm.get_keyed(res, Value::from_i32(k as i32))?;
+                let v = vm.get_keyed_b(res, Value::from_i32(k as i32))?.take();
                 caps.push(if v.is_undefined() {
                     None
                 } else {
-                    let sv = crate::intrinsics::to_string(vm, v)?;
+                    let sv = vm.to_string_b(v)?.take();
                     Some(string_units(sv).unwrap_or(&[]).to_vec())
                 });
             }
             let ag = vm.intern_name("groups");
-            let named = vm.get(res, ag)?;
             // (`named`, maybe a getter's only, rooted across the
-            // substitution's getters and the replacer's call.)
+            // substitution's getters and the replacer's call, in a slot of
+            // its own: its object, once made, stored over it.)
+            let named = vm.get_atom_b(res, ag)?.take();
             let depth = vm.handles.len();
             vm.handles.push(named);
             let replacement = (|| -> Result<Vec<u16>> {
@@ -4313,9 +4359,9 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
                         if !named.is_undefined() {
                             args.push(named);
                         }
-                        crate::interp::call_function(vm, replace, Value::UNDEFINED, &args)
+                        vm.call_b(replace, Value::UNDEFINED, &args).map(Fresh::take)
                     })?;
-                    let sv = crate::intrinsics::to_string(vm, v)?;
+                    let sv = vm.to_string_b(v)?.take();
                     // (Past the longest string, if it is used: thrown before a long
                     // string's units are read.)
                     if position >= next {
@@ -4323,7 +4369,8 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
                     }
                     string_units(sv).unwrap_or(&[]).to_vec()
                 } else {
-                    let named = if named.is_undefined() { named } else { object_value((vm.to_object(named)?).ptr()) };
+                    let named =
+                        if named.is_undefined() { named } else { object_value(vm.to_obj_b(named)?.take().ptr()) };
                     vm.handles[depth] = named;
                     substitution(vm, &matched, &su, position, &caps, named, &template)?
                 })
@@ -4349,25 +4396,27 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
 #[inline(never)]
 fn rx_species(vm: &mut Vm, r: Value) -> Result<Value> {
     let a_c = vm.a_constructor;
-    let regexp = vm.get(object_value(vm.regexp_prototype), a_c)?;
     // (`regexp`, maybe a getter's only, rooted across the getters after.)
-    vm.rooted(&[regexp], |vm| rx_species_of(vm, r, regexp))
+    let sc = Scope::new(vm);
+    let regexp = vm.get_atom_b(object_value(vm.regexp_prototype), a_c)?.root(&sc);
+    rx_species_of(vm, r, regexp.peek())
 }
 
 /// [`rx_species`], `%RegExp%` being `regexp`.
 fn rx_species_of(vm: &mut Vm, r: Value, regexp: Value) -> Result<Value> {
     let a_c = vm.a_constructor;
-    let c = vm.get(r, a_c)?;
-    if c.is_undefined() {
+    let sc = Scope::new(vm);
+    let c = vm.get_atom_b(r, a_c)?.root(&sc);
+    if c.peek().is_undefined() {
         return Ok(regexp);
     }
-    if !crate::props::is_object(c) {
+    if !crate::props::is_object(c.peek()) {
         return Err(Error::type_error("object.constructor is not an object"));
     }
     let a_s = vm.intern_name(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
     // (Maybe a getter's new object, a proxy maybe, held across its
     // trap's lookup: rooted.)
-    let sp = vm.rooted(&[c], |vm| vm.get(c, a_s))?;
+    let sp = vm.get_atom_b(c.peek(), a_s)?.take();
     if sp.is_undefined() || sp.is_null() {
         return Ok(regexp);
     }
@@ -4473,8 +4522,16 @@ fn rx_split(vm: &mut Vm, r: Value, s: Value, limit: Value) -> Result<Value> {
         let fv = vm.new_string(&flags);
         Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv])?, unicode))
     })?;
-    let out = vm.rooted(&[splitter], |vm| vm.new_array());
-    vm.rooted(&[splitter, out, Value::UNDEFINED], |vm| rx_split_with(vm, s, limit, splitter, out, unicode))
+    let out = {
+        let sc = Scope::new(vm);
+        let _held = sc.roots([splitter]);
+        vm.new_array()
+    };
+    {
+        let sc = Scope::new(vm);
+        let _held = sc.roots([splitter, out, Value::UNDEFINED]);
+        rx_split_with(vm, s, limit, splitter, out, unicode)
+    }
 }
 
 /// [`rx_split`] by `splitter` into `out` (both rooted, and a handle after
@@ -4526,7 +4583,7 @@ fn rx_split_with(vm: &mut Vm, s: Value, limit: Value, splitter: Value, out: Valu
         p = e;
         let ncaps = (get_length(vm, z, "length")? - 1.0).max(0.0) as usize;
         for k in 1..=ncaps {
-            let v = vm.get_keyed(z, Value::from_i32(k as i32))?;
+            let v = vm.get_keyed_b(z, Value::from_i32(k as i32))?.take();
             crate::vm::array_push(vm, out, &[v])?;
             n += 1.0;
             if n == lim {
@@ -4554,7 +4611,8 @@ fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
         let fv = vm.new_string(&flags);
         Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv])?, flags))
     })?;
-    let _rooted = vm.root_scope(&[matcher]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([matcher]);
     let li = get_length(vm, r, "lastIndex")?;
     set_last_index(vm, matcher, li)?;
     let global = flags_have(&flags, b'g');
@@ -4572,10 +4630,15 @@ const RSI_UNICODE: usize = 3;
 /// CreateRegExpStringIterator(R, S, global, fullUnicode) (22.2.9.1).
 fn regexp_string_iterator(vm: &mut Vm, matcher: Value, s: Value, global: bool, unicode: bool) -> Result<Value> {
     // (Each rooted while the next cell is made.)
-    let _rooted = vm.root_scope(&[matcher, s]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([matcher, s]);
     let state = crate::array::new_array_of(vm, &[matcher, s, Value::from_bool(global), Value::from_bool(unicode)])?;
     let proto = crate::symbol::Root::RegExpStringIteratorPrototype;
-    Ok(vm.rooted(&[state], |vm| crate::symbol::iterator_with_state(vm, Class::RegExpStringIterator, proto, state)))
+    Ok({
+        let sc = Scope::new(vm);
+        let _held = sc.roots([state]);
+        crate::symbol::iterator_with_state(vm, Class::RegExpStringIterator, proto, state)
+    })
 }
 
 /// `%RegExpStringIteratorPrototype%.next()` (22.2.9.2.1): one RegExpExec
@@ -4613,7 +4676,12 @@ pub(crate) fn regexp_string_iterator_step(vm: &mut Vm, this: Value) -> Result<Op
         None => {
             let res = rx_exec(vm, matcher, s)?;
             // (`res`, maybe `exec`'s only, rooted across its getter.)
-            let empty = !res.is_null() && global && vm.rooted(&[res], |vm| get_units(vm, res, "0"))?.is_empty();
+            let empty = !res.is_null() && global && {
+                let sc = Scope::new(vm);
+                let _held = sc.roots([res]);
+                get_units(vm, res, "0")
+            }?
+            .is_empty();
             (res, empty)
         }
     };
@@ -4675,7 +4743,7 @@ fn regexp_flags_getter(vm: &mut Vm, this: Value) -> Result<Value> {
         ("sticky", 'y'),
     ] {
         let a = vm.intern_name(name);
-        if crate::interp::to_boolean(vm.get(this, a)?) {
+        if crate::interp::to_boolean(vm.get_atom_b(this, a)?.take()) {
             out.push(c);
         }
     }

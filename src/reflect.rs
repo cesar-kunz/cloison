@@ -1,7 +1,13 @@
 //! `Reflect`: the object operations as functions.
+//!
+//! Its cells are branded (see `brand`): what a call that may collect
+//! returns is a `Fresh`, rooted in a `Scope` or given on at once, so
+//! holding one across another such call doesn't compile. Its arguments
+//! are roots already (the VM stack), and its keys' atoms are held while
+//! it runs (`Vm::hold_atom`).
 
-use crate::interp::call_function;
-use crate::intrinsics::{construct_with, get_from, is_constructor, ordinary_set, to_property_key};
+use crate::brand::{Fresh, Scope};
+use crate::intrinsics::{is_constructor, ordinary_set, to_property_key};
 use crate::object::{DONT_ENUM, Obj, object_value};
 use crate::props::is_object;
 use crate::value::Value;
@@ -20,12 +26,13 @@ fn target(a: &[Value], what: &str) -> Result<Obj> {
     Ok(Obj::of(t))
 }
 
-/// An arguments list (CreateListFromArrayLike), which must be an object.
-fn list(vm: &mut Vm, v: Value) -> Result<Vec<Value>> {
+/// An arguments list (CreateListFromArrayLike), which must be an object:
+/// to give at once to the call (which copies it onto the VM stack).
+fn list(vm: &mut Vm, v: Value) -> Result<Fresh<'_, Vec<Value>>> {
     if !is_object(v) {
         return Err(Error::type_error("CreateListFromArrayLike called on non-object"));
     }
-    crate::array::apply_list(vm, v)
+    vm.list_b(v)
 }
 
 pub(crate) fn install(vm: &mut Vm) {
@@ -59,10 +66,8 @@ fn reflect_apply(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(f) {
         return Err(Error::type_error("Reflect.apply target is not a function"));
     }
-    // (The list rooted while it is made, a getter maybe running; the call
-    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
-    let args = vm.handle_scope(|vm| list(vm, arg(a, 2)))?;
-    call_function(vm, f, arg(a, 1), &args)
+    let args = list(vm, arg(a, 2))?.take();
+    vm.call_b(f, arg(a, 1), &args).map(Fresh::take)
 }
 
 fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -74,19 +79,17 @@ fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_constructor(nt) {
         return Err(Error::type_error("Reflect.construct newTarget is not a constructor"));
     }
-    // (The list rooted while it is made, a getter maybe running; the call
-    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
-    let args = vm.handle_scope(|vm| list(vm, arg(a, 1)))?;
-    construct_with(vm, f, &args, nt)
+    let args = list(vm, arg(a, 1))?.take();
+    vm.construct_b(f, &args, nt).map(Fresh::take)
 }
 
 pub(crate) fn reflect_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "defineProperty")?;
     let key = to_property_key(vm, arg(a, 1))?;
-    let d = vm.to_descriptor(arg(a, 2))?;
-    // (Its values, maybe getters' only, rooted until defined.)
-    vm.rooted(&crate::proxy::desc_values(Some(&d)), |vm| crate::proxy::define_property(vm, o, key, &d))
-        .map(Value::from_bool)
+    let s = Scope::new(vm);
+    // (Its values, maybe getters' only.)
+    let d = vm.to_descriptor_b(arg(a, 2))?.root(&s);
+    crate::proxy::define_property(vm, o, key, &d.desc()).map(Value::from_bool)
 }
 
 pub(crate) fn reflect_delete_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -99,26 +102,23 @@ pub(crate) fn reflect_get(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "get")?;
     let key = to_property_key(vm, arg(a, 1))?;
     let receiver = if a.len() > 2 { a[2] } else { object_value(o.ptr()) };
-    if crate::proxy::chain_has_proxy(vm, o) {
-        return crate::proxy::generic_get(vm, object_value(o.ptr()), key, receiver);
-    }
-    get_from(vm, object_value(o.ptr()), key, receiver)
+    vm.get_from_b(o, key, receiver).map(Fresh::take)
 }
 
 pub(crate) fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "getOwnPropertyDescriptor")?;
     let key = to_property_key(vm, arg(a, 1))?;
-    Ok(match crate::proxy::get_own_property(vm, o, key)? {
-        // (Its values, maybe a trap's only, rooted while its object is
-        // made.)
-        Some(d) => vm.rooted(&crate::proxy::desc_values(Some(&d)), |vm| vm.from_descriptor(&d)),
+    // (Its values maybe a trap's only; its object made where nothing
+    // collects.)
+    Ok(match vm.own_property_b(o, key)?.take() {
+        Some(d) => vm.mu().from_descriptor(&d).v(),
         None => Value::UNDEFINED,
     })
 }
 
 fn reflect_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "getPrototypeOf")?;
-    crate::proxy::get_prototype_of(vm, o)
+    vm.prototype_of_b(o).map(Fresh::take)
 }
 
 pub(crate) fn reflect_has(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -136,16 +136,13 @@ fn reflect_is_extensible(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 pub(crate) fn reflect_own_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "ownKeys")?;
     let keys = crate::proxy::own_keys(vm, o)?;
-    let out = vm.new_array();
-    vm.handle_scope(|vm| {
-        vm.handles.push(out);
-        for key in keys {
-            let s = vm.key_value(key);
-            let s = if s.is_number() { vm.key_string(key) } else { s };
-            crate::vm::array_push(vm, out, &[s])?;
-        }
-        Ok(out)
-    })
+    let s = Scope::new(vm);
+    let out = vm.mu().new_array().root(&s);
+    for key in keys {
+        let k = vm.mu().key_string(key).v();
+        crate::vm::array_push(vm, out.v(), &[k])?;
+    }
+    Ok(out.v())
 }
 
 fn reflect_prevent_extensions(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {

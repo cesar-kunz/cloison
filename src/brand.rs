@@ -95,37 +95,94 @@
 //! ```
 use std::marker::PhantomData;
 
+use crate::object::{Obj, object_value};
+use crate::props::Desc;
 use crate::value::Value;
-use crate::vm::{Result, Vm};
+use crate::vm::{Key, Result, Vm};
 
-/// A value a call that may collect returned: unrooted, borrowing the VM
-/// as the call did. Root it ([`Fresh::root`]) to keep it, or give it on
-/// to the next call at once ([`Fresh::take`]), its callee's to root.
+/// What a call that may collect returned (a value, a descriptor, a
+/// list): unrooted, borrowing the VM as the call did. Root it
+/// ([`Fresh::root`]) to keep it, or give it on to the next call at once
+/// ([`Fresh::take`]), its callee's to root.
 #[must_use = "a fresh value is to be rooted, or given on at once"]
-pub struct Fresh<'a> {
-    v: Value,
+pub struct Fresh<'a, T = Value> {
+    v: T,
     _vm: PhantomData<&'a mut Vm>,
 }
 
-impl<'a> Fresh<'a> {
-    pub(crate) fn new(v: Value) -> Fresh<'a> {
+impl<'a, T: Rootable> Fresh<'a, T> {
+    pub(crate) fn new(v: T) -> Fresh<'a, T> {
         Fresh { v, _vm: PhantomData }
     }
 
     /// Rooted in `s`, until it ends.
-    pub fn root<'s>(self, s: &'s Scope) -> Handle<'s> {
-        s.root(self.v)
+    pub fn root<'s>(self, s: &'s Scope) -> T::Rooted<'s> {
+        self.v.root_in(s)
     }
 
-    /// The value, for the call it is given to at once (an argument
-    /// rooted by its callee), or one not a cell (a number's).
-    pub fn take(self) -> Value {
+    /// What it holds, for the call it is given to at once (an argument
+    /// its callee roots), or not a cell (a number's).
+    pub fn take(self) -> T {
         self.v
     }
+}
 
+impl<'a> Fresh<'a> {
     /// The value as a `Gc`, while nothing collects.
     pub fn gc(self) -> Gc<'a> {
         Gc { v: self.v, _vm: PhantomData }
+    }
+}
+
+/// What holds cells, and its rooted form in a [`Scope`].
+pub trait Rootable {
+    type Rooted<'s>;
+    fn root_in(self, s: &Scope) -> Self::Rooted<'_>;
+}
+
+impl Rootable for Value {
+    type Rooted<'s> = Handle<'s>;
+    fn root_in(self, s: &Scope) -> Handle<'_> {
+        s.root(self)
+    }
+}
+
+impl Rootable for Desc {
+    type Rooted<'s> = RootedDesc<'s>;
+    fn root_in(self, s: &Scope) -> RootedDesc<'_> {
+        let h = |v: Option<Value>| v.map(|v| s.root(v));
+        RootedDesc { value: h(self.value), get: h(self.get), set: h(self.set), d: self }
+    }
+}
+
+impl<T: Rootable> Rootable for Option<T> {
+    type Rooted<'s> = Option<T::Rooted<'s>>;
+    fn root_in(self, s: &Scope) -> Option<T::Rooted<'_>> {
+        self.map(|v| v.root_in(s))
+    }
+}
+
+/// A list of values (CreateListFromArrayLike's), rooted only as it is
+/// given at once to a call (which copies it onto the VM stack first).
+impl Rootable for Vec<Value> {
+    type Rooted<'s> = Vec<Handle<'s>>;
+    fn root_in(self, s: &Scope) -> Vec<Handle<'_>> {
+        self.into_iter().map(|v| s.root(v)).collect()
+    }
+}
+
+/// A property descriptor, its value, getter and setter rooted.
+pub struct RootedDesc<'s> {
+    d: Desc,
+    value: Option<Handle<'s>>,
+    get: Option<Handle<'s>>,
+    set: Option<Handle<'s>>,
+}
+
+impl RootedDesc<'_> {
+    /// The descriptor now (its values' current addresses).
+    pub(crate) fn desc(&self) -> Desc {
+        Desc { value: self.value.map(Handle::v), get: self.get.map(Handle::v), set: self.set.map(Handle::v), ..self.d }
     }
 }
 
@@ -175,6 +232,23 @@ impl<'a> Mu<'a> {
     /// A new string of `units`.
     pub fn new_string(&self, units: &[u16]) -> Gc<'a> {
         Gc { v: self.with(|vm| vm.new_string(units)), _vm: PhantomData }
+    }
+
+    /// FromPropertyDescriptor: a new object of `d`'s fields.
+    pub(crate) fn from_descriptor(&self, d: &Desc) -> Gc<'a> {
+        Gc { v: self.with(|vm| vm.from_descriptor(d)), _vm: PhantomData }
+    }
+
+    /// A key as a property key value: a string (an index's made) or a
+    /// symbol.
+    pub(crate) fn key_string(&self, key: Key) -> Gc<'a> {
+        Gc {
+            v: self.with(|vm| {
+                let s = vm.key_value(key);
+                if s.is_number() { vm.key_string(key) } else { s }
+            }),
+            _vm: PhantomData,
+        }
     }
 }
 
@@ -261,5 +335,47 @@ impl Vm {
     /// LengthOfArrayLike.
     pub fn length_of_b(&mut self, o: Value) -> Result<f64> {
         self.length_of(o)
+    }
+
+    /// Call `f` with `this` and `args`.
+    pub fn call_b(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Fresh<'_>> {
+        crate::interp::call_function(self, f, this, args).map(Fresh::new)
+    }
+
+    /// Construct `f` with `args`, `nt` its `new.target`.
+    pub(crate) fn construct_b(&mut self, f: Value, args: &[Value], nt: Value) -> Result<Fresh<'_>> {
+        crate::intrinsics::construct_with(self, f, args, nt).map(Fresh::new)
+    }
+
+    /// CreateListFromArrayLike of `v`, an object (rooted while it is made:
+    /// its getters run).
+    pub(crate) fn list_b(&mut self, v: Value) -> Result<Fresh<'_, Vec<Value>>> {
+        self.handle_scope(|vm| crate::array::apply_list(vm, v)).map(Fresh::new)
+    }
+
+    /// ToPropertyDescriptor (its getters run).
+    pub(crate) fn to_descriptor_b(&mut self, v: Value) -> Result<Fresh<'_, Desc>> {
+        self.to_descriptor(v).map(Fresh::new)
+    }
+
+    /// `o.[[GetOwnProperty]](key)` (a proxy's trap runs).
+    pub(crate) fn own_property_b(&mut self, o: Obj, key: Key) -> Result<Fresh<'_, Option<Desc>>> {
+        crate::proxy::get_own_property(self, o, key).map(Fresh::new)
+    }
+
+    /// `o.[[GetPrototypeOf]]()`.
+    pub(crate) fn prototype_of_b(&mut self, o: Obj) -> Result<Fresh<'_>> {
+        crate::proxy::get_prototype_of(self, o).map(Fresh::new)
+    }
+
+    /// `o.[[Get]](key, receiver)`.
+    pub(crate) fn get_from_b(&mut self, o: Obj, key: Key, receiver: Value) -> Result<Fresh<'_>> {
+        let ov = object_value(o.ptr());
+        if crate::proxy::chain_has_proxy(self, o) {
+            crate::proxy::generic_get(self, ov, key, receiver)
+        } else {
+            crate::intrinsics::get_from(self, ov, key, receiver)
+        }
+        .map(Fresh::new)
     }
 }

@@ -174,6 +174,22 @@ impl Rootable for Vec<Value> {
     }
 }
 
+/// An element's read: whether it was there, and its value.
+impl Rootable for (bool, Value) {
+    type Rooted<'s> = (bool, Handle<'s>);
+    fn root_in(self, s: &Scope) -> (bool, Handle<'_>) {
+        (self.0, s.root(self.1))
+    }
+}
+
+/// An object and its length.
+impl Rootable for (Value, f64) {
+    type Rooted<'s> = (Handle<'s>, f64);
+    fn root_in(self, s: &Scope) -> (Handle<'_>, f64) {
+        (s.root(self.0), self.1)
+    }
+}
+
 /// A property descriptor, its value, getter and setter rooted.
 pub struct RootedDesc<'s> {
     d: Desc,

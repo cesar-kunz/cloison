@@ -19,9 +19,10 @@
 //! [`JOB`] values each, and run once the script is done ([`run_jobs`],
 //! from `Vm::run`), in order, the ones they queue after them.
 
+use crate::brand::{Fresh, Handle, Rootable, Scope};
 use crate::builtins::{caught, is_class, link_constructor, make_error, run_source};
 use crate::collections::iterate;
-use crate::interp::{call_function, to_string_units};
+use crate::interp::to_string_units;
 use crate::jit::Ty;
 use crate::object::{Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{is_callable, is_object};
@@ -173,8 +174,10 @@ pub(crate) fn new_with_resolvers(vm: &mut Vm) -> (Value, Value, Value) {
 pub(crate) fn await_then(vm: &mut Vm, v: Value, on_fulfilled: Value, on_rejected: Value) -> Result<()> {
     let c = object_value(root(vm, Root::Constructor).ptr());
     // (The handlers rooted: PromiseResolve may run a `constructor` getter.)
-    let p = vm.rooted(&[on_fulfilled, on_rejected], |vm| promise_resolve_with(vm, c, v))?;
-    perform_then(vm, Obj::of(p), on_fulfilled, on_rejected, &Cap::NONE)
+    let s = Scope::new(vm);
+    let [on_fulfilled, on_rejected] = s.roots([on_fulfilled, on_rejected]);
+    let p = vm.fresh(|vm| promise_resolve_with(vm, c, v))?.take();
+    perform_then(vm, Obj::of(p), on_fulfilled.v(), on_rejected.v(), &Cap::NONE)
 }
 
 /// `await v` of coroutine `g` (an async function's or async generator's):
@@ -185,8 +188,10 @@ pub(crate) fn await_then(vm: &mut Vm, v: Value, on_fulfilled: Value, on_rejected
 /// isn't callable).
 pub(crate) fn await_coroutine(vm: &mut Vm, v: Value, g: Value) -> Result<()> {
     let c = object_value(root(vm, Root::Constructor).ptr());
-    let p = vm.rooted(&[g], |vm| promise_resolve_with(vm, c, v))?;
-    perform_reaction(vm, Obj::of(p), g, g, &Cap::NONE)
+    let s = Scope::new(vm);
+    let g = s.root(g);
+    let p = vm.fresh(|vm| promise_resolve_with(vm, c, v))?.take();
+    perform_reaction(vm, Obj::of(p), g.v(), g.v(), &Cap::NONE)
 }
 
 /// Resolve `p`, %Promise%'s, with `v`, as its resolve function would (an
@@ -209,26 +214,30 @@ pub(crate) fn reject_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
 pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, record: Value, close: Value) -> Result<Value> {
     let c = object_value(root(vm, Root::Constructor).ptr());
     // (`record` and `close` rooted across a `constructor` getter.)
-    let wrapper = match vm.rooted(&[record, close], |vm| promise_resolve_with(vm, c, v)) {
-        Ok(w) => w,
+    let s = Scope::new(vm);
+    let [record, close] = s.roots([record, close]);
+    let wrapper = match vm.fresh(|vm| promise_resolve_with(vm, c, v)) {
+        Ok(w) => w.root(&s),
         Err(e) => {
             // (A rejected promise, the iterator closed first, what was
             // thrown rooted meanwhile.)
-            let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| crate::symbol::close(vm, close));
+            let _thrown = s.root(e.1.unwrap_or(Value::UNDEFINED));
+            let _ = crate::symbol::close(vm, close.v());
             return rejected(vm, e);
         }
     };
     // (No handler for a promise already fulfilled, as a plain value's.)
-    let on_rejected = if close.is_undefined() || state(wrapper).0 == FULFILLED {
-        Value::UNDEFINED
+    let on_rejected = if close.v().is_undefined() || state(wrapper.v()).0 == FULFILLED {
+        s.root(Value::UNDEFINED)
     } else {
-        closure(vm, Root::CloseOnRejection, &[close])
+        vm.mu().make(|vm| closure(vm, Root::CloseOnRejection, &[close.v()])).root(&s)
     };
     // (Its `onFulfilled`'s iterator result: the record for `resolve`, see
     // `cap_resolve`.)
-    let cap = Cap { promise: new_promise(vm), resolve: record, reject: Value::UNDEFINED };
-    perform_then(vm, Obj::of(wrapper), Value::UNDEFINED, on_rejected, &cap)?;
-    Ok(cap.promise)
+    let promise = vm.mu().make(new_promise).root(&s);
+    let cap = Cap { promise: promise.v(), resolve: record.v(), reject: Value::UNDEFINED };
+    perform_then(vm, Obj::of(wrapper.v()), Value::UNDEFINED, on_rejected.v(), &cap)?;
+    Ok(promise.v())
 }
 
 /// `Call(cap.[[Resolve]], undefined, « CreateIteratorResultObject(v,
@@ -248,20 +257,22 @@ pub(crate) fn resolve_iter_result(vm: &mut Vm, p: Obj, v: Value, record: Value) 
     if vm.lookup(vm.object_prototype_obj(), a_then).is_none() {
         return settle(vm, p, FULFILLED, v);
     }
-    let r = crate::symbol::iter_result(vm, v, crate::symbol::sync_done(record))?;
     // (`p`, `r` and `record` rooted across a `then` getter.)
-    let then = match vm.rooted(&[object_value(p.ptr()), r, record], |vm| vm.get(r, a_then)) {
-        Ok(t) => t,
+    let s = Scope::new(vm);
+    let [p, record] = s.roots([object_value(p.ptr()), record]);
+    let r = s.root(crate::symbol::iter_result(vm, v, crate::symbol::sync_done(record.v()))?);
+    let then = match vm.get_atom_b(r.v(), a_then) {
+        Ok(t) => t.take(),
         Err(e) => {
             let e = thrown(vm, e)?;
-            return settle(vm, p, REJECTED, e);
+            return settle(vm, Obj::of(p.v()), REJECTED, e);
         }
     };
-    crate::symbol::set_sync_result(record);
+    crate::symbol::set_sync_result(record.v());
     if !is_callable(then) {
-        return settle(vm, p, FULFILLED, r);
+        return settle(vm, Obj::of(p.v()), FULFILLED, r.v());
     }
-    enqueue(vm, [Value::from_i32(THENABLE), object_value(p.ptr()), r, then, Value::UNDEFINED, Value::UNDEFINED])
+    enqueue(vm, [Value::from_i32(THENABLE), p.v(), r.v(), then, Value::UNDEFINED, Value::UNDEFINED])
 }
 
 /// A promise resolved as [`resolve_iter_result`] of `v` and sync record
@@ -494,20 +505,19 @@ fn resolve_promise(vm: &mut Vm, p: Obj, resolution: Value) -> Result<()> {
     }
     let a_then = vm.a_then;
     // (`p` rooted across a `then` getter; `resolution` too, used after.)
-    let then = match vm.rooted(&[object_value(p.ptr()), resolution], |vm| vm.get(resolution, a_then)) {
-        Ok(t) => t,
+    let s = Scope::new(vm);
+    let [p, resolution] = s.roots([object_value(p.ptr()), resolution]);
+    let then = match vm.get_atom_b(resolution.v(), a_then) {
+        Ok(t) => t.take(),
         Err(e) => {
             let v = thrown(vm, e)?;
-            return settle(vm, p, REJECTED, v);
+            return settle(vm, Obj::of(p.v()), REJECTED, v);
         }
     };
     if !is_callable(then) {
-        return settle(vm, p, FULFILLED, resolution);
+        return settle(vm, Obj::of(p.v()), FULFILLED, resolution.v());
     }
-    enqueue(
-        vm,
-        [Value::from_i32(THENABLE), object_value(p.ptr()), resolution, then, Value::UNDEFINED, Value::UNDEFINED],
-    )
+    enqueue(vm, [Value::from_i32(THENABLE), p.v(), resolution.v(), then, Value::UNDEFINED, Value::UNDEFINED])
 }
 
 /// CreateResolvingFunctions: a resolve and a reject function for
@@ -563,6 +573,28 @@ struct Cap {
     reject: Value,
 }
 
+/// A capability rooted in a scope (see `brand`).
+struct RootedCap<'s> {
+    promise: Handle<'s>,
+    resolve: Handle<'s>,
+    reject: Handle<'s>,
+}
+
+impl RootedCap<'_> {
+    /// The capability now (its values' current addresses).
+    fn cap(&self) -> Cap {
+        Cap { promise: self.promise.v(), resolve: self.resolve.v(), reject: self.reject.v() }
+    }
+}
+
+impl Rootable for Cap {
+    type Rooted<'s> = RootedCap<'s>;
+    fn root_in(self, s: &Scope) -> RootedCap<'_> {
+        let [promise, resolve, reject] = s.roots([self.promise, self.resolve, self.reject]);
+        RootedCap { promise, resolve, reject }
+    }
+}
+
 impl Cap {
     /// None: a reaction's result goes nowhere (`await`'s).
     const NONE: Cap = Cap { promise: Value::UNDEFINED, resolve: Value::UNDEFINED, reject: Value::UNDEFINED };
@@ -578,10 +610,11 @@ fn new_capability(vm: &mut Vm, c: Value) -> Result<Cap> {
     if !is_constructor(c) {
         return Err(Error::type_error(format!("{} is not a constructor", crate::vm::shown(c))));
     }
-    let executor = closure(vm, Root::Executor, &[Value::UNDEFINED, Value::UNDEFINED]);
     // (The executor rooted: its slots are read after the constructor ran.)
-    let promise = vm.rooted(&[executor], |vm| construct(vm, c, executor))?;
-    let eo = Obj::of(executor);
+    let s = Scope::new(vm);
+    let executor = vm.mu().make(|vm| closure(vm, Root::Executor, &[Value::UNDEFINED, Value::UNDEFINED])).root(&s);
+    let promise = vm.fresh(|vm| construct(vm, c, executor.v()))?.take();
+    let eo = Obj::of(executor.v());
     let (resolve, reject) = (slot(eo, 0), slot(eo, 1));
     if !is_callable(resolve) {
         return Err(Error::type_error("Promise resolve function is not callable"));
@@ -601,11 +634,13 @@ fn construct(vm: &mut Vm, c: Value, executor: Value) -> Result<Value> {
     let k = Root::Construct as usize;
     if vm.promise_roots[k].is_null() {
         let src = "(function (C, executor) { return new C(executor); })";
-        let h = vm.rooted(&[c, executor], |vm| run_source(vm, src))?;
+        let s = Scope::new(vm);
+        let _held = (s.root(c), s.root(executor));
+        let h = vm.fresh(|vm| run_source(vm, src))?.take();
         vm.promise_roots[k] = Obj::of(h).ptr();
     }
     let h = object_value(vm.promise_roots[k]);
-    call_function(vm, h, Value::UNDEFINED, &[c, executor])
+    vm.call_b(h, Value::UNDEFINED, &[c, executor]).map(Fresh::take)
 }
 
 /// The capability's executor: keeps the resolve and reject functions it
@@ -648,7 +683,9 @@ fn cap_resolve(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
         );
         return resolve_iter_result(vm, Obj::of(cap.promise), v, cap.resolve);
     }
-    call_function(vm, cap.resolve, Value::UNDEFINED, &[v]).map(drop)
+    vm.call_b(cap.resolve, Value::UNDEFINED, &[v]).map(|r| {
+        r.take();
+    })
 }
 
 /// `Call(cap.[[Reject]], undefined, « v »)`; nothing without one.
@@ -659,7 +696,9 @@ fn cap_reject(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
     if cap.reject.is_undefined() {
         return settle(vm, Obj::of(cap.promise), REJECTED, v);
     }
-    call_function(vm, cap.reject, Value::UNDEFINED, &[v]).map(drop)
+    vm.call_b(cap.reject, Value::UNDEFINED, &[v]).map(|r| {
+        r.take();
+    })
 }
 
 // ---- Jobs ----
@@ -712,9 +751,11 @@ fn run_job(vm: &mut Vm, job: &[Value; JOB]) -> Result<()> {
         let (promise, thenable, then) = (job[1], job[2], job[3]);
         let (resolve, reject) = resolving_functions(vm, promise);
         // (`reject` rooted: the job's values are only in Rust's copy.)
-        if let Err(e) = vm.rooted(&[reject], |vm| call_function(vm, then, thenable, &[resolve, reject])) {
+        let s = Scope::new(vm);
+        let reject = s.root(reject);
+        if let Err(e) = vm.call_b(then, thenable, &[resolve, reject.v()]) {
             let v = thrown(vm, e)?;
-            call_function(vm, reject, Value::UNDEFINED, &[v])?;
+            vm.call_b(reject.v(), Value::UNDEFINED, &[v])?.take();
         }
         return Ok(());
     }
@@ -725,21 +766,22 @@ fn run_job(vm: &mut Vm, job: &[Value; JOB]) -> Result<()> {
         let mode = if tag == FULFILLED { crate::generator::NEXT } else { crate::generator::THROW };
         return crate::generator::async_step(vm, handler, mode, argument);
     }
-    let outcome = if handler.is_undefined() {
-        if tag == FULFILLED { Ok(argument) } else { Err(argument) }
-    } else {
-        // (The capability rooted across the handler: the job's values are
-        // only in Rust's copy.)
-        match vm.rooted(&[cap.promise, cap.resolve, cap.reject], |vm| {
-            call_function(vm, handler, Value::UNDEFINED, &[argument])
-        }) {
-            Ok(v) => Ok(v),
-            Err(e) => Err(thrown(vm, e)?),
+    if handler.is_undefined() {
+        return if tag == FULFILLED { cap_resolve(vm, &cap, argument) } else { cap_reject(vm, &cap, argument) };
+    }
+    // (The capability rooted across the handler: the job's values are
+    // only in Rust's copy.)
+    let s = Scope::new(vm);
+    let cap = s.hold(cap);
+    match vm.call_b(handler, Value::UNDEFINED, &[argument]) {
+        Ok(v) => {
+            let v = v.take();
+            cap_resolve(vm, &cap.cap(), v)
         }
-    };
-    match outcome {
-        Ok(v) => cap_resolve(vm, &cap, v),
-        Err(v) => cap_reject(vm, &cap, v),
+        Err(e) => {
+            let v = thrown(vm, e)?;
+            cap_reject(vm, &cap.cap(), v)
+        }
     }
 }
 
@@ -755,31 +797,34 @@ fn promise_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_callable(executor) {
         return Err(Error::type_error(format!("Promise resolver {} is not a function", crate::vm::shown(executor))));
     }
-    let p = new_promise(vm);
-    let (resolve, reject) = resolving_functions(vm, p);
-    if let Err(e) = vm.rooted(&[p, reject], |vm| call_function(vm, executor, Value::UNDEFINED, &[resolve, reject])) {
+    let s = Scope::new(vm);
+    let p = vm.mu().make(new_promise).root(&s);
+    let (resolve, reject) = resolving_functions(vm, p.v());
+    let reject = s.root(reject);
+    if let Err(e) = vm.call_b(executor, Value::UNDEFINED, &[resolve, reject.v()]) {
         let v = thrown(vm, e)?;
-        call_function(vm, reject, Value::UNDEFINED, &[v])?;
+        vm.call_b(reject.v(), Value::UNDEFINED, &[v])?.take();
     }
-    Ok(p)
+    Ok(p.v())
 }
 
 /// SpeciesConstructor(o, %Promise%): `o.constructor[Symbol.species]`, or
 /// `Promise` if either is undefined (or the species null).
 fn species_constructor(vm: &mut Vm, o: Value) -> Result<Value> {
     let a_constructor = vm.intern_name("constructor");
-    let c = vm.get(o, a_constructor)?;
+    // (`c`, maybe a getter's result only, the receiver after a proxy's
+    // handler ran: rooted.)
+    let sc = Scope::new(vm);
+    let c = vm.get_atom_b(o, a_constructor)?.root(&sc);
     let intrinsic = object_value(root(vm, Root::Constructor).ptr());
-    if c.is_undefined() {
+    if c.v().is_undefined() {
         return Ok(intrinsic);
     }
-    if !is_object(c) {
+    if !is_object(c.v()) {
         return Err(Error::type_error("The .constructor property is not an object"));
     }
     let a_species = vm.a_sym_species;
-    // (`c`, maybe a getter's result only, the receiver after a proxy's
-    // handler ran: rooted.)
-    let s = vm.rooted(&[c], |vm| vm.get(c, a_species))?;
+    let s = vm.get_atom_b(c.v(), a_species)?.take();
     if s.is_undefined() || s.is_null() {
         return Ok(intrinsic);
     }
@@ -825,17 +870,18 @@ fn perform_reaction(vm: &mut Vm, p: Obj, on_fulfilled: Value, on_rejected: Value
 /// constructor) for the handler's result.
 fn promise_then(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let p = this_promise(this, "Promise.prototype.then")?;
-    let c = species_constructor(vm, this)?;
-    let cap = new_capability(vm, c)?;
-    perform_then(vm, p, arg(a, 0), arg(a, 1), &cap)?;
-    Ok(cap.promise)
+    let c = vm.fresh(|vm| species_constructor(vm, this))?.take();
+    let s = Scope::new(vm);
+    let cap = vm.fresh(|vm| new_capability(vm, c))?.root(&s);
+    perform_then(vm, p, arg(a, 0), arg(a, 1), &cap.cap())?;
+    Ok(cap.promise.v())
 }
 
 /// `promise.catch(onRejected)`: `promise.then(undefined, onRejected)`.
 fn promise_catch(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let a_then = vm.a_then;
-    let then = vm.get(this, a_then)?;
-    call_function(vm, then, this, &[Value::UNDEFINED, arg(a, 0)])
+    let then = vm.get_atom_b(this, a_then)?.take();
+    vm.call_b(then, this, &[Value::UNDEFINED, arg(a, 0)]).map(Fresh::take)
 }
 
 /// `promise.finally(onFinally)`: `promise.then(f, g)` where `f` and `g`
@@ -846,16 +892,18 @@ fn promise_finally(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !is_object(this) {
         return Err(Error::type_error("Promise.prototype.finally called on a non-object"));
     }
-    let c = species_constructor(vm, this)?;
+    let s = Scope::new(vm);
+    let c = vm.fresh(|vm| species_constructor(vm, this))?.root(&s);
     let on_finally = arg(a, 0);
     let (then_fn, catch_fn) = if is_callable(on_finally) {
-        (closure(vm, Root::ThenFinally, &[on_finally, c]), closure(vm, Root::CatchFinally, &[on_finally, c]))
+        let t = vm.mu().make(|vm| closure(vm, Root::ThenFinally, &[on_finally, c.v()])).root(&s);
+        (t, vm.mu().make(|vm| closure(vm, Root::CatchFinally, &[on_finally, c.v()])).root(&s))
     } else {
-        (on_finally, on_finally)
+        (s.root(on_finally), s.root(on_finally))
     };
     let a_then = vm.a_then;
-    let then = vm.rooted(&[c, then_fn, catch_fn], |vm| vm.get(this, a_then))?;
-    call_function(vm, then, this, &[then_fn, catch_fn])
+    let then = vm.get_atom_b(this, a_then)?.take();
+    vm.call_b(then, this, &[then_fn.v(), catch_fn.v()]).map(Fresh::take)
 }
 
 /// `finally`'s fulfillment handler: `onFinally()`, then the value again
@@ -863,12 +911,13 @@ fn promise_finally(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn then_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let me = vm.callee_obj();
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
-    let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
-    let p = promise_resolve_with(vm, c, result)?;
-    let thunk = closure(vm, Root::ValueThunk, &[arg(a, 0)]);
+    let result = vm.call_b(on_finally, Value::UNDEFINED, &[])?.take();
+    let s = Scope::new(vm);
+    let p = vm.fresh(|vm| promise_resolve_with(vm, c, result))?.root(&s);
+    let thunk = vm.mu().make(|vm| closure(vm, Root::ValueThunk, &[arg(a, 0)])).root(&s);
     let a_then = vm.a_then;
-    let then = vm.rooted(&[p, thunk], |vm| vm.get(p, a_then))?;
-    call_function(vm, then, p, &[thunk])
+    let then = vm.get_atom_b(p.v(), a_then)?.take();
+    vm.call_b(then, p.v(), &[thunk.v()]).map(Fresh::take)
 }
 
 /// `finally`'s rejection handler: as [`then_finally`], the reason thrown
@@ -876,12 +925,13 @@ fn then_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn catch_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let me = vm.callee_obj();
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
-    let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
-    let p = promise_resolve_with(vm, c, result)?;
-    let thrower = closure(vm, Root::Thrower, &[arg(a, 0)]);
+    let result = vm.call_b(on_finally, Value::UNDEFINED, &[])?.take();
+    let s = Scope::new(vm);
+    let p = vm.fresh(|vm| promise_resolve_with(vm, c, result))?.root(&s);
+    let thrower = vm.mu().make(|vm| closure(vm, Root::Thrower, &[arg(a, 0)])).root(&s);
     let a_then = vm.a_then;
-    let then = vm.rooted(&[p, thrower], |vm| vm.get(p, a_then))?;
-    call_function(vm, then, p, &[thrower])
+    let then = vm.get_atom_b(p.v(), a_then)?.take();
+    vm.call_b(then, p.v(), &[thrower.v()]).map(Fresh::take)
 }
 
 fn value_thunk(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
@@ -898,17 +948,18 @@ fn thrower(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// a new promise of `C` resolved with it.
 fn promise_resolve_with(vm: &mut Vm, c: Value, x: Value) -> Result<Value> {
     // (`x` rooted across a `constructor` getter and `C`'s executor; the
-    // promise across `resolve`.)
-    let _rooted = vm.root_scope(&[c, x]);
-    if is_class(x, Class::Promise) {
+    // capability across `resolve`.)
+    let s = Scope::new(vm);
+    let [c, x] = s.roots([c, x]);
+    if is_class(x.v(), Class::Promise) {
         let a_constructor = vm.intern_name("constructor");
-        if vm.get(x, a_constructor)? == c {
-            return Ok(x);
+        if vm.get_atom_b(x.v(), a_constructor)?.take() == c.v() {
+            return Ok(x.v());
         }
     }
-    let cap = new_capability(vm, c)?;
-    vm.rooted(&[cap.promise], |vm| cap_resolve(vm, &cap, x))?;
-    Ok(cap.promise)
+    let cap = vm.fresh(|vm| new_capability(vm, c.v()))?.root(&s);
+    cap_resolve(vm, &cap.cap(), x.v())?;
+    Ok(cap.promise.v())
 }
 
 fn this_constructor(this: Value, what: &str) -> Result<Value> {
@@ -918,21 +969,23 @@ fn this_constructor(this: Value, what: &str) -> Result<Value> {
 /// `Promise.resolve(x)`.
 fn promise_resolve(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let c = this_constructor(this, "Promise.resolve")?;
-    promise_resolve_with(vm, c, arg(a, 0))
+    vm.fresh(|vm| promise_resolve_with(vm, c, arg(a, 0))).map(Fresh::take)
 }
 
 /// `Promise.reject(r)`.
 fn promise_reject(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let c = this_constructor(this, "Promise.reject")?;
-    let cap = new_capability(vm, c)?;
-    vm.rooted(&[cap.promise], |vm| cap_reject(vm, &cap, arg(a, 0)))?;
-    Ok(cap.promise)
+    let s = Scope::new(vm);
+    let cap = vm.fresh(|vm| new_capability(vm, c))?.root(&s);
+    cap_reject(vm, &cap.cap(), arg(a, 0))?;
+    Ok(cap.promise.v())
 }
 
 /// `Promise.withResolvers()`: `{ promise, resolve, reject }`.
 fn promise_with_resolvers(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let c = this_constructor(this, "Promise.withResolvers")?;
-    let mut cap = new_capability(vm, c)?;
+    // (Its functions made, and the object, where nothing collects.)
+    let mut cap = vm.fresh(|vm| new_capability(vm, c))?.take();
     materialize(vm, &mut cap);
     let op = object_value(vm.object_prototype);
     let o = vm.new_plain(op);
@@ -945,26 +998,27 @@ fn promise_with_resolvers(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
 /// throws (what it returns itself if a promise of `this`).
 fn promise_try(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let c = this_constructor(this, "Promise.try")?;
-    let cap = new_capability(vm, c)?;
     // (The capability rooted across the call; its result across a
     // `constructor` getter.)
-    let _rooted = vm.root_scope(&[cap.promise, cap.resolve, cap.reject]);
-    match call_function(vm, arg(a, 0), Value::UNDEFINED, a.get(1..).unwrap_or(&[])) {
-        Ok(v)
-            if is_class(v, Class::Promise) && {
+    let s = Scope::new(vm);
+    let cap = vm.fresh(|vm| new_capability(vm, c))?.root(&s);
+    match vm.call_b(arg(a, 0), Value::UNDEFINED, a.get(1..).unwrap_or(&[])) {
+        Ok(v) => {
+            let v = v.root(&s);
+            if is_class(v.v(), Class::Promise) {
                 let a_constructor = vm.intern_name("constructor");
-                vm.rooted(&[v], |vm| vm.get(v, a_constructor))? == c
-            } =>
-        {
-            return Ok(v);
+                if vm.get_atom_b(v.v(), a_constructor)?.take() == c {
+                    return Ok(v.v());
+                }
+            }
+            cap_resolve(vm, &cap.cap(), v.v())?;
         }
-        Ok(v) => cap_resolve(vm, &cap, v)?,
         Err(e) => {
             let v = thrown(vm, e)?;
-            cap_reject(vm, &cap, v)?;
+            cap_reject(vm, &cap.cap(), v)?;
         }
     }
-    Ok(cap.promise)
+    Ok(cap.promise.v())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -978,80 +1032,98 @@ enum Combinator {
 /// `Promise.all(iterable)` and the others: a capability of `this`, which
 /// what goes wrong while iterating rejects.
 fn combine(vm: &mut Vm, this: Value, a: &[Value], kind: Combinator) -> Result<Value> {
-    let mut cap = new_capability(vm, this)?;
+    let mut cap = vm.fresh(|vm| new_capability(vm, this))?.take();
     materialize(vm, &mut cap);
     // (The capability rooted while the iteration runs JS.)
-    let _rooted = vm.root_scope(&[cap.promise, cap.resolve, cap.reject]);
+    let s = Scope::new(vm);
+    let cap = s.hold(cap);
     if let Err(e) = perform_combine(vm, this, &cap, arg(a, 0), kind) {
         let v = thrown(vm, e)?;
-        cap_reject(vm, &cap, v)?;
+        cap_reject(vm, &cap.cap(), v)?;
     }
-    Ok(cap.promise)
+    Ok(cap.promise.v())
 }
 
 /// PerformPromiseAll and the others: each value iterated, through
 /// `C.resolve`, gets a `then` whose handlers settle the capability: at
 /// the first for `race`, at the last for the others, which collect.
-fn perform_combine(vm: &mut Vm, c: Value, cap: &Cap, iterable: Value, kind: Combinator) -> Result<()> {
+fn perform_combine(vm: &mut Vm, c: Value, cap: &RootedCap, iterable: Value, kind: Combinator) -> Result<()> {
     let a_resolve = vm.intern_name("resolve");
-    let promise_resolve = vm.get(c, a_resolve)?;
-    if !is_callable(promise_resolve) {
+    // (Rooted across the iteration, which runs JS.)
+    let s = Scope::new(vm);
+    let promise_resolve = vm.get_atom_b(c, a_resolve)?.root(&s);
+    if !is_callable(promise_resolve.v()) {
         return Err(Error::type_error("Promise resolve is not a function"));
     }
     let a_then = vm.a_then;
-    let values = vm.new_array();
+    let values = vm.mu().new_array().root(&s);
     // `[remaining]`: the elements not settled yet, plus one until the
     // iteration is done (shared by the element functions).
-    let state = vm.new_array();
-    array_push(vm, state, &[Value::from_i32(1)])?;
-    // (Rooted across the iteration, which runs JS.)
-    let _rooted = vm.root_scope(&[promise_resolve, values, state]);
+    let state = vm.mu().new_array().root(&s);
+    array_push(vm, state.v(), &[Value::from_i32(1)])?;
     let mut index = 0;
     iterate(vm, iterable, |vm, next| {
-        let next_promise = call_function(vm, promise_resolve, c, &[next])?;
+        let cap_now = cap.cap();
+        let (values, state) = (values.v(), state.v());
+        // (Its value's place first, as the spec has it: an array no JS
+        // sees, so pushing runs none.)
+        if kind != Combinator::Race {
+            array_push(vm, values, &[Value::UNDEFINED])?;
+        }
+        let next_promise = vm.call_b(promise_resolve.v(), c, &[next])?.take();
+        // (The handlers made where nothing collects; the capability's own
+        // functions its handles' values.)
+        let mu = vm.mu();
         let (on_fulfilled, on_rejected) = match kind {
-            Combinator::Race => (cap.resolve, cap.reject),
+            Combinator::Race => (cap_now.resolve, cap_now.reject),
             Combinator::All => {
-                array_push(vm, values, &[Value::UNDEFINED])?;
-                let data = [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE];
-                (closure(vm, Root::AllElement, &data), cap.reject)
+                let data = [values, state, cap_now.promise, cap_now.resolve, Value::from_i32(index), Value::FALSE];
+                (mu.make(|vm| closure(vm, Root::AllElement, &data)).v(), cap_now.reject)
             }
             Combinator::AllSettled => {
-                array_push(vm, values, &[Value::UNDEFINED])?;
-                let data =
-                    [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED];
-                let f = closure(vm, Root::SettledFulfill, &data);
+                let data = [
+                    values,
+                    state,
+                    cap_now.promise,
+                    cap_now.resolve,
+                    Value::from_i32(index),
+                    Value::FALSE,
+                    Value::UNDEFINED,
+                ];
+                let f = mu.make(|vm| closure(vm, Root::SettledFulfill, &data)).v();
                 let mut data = data;
                 data[6] = f;
-                let r = closure(vm, Root::SettledReject, &data);
+                let r = mu.make(|vm| closure(vm, Root::SettledReject, &data)).v();
                 set_slot(Obj::of(f), 6, r);
                 (f, r)
             }
             Combinator::Any => {
-                array_push(vm, values, &[Value::UNDEFINED])?;
-                let data = [values, state, cap.promise, cap.reject, Value::from_i32(index), Value::FALSE];
-                (cap.resolve, closure(vm, Root::AnyElement, &data))
+                let data = [values, state, cap_now.promise, cap_now.reject, Value::from_i32(index), Value::FALSE];
+                (cap_now.resolve, mu.make(|vm| closure(vm, Root::AnyElement, &data)).v())
             }
         };
         if kind != Combinator::Race {
             let s = Obj::of(state);
             put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
         }
-        let then = vm.rooted(&[next_promise, on_fulfilled, on_rejected], |vm| vm.get(next_promise, a_then))?;
-        call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
+        // (The element's promise and handlers across its `then` getter.)
+        let step = Scope::new(vm);
+        let [next_promise, on_fulfilled, on_rejected] = step.roots([next_promise, on_fulfilled, on_rejected]);
+        let then = vm.get_atom_b(next_promise.v(), a_then)?.take();
+        vm.call_b(then, next_promise.v(), &[on_fulfilled.v(), on_rejected.v()])?.take();
         index += 1;
         Ok(())
     })?;
     if kind != Combinator::Race {
-        let s = Obj::of(state);
-        let remaining = elem(s, 0).as_i32_unchecked() - 1;
-        put(s, 0, Value::from_i32(remaining));
+        let st = Obj::of(state.v());
+        let remaining = elem(st, 0).as_i32_unchecked() - 1;
+        put(st, 0, Value::from_i32(remaining));
         if remaining == 0 {
             if kind == Combinator::Any {
-                let e = aggregate_error(vm, values);
-                cap_reject(vm, cap, e)?;
+                let e = aggregate_error(vm, values.v());
+                cap_reject(vm, &cap.cap(), e)?;
             } else {
-                cap_resolve(vm, cap, values)?;
+                cap_resolve(vm, &cap.cap(), values.v())?;
             }
         }
     }
@@ -1078,22 +1150,25 @@ fn promise_any(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `all` (`allSettled`) of the values of the object's own enumerable
 /// properties, settled with an object of them by the same keys.
 fn combine_keyed(vm: &mut Vm, this: Value, a: &[Value], settled: bool) -> Result<Value> {
-    let mut cap = new_capability(vm, this)?;
+    let mut cap = vm.fresh(|vm| new_capability(vm, this))?.take();
     materialize(vm, &mut cap);
     // (The capability rooted while the properties' reads run JS.)
-    let _rooted = vm.root_scope(&[cap.promise, cap.resolve, cap.reject]);
+    let s = Scope::new(vm);
+    let cap = s.hold(cap);
     if let Err(e) = perform_keyed(vm, this, &cap, arg(a, 0), settled) {
         let v = thrown(vm, e)?;
-        cap_reject(vm, &cap, v)?;
+        cap_reject(vm, &cap.cap(), v)?;
     }
-    Ok(cap.promise)
+    Ok(cap.promise.v())
 }
 
 /// PerformPromiseAllKeyed.
-fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: bool) -> Result<()> {
+fn perform_keyed(vm: &mut Vm, c: Value, cap: &RootedCap, promises: Value, settled: bool) -> Result<()> {
     let a_resolve = vm.intern_name("resolve");
-    let promise_resolve = vm.get(c, a_resolve)?;
-    if !is_callable(promise_resolve) {
+    // (Rooted across the properties' reads and the calls, which run JS.)
+    let s = Scope::new(vm);
+    let promise_resolve = vm.get_atom_b(c, a_resolve)?.root(&s);
+    if !is_callable(promise_resolve.v()) {
         return Err(Error::type_error("Promise resolve is not a function"));
     }
     if !is_object(promises) {
@@ -1101,46 +1176,56 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
     }
     let o = Obj::of(promises);
     let a_then = vm.a_then;
-    let keys = vm.new_array();
-    let values = vm.new_array();
-    let state = vm.new_array();
-    array_push(vm, state, &[Value::from_i32(1)])?;
-    // (Rooted across the properties' reads and the calls, which run JS.)
-    let _rooted = vm.root_scope(&[promise_resolve, keys, values, state]);
+    let keys = vm.mu().new_array().root(&s);
+    let values = vm.mu().new_array().root(&s);
+    let state = vm.mu().new_array().root(&s);
+    array_push(vm, state.v(), &[Value::from_i32(1)])?;
     let mut index = 0;
     for key in crate::proxy::own_keys(vm, o)? {
-        if !crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+        if !vm.own_property_b(o, key)?.take().is_some_and(|d| d.enumerable == Some(true)) {
             continue;
         }
-        let k = vm.key_value(key);
-        let value = vm.rooted(&[k], |vm| vm.get_keyed(promises, k))?;
-        array_push(vm, keys, &[k])?;
-        array_push(vm, values, &[Value::UNDEFINED])?;
-        let next_promise = call_function(vm, promise_resolve, c, &[value])?;
-        let data =
-            [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED, keys];
+        let step = Scope::new(vm);
+        let k = vm.mu().make(|vm| vm.key_value(key)).root(&step);
+        let value = vm.get_keyed_b(promises, k.v())?.take();
+        array_push(vm, keys.v(), &[k.v()])?;
+        // (`value` rooted across the push.)
+        let value = step.root(value);
+        array_push(vm, values.v(), &[Value::UNDEFINED])?;
+        let next_promise = vm.call_b(promise_resolve.v(), c, &[value.v()])?.root(&step);
+        let cp = cap.cap();
+        let data = [
+            values.v(),
+            state.v(),
+            cp.promise,
+            cp.resolve,
+            Value::from_i32(index),
+            Value::FALSE,
+            Value::UNDEFINED,
+            keys.v(),
+        ];
         let (on_fulfilled, on_rejected) = if settled {
-            let f = closure(vm, Root::SettledFulfill, &data);
+            let f = vm.mu().make(|vm| closure(vm, Root::SettledFulfill, &data)).root(&step);
             let mut data = data;
-            data[PARTNER] = f;
-            let r = closure(vm, Root::SettledReject, &data);
-            set_slot(Obj::of(f), PARTNER, r);
+            data[PARTNER] = f.v();
+            let r = vm.mu().make(|vm| closure(vm, Root::SettledReject, &data)).root(&step);
+            set_slot(Obj::of(f.v()), PARTNER, r.v());
             (f, r)
         } else {
-            (closure(vm, Root::AllElement, &data), cap.reject)
+            (vm.mu().make(|vm| closure(vm, Root::AllElement, &data)).root(&step), cap.reject)
         };
-        let s = Obj::of(state);
-        put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
-        let then = vm.rooted(&[next_promise, on_fulfilled, on_rejected], |vm| vm.get(next_promise, a_then))?;
-        call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
+        let st = Obj::of(state.v());
+        put(st, 0, Value::from_i32(elem(st, 0).as_i32_unchecked() + 1));
+        let then = vm.get_atom_b(next_promise.v(), a_then)?.take();
+        vm.call_b(then, next_promise.v(), &[on_fulfilled.v(), on_rejected.v()])?.take();
         index += 1;
     }
-    let s = Obj::of(state);
-    let remaining = elem(s, 0).as_i32_unchecked() - 1;
-    put(s, 0, Value::from_i32(remaining));
+    let st = Obj::of(state.v());
+    let remaining = elem(st, 0).as_i32_unchecked() - 1;
+    put(st, 0, Value::from_i32(remaining));
     if remaining == 0 {
-        let r = keyed_result(vm, keys, values)?;
-        cap_resolve(vm, cap, r)?;
+        let r = vm.fresh(|vm| keyed_result(vm, keys.v(), values.v()))?.take();
+        cap_resolve(vm, &cap.cap(), r)?;
     }
     Ok(())
 }
@@ -1148,13 +1233,16 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
 /// CreateKeyedPromiseCombinatorResultObject: a null-prototype object of
 /// `values` by `keys` (arrays).
 fn keyed_result(vm: &mut Vm, keys: Value, values: Value) -> Result<Value> {
-    let o = object_value(vm.new_plain(Value::NULL).ptr());
-    let (k, v) = (as_object(keys), as_object(values));
-    for i in 0..len(unsafe { Obj::from_ptr(k) }) {
-        let key = crate::intrinsics::to_property_key(vm, elem(unsafe { Obj::from_ptr(k) }, i))?;
-        vm.create_data_property(o, key, elem(unsafe { Obj::from_ptr(v) }, i))?;
+    // (`keys` holds the keys' primitive values, `o` is a new object with
+    // no prototype: nothing here runs JS, but rooted as the types ask.)
+    let s = Scope::new(vm);
+    let (keys, values) = (s.root(keys), s.root(values));
+    let o = vm.mu().make(|vm| object_value(vm.new_plain(Value::NULL).ptr())).root(&s);
+    for i in 0..len(Obj::of(keys.v())) {
+        let key = crate::intrinsics::to_property_key(vm, elem(Obj::of(keys.v()), i))?;
+        vm.create_data_property(o.v(), key, elem(Obj::of(values.v()), i))?;
     }
-    Ok(o)
+    Ok(o.v())
 }
 
 fn promise_all_keyed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1189,13 +1277,13 @@ fn element_done(vm: &mut Vm, me: Obj, v: Value) -> Result<Value> {
     if remaining == 0 {
         let any = me.code() == unsafe { (*root(vm, Root::AnyElement).ptr()).code };
         let result = if Object::inline_cap(me.ptr().cast_const()) > KEYS {
-            keyed_result(vm, slot(me, KEYS), values)?
+            vm.fresh(|vm| keyed_result(vm, slot(me, KEYS), values))?.take()
         } else if any {
             aggregate_error(vm, values)
         } else {
             values
         };
-        call_function(vm, slot(me, SETTLE), Value::UNDEFINED, &[result])?;
+        vm.call_b(slot(me, SETTLE), Value::UNDEFINED, &[result])?.take();
     }
     Ok(Value::UNDEFINED)
 }
@@ -1302,19 +1390,18 @@ fn aggregate_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // InstallErrorCause comes first.)
     let options = arg(a, 2);
     let a_cause = vm.intern_name("cause");
+    // (`errors` and the cause rooted across the iteration.)
+    let s = Scope::new(vm);
     let cause = if crate::props::is_object(options) && vm.has_key(options, crate::vm::Key::Name(a_cause))? {
-        Some(vm.get(options, a_cause)?)
+        Some(vm.get_atom_b(options, a_cause)?.root(&s))
     } else {
         None
     };
-    let errors = vm.new_array();
-    // (`errors` and the cause rooted across the iteration.)
-    vm.rooted(&[errors, cause.unwrap_or(Value::UNDEFINED)], |vm| {
-        iterate(vm, arg(a, 0), |vm, e| array_push(vm, errors, &[e]).map(drop))
-    })?;
-    let e = new_aggregate_error(vm, errors, message.as_deref());
+    let errors = vm.mu().new_array().root(&s);
+    iterate(vm, arg(a, 0), |vm, e| array_push(vm, errors.v(), &[e]).map(drop))?;
+    let e = new_aggregate_error(vm, errors.v(), message.as_deref());
     if let Some(c) = cause {
-        vm.add_property_with(Obj::of(e), a_cause, c, crate::object::DONT_ENUM);
+        vm.add_property_with(Obj::of(e), a_cause, c.v(), crate::object::DONT_ENUM);
     }
     Ok(e)
 }

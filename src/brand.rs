@@ -234,6 +234,13 @@ impl<'a> Mu<'a> {
         Gc { v: object_value(o.ptr()), _vm: PhantomData }
     }
 
+    /// What `f`, which allocates but never collects (a module's helper
+    /// making a closure or a promise), makes.
+    #[inline(always)]
+    pub(crate) fn make(&self, f: impl FnOnce(&mut Vm) -> Value) -> Gc<'a> {
+        Gc { v: self.with(f), _vm: PhantomData }
+    }
+
     /// A new array.
     pub fn new_array(&self) -> Gc<'a> {
         Gc { v: self.with(Vm::new_array), _vm: PhantomData }
@@ -276,6 +283,25 @@ impl Scope {
     #[inline(always)]
     pub fn new(vm: &mut Vm) -> Scope {
         Scope { depth: vm.handles.len(), vm }
+    }
+
+    /// `vs` rooted until the scope ends, at once (one growth check).
+    #[inline(always)]
+    pub fn roots<const N: usize>(&self, vs: [Value; N]) -> [Handle<'_>; N] {
+        // SAFETY: as `root`.
+        let at = unsafe {
+            let h = &mut (*self.vm).handles;
+            h.extend_from_slice(&vs);
+            h.len() - N
+        };
+        std::array::from_fn(|i| Handle { vm: self.vm, slot: at + i, _s: PhantomData })
+    }
+
+    /// What `x` holds rooted until the scope ends: what a caller passed
+    /// (a record of values), held across a call that may collect.
+    #[inline(always)]
+    pub fn hold<T: Rootable>(&self, x: T) -> T::Rooted<'_> {
+        x.root_in(self)
     }
 
     /// `v` rooted until the scope ends: a value a caller passed, which
@@ -330,6 +356,13 @@ impl Handle<'_> {
 
 /// The calls that may collect, their results branded ([`Fresh`]).
 impl Vm {
+    /// What `f`, a call that may collect, returns, branded: a module's own
+    /// calls, which have no `*_b` form here.
+    #[inline(always)]
+    pub(crate) fn fresh<T: Rootable>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T>) -> Result<Fresh<'_, T>> {
+        f(self).map(Fresh::new)
+    }
+
     /// The VM where nothing collects.
     #[inline(always)]
     pub fn mu(&mut self) -> Mu<'_> {

@@ -5,7 +5,7 @@
 3 src/bigint.rs
 4 src/bin/cloison.rs
 2 src/bin/dispatch_bench.rs
-5 src/brand.rs
+6 src/brand.rs
 30 src/builtins.rs
 14 src/collections.rs
 11 src/date.rs
@@ -26,7 +26,7 @@
 62 src/layout.rs
 2 src/module.rs
 79 src/object.rs
-16 src/promise.rs
+13 src/promise.rs
 18 src/props.rs
 10 src/proxy.rs
 11 src/racy.rs
@@ -43,4 +43,4 @@
 1 src/value.rs
 183 src/vm.rs
 187 stencils/stencils.rs
-236 (Obj::from_ptr bridges)
+233 (Obj::from_ptr bridges)

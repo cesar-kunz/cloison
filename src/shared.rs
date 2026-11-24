@@ -471,7 +471,7 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut max = None;
     if is_object(options) {
         let a_max = vm.intern_name("maxByteLength");
-        let m = vm.get(options, a_max)?;
+        let m = vm.get_atom_b(options, a_max)?.take();
         if !m.is_undefined() {
             max = Some(to_index(vm, m)?);
         }
@@ -986,7 +986,7 @@ pub(crate) fn poll(vm: &mut Vm) -> Result<bool> {
         }
         for (_, _, resolve, outcome) in done {
             let s = str_value(vm, outcome);
-            crate::interp::call_function(vm, resolve, Value::UNDEFINED, &[s])?;
+            vm.call_b(resolve, Value::UNDEFINED, &[s])?.take();
         }
         Ok(())
     })?;

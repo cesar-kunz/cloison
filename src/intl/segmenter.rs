@@ -11,6 +11,7 @@ use super::{
     Kind, Root, canonicalize_locale_list, coerce_options, create, data_error, options_object, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
+use crate::brand::Scope;
 use crate::object::{DONT_ENUM, Obj, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
@@ -112,7 +113,10 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// (CreateSegmentsObject).
 fn segment(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = require(this, Kind::Segmenter, "Intl.Segmenter.prototype.segment")?;
-    let string = crate::intrinsics::to_string(vm, arg(a, 0))?;
+    // (`string`, a new string maybe, held across the prototype's making
+    // and the object's: rooted.)
+    let sc = Scope::new(vm);
+    let string = vm.to_string_b(arg(a, 0))?.root(&sc).v();
     let proto = object_value(root(vm, Root::SegmentsPrototype).ptr());
     let zero = Value::number(0.0);
     Ok(create(vm, proto, Kind::Segments, &[string, slot(o, GRANULARITY), zero, zero, Value::FALSE, Value::UNDEFINED]))
@@ -147,7 +151,7 @@ fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // the indices backwards, or here and there, in a long string).
     let mut marks = slot(o, MARKS);
     let count = if marks.is_undefined() { 0 } else { crate::far::array_length(Obj::of(marks)) };
-    let mark = |vm: &mut Vm, i: u32| Ok(vm.get_keyed(marks, Value::number(i as f64))?.to_number() as usize);
+    let mark = |vm: &mut Vm, i: u32| Ok(vm.get_keyed_b(marks, Value::number(i as f64))?.take().to_number() as usize);
     let mut top = if count == 0 { 0 } else { mark(vm, count - 1)? };
     let mut start = if last_end <= n && n - last_end < STRIDE {
         last_end

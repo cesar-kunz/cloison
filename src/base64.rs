@@ -82,11 +82,12 @@ fn options(v: Value) -> Result<Option<Value>> {
 fn choice(vm: &mut Vm, opts: Option<Value>, name: &str, allowed: &[&str]) -> Result<usize> {
     let Some(o) = opts else { return Ok(0) };
     let a = vm.intern_name(name);
-    let v = vm.get(o, a)?;
-    if v.is_undefined() {
+    let v = vm.get_atom_b(o, a)?;
+    if v.peek().is_undefined() {
         return Ok(0);
     }
-    let found = string_units(v).and_then(|u| allowed.iter().position(|s| s.encode_utf16().eq(u.iter().copied())));
+    let found =
+        string_units(v.peek()).and_then(|u| allowed.iter().position(|s| s.encode_utf16().eq(u.iter().copied())));
     found.ok_or_else(|| Error::type_error(format!("{name} must be one of {}", allowed.join(", "))))
 }
 
@@ -311,7 +312,7 @@ fn to_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let omit_padding = match opts {
         Some(o) => {
             let a = vm.intern_name("omitPadding");
-            to_boolean(vm.get(o, a)?)
+            to_boolean(vm.get_atom_b(o, a)?.take())
         }
         None => false,
     };

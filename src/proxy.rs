@@ -16,7 +16,8 @@
 //! §10.5.*: a non-configurable property can't be reported otherwise than
 //! the target has it, nor a non-extensible target otherwise than it is).
 
-use crate::interp::{call_function, to_boolean};
+use crate::brand::{Fresh, Scope};
+use crate::interp::to_boolean;
 use crate::jit::HashSet;
 use crate::object::{Class, Obj, Object, object_value};
 use crate::props::{Desc, is_callable, is_object, same_value};
@@ -108,14 +109,14 @@ fn trap(vm: &mut Vm, h: Value, name: &str) -> Result<Option<Value>> {
         return Err(Error::range_error("Maximum call stack size exceeded"));
     }
     let a = vm.intern_name(name);
-    let m = vm.get(h, a)?;
-    if m.is_undefined() || m.is_null() {
+    let m = vm.get_atom_b(h, a)?;
+    if m.peek().is_undefined() || m.peek().is_null() {
         return Ok(None);
     }
-    if !is_callable(m) {
+    if !is_callable(m.peek()) {
         return Err(Error::type_error(format!("The proxy's '{name}' trap is not a function")));
     }
-    Ok(Some(m))
+    Ok(Some(m.peek()))
 }
 
 /// The values of a descriptor `d` (its value, getter and setter), to root.
@@ -242,9 +243,14 @@ fn trampoline(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     let (t, h) = parts(p)?;
     // (The target and handler, which a trap's lookup may revoke,
     // `new.target`, taken from the VM, and the arguments' list rooted.)
-    let _rooted = vm.root_scope(&[t, h, nt]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([t, h, nt]);
     let list = crate::array::new_array_of(vm, args)?;
-    vm.rooted(&[list], |vm| trampoline_with(vm, constructing, p, t, h, nt, this, args, list))
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([list]);
+        trampoline_with(vm, constructing, p, t, h, nt, this, args, list)
+    }
 }
 
 /// [`trampoline`] with its arguments' array `list`.
@@ -265,15 +271,15 @@ fn trampoline_with(
         let Some(f) = trap(vm, h, "construct")? else {
             return crate::intrinsics::construct_with(vm, t, args, nt);
         };
-        let r = call_function(vm, f, h, &[t, list, nt])?;
-        if !is_object(r) {
+        let r = vm.call_b(f, h, &[t, list, nt])?;
+        if !is_object(r.peek()) {
             return Err(Error::type_error("The proxy's 'construct' trap returned a non-object"));
         }
-        return Ok(r);
+        return Ok(r.peek());
     }
     match trap(vm, h, "apply")? {
-        Some(f) => call_function(vm, f, h, &[t, this, list]),
-        None => call_function(vm, t, this, args),
+        Some(f) => vm.call_b(f, h, &[t, this, list]).map(Fresh::take),
+        None => vm.call_b(t, this, args).map(Fresh::take),
     }
 }
 
@@ -282,11 +288,12 @@ fn trampoline_with(
 /// A proxy's `[[Get]]` by its handler `h`'s `get` trap `f`, its target
 /// `t` (one without the trap forwards in `generic_get`'s loop).
 fn get(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, receiver: Value) -> Result<Value> {
-    let _rooted = vm.root_scope(&[t, h, f]);
+    let sc = Scope::new(vm);
+    let _rooted = sc.roots([t, h, f]);
     let k = trap_key(vm, key);
-    let v = call_function(vm, f, h, &[t, k, receiver])?;
     // (Read after the target's traps.)
-    vm.rooted(&[v], |vm| get_checked(vm, t, key, v))
+    let v = vm.call_b(f, h, &[t, k, receiver])?.root(&sc).v();
+    get_checked(vm, t, key, v)
 }
 
 /// [`get`]'s check of the trap's result `v` against the target's property.
@@ -306,13 +313,17 @@ fn get_checked(vm: &mut Vm, t: Value, key: Key, v: Value) -> Result<Value> {
 
 /// A proxy's `[[Set]]` by its `set` trap `f` (see [`get`]).
 fn set(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
-    vm.rooted(&[t, h, f, v], |vm| set_rooted(vm, t, h, f, key, v, receiver))
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([t, h, f, v]);
+        set_rooted(vm, t, h, f, key, v, receiver)
+    }
 }
 
 /// [`set`], its values rooted.
 fn set_rooted(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
     let k = trap_key(vm, key);
-    if !to_boolean(call_function(vm, f, h, &[t, k, v, receiver])?) {
+    if !to_boolean(vm.call_b(f, h, &[t, k, v, receiver])?.take()) {
         return Ok(false);
     }
     if let Some(d) = get_own_property(vm, Obj::of(t), key)?
@@ -330,13 +341,17 @@ fn set_rooted(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, v: Value, rec
 
 /// A proxy's `[[HasProperty]]` by its `has` trap `f` (see [`get`]).
 fn has(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key) -> Result<bool> {
-    vm.rooted(&[t, h, f], |vm| has_rooted(vm, t, h, f, key))
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([t, h, f]);
+        has_rooted(vm, t, h, f, key)
+    }
 }
 
 /// [`has`], its values rooted.
 fn has_rooted(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key) -> Result<bool> {
     let k = trap_key(vm, key);
-    if to_boolean(call_function(vm, f, h, &[t, k])?) {
+    if to_boolean(vm.call_b(f, h, &[t, k])?.take()) {
         return Ok(true);
     }
     if let Some(d) = get_own_property(vm, Obj::of(t), key)? {
@@ -371,7 +386,11 @@ fn forward(vm: &mut Vm, p: Obj, name: &str, hops: &mut u32) -> Result<(Value, Va
     }
     let (t, h) = parts(p)?;
     // (A getter of the trap may revoke the proxy: its parts rooted.)
-    Ok((t, h, vm.rooted(&[t, h], |vm| trap(vm, h, name))?))
+    Ok((t, h, {
+        let held = Scope::new(vm);
+        let _held = held.roots([t, h]);
+        trap(vm, h, name)
+    }?))
 }
 
 /// Proxy `o`'s target, handler and trap `name` (if it has one), the
@@ -382,7 +401,11 @@ fn forward(vm: &mut Vm, p: Obj, name: &str, hops: &mut u32) -> Result<(Value, Va
 #[inline(always)]
 fn trap_of(vm: &mut Vm, o: Obj, name: &str) -> Result<(Value, Value, Option<Value>)> {
     let (t, h) = parts(o)?;
-    Ok((t, h, vm.rooted(&[t, h], |vm| trap(vm, h, name))?))
+    Ok((t, h, {
+        let held = Scope::new(vm);
+        let _held = held.roots([t, h]);
+        trap(vm, h, name)
+    }?))
 }
 
 /// Run a proxy's trap `f` (`run`, given its target `t` and handler `h`),
@@ -397,14 +420,19 @@ fn trapped<T>(
     f: Value,
     run: impl FnOnce(&mut Vm, Value, Value, Value) -> Result<T>,
 ) -> Result<T> {
-    vm.rooted(&[t, h, f], |vm| run(vm, t, h, f))
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([t, h, f]);
+        run(vm, t, h, f)
+    }
 }
 
 /// `o.[[Get]](key, receiver)`.
 pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> Result<Value> {
     // (`receiver`, maybe a Rust caller's only, held across a trap's
     // getter: rooted.)
-    let _rooted = vm.root_scope(&[receiver]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([receiver]);
     let mut cur = Obj::of(o);
     let mut hops = 0;
     loop {
@@ -420,7 +448,7 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
         if let Some(d) = vm.own_property(cur, key) {
             if d.is_accessor() {
                 return match d.get.filter(|g| !g.is_undefined()) {
-                    Some(g) => call_function(vm, g, receiver, &[]),
+                    Some(g) => vm.call_b(g, receiver, &[]).map(Fresh::take),
                     None => Ok(Value::UNDEFINED),
                 };
             }
@@ -438,7 +466,8 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
 pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
     // (`v` and `receiver`, maybe a Rust caller's only, held across a
     // trap's getter and the receiver's own traps: rooted.)
-    let _rooted = vm.root_scope(&[v, receiver]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([v, receiver]);
     let mut cur = Obj::of(o);
     let mut hops = 0;
     let found = loop {
@@ -463,7 +492,7 @@ pub(crate) fn generic_set(vm: &mut Vm, o: Value, key: Key, v: Value, receiver: V
     match found {
         Some(d) if d.is_accessor() => match d.set.filter(|s| !s.is_undefined()) {
             Some(s) => {
-                call_function(vm, s, receiver, &[v])?;
+                vm.call_b(s, receiver, &[v])?.take();
                 Ok(true)
             }
             None => Ok(false),
@@ -519,7 +548,7 @@ pub(crate) fn delete(vm: &mut Vm, o: Obj, key: Key) -> Result<bool> {
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
         let k = trap_key(vm, key);
-        if !to_boolean(call_function(vm, f, h, &[t, k])?) {
+        if !to_boolean(vm.call_b(f, h, &[t, k])?.take()) {
             return Ok(false);
         }
         if let Some(d) = get_own_property(vm, Obj::of(t), key)? {
@@ -545,7 +574,7 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: Obj, key: Key) -> Result<Option<D
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
         let k = trap_key(vm, key);
-        let r = call_function(vm, f, h, &[t, k])?;
+        let r = vm.call_b(f, h, &[t, k])?.take();
         if !r.is_undefined() && !is_object(r) {
             return Err(Error::type_error(
                 "The proxy's 'getOwnPropertyDescriptor' trap returned neither an object nor undefined",
@@ -553,9 +582,17 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: Obj, key: Key) -> Result<Option<D
         }
         // (`r`, then the target's property's values, compared after the
         // target's traps and `r`'s getters, rooted.)
-        let target = vm.rooted(&[r], |vm| get_own_property(vm, Obj::of(t), key))?;
+        let target = {
+            let held = Scope::new(vm);
+            let _held = held.roots([r]);
+            get_own_property(vm, Obj::of(t), key)
+        }?;
         let [a, b, c] = desc_values(target.as_ref());
-        vm.rooted(&[r, a, b, c], |vm| own_property_checked(vm, t, r, target))
+        {
+            let held = Scope::new(vm);
+            let _held = held.roots([r, a, b, c]);
+            own_property_checked(vm, t, r, target)
+        }
     })
 }
 
@@ -624,7 +661,12 @@ pub(crate) fn proxy_define(vm: &mut Vm, o: Obj, key: Key, d: &Desc) -> Result<bo
         // (`d`'s values, maybe a Rust caller's only, rooted across the
         // traps.)
         let [a, b, c] = desc_values(Some(d));
-        let Some((target, extensible)) = vm.rooted(&[a, b, c], |vm| define_trapped(vm, t, h, f, key, d))? else {
+        let Some((target, extensible)) = {
+            let held = Scope::new(vm);
+            let _held = held.roots([a, b, c]);
+            define_trapped(vm, t, h, f, key, d)
+        }?
+        else {
             return Ok(false);
         };
         let config_false = d.configurable == Some(false);
@@ -668,14 +710,22 @@ fn define_trapped(
     d: &Desc,
 ) -> Result<Option<(Option<Desc>, bool)>> {
     let k = trap_key(vm, key);
-    let dv = vm.rooted(&[k], |vm| from_partial_descriptor(vm, d));
-    if !to_boolean(call_function(vm, f, h, &[t, k, dv])?) {
+    let dv = {
+        let held = Scope::new(vm);
+        let _held = held.roots([k]);
+        from_partial_descriptor(vm, d)
+    };
+    if !to_boolean(vm.call_b(f, h, &[t, k, dv])?.take()) {
         return Ok(None);
     }
     let target = get_own_property(vm, Obj::of(t), key)?;
     // (The target's property's values, compared after its trap, rooted.)
     let [a, b, c] = desc_values(target.as_ref());
-    let extensible = vm.rooted(&[a, b, c], |vm| is_extensible(vm, Obj::of(t)))?;
+    let extensible = {
+        let held = Scope::new(vm);
+        let _held = held.roots([a, b, c]);
+        is_extensible(vm, Obj::of(t))
+    }?;
     Ok(Some((target, extensible)))
 }
 
@@ -683,7 +733,11 @@ fn define_trapped(
 fn from_partial_descriptor(vm: &mut Vm, d: &Desc) -> Value {
     let o = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
     // (Rooted as its properties are added.)
-    vm.rooted(&[o], |vm| fill_descriptor(vm, o, d));
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([o]);
+        fill_descriptor(vm, o, d)
+    };
     o
 }
 
@@ -719,7 +773,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: Obj) -> Result<Vec<Key>> {
         return own_keys(vm, Obj::of(t));
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
-        let r = call_function(vm, f, h, &[t])?;
+        let r = vm.call_b(f, h, &[t])?.take();
         if !is_object(r) {
             return Err(Error::type_error("The proxy's 'ownKeys' trap returned a non-object"));
         }
@@ -729,7 +783,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: Obj) -> Result<Vec<Key>> {
             let mut keys = Vec::new();
             let mut i = 0.0;
             while i < n {
-                let k = vm.get_keyed(r, Value::number(i))?;
+                let k = vm.get_keyed_b(r, Value::number(i))?.take();
                 if !crate::vm::is_string(k) && !crate::symbol::is_symbol(k) {
                     return Err(Error::type_error(
                         "The proxy's 'ownKeys' trap gave a key neither a string nor a symbol",
@@ -808,7 +862,7 @@ pub(crate) fn get_prototype_of(vm: &mut Vm, o: Obj) -> Result<Value> {
         return get_prototype_of(vm, Obj::of(t));
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
-        let r = call_function(vm, f, h, &[t])?;
+        let r = vm.call_b(f, h, &[t])?.take();
         if !is_object(r) && !r.is_null() {
             return Err(Error::type_error("The proxy's 'getPrototypeOf' trap returned neither an object nor null"));
         }
@@ -848,7 +902,7 @@ pub(crate) fn set_prototype_of(vm: &mut Vm, o: Obj, proto: Value) -> Result<bool
         return set_prototype_of(vm, Obj::of(t), proto);
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
-        if !to_boolean(call_function(vm, f, h, &[t, proto])?) {
+        if !to_boolean(vm.call_b(f, h, &[t, proto])?.take()) {
             return Ok(false);
         }
         if !is_extensible(vm, Obj::of(t))? && !same_value(proto, get_prototype_of(vm, Obj::of(t))?) {
@@ -868,7 +922,7 @@ pub(crate) fn is_extensible(vm: &mut Vm, o: Obj) -> Result<bool> {
         return is_extensible(vm, Obj::of(t));
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
-        let r = to_boolean(call_function(vm, f, h, &[t])?);
+        let r = to_boolean(vm.call_b(f, h, &[t])?.take());
         if r != is_extensible(vm, Obj::of(t))? {
             return Err(broken("isExtensible", "reported the target's extensibility otherwise"));
         }
@@ -887,7 +941,7 @@ pub(crate) fn prevent_extensions(vm: &mut Vm, o: Obj) -> Result<bool> {
         return prevent_extensions(vm, Obj::of(t));
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
-        let r = to_boolean(call_function(vm, f, h, &[t])?);
+        let r = to_boolean(vm.call_b(f, h, &[t])?.take());
         if r && is_extensible(vm, Obj::of(t))? {
             return Err(broken("preventExtensions", "reported an extensible target as not"));
         }
@@ -910,7 +964,8 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: Obj) -> Result<Vec<Vec<u16>>> {
     // This follows the same shadowing rule as the ordinary path in
     // `Vm::for_in_key_array`; proxy traps must not turn it quadratic.
     // (The object the walk is at, a trap's result maybe, rooted.)
-    let _rooted = vm.root_scope(&[object_value(o.ptr())]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([object_value(o.ptr())]);
     let slot = vm.handles.len() - 1;
     let mut seen: HashSet<Key> = HashSet::default();
     let mut out = Vec::new();

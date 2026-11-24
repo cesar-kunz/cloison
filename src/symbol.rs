@@ -9,7 +9,7 @@
 //! once it is a key: see [`symbol_atom`]) and its description in `code`'s
 //! bits (traced: see `gc`).
 
-use crate::brand::Scope;
+use crate::brand::{Fresh, Scope};
 use crate::interp::to_boolean;
 use crate::object::{Atom, Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
@@ -378,7 +378,7 @@ pub(crate) fn install(vm: &mut Vm) {
     to_string_tag(vm, sp, "Symbol");
     let object_ctor = {
         let a = vm.intern_name("Object");
-        vm.get(object_value(g.ptr()), a)
+        vm.get_atom_b(object_value(g.ptr()), a).map(Fresh::take)
     }
     .unwrap_or(Value::UNDEFINED);
     if object_ctor.is_cell() {
@@ -389,7 +389,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let a_species = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.species"));
     for name in ["Array", "Map", "Set", "Promise", "RegExp", "ArrayBuffer", "SharedArrayBuffer"] {
         let a = vm.intern_name(name);
-        let c = vm.get(object_value(g.ptr()), a).unwrap_or(Value::UNDEFINED);
+        let c = vm.get_atom_b(object_value(g.ptr()), a).map(Fresh::take).unwrap_or(Value::UNDEFINED);
         if is_object(c) {
             define_getter(vm, Obj::of(c), Key::Name(a_species), "[Symbol.species]", return_this);
         }
@@ -433,7 +433,7 @@ pub(crate) fn install(vm: &mut Vm) {
     for (p, method, tag) in [(Proto::Map, "entries", "Map"), (Proto::Set, "values", "Set")] {
         let o = cp[p as usize];
         let a = vm.intern_name(method);
-        let f = vm.get(object_value(o.ptr()), a).unwrap_or(Value::UNDEFINED);
+        let f = vm.get_atom_b(object_value(o.ptr()), a).map(Fresh::take).unwrap_or(Value::UNDEFINED);
         vm.add_property_with(o, a_iter, f, DONT_ENUM);
         to_string_tag(vm, o, tag);
     }
@@ -451,7 +451,7 @@ pub(crate) fn install(vm: &mut Vm) {
     to_string_tag(vm, cp[Proto::DataView as usize], "DataView");
     let math = {
         let a = vm.intern_name("Math");
-        vm.get(object_value(g.ptr()), a)
+        vm.get_atom_b(object_value(g.ptr()), a).map(Fresh::take)
     }
     .unwrap_or(Value::UNDEFINED);
     if is_object(math) {
@@ -460,7 +460,7 @@ pub(crate) fn install(vm: &mut Vm) {
     for name in ["JSON", "Reflect"] {
         let o = {
             let a = vm.intern_name(name);
-            vm.get(object_value(g.ptr()), a)
+            vm.get_atom_b(object_value(g.ptr()), a).map(Fresh::take)
         }
         .unwrap_or(Value::UNDEFINED);
         if is_object(o) {

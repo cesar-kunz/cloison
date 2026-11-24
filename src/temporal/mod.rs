@@ -21,6 +21,7 @@ mod plain;
 pub(crate) mod tz;
 mod zoned;
 
+use crate::brand::Fresh;
 use crate::raw::ObjectPtr;
 use std::collections::HashMap;
 
@@ -216,8 +217,8 @@ pub(crate) fn require_string(v: Value) -> Result<String> {
 
 /// ToString, as a Rust string.
 pub(crate) fn to_rust_string(vm: &mut Vm, v: Value) -> Result<String> {
-    let s = crate::intrinsics::to_string(vm, v)?;
-    Ok(String::from_utf16_lossy(string_units(s).unwrap_or(&[])))
+    let s = vm.to_string_b(v)?;
+    Ok(String::from_utf16_lossy(string_units(s.peek()).unwrap_or(&[])))
 }
 
 /// ToPrimitive with hint "string".
@@ -228,7 +229,7 @@ fn to_primitive_string(vm: &mut Vm, v: Value) -> Result<Value> {
 
 fn get(vm: &mut Vm, o: Value, name: &str) -> Result<Value> {
     let a = vm.intern_name(name);
-    vm.get(o, a)
+    vm.get_atom_b(o, a).map(Fresh::take)
 }
 
 /// An exact time as a BigInt.

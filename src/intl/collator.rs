@@ -11,6 +11,7 @@ use super::{
     Kind, Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
+use crate::brand::Scope;
 use crate::object::{Obj, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
@@ -208,8 +209,10 @@ fn compare_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// CompareStrings of its arguments as strings.
 fn bound_compare(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let h = slot(vm.callee_obj(), 0).as_i32_unchecked() as usize;
-    let x = crate::intrinsics::to_string(vm, arg(a, 0))?;
-    let y = crate::intrinsics::to_string(vm, arg(a, 1))?;
+    // (`x`, a new string maybe, held across `y`'s conversion: rooted.)
+    let sc = Scope::new(vm);
+    let x = vm.to_string_b(arg(a, 0))?.root(&sc).v();
+    let y = vm.to_string_b(arg(a, 1))?.take();
     let ord = vm.intl.collators[h].compare(string_units(x).unwrap_or(&[]), string_units(y).unwrap_or(&[]));
     Ok(Value::from_i32(ord as i32))
 }

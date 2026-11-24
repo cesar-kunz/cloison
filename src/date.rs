@@ -4,10 +4,11 @@
 //! library's `localtime_r` (its `tm_gmtoff`), so it follows the machine's
 //! time zone, and the spec's own calendar arithmetic does the rest.
 
+use crate::brand::Fresh;
 use crate::raw::ObjectPtr;
 use std::ffi::CStr;
 
-use crate::interp::{call_function, to_number, to_primitive, to_primitive_default, to_string_units};
+use crate::interp::{to_number, to_primitive, to_primitive_default, to_string_units};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, READ_ONLY, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Code, Error, NativeFn, Result, Vm, string_units};
@@ -345,9 +346,9 @@ pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: &[Value]) -> Result
     };
     for name in order {
         let a = vm.intern_name(name);
-        let m = vm.get(this, a)?;
+        let m = vm.get_atom_b(this, a)?.take();
         if crate::props::is_callable(m) {
-            let r = crate::interp::call_function(vm, m, this, &[])?;
+            let r = vm.call_b(m, this, &[])?.take();
             if !crate::props::is_object(r) {
                 return Ok(r);
             }
@@ -715,8 +716,8 @@ fn to_json(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         return Ok(Value::NULL);
     }
     let a = vm.intern_name("toISOString");
-    let f = vm.get(this, a)?;
-    call_function(vm, f, this, &[])
+    let f = vm.get_atom_b(this, a)?.take();
+    vm.call_b(f, this, &[]).map(Fresh::take)
 }
 
 // ---- Parsing ----

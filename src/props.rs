@@ -1590,7 +1590,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = vm.object_prototype_obj();
     let a_object = vm.intern_name("Object");
-    let object = Obj::of(vm.get(object_value(g), a_object).unwrap());
+    let object = Obj::of(vm.get_atom_b(object_value(g), a_object).unwrap().take());
     vm.define_natives(
         object,
         &[
@@ -1671,7 +1671,7 @@ fn descriptors(vm: &mut Vm, props: Value) -> Result<Fresh<'_, Vec<(Key, Desc)>>>
 }
 
 fn descriptors_raw(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
-    let po = vm.to_object(props)?;
+    let po = vm.to_obj_b(props)?.take();
     let mut out = Vec::new();
     // (Each descriptor's values in `vm.handles` while the next are read, the
     // `Vec`'s copies valid in this handle scope, where no cell moves.)
@@ -1684,7 +1684,7 @@ fn descriptors_raw(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
             if d.enumerable != Some(true) {
                 continue;
             }
-            let v = vm.fresh(|vm| vm.get_key(object_value(po.ptr()), key))?.take();
+            let v = vm.get_key_b(object_value(po.ptr()), key)?.take();
             let d = vm.to_descriptor_b(v)?.take();
             for v in [d.value, d.get, d.set].into_iter().flatten() {
                 vm.handles.push(v);
@@ -1783,19 +1783,19 @@ fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
 
 /// `Object.getOwnPropertyNames(o)`.
 fn object_get_own_property_names(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
+    let o = vm.to_obj_b(arg(a, 0))?.take();
     keys_array(vm, o, true)
 }
 
 /// `Object.keys(o)`: its own enumerable keys.
 fn object_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
+    let o = vm.to_obj_b(arg(a, 0))?.take();
     keys_array(vm, o, false)
 }
 
 /// `Object.getPrototypeOf(o)`.
 fn object_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
+    let o = vm.to_obj_b(arg(a, 0))?.take();
     crate::proxy::get_prototype_of(vm, o)
 }
 
@@ -1947,7 +1947,7 @@ fn assign_from(vm: &mut Vm, t: Value, so: Obj) -> Result<()> {
                 so.slot_value(cur.location(k))
             } else {
                 match crate::proxy::get_own_property(vm, so, key)? {
-                    Some(d) if d.enumerable == Some(true) => vm.fresh(|vm| vm.get_key(s, key))?.take(),
+                    Some(d) if d.enumerable == Some(true) => vm.get_key_b(s, key)?.take(),
                     _ => continue,
                 }
             };
@@ -1970,7 +1970,7 @@ fn assign_from(vm: &mut Vm, t: Value, so: Obj) -> Result<()> {
         // (Maybe a getter's new value, held across a proxy's trap lookup:
         // rooted.)
         let step = Scope::new(vm);
-        let v = vm.fresh(|vm| vm.get_key(s, key))?.root(&step);
+        let v = vm.get_key_b(s, key)?.root(&step);
         vm.put_key(t, key, v.v())?;
     }
     Ok(())
@@ -1979,7 +1979,7 @@ fn assign_from(vm: &mut Vm, t: Value, so: Obj) -> Result<()> {
 /// `Object.values(o)` (`entries`: `Object.entries(o)`): the own
 /// enumerable string-keyed properties' values, or `[key, value]` pairs.
 fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
+    let o = vm.to_obj_b(arg(a, 0))?.take();
     let ov = object_value(o.ptr());
     // A plain object's data properties, read from their slots: nothing
     // here runs user code.
@@ -2011,7 +2011,7 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
         if d.enumerable != Some(true) {
             continue;
         }
-        let v = vm.fresh(|vm| vm.get_key(ov, key))?.take();
+        let v = vm.get_key_b(ov, key)?.take();
         // (The pair made, and filled, where nothing collects.)
         let item = if entries {
             let k = vm.key_string(key);
@@ -2073,8 +2073,8 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             )));
         }
         let step = Scope::new(vm);
-        let k = vm.fresh(|vm| vm.get_key(entry, Key::Index(0)))?.root(&step);
-        let v = vm.fresh(|vm| vm.get_key(entry, Key::Index(1)))?.root(&step);
+        let k = vm.get_key_b(entry, Key::Index(0))?.root(&step);
+        let v = vm.get_key_b(entry, Key::Index(1))?.root(&step);
         let key = crate::intrinsics::to_property_key(vm, k.v())?;
         vm.create_data_property(out, key, v.v())
     })?;
@@ -2124,7 +2124,7 @@ fn object_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         // (`out` has no prototype and only these arrays: reading, defining
         // and pushing run no JS.)
         let group = match vm.own_property(Obj::of(out), key) {
-            Some(_) => vm.fresh(|vm| vm.get_key(out, key))?.take(),
+            Some(_) => vm.get_key_b(out, key)?.take(),
             None => {
                 let g = vm.new_array();
                 vm.create_data_property(out, key, g)?;
@@ -2140,7 +2140,7 @@ fn object_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `Object.prototype.hasOwnProperty(key)`.
 fn object_has_own_property(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let key = vm.to_key(arg(a, 0));
-    let o = vm.to_object(this)?;
+    let o = vm.to_obj_b(this)?.take();
     if vm.proxies_exist {
         return Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some()));
     }
@@ -2189,7 +2189,7 @@ fn object_is_prototype_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
 /// `Object.prototype.propertyIsEnumerable(key)`.
 fn object_property_is_enumerable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let key = crate::intrinsics::to_property_key(vm, arg(a, 0))?;
-    let o = vm.to_object(this)?;
+    let o = vm.to_obj_b(this)?.take();
     Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true))))
 }
 

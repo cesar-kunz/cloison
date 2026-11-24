@@ -128,7 +128,7 @@ fn canonicalize_locale_list(vm: &mut Vm, locales: Value) -> Result<Vec<String>> 
         seen.push(canonical_tag(&to_rust_string(vm, locales)?)?);
         return Ok(seen);
     }
-    let o = object_value((vm.to_object(locales)?).ptr());
+    let o = object_value((vm.to_obj_b(locales)?.take()).ptr());
     let len = vm.length_of(o)?;
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
@@ -137,7 +137,7 @@ fn canonicalize_locale_list(vm: &mut Vm, locales: Value) -> Result<Vec<String>> 
     while k < len {
         let key = Value::number(k);
         if vm.has_property(o, key)? {
-            let v = vm.get_keyed(o, key)?;
+            let v = vm.get_keyed_b(o, key)?.take();
             if !is_string(v) && !is_object(v) {
                 return Err(Error::type_error("a locale must be a string or an object"));
             }
@@ -309,7 +309,7 @@ fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
         return Ok(object_value(vm.new_plain(Value::NULL).ptr()));
     }
-    Ok(object_value((vm.to_object(v)?).ptr()))
+    Ok(object_value((vm.to_obj_b(v)?.take()).ptr()))
 }
 
 /// GetOptionsObject.
@@ -326,7 +326,7 @@ fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
 /// GetOption of a string: undefined, or one of `allowed` (any, if empty).
 fn string_option(vm: &mut Vm, options: Value, name: &str, allowed: &[&str]) -> Result<Option<String>> {
     let a = vm.intern_name(name);
-    let v = vm.get(options, a)?;
+    let v = vm.get_atom_b(options, a)?.take();
     if v.is_undefined() {
         return Ok(None);
     }
@@ -340,7 +340,7 @@ fn string_option(vm: &mut Vm, options: Value, name: &str, allowed: &[&str]) -> R
 /// GetOption of a boolean.
 fn bool_option(vm: &mut Vm, options: Value, name: &str) -> Result<Option<bool>> {
     let a = vm.intern_name(name);
-    let v = vm.get(options, a)?;
+    let v = vm.get_atom_b(options, a)?.take();
     Ok((!v.is_undefined()).then(|| crate::interp::to_boolean(v)))
 }
 

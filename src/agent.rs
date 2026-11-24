@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::brand::Fresh;
 use crate::builtins::is_class;
 use crate::object::{Class, Obj, object_value};
 use crate::value::Value;
@@ -232,7 +233,7 @@ fn run_agent_vm(mut vm: Vm, src: &[u16], mailbox: &Mailbox, reports: Reports) {
             crate::shared::catch_up(vm);
             let sab = sab?;
             vm.handles.push(sab);
-            crate::interp::call_function(vm, callback, Value::UNDEFINED, &[sab, m.id])
+            vm.call_b(callback, Value::UNDEFINED, &[sab, m.id]).map(Fresh::take)
         });
         if let Err(e) = r {
             report_error(format_args!("uncaught {}", vm.uncaught_message(&e)));
@@ -305,8 +306,8 @@ fn agent_receive_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> 
 /// `$262.agent.report(value)`: its string queued, for the agent's
 /// starter (a VM no agent's: its own).
 fn agent_report(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let s = crate::intrinsics::to_string(vm, arg(a, 0))?;
-    let s = String::from_utf16_lossy(string_units(s).unwrap_or(&[]));
+    let s = vm.to_string_b(arg(a, 0))?;
+    let s = String::from_utf16_lossy(string_units(s.peek()).unwrap_or(&[]));
     lock(vm.agent.report_to.as_ref().unwrap_or(&vm.agent.reports)).push_back(s);
     Ok(Value::UNDEFINED)
 }

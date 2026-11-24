@@ -14,8 +14,9 @@
 //! async JS helper made on first use (as `Array.fromAsync`'s), so its
 //! awaits are the language's, calling only what it is given here.
 
+use crate::brand::{Fresh, Scope};
 use crate::builtins::{getter, link_constructor};
-use crate::interp::{call_function, to_string_units};
+use crate::interp::to_string_units;
 use crate::object::{Class, DONT_ENUM, Obj, object_value};
 use crate::props::{Desc, is_callable, is_object};
 use crate::raw::{Live, ObjectPtr};
@@ -57,7 +58,7 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     link_constructor(vm, sc, sep);
     // (Its prototype is `Error`, as the other kinds'.)
     let a_error = vm.intern_name("Error");
-    let error = vm.get(object_value(g.ptr()), a_error)?;
+    let error = vm.get_atom_b(object_value(g.ptr()), a_error)?.take();
     vm.set_prototype_of(sc, error);
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = str_value(vm, "SuppressedError");
@@ -176,14 +177,14 @@ pub(crate) fn is_empty(state: Value) -> bool {
 /// GetMethod(v, `key`): undefined if absent, a TypeError if not callable.
 fn get_method(vm: &mut Vm, v: Value, key: &str) -> Result<Value> {
     let a = vm.intern_name(&format!("{}Symbol.{key}", crate::symbol::SYMBOL_MARK));
-    let m = vm.get(v, a)?;
-    if m.is_undefined() || m.is_null() {
+    let m = vm.get_atom_b(v, a)?;
+    if m.peek().is_undefined() || m.peek().is_null() {
         return Ok(Value::UNDEFINED);
     }
-    if !is_callable(m) {
+    if !is_callable(m.peek()) {
         return Err(Error::type_error(format!("Symbol.{key} is not a function")));
     }
-    Ok(m)
+    Ok(m.peek())
 }
 
 /// AddDisposableResource of value `v` to capability `state` (`async_`:
@@ -200,7 +201,8 @@ pub(crate) fn add_resource(vm: &mut Vm, state: Value, v: Value, async_: bool) ->
         return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
     }
     // (`v` rooted across the getters, its method across the push.)
-    let _rooted = vm.root_scope(&[v]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([v]);
     let (method, kind) = if async_ {
         match get_method(vm, v, "asyncDispose")? {
             m if m.is_undefined() => (get_method(vm, v, "dispose")?, ASYNC_FROM_SYNC),
@@ -212,7 +214,11 @@ pub(crate) fn add_resource(vm: &mut Vm, state: Value, v: Value, async_: bool) ->
     if method.is_undefined() {
         return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
     }
-    vm.rooted(&[method], |vm| push(vm, state, v, method, kind))
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([method]);
+        push(vm, state, v, method, kind)
+    }
 }
 
 fn push(vm: &mut Vm, state: Value, v: Value, method: Value, kind: i32) -> Result<()> {
@@ -251,7 +257,8 @@ pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Va
         Ok(v) => *v,
         Err(e) => e.1.unwrap_or(Value::UNDEFINED),
     };
-    let _rooted = vm.root_scope(&[resources, kept]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([resources, kept]);
     let at = vm.handles.len() - 1;
     let empty = vm.new_array();
     put(state, RESOURCES, empty);
@@ -260,14 +267,18 @@ pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Va
     for k in (0..n).rev() {
         let (v, method, kind) = (elem(resources, 3 * k), elem(resources, 3 * k + 1), elem(resources, 3 * k + 2));
         let r = match kind.as_i32_unchecked() {
-            ADOPT_SYNC => call_function(vm, method, Value::UNDEFINED, &[v]),
-            _ => call_function(vm, method, v, &[]),
+            ADOPT_SYNC => vm.call_b(method, Value::UNDEFINED, &[v]),
+            _ => vm.call_b(method, v, &[]),
         };
         if let Err(e) = r {
             let e = thrown(vm, e)?;
             let next = match completion {
                 Err(prev) => {
-                    let prev = vm.rooted(&[e], |vm| thrown(vm, prev))?;
+                    let prev = {
+                        let held = Scope::new(vm);
+                        let _held = held.roots([e]);
+                        thrown(vm, prev)
+                    }?;
                     suppressed_error(vm, e, prev)
                 }
                 Ok(_) => e,
@@ -295,7 +306,7 @@ fn async_helper(vm: &mut Vm) -> Result<Value> {
         let suppress =
             object_value(vm.native_function("suppress", helper_suppress, 2, crate::jit::Ty::Any, false).ptr());
         vm.handles.push(suppress);
-        call_function(vm, make, Value::UNDEFINED, &[call, suppress])
+        vm.call_b(make, Value::UNDEFINED, &[call, suppress]).map(Fresh::take)
     })?;
     vm.dispose_roots[Root::AsyncHelper as usize] = h;
     Ok(h)
@@ -335,7 +346,7 @@ const ASYNC_DISPOSE: &str = r#"(function (call, suppress) {
 })"#;
 
 fn helper_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    call_function(vm, arg(a, 0), arg(a, 1), a.get(2..).unwrap_or(&[]))
+    vm.call_b(arg(a, 0), arg(a, 1), a.get(2..).unwrap_or(&[])).map(Fresh::take)
 }
 
 fn helper_suppress(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -349,7 +360,7 @@ pub(crate) fn dispose_resources_async(vm: &mut Vm, state: Value, has_error: bool
     let empty = vm.new_array();
     put(state, RESOURCES, empty);
     let h = async_helper(vm)?;
-    call_function(vm, h, Value::UNDEFINED, &[resources, Value::from_bool(has_error), error])
+    vm.call_b(h, Value::UNDEFINED, &[resources, Value::from_bool(has_error), error]).map(Fresh::take)
 }
 
 // ---- SuppressedError ----
@@ -483,7 +494,7 @@ fn stack_dispose_async(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     };
     if elem(state, DISPOSED) == Value::TRUE {
         let (p, resolve, _) = crate::promise::new_with_resolvers(vm);
-        call_function(vm, resolve, Value::UNDEFINED, &[Value::UNDEFINED])?;
+        vm.call_b(resolve, Value::UNDEFINED, &[Value::UNDEFINED])?.take();
         return Ok(p);
     }
     put(state, DISPOSED, Value::TRUE);
@@ -494,7 +505,7 @@ fn stack_dispose_async(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
     let v = thrown(vm, e)?;
     let (p, _, reject) = crate::promise::new_with_resolvers(vm);
-    call_function(vm, reject, Value::UNDEFINED, &[v])?;
+    vm.call_b(reject, Value::UNDEFINED, &[v])?.take();
     Ok(p)
 }
 
@@ -504,9 +515,9 @@ fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
 /// one.
 fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let a = vm.intern_name("return");
-    let m = vm.get(this, a)?;
+    let m = vm.get_atom_b(this, a)?.take();
     if !m.is_undefined() && !m.is_null() {
-        call_function(vm, m, this, &[])?;
+        vm.call_b(m, this, &[])?.take();
     }
     Ok(Value::UNDEFINED)
 }
@@ -516,11 +527,11 @@ fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn async_iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let r = (|| -> Result<Value> {
         let a = vm.intern_name("return");
-        let m = vm.get(this, a)?;
+        let m = vm.get_atom_b(this, a)?.take();
         if m.is_undefined() || m.is_null() {
             return Ok(Value::UNDEFINED);
         }
-        call_function(vm, m, this, &[])
+        vm.call_b(m, this, &[]).map(Fresh::take)
     })();
     match r {
         Err(e) => rejected(vm, e),
@@ -529,7 +540,7 @@ fn async_iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
             // (`return()`'s result held across the helper's first making:
             // rooted.)
             let h = vm.rooted(&[v], async_helper_await)?;
-            call_function(vm, h, Value::UNDEFINED, &[v])
+            vm.call_b(h, Value::UNDEFINED, &[v]).map(Fresh::take)
         }
     }
 }

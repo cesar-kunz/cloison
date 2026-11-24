@@ -32,7 +32,7 @@
 //! has none (a SyntaxError); the specifier `<module source>` is a module
 //! of the host's that has one, an `%AbstractModuleSource%` (test262's).
 
-use crate::interp::call_function;
+use crate::brand::{Fresh, Handle, Scope};
 use crate::js::ast::{IMPORT_PARAMS, ImportName, ModuleInfo, Phase};
 use crate::object::{Obj, Object, object_value};
 use crate::promise::{native_closure, slot};
@@ -600,7 +600,7 @@ fn ns_key(vm: &mut Vm, k: Value) -> Result<Option<Vec<u16>>> {
     if crate::symbol::is_symbol(k) {
         return Ok(None);
     }
-    let s = if k.is_number() { crate::intrinsics::to_string(vm, k)? } else { k };
+    let s = if k.is_number() { vm.to_string_b(k)?.take() } else { k };
     let u = string_units(s).unwrap_or(&[]).to_vec();
     if slot(vm.callee_obj(), 1) == Value::TRUE && u == "then".encode_utf16().collect::<Vec<u16>>() {
         return Ok(None);
@@ -625,12 +625,12 @@ fn binding_value(vm: &mut Vm, res: &Resolution, name: &[u16]) -> Result<Value> {
     };
     let env = rec(vm, k).env;
     let a = vm.intern_name(local);
-    let v = vm.get(env, a)?;
-    if v == Value::HOLE {
+    let v = vm.get_atom_b(env, a)?;
+    if v.peek() == Value::HOLE {
         let n = String::from_utf16_lossy(name);
         return Err(Error::reference_error(format!("Cannot access '{n}' before initialization")));
     }
-    Ok(v)
+    Ok(v.peek())
 }
 
 /// GetModuleSource: module `k`'s source object; a JavaScript module has
@@ -870,8 +870,8 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
         }
         let f = crate::interp::run_script_at(vm, code)?;
         vm.handles.push(f);
-        let g = call_function(vm, f, Value::UNDEFINED, &holders)?;
-        rec_mut(vm, m).generator = g;
+        let g = vm.call_b(f, Value::UNDEFINED, &holders)?;
+        rec_mut(vm, m).generator = g.peek();
         Ok(())
     })
 }
@@ -899,11 +899,11 @@ fn evaluate(vm: &mut Vm, m: usize) -> Result<Value> {
                 r.status = Status::Evaluated;
                 r.error = Some(v);
             }
-            call_function(vm, cap.2, Value::UNDEFINED, &[v])?;
+            vm.call_b(cap.2, Value::UNDEFINED, &[v])?.take();
         }
         Ok(_) => {
             if rec(vm, m).async_order.is_none() {
-                call_function(vm, cap.1, Value::UNDEFINED, &[Value::UNDEFINED])?;
+                vm.call_b(cap.1, Value::UNDEFINED, &[Value::UNDEFINED])?.take();
             }
         }
     }
@@ -1114,9 +1114,14 @@ fn execute_async(vm: &mut Vm, m: usize) -> Result<()> {
     let g = rec(vm, m).generator;
     let p = with_budget(vm, |vm| crate::generator::async_start(vm, g))?;
     // (The promise, then the first closure, rooted while the next is made.)
-    let _rooted = vm.root_scope(&[p]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([p]);
     let on_fulfilled = closure(vm, Template::Fulfilled, &[Value::from_i32(m as i32)]);
-    let on_rejected = vm.rooted(&[on_fulfilled], |vm| closure(vm, Template::Rejected, &[Value::from_i32(m as i32)]));
+    let on_rejected = {
+        let held = Scope::new(vm);
+        let _held = held.roots([on_fulfilled]);
+        closure(vm, Template::Rejected, &[Value::from_i32(m as i32)])
+    };
     crate::promise::await_then(vm, p, on_fulfilled, on_rejected)
 }
 
@@ -1154,7 +1159,7 @@ fn module_fulfilled(vm: &mut Vm, m: usize) -> Result<()> {
         r.status = Status::Evaluated;
     }
     if let Some((_, resolve, _)) = rec(vm, m).capability {
-        call_function(vm, resolve, Value::UNDEFINED, &[Value::UNDEFINED])?;
+        vm.call_b(resolve, Value::UNDEFINED, &[Value::UNDEFINED])?.take();
     }
     let mut ready = Vec::new();
     gather_ancestors(vm, m, &mut ready);
@@ -1178,7 +1183,7 @@ fn module_fulfilled(vm: &mut Vm, m: usize) -> Result<()> {
                 r.async_order = None;
                 r.status = Status::Evaluated;
                 if let Some((_, resolve, _)) = r.capability {
-                    call_function(vm, resolve, Value::UNDEFINED, &[Value::UNDEFINED])?;
+                    vm.call_b(resolve, Value::UNDEFINED, &[Value::UNDEFINED])?.take();
                 }
             }
         }
@@ -1205,7 +1210,7 @@ fn module_rejected(vm: &mut Vm, m: usize, error: Value) -> Result<()> {
     }
     // (Its own promise first, then those of the modules waiting.)
     if let Some((_, _, reject)) = rec(vm, m).capability {
-        call_function(vm, reject, Value::UNDEFINED, &[error])?;
+        vm.call_b(reject, Value::UNDEFINED, &[error])?.take();
     }
     for parent in rec(vm, m).async_parents.clone() {
         module_rejected(vm, parent, error)?;
@@ -1264,7 +1269,8 @@ pub(crate) fn dynamic_import(
     // (The promise and its functions rooted across the specifier's and the
     // options' conversions and getters, then the specifier and the type
     // while the job is made.)
-    let _rooted = vm.root_scope(&[p, resolve, reject]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([p, resolve, reject]);
     match import_request(vm, specifier, options) {
         Ok((spec, ty)) => {
             let job = vm.rooted(&[spec, ty], |vm| {
@@ -1274,7 +1280,7 @@ pub(crate) fn dynamic_import(
         }
         Err(e) => {
             let v = thrown(vm, e)?;
-            call_function(vm, reject, Value::UNDEFINED, &[v])?;
+            vm.call_b(reject, Value::UNDEFINED, &[v])?.take();
         }
     }
     Ok(p)
@@ -1284,29 +1290,38 @@ pub(crate) fn dynamic_import(
 /// undefined), from its options (`{ with: { type: "json" } }`: each
 /// attribute a string).
 fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Value, Value)> {
-    let spec = crate::intrinsics::to_string(vm, specifier)?;
     // (`spec`, a new string maybe, `attrs`, maybe a getter's only, and the
     // type found rooted across the getters and traps.)
-    vm.rooted(&[spec, Value::UNDEFINED, Value::UNDEFINED], |vm| import_attributes(vm, spec, options))
+    let sc = Scope::new(vm);
+    let spec = vm.to_string_b(specifier)?.root(&sc);
+    let [attrs, found] = sc.roots([Value::UNDEFINED, Value::UNDEFINED]);
+    import_attributes(vm, spec.v(), attrs, found, options)
 }
 
-/// [`import_request`] of the string `spec`, the two handles after it free.
-fn import_attributes(vm: &mut Vm, spec: Value, options: Value) -> Result<(Value, Value)> {
-    let slot = vm.handles.len() - 2;
+/// [`import_request`] of the string `spec`, `attrs` and `found` the
+/// handles to root the attributes and the type in.
+fn import_attributes(
+    vm: &mut Vm,
+    spec: Value,
+    attrs_root: Handle,
+    found: Handle,
+    options: Value,
+) -> Result<(Value, Value)> {
     let mut ty = Value::UNDEFINED;
     if !options.is_undefined() {
         if !crate::props::is_object(options) {
             return Err(Error::type_error("The second argument of import() must be an object"));
         }
         let a_with = vm.intern_name("with");
-        let attrs = vm.get(options, a_with)?;
-        vm.handles[slot] = attrs;
-        if !attrs.is_undefined() {
-            if !crate::props::is_object(attrs) {
+        let attrs = vm.get_atom_b(options, a_with)?.take();
+        attrs_root.set(attrs);
+        let attrs = attrs_root;
+        if !attrs.peek().is_undefined() {
+            if !crate::props::is_object(attrs.peek()) {
                 return Err(Error::type_error("The 'with' option of import() must be an object"));
             }
             // (EnumerableOwnProperties: through a proxy's traps too.)
-            let o = Obj::of(attrs);
+            let o = Obj::of(attrs.peek());
             for key in crate::proxy::own_keys(vm, o)? {
                 if crate::symbol::is_symbol(vm.key_value(key)) {
                     continue;
@@ -1314,14 +1329,14 @@ fn import_attributes(vm: &mut Vm, spec: Value, options: Value) -> Result<(Value,
                 if !crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true)) {
                     continue;
                 }
-                let v = vm.get_key(attrs, key)?;
+                let v = vm.get_key_b(attrs.peek(), key)?.take();
                 if !is_string(v) {
                     return Err(Error::type_error("Import attribute values must be strings"));
                 }
                 let k = vm.key_string(key);
                 if string_units(k) == Some(&"type".encode_utf16().collect::<Vec<u16>>()[..]) {
                     ty = v;
-                    vm.handles[slot + 1] = v;
+                    found.set(v);
                 }
             }
         }
@@ -1351,7 +1366,7 @@ fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
         let m = load(vm, &path, kind)?;
         if phase == 2 {
             let s = module_source(vm, m)?;
-            return call_function(vm, resolve, Value::UNDEFINED, &[s]).map(drop);
+            return vm.call_b(resolve, Value::UNDEFINED, &[s]).map(drop);
         }
         link(vm, m)?;
         if phase == 1 {
@@ -1370,17 +1385,21 @@ fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
                     let p = evaluate(vm, k)?;
                     crate::promise::await_then(vm, p, done, reject)?;
                 }
-                call_function(vm, done, Value::UNDEFINED, &[]).map(drop)
+                vm.call_b(done, Value::UNDEFINED, &[]).map(drop)
             });
         }
         let p = evaluate(vm, m)?;
         // (Rooted while the closure is made.)
-        let done = vm.rooted(&[p], |vm| closure(vm, Template::ImportDone, &[Value::from_i32(m as i32), resolve]));
+        let done = {
+            let held = Scope::new(vm);
+            let _held = held.roots([p]);
+            closure(vm, Template::ImportDone, &[Value::from_i32(m as i32), resolve])
+        };
         crate::promise::await_then(vm, p, done, reject)
     })();
     if let Err(e) = r {
         let v = thrown(vm, e)?;
-        call_function(vm, reject, Value::UNDEFINED, &[v])?;
+        vm.call_b(reject, Value::UNDEFINED, &[v])?.take();
     }
     Ok(Value::UNDEFINED)
 }
@@ -1391,7 +1410,7 @@ fn import_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let me = vm.callee_obj();
     let (m, resolve) = (slot(me, 0).as_i32_unchecked() as usize, slot(me, 1));
     match namespace(vm, m) {
-        Ok(ns) => call_function(vm, resolve, Value::UNDEFINED, &[ns]),
+        Ok(ns) => vm.call_b(resolve, Value::UNDEFINED, &[ns]).map(Fresh::take),
         Err(e) => Err(e),
     }
 }
@@ -1402,13 +1421,13 @@ fn import_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 fn defer_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let me = vm.callee_obj();
     let (m, resolve, count) = (slot(me, 0).as_i32_unchecked() as usize, slot(me, 1), slot(me, 2));
-    let left = vm.get_keyed(count, Value::from_i32(0))?.as_i32_unchecked() - 1;
+    let left = vm.get_keyed_b(count, Value::from_i32(0))?.take().as_i32_unchecked() - 1;
     vm.set_keyed(count, Value::from_i32(0), Value::from_i32(left))?;
     if left > 0 {
         return Ok(Value::UNDEFINED);
     }
     let ns = deferred_namespace(vm, m)?;
-    call_function(vm, resolve, Value::UNDEFINED, &[ns])
+    vm.call_b(resolve, Value::UNDEFINED, &[ns]).map(Fresh::take)
 }
 
 /// `%AbstractModuleSource%`: a constructor that always throws, whose

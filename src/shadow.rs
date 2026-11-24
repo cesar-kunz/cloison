@@ -4,7 +4,7 @@
 //! crosses as a wrapped function, which wraps what it is passed and what
 //! it returns the same way (and turns what is thrown into a `TypeError`).
 
-use crate::interp::call_function;
+use crate::brand::{Fresh, Scope};
 use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, is_callable, is_object};
@@ -147,7 +147,8 @@ fn wrap(vm: &mut Vm, v: Value) -> Result<Value> {
     let f = native_closure(vm, template, &[v]);
     // (The wrapper, and its target, held across the target's `length`
     // and `name` getters and traps: rooted.)
-    let _rooted = vm.root_scope(&[f, v]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([f, v]);
     copy_name_and_length(vm, f, v)
         .map_err(|e| Error::type_error(format!("wrapping a function: {}", thrown_message(vm, &e))))?;
     Ok(f)
@@ -167,8 +168,8 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
     let (a_length, a_name) = (vm.a_length, vm.a_name);
     let mut len = 0.0;
     if crate::proxy::get_own_property(vm, Obj::of(target), Key::Name(a_length))?.is_some() {
-        let l = vm.get(target, a_length)?;
-        if let Some(n) = l.as_number() {
+        let l = vm.get_atom_b(target, a_length)?;
+        if let Some(n) = l.peek().as_number() {
             len = if n == f64::INFINITY {
                 n
             } else if n == f64::NEG_INFINITY || n.is_nan() {
@@ -180,8 +181,8 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
     }
     let d = Desc::data(Value::number(len), false, false, true);
     vm.define_own_property(Obj::of(f), Key::Name(a_length), &d)?;
-    let name = vm.get(target, a_name)?;
-    let name = if is_string(name) { name } else { vm.new_string(&[]) };
+    let name = vm.get_atom_b(target, a_name)?;
+    let name = if is_string(name.peek()) { name.peek() } else { vm.new_string(&[]) };
     let d = Desc::data(name, false, false, true);
     vm.define_own_property(Obj::of(f), Key::Name(a_name), &d)?;
     Ok(())
@@ -202,7 +203,7 @@ fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 args.push(w);
             }
             let this = wrap_in(vm, target_realm, this)?;
-            let v = call_function(vm, target, this, &args)?;
+            let v = vm.call_b(target, this, &args)?.take();
             wrap(vm, v)
         })
     })();
@@ -220,7 +221,8 @@ fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// of the module's export, imported in the realm, wrapped.
 fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let r = realm_of(vm, this, "importValue")?;
-    let spec = crate::intrinsics::to_string(vm, arg(a, 0))?;
+    let sc = Scope::new(vm);
+    let spec = vm.to_string_b(arg(a, 0))?.root(&sc);
     let name = arg(a, 1);
     if !is_string(name) {
         return Err(Error::type_error("ShadowRealm.prototype.importValue requires a string export name"));
@@ -228,8 +230,9 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
     // (The promise and its functions held across the module's evaluation:
     // rooted.)
-    let _rooted = vm.root_scope(&[p, resolve, reject]);
-    let loaded = crate::realm::run_in(vm, r, |vm| crate::module::import_now(vm, spec));
+    let held = Scope::new(vm);
+    let _rooted = held.roots([p, resolve, reject]);
+    let loaded = crate::realm::run_in(vm, r, |vm| crate::module::import_now(vm, spec.peek()));
     match loaded {
         Ok((m, done)) => {
             let ok = native_closure(vm, root(vm, Root::Imported), &[Value::from_i32(m as i32), name, resolve, reject]);
@@ -240,7 +243,7 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         Err(e) => {
             let m = thrown_message(vm, &e);
             let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));
-            call_function(vm, reject, Value::UNDEFINED, &[v])?;
+            vm.call_b(reject, Value::UNDEFINED, &[v])?.take();
         }
     }
     Ok(p)
@@ -262,12 +265,12 @@ fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
         wrap(vm, v)
     })();
     match r {
-        Ok(v) => call_function(vm, resolve, Value::UNDEFINED, &[v]),
+        Ok(v) => vm.call_b(resolve, Value::UNDEFINED, &[v]).map(Fresh::take),
         Err(e) if e.0.starts_with("unsupported") => Err(e),
         Err(e) => {
             let m = thrown_message(vm, &e);
             let v = crate::builtins::caught(vm, &Error::type_error(m));
-            call_function(vm, reject, Value::UNDEFINED, &[v])
+            vm.call_b(reject, Value::UNDEFINED, &[v]).map(Fresh::take)
         }
     }
 }
@@ -278,5 +281,5 @@ fn import_failed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let e = Error::thrown(arg(a, 0));
     let m = thrown_message(vm, &e);
     let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));
-    call_function(vm, reject, Value::UNDEFINED, &[v])
+    vm.call_b(reject, Value::UNDEFINED, &[v]).map(Fresh::take)
 }

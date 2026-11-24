@@ -12,6 +12,7 @@
 //! The object (class `Generator`) keeps a hidden array in `code`:
 //! `[state, registers, pc, function, mode]`.
 
+use crate::brand::{Fresh, Scope};
 use crate::interp::{native_stack_low, write_frame_header};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, object_value};
 use crate::raw::{Live, ObjectPtr};
@@ -99,7 +100,7 @@ fn set(_: &mut Vm, st: *mut Value, k: i32, v: Value) {
 
 /// Element `k` of an async generator's request queue (an array).
 fn qget(vm: &mut Vm, q: Value, k: i32) -> Value {
-    vm.get_keyed(q, Value::from_i32(k)).unwrap_or(Value::UNDEFINED)
+    vm.get_keyed_b(q, Value::from_i32(k)).map(Fresh::take).unwrap_or(Value::UNDEFINED)
 }
 
 /// Drop the registers kept in state `st` (of `code`'s frame): done.
@@ -114,12 +115,13 @@ fn clear_regs(st: *mut Value, code: *const Code) {
 /// (or `%GeneratorPrototype%`).
 pub(crate) fn create(vm: &mut Vm, f: Obj) -> Result<Value> {
     let a_prototype = vm.a_prototype;
-    let p = vm.get(object_value(f.ptr()), a_prototype)?;
+    let p = vm.get_atom_b(object_value(f.ptr()), a_prototype)?;
     // (An async generator function's: kind 6, see `vm::Code::kind`.)
     let is_async = f.code().live().kind == 6;
     let root =
         if is_async { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
-    let proto = if crate::props::is_object(p) { p } else { object_value((vm.symbol_roots[root as usize]).ptr()) };
+    let proto =
+        if crate::props::is_object(p.peek()) { p.peek() } else { object_value((vm.symbol_roots[root as usize]).ptr()) };
     let code = f.code();
     let n = cells_for(code.live().kind) + code.live().nregs as usize;
     let queue = if is_async { vm.new_array() } else { Value::UNDEFINED };
@@ -196,7 +198,11 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     let pc = get(vm, st, PC).as_i32_unchecked() as usize;
     // (`g` rooted, its state read after the run; `v` across the safepoint
     // before its frame holds it.)
-    let r = vm.rooted(&[g, v], |vm| unsafe { run(vm, Obj::of(f), regs_at(st, Obj::of(f).code()), pc, v) });
+    let r = {
+        let held = Scope::new(vm);
+        let _held = held.roots([g, v]);
+        unsafe { run(vm, Obj::of(f), regs_at(st, Obj::of(f).code()), pc, v) }
+    };
     match r {
         Ok(out) => {
             let yielded = get(vm, st, STATE).as_i32_unchecked() == SUSPENDED_YIELD;
@@ -259,7 +265,11 @@ pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Value> {
     let p = crate::promise::new_promise(vm);
     let st = state_of(g).unwrap();
     set(vm, st, 5, p);
-    vm.rooted(&[p], |vm| async_step(vm, g, NEXT, Value::UNDEFINED))?;
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([p]);
+        async_step(vm, g, NEXT, Value::UNDEFINED)
+    }?;
     Ok(p)
 }
 
@@ -273,7 +283,8 @@ pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     }
     let (mut mode, mut v) = (mode, v);
     // (`g` rooted: a promise job's handler, only in Rust's copy.)
-    let _rooted = vm.root_scope(&[g]);
+    let held = Scope::new(vm);
+    let _rooted = held.roots([g]);
     loop {
         match resume_raw(vm, g, v, mode, "an async function") {
             Ok((out, true)) => {
@@ -319,14 +330,18 @@ fn async_gen_enqueue(vm: &mut Vm, g: Value, v: Value, mode: i32) -> Result<Value
         Some(st) if is_async_generator(st) => st,
         _ => {
             let e = crate::builtins::caught(vm, &Error::type_error("not an async generator"));
-            crate::interp::call_function(vm, reject, Value::UNDEFINED, &[e])?;
+            vm.call_b(reject, Value::UNDEFINED, &[e])?.take();
             return Ok(p);
         }
     };
     let q = get(vm, st, AG_QUEUE);
     crate::vm::array_push(vm, q, &[Value::from_i32(mode), v, resolve, reject])?;
     if get(vm, st, AG_BUSY) != Value::TRUE {
-        vm.rooted(&[p], |vm| async_gen_run(vm, g))?;
+        {
+            let held = Scope::new(vm);
+            let _held = held.roots([p]);
+            async_gen_run(vm, g)
+        }?;
     }
     Ok(p)
 }
@@ -351,7 +366,11 @@ fn async_gen_run(vm: &mut Vm, g: Value) -> Result<()> {
 /// then.
 fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
     // (`g` rooted: a promise job's handler, only in Rust's copy.)
-    vm.rooted(&[g], |vm| async_gen_step_rooted(vm, g, mode, v))
+    {
+        let held = Scope::new(vm);
+        let _held = held.roots([g]);
+        async_gen_step_rooted(vm, g, mode, v)
+    }
 }
 
 /// [`async_gen_step`], `g` rooted.
@@ -404,10 +423,10 @@ fn async_gen_step_rooted(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     match settled {
         Ok((v, done)) => {
             let r = crate::symbol::iter_result(vm, v, done)?;
-            crate::interp::call_function(vm, resolve, Value::UNDEFINED, &[r])?;
+            vm.call_b(resolve, Value::UNDEFINED, &[r])?.take();
         }
         Err(reason) => {
-            crate::interp::call_function(vm, reject, Value::UNDEFINED, &[reason])?;
+            vm.call_b(reject, Value::UNDEFINED, &[reason])?.take();
         }
     }
     async_gen_run(vm, g)
@@ -497,7 +516,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let fp = object_value(vm.function_prototype);
     let function = {
         let a = vm.intern_name("Function");
-        vm.get(object_value(vm.global), a).unwrap_or(Value::UNDEFINED)
+        vm.get_atom_b(object_value(vm.global), a).map(Fresh::take).unwrap_or(Value::UNDEFINED)
     };
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
     for (name, ctor, instances) in [

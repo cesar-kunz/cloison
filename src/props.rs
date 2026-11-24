@@ -18,7 +18,8 @@ use crate::object::Obj;
 use crate::raw::{Live, ObjectPtr};
 use std::cell::Cell;
 
-use crate::interp::{call_function, strict_equals, to_boolean, to_number};
+use crate::brand::{Fresh, RootedDesc, Scope};
+use crate::interp::{strict_equals, to_boolean, to_number};
 use crate::object::{
     ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FN_LENGTH_DELETED, FN_NAME_DELETED, FROZEN, FieldType,
     LENGTH_READ_ONLY, NOT_EXTENSIBLE, READ_ONLY, SEALED, SPARSE, Shape, Slots, as_object, object_value,
@@ -775,7 +776,9 @@ impl Vm {
             // (The proxy, and the values its checks read after the trap,
             // may be Rust's alone: rooted.)
             let [v, g, s] = d.values();
-            return self.rooted(&[object_value(o.ptr()), v, g, s], |vm| crate::proxy::proxy_define(vm, o, key, d));
+            let sc = Scope::new(self);
+            let _held = sc.roots([object_value(o.ptr()), v, g, s]);
+            return crate::proxy::proxy_define(self, o, key, d);
         }
         // A mapped `arguments` element: its parameter set too, and unmapped
         // by an accessor or a non-writable value.
@@ -1267,17 +1270,15 @@ impl Vm {
         if !is_object(v) {
             return Err(Error::type_error("Property description must be an object"));
         }
-        // (`v`, and the values read before the next getter runs: rooted.)
-        let depth = self.handles.len();
-        self.handles.push(v);
-        let r = self.to_descriptor_rooted(v);
-        self.handles.truncate(depth);
-        r
+        // (`v`, and the values read before the next getter runs: rooted
+        // until it returns them, its caller's to root.)
+        let sc = Scope::new(self);
+        let v = sc.root(v).v();
+        self.to_descriptor_rooted(&sc, v)
     }
 
-    /// [`Vm::to_descriptor`] of object `v`, each value read pushed on
-    /// `handles`.
-    fn to_descriptor_rooted(&mut self, v: Value) -> Result<Desc> {
+    /// [`Vm::to_descriptor`] of object `v`, each value read rooted in `sc`.
+    fn to_descriptor_rooted(&mut self, sc: &Scope, v: Value) -> Result<Desc> {
         let mut d = Desc::default();
         let has = |vm: &mut Vm, a: Atom| {
             let k = vm.key_string(Key::Name(a));
@@ -1286,29 +1287,26 @@ impl Vm {
         let (a_enumerable, a_configurable) = (self.a_enumerable, self.a_configurable);
         let (a_value, a_writable, a_get, a_set) = (self.a_value, self.a_writable, self.a_get, self.a_set);
         if has(self, a_enumerable)? {
-            d.enumerable = Some(to_boolean(self.get(v, a_enumerable)?));
+            d.enumerable = Some(to_boolean(self.get_atom_b(v, a_enumerable)?.take()));
         }
         if has(self, a_configurable)? {
-            d.configurable = Some(to_boolean(self.get(v, a_configurable)?));
+            d.configurable = Some(to_boolean(self.get_atom_b(v, a_configurable)?.take()));
         }
         if has(self, a_value)? {
-            let x = self.get(v, a_value)?;
-            self.handles.push(x);
-            d.value = Some(x);
+            d.value = Some(self.get_atom_b(v, a_value)?.root(sc).v());
         }
         if has(self, a_writable)? {
-            d.writable = Some(to_boolean(self.get(v, a_writable)?));
+            d.writable = Some(to_boolean(self.get_atom_b(v, a_writable)?.take()));
         }
         if has(self, a_get)? {
-            let g = self.get(v, a_get)?;
+            let g = self.get_atom_b(v, a_get)?.root(sc).v();
             if !g.is_undefined() && !is_callable(g) {
                 return Err(Error::type_error("Getter must be a function"));
             }
-            self.handles.push(g);
             d.get = Some(g);
         }
         if has(self, a_set)? {
-            let s = self.get(v, a_set)?;
+            let s = self.get_atom_b(v, a_set)?.take();
             if !s.is_undefined() && !is_callable(s) {
                 return Err(Error::type_error("Setter must be a function"));
             }
@@ -1655,12 +1653,11 @@ fn object_arg(v: Value, what: &str) -> Result<Obj> {
 fn object_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = object_arg(arg(a, 0), "Object.defineProperty")?;
     let key = vm.to_key(arg(a, 1));
-    let d = vm.to_descriptor(arg(a, 2))?;
     // (Its values, maybe getters' new objects, held across a proxy's
     // trap lookup: rooted.)
-    let none = Value::UNDEFINED;
-    let held = [d.value.unwrap_or(none), d.get.unwrap_or(none), d.set.unwrap_or(none)];
-    if !vm.rooted(&held, |vm| vm.define_own_property(o, key, &d))? {
+    let sc = Scope::new(vm);
+    let d = vm.to_descriptor_b(arg(a, 2))?.root(&sc);
+    if !vm.define_own_property(o, key, &d.desc())? {
         let k = vm.key_string(key);
         return Err(Error::type_error(format!("Cannot redefine property: {}", crate::vm::shown(k))));
     }
@@ -1669,9 +1666,15 @@ fn object_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// The descriptors of `props`' own enumerable properties, for
 /// `Object.defineProperties` and `Object.create`.
-fn descriptors(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
+fn descriptors(vm: &mut Vm, props: Value) -> Result<Fresh<'_, Vec<(Key, Desc)>>> {
+    descriptors_raw(vm, props).map(Fresh::new)
+}
+
+fn descriptors_raw(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
     let po = vm.to_object(props)?;
     let mut out = Vec::new();
+    // (Each descriptor's values in `vm.handles` while the next are read, the
+    // `Vec`'s copies valid in this handle scope, where no cell moves.)
     vm.handle_scope(|vm| {
         vm.handles.push(object_value(po.ptr()));
         // (A proxy's through its traps; symbols too.)
@@ -1681,8 +1684,8 @@ fn descriptors(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
             if d.enumerable != Some(true) {
                 continue;
             }
-            let v = vm.get_key(object_value(po.ptr()), key)?;
-            let d = vm.to_descriptor(v)?;
+            let v = vm.fresh(|vm| vm.get_key(object_value(po.ptr()), key))?.take();
+            let d = vm.to_descriptor_b(v)?.take();
             for v in [d.value, d.get, d.set].into_iter().flatten() {
                 vm.handles.push(v);
             }
@@ -1693,9 +1696,10 @@ fn descriptors(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
     Ok(out)
 }
 
-fn define_all(vm: &mut Vm, o: Obj, descs: &[(Key, Desc)]) -> Result<()> {
-    for &(key, d) in descs {
-        if !vm.define_own_property(o, key, &d)? {
+fn define_all(vm: &mut Vm, o: Obj, descs: &[(Key, RootedDesc)]) -> Result<()> {
+    for (key, d) in descs {
+        let key = *key;
+        if !vm.define_own_property(o, key, &d.desc())? {
             let k = vm.key_string(key);
             return Err(Error::type_error(format!("Cannot redefine property: {}", crate::vm::shown(k))));
         }
@@ -1706,15 +1710,9 @@ fn define_all(vm: &mut Vm, o: Obj, descs: &[(Key, Desc)]) -> Result<()> {
 /// `Object.defineProperties(o, props)`.
 fn object_define_properties(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = object_arg(arg(a, 0), "Object.defineProperties")?;
-    let descs = descriptors(vm, arg(a, 1))?;
-    vm.handle_scope(|vm| {
-        for (_, d) in &descs {
-            for v in [d.value, d.get, d.set].into_iter().flatten() {
-                vm.handles.push(v);
-            }
-        }
-        define_all(vm, o, &descs)
-    })?;
+    let sc = Scope::new(vm);
+    let descs = descriptors(vm, arg(a, 1))?.root(&sc);
+    define_all(vm, o, &descs)?;
     Ok(arg(a, 0))
 }
 
@@ -1724,32 +1722,24 @@ fn object_create(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !(proto.is_null() || is_object(proto)) {
         return Err(Error::type_error("Object prototype may only be an Object or null"));
     }
-    let o = vm.new_plain(proto);
+    let sc = Scope::new(vm);
+    let o = vm.mu().make(|vm| object_value(vm.new_plain(proto).ptr())).root(&sc).v();
     if !arg(a, 1).is_undefined() {
-        let descs = vm.handle_scope(|vm| {
-            vm.handles.push(object_value(o.ptr()));
-            descriptors(vm, arg(a, 1))
-        })?;
-        vm.handle_scope(|vm| {
-            vm.handles.push(object_value(o.ptr()));
-            for (_, d) in &descs {
-                for v in [d.value, d.get, d.set].into_iter().flatten() {
-                    vm.handles.push(v);
-                }
-            }
-            define_all(vm, o, &descs)
-        })?;
+        let descs = descriptors(vm, arg(a, 1))?.root(&sc);
+        define_all(vm, Obj::of(o), &descs)?;
     }
-    Ok(object_value(o.ptr()))
+    Ok(o)
 }
 
 /// `Object.getOwnPropertyDescriptor(o, key)`.
 fn object_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
     // (A wrapper held across the key's conversion: rooted.)
-    let key = vm.rooted(&[object_value(o.ptr())], |vm| crate::intrinsics::to_property_key(vm, arg(a, 1)))?;
-    Ok(match crate::proxy::get_own_property(vm, o, key)? {
-        Some(d) => vm.from_descriptor(&d),
+    let sc = Scope::new(vm);
+    let o = Obj::of(vm.to_object_b(arg(a, 0))?.root(&sc).v());
+    let key = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
+    // (Its object made where nothing collects.)
+    Ok(match vm.own_property_b(o, key)?.take() {
+        Some(d) => vm.mu().from_descriptor(&d).v(),
         None => Value::UNDEFINED,
     })
 }
@@ -1904,11 +1894,11 @@ fn object_is(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `Object.assign(target, …sources)`.
 fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let target = vm.to_object(arg(a, 0))?;
-    let t = object_value(target.ptr());
     // (A wrapper `target`, and each source's, held across getters and
     // setters: rooted.)
-    vm.rooted(&[t], |vm| assign_rooted(vm, t, a))?;
+    let sc = Scope::new(vm);
+    let t = vm.to_object_b(arg(a, 0))?.root(&sc).v();
+    assign_rooted(vm, t, a)?;
     Ok(t)
 }
 
@@ -1918,9 +1908,9 @@ fn assign_rooted(vm: &mut Vm, t: Value, a: &[Value]) -> Result<()> {
         if src.is_undefined() || src.is_null() {
             continue;
         }
-        let so = vm.to_object(src)?;
-        let s = object_value(so.ptr());
-        vm.rooted(&[s], |vm| assign_from(vm, t, so))?;
+        let sc = Scope::new(vm);
+        let so = Obj::of(vm.to_object_b(src)?.root(&sc).v());
+        assign_from(vm, t, so)?;
     }
     Ok(())
 }
@@ -1957,14 +1947,16 @@ fn assign_from(vm: &mut Vm, t: Value, so: Obj) -> Result<()> {
                 so.slot_value(cur.location(k))
             } else {
                 match crate::proxy::get_own_property(vm, so, key)? {
-                    Some(d) if d.enumerable == Some(true) => vm.get_key(s, key)?,
+                    Some(d) if d.enumerable == Some(true) => vm.fresh(|vm| vm.get_key(s, key))?.take(),
                     _ => continue,
                 }
             };
             // (Maybe a getter's new value, or one a setter of the
             // target's took out of `so`, held across a proxy's trap
             // lookup: rooted.)
-            vm.rooted(&[v], |vm| vm.put_key(t, key, v))?;
+            let step = Scope::new(vm);
+            let v = step.root(v);
+            vm.put_key(t, key, v.v())?;
         }
         return Ok(());
     }
@@ -1975,10 +1967,11 @@ fn assign_from(vm: &mut Vm, t: Value, so: Obj) -> Result<()> {
         if d.enumerable != Some(true) {
             continue;
         }
-        let v = vm.get_key(s, key)?;
         // (Maybe a getter's new value, held across a proxy's trap lookup:
         // rooted.)
-        vm.rooted(&[v], |vm| vm.put_key(t, key, v))?;
+        let step = Scope::new(vm);
+        let v = vm.fresh(|vm| vm.get_key(s, key))?.root(&step);
+        vm.put_key(t, key, v.v())?;
     }
     Ok(())
 }
@@ -2004,33 +1997,33 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
             vm.array_of(&pair)
         }));
     }
-    let out = vm.new_array();
     // (A wrapper `o`, and `out`, held across getters: rooted.)
-    vm.rooted(&[ov, out], |vm| {
-        let mut n = 0;
-        for key in crate::proxy::own_keys(vm, o)? {
-            if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) {
-                continue;
-            }
-            // (Enumerability as of now.)
-            let Some(d) = crate::proxy::get_own_property(vm, o, key)? else { continue };
-            if d.enumerable != Some(true) {
-                continue;
-            }
-            let v = vm.get_key(ov, key)?;
-            let item = if entries {
-                let k = vm.key_string(key);
-                let pair = vm.new_array();
-                crate::vm::array_push(vm, pair, &[k, v])?;
-                pair
-            } else {
-                v
-            };
-            vm.create_data_property(out, Key::Index(n), item)?;
-            n += 1;
+    let sc = Scope::new(vm);
+    let [_, out] = sc.roots([ov, vm.mu().new_array().v()]);
+    let out = out.v();
+    let mut n = 0;
+    for key in crate::proxy::own_keys(vm, o)? {
+        if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) {
+            continue;
         }
-        Ok(())
-    })?;
+        // (Enumerability as of now.)
+        let Some(d) = crate::proxy::get_own_property(vm, o, key)? else { continue };
+        if d.enumerable != Some(true) {
+            continue;
+        }
+        let v = vm.fresh(|vm| vm.get_key(ov, key))?.take();
+        // (The pair made, and filled, where nothing collects.)
+        let item = if entries {
+            let k = vm.key_string(key);
+            let pair = vm.new_array();
+            crate::vm::array_push(vm, pair, &[k, v])?;
+            pair
+        } else {
+            v
+        };
+        vm.create_data_property(out, Key::Index(n), item)?;
+        n += 1;
+    }
     Ok(out)
 }
 
@@ -2044,19 +2037,19 @@ fn object_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `Object.getOwnPropertyDescriptors(o)`.
 fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
-    let op = object_value(vm.object_prototype);
-    let out = object_value(vm.new_plain(op).ptr());
     // (A wrapper `o`, and `out`, held across a proxy's traps: rooted.)
-    vm.rooted(&[object_value(o.ptr()), out], |vm| {
-        for key in crate::proxy::own_keys(vm, o)? {
-            if let Some(d) = crate::proxy::get_own_property(vm, o, key)? {
-                let dv = vm.from_descriptor(&d);
-                vm.create_data_property(out, key, dv)?;
-            }
+    let sc = Scope::new(vm);
+    let o = Obj::of(vm.to_object_b(arg(a, 0))?.root(&sc).v());
+    let op = object_value(vm.object_prototype);
+    let out = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+    for key in crate::proxy::own_keys(vm, o)? {
+        if let Some(d) = vm.own_property_b(o, key)?.take() {
+            // (Its object made where nothing collects; defined on a new
+            // ordinary object, which runs no JS.)
+            let dv = vm.mu().from_descriptor(&d).v();
+            vm.create_data_property(out, key, dv)?;
         }
-        Ok(())
-    })?;
+    }
     Ok(out)
 }
 
@@ -2067,35 +2060,32 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if it.is_undefined() || it.is_null() {
         return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(it))));
     }
+    // (`out`, and the entry's key and value, each held across the getters
+    // and conversion after it: rooted.)
+    let sc = Scope::new(vm);
     let op = object_value(vm.object_prototype);
-    let out = object_value(vm.new_plain(op).ptr());
-    // (`out`, the entry, and its key and value, each held across the
-    // getters and conversion after it: rooted.)
-    vm.rooted(&[out], |vm| {
-        crate::symbol::iterate(vm, it, |vm, entry| {
-            if !is_object(entry) {
-                return Err(Error::type_error(format!(
-                    "Iterator value {} is not an entry object",
-                    crate::vm::shown(entry)
-                )));
-            }
-            vm.rooted(&[entry], |vm| {
-                let k = vm.get_key(entry, Key::Index(0))?;
-                vm.rooted(&[k], |vm| {
-                    let v = vm.get_key(entry, Key::Index(1))?;
-                    let key = vm.rooted(&[v], |vm| crate::intrinsics::to_property_key(vm, k))?;
-                    vm.create_data_property(out, key, v)
-                })
-            })
-        })
+    let out = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+    crate::symbol::iterate(vm, it, |vm, entry| {
+        if !is_object(entry) {
+            return Err(Error::type_error(format!(
+                "Iterator value {} is not an entry object",
+                crate::vm::shown(entry)
+            )));
+        }
+        let step = Scope::new(vm);
+        let k = vm.fresh(|vm| vm.get_key(entry, Key::Index(0)))?.root(&step);
+        let v = vm.fresh(|vm| vm.get_key(entry, Key::Index(1)))?.root(&step);
+        let key = crate::intrinsics::to_property_key(vm, k.v())?;
+        vm.create_data_property(out, key, v.v())
     })?;
     Ok(out)
 }
 
 /// `Object.hasOwn(o, key)`.
 fn object_has_own(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
-    let key = vm.rooted(&[object_value(o.ptr())], |vm| crate::intrinsics::to_property_key(vm, arg(a, 1)))?;
+    let sc = Scope::new(vm);
+    let o = Obj::of(vm.to_object_b(arg(a, 0))?.root(&sc).v());
+    let key = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
     Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some()))
 }
 
@@ -2117,23 +2107,24 @@ pub(crate) fn group_by(
     crate::symbol::iterate(vm, items, |vm, v| {
         // (`v` held across the callback and `add`'s conversion of the key,
         // the key across `add`: rooted.)
-        vm.rooted(&[v], |vm| {
-            let key = call_function(vm, f, Value::UNDEFINED, &[v, Value::number(k)])?;
-            k += 1.0;
-            vm.rooted(&[key], |vm| add(vm, key, v))
-        })
+        let step = Scope::new(vm);
+        let v = step.root(v);
+        let key = vm.call_b(f, Value::UNDEFINED, &[v.v(), Value::number(k)])?.root(&step);
+        k += 1.0;
+        add(vm, key.v(), v.v())
     })
 }
 
 /// `Object.groupBy(items, callback)`: a null-prototype object of arrays.
 fn object_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let out = object_value(vm.new_plain(Value::NULL).ptr());
-    let depth = vm.handles.len();
-    vm.handles.push(out);
-    let r = group_by(vm, a, |vm, key, v| {
+    let sc = Scope::new(vm);
+    let out = vm.mu().make(|vm| object_value(vm.new_plain(Value::NULL).ptr())).root(&sc).v();
+    group_by(vm, a, |vm, key, v| {
         let key = crate::intrinsics::to_property_key(vm, key)?;
+        // (`out` has no prototype and only these arrays: reading, defining
+        // and pushing run no JS.)
         let group = match vm.own_property(Obj::of(out), key) {
-            Some(_) => vm.get_key(out, key)?,
+            Some(_) => vm.fresh(|vm| vm.get_key(out, key))?.take(),
             None => {
                 let g = vm.new_array();
                 vm.create_data_property(out, key, g)?;
@@ -2142,9 +2133,7 @@ fn object_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         };
         crate::vm::array_push(vm, group, &[v])?;
         Ok(())
-    });
-    vm.handles.truncate(depth);
-    r?;
+    })?;
     Ok(out)
 }
 
@@ -2181,10 +2170,10 @@ fn object_is_prototype_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
     if !is_object(v) {
         return Ok(Value::FALSE);
     }
-    let o = vm.to_object(this)?;
     // (A primitive's new wrapper, compared after the traps: rooted, its
     // address not another's meanwhile.)
-    let _rooted = vm.root_scope(&[object_value(o.ptr())]);
+    let sc = Scope::new(vm);
+    let o = Obj::of(vm.to_object_b(this)?.root(&sc).v());
     // (Each step V.[[GetPrototypeOf]](), 20.1.3.3: a proxy's trap runs.)
     let mut hops = 0;
     let mut p = crate::proxy::walk_prototype(vm, Obj::of(v), &mut hops)?;
@@ -2209,14 +2198,14 @@ fn object_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Valu
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("Object.prototype.toLocaleString called on null or undefined"));
     }
-    let f = vm.get(this, vm.a_to_string)?;
-    call_function(vm, f, this, &[])
+    let f = vm.get_atom_b(this, vm.a_to_string)?.take();
+    vm.call_b(f, this, &[]).map(Fresh::take)
 }
 
 /// `Object.prototype.__proto__`'s getter.
 fn object_get_proto(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = vm.to_object(this)?;
-    crate::proxy::get_prototype_of(vm, o)
+    let o = Obj::of(vm.to_object_b(this)?.take());
+    vm.prototype_of_b(o).map(Fresh::take)
 }
 
 /// `Object.prototype.__proto__`'s setter.
@@ -2235,13 +2224,14 @@ fn object_set_proto(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn define_accessor_half(vm: &mut Vm, this: Value, a: &[Value], setter: bool) -> Result<Value> {
-    let o = vm.to_object(this)?;
+    // (A wrapper `o` held across the key's conversion: rooted.)
+    let sc = Scope::new(vm);
+    let o = Obj::of(vm.to_object_b(this)?.root(&sc).v());
     let f = arg(a, 1);
     if !is_callable(f) {
         return Err(Error::type_error("Getter must be a function"));
     }
-    // (A wrapper `o` held across the key's conversion: rooted.)
-    let key = vm.rooted(&[object_value(o.ptr())], |vm| vm.to_key(arg(a, 0)));
+    let key = vm.to_key(arg(a, 0));
     let d = Desc {
         get: (!setter).then_some(f),
         set: setter.then_some(f),
@@ -2264,16 +2254,17 @@ fn object_define_setter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> 
 }
 
 fn lookup_accessor_half(vm: &mut Vm, this: Value, a: &[Value], setter: bool) -> Result<Value> {
-    let o = vm.to_object(this)?;
-    let key = vm.rooted(&[object_value(o.ptr())], |vm| vm.to_key(arg(a, 0)));
-    let mut p = object_value(o.ptr());
+    let sc = Scope::new(vm);
+    let o = vm.to_object_b(this)?.root(&sc).v();
+    let key = vm.to_key(arg(a, 0));
     // (A proxy's through its traps: each object held across them, rooted.)
-    while p.is_cell() {
-        let po = Obj::of(p);
-        let (d, next) = vm.rooted(&[p], |vm| match crate::proxy::get_own_property(vm, po, key)? {
-            Some(d) => Ok((Some(d), Value::NULL)),
-            None => Ok((None, crate::proxy::get_prototype_of(vm, po)?)),
-        })?;
+    let p = sc.root(o);
+    while p.v().is_cell() {
+        let po = Obj::of(p.v());
+        let (d, next) = match vm.own_property_b(po, key)?.take() {
+            Some(d) => (Some(d), Value::NULL),
+            None => (None, vm.prototype_of_b(Obj::of(p.v()))?.take()),
+        };
         if let Some(d) = d {
             return Ok(if d.is_accessor() {
                 if setter { d.set.unwrap() } else { d.get.unwrap() }
@@ -2281,7 +2272,7 @@ fn lookup_accessor_half(vm: &mut Vm, this: Value, a: &[Value], setter: bool) -> 
                 Value::UNDEFINED
             });
         }
-        p = next;
+        p.set(next);
     }
     Ok(Value::UNDEFINED)
 }

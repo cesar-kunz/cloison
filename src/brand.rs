@@ -165,12 +165,20 @@ impl<T: Rootable> Rootable for Option<T> {
     }
 }
 
-/// A list of values (CreateListFromArrayLike's), rooted only as it is
-/// given at once to a call (which copies it onto the VM stack first).
-impl Rootable for Vec<Value> {
-    type Rooted<'s> = Vec<Handle<'s>>;
-    fn root_in(self, s: &Scope) -> Vec<Handle<'_>> {
-        self.into_iter().map(|v| s.root(v)).collect()
+/// A list of what holds cells (CreateListFromArrayLike's values, a
+/// properties' descriptors), each rooted.
+impl<T: Rootable> Rootable for Vec<T> {
+    type Rooted<'s> = Vec<T::Rooted<'s>>;
+    fn root_in(self, s: &Scope) -> Vec<T::Rooted<'_>> {
+        self.into_iter().map(|v| v.root_in(s)).collect()
+    }
+}
+
+/// A property's key (its atom held while the native runs) and descriptor.
+impl Rootable for (Key, Desc) {
+    type Rooted<'s> = (Key, RootedDesc<'s>);
+    fn root_in(self, s: &Scope) -> (Key, RootedDesc<'_>) {
+        (self.0, self.1.root_in(s))
     }
 }
 

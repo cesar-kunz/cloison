@@ -111,17 +111,20 @@ pub struct Fresh<'a, T = Value> {
 }
 
 impl<'a, T: Rootable> Fresh<'a, T> {
+    #[inline(always)]
     pub(crate) fn new(v: T) -> Fresh<'a, T> {
         Fresh { v, _vm: PhantomData }
     }
 
     /// Rooted in `s`, until it ends.
+    #[inline(always)]
     pub fn root<'s>(self, s: &'s Scope) -> T::Rooted<'s> {
         self.v.root_in(s)
     }
 
     /// What it holds, for the call it is given to at once (an argument
     /// its callee roots), or not a cell (a number's).
+    #[inline(always)]
     pub fn take(self) -> T {
         self.v
     }
@@ -224,6 +227,13 @@ impl<'a> Mu<'a> {
         f(unsafe { &mut *self.vm })
     }
 
+    /// A new object of `class` inheriting from `proto`, room for
+    /// `capacity` slots.
+    pub(crate) fn new_object_with(&self, class: crate::object::Class, proto: Value, capacity: u32) -> Gc<'a> {
+        let o = self.with(|vm| vm.new_object_with(class, proto, capacity));
+        Gc { v: object_value(o.ptr()), _vm: PhantomData }
+    }
+
     /// A new array.
     pub fn new_array(&self) -> Gc<'a> {
         Gc { v: self.with(Vm::new_array), _vm: PhantomData }
@@ -263,11 +273,15 @@ pub struct Scope {
 
 impl Scope {
     /// A scope from `vm.handles`' current depth.
+    #[inline(always)]
     pub fn new(vm: &mut Vm) -> Scope {
         Scope { depth: vm.handles.len(), vm }
     }
 
-    fn root(&self, v: Value) -> Handle<'_> {
+    /// `v` rooted until the scope ends: a value a caller passed, which
+    /// this code holds across a call that may collect.
+    #[inline(always)]
+    pub fn root(&self, v: Value) -> Handle<'_> {
         // SAFETY: the scope doesn't outlive its VM, and nothing else
         // borrows `handles` while it is pushed to.
         let slot = unsafe {
@@ -280,6 +294,7 @@ impl Scope {
 }
 
 impl Drop for Scope {
+    #[inline(always)]
     fn drop(&mut self) {
         // SAFETY: as `root`.
         unsafe { (*self.vm).handles.truncate(self.depth) };
@@ -297,78 +312,118 @@ pub struct Handle<'s> {
 
 impl Handle<'_> {
     /// The value now.
+    #[inline(always)]
     pub fn v(self) -> Value {
         // SAFETY: the slot is the scope's, which outlives the handle, and
-        // the scope its VM.
-        unsafe { (&(*self.vm).handles)[self.slot] }
+        // the scope its VM; `handles` is cut back only to a scope's depth,
+        // no deeper than this slot while its scope lives.
+        unsafe { *(&(*self.vm).handles).get_unchecked(self.slot) }
+    }
+
+    /// Root `v` in this slot instead (a loop's current value).
+    #[inline(always)]
+    pub fn set(self, v: Value) {
+        // SAFETY: as `v`.
+        unsafe { *(&mut (*self.vm.cast_mut()).handles).get_unchecked_mut(self.slot) = v }
     }
 }
 
 /// The calls that may collect, their results branded ([`Fresh`]).
 impl Vm {
     /// The VM where nothing collects.
+    #[inline(always)]
     pub fn mu(&mut self) -> Mu<'_> {
         Mu { vm: self, _vm: PhantomData }
     }
 
     /// `o[name]`.
+    #[inline(always)]
     pub fn get_b(&mut self, o: Value, name: &str) -> Result<Fresh<'_>> {
         let a = self.intern_name(name);
         self.get(o, a).map(Fresh::new)
     }
 
+    /// `o[a]`, an atom's name.
+    #[inline(always)]
+    pub(crate) fn get_atom_b(&mut self, o: Value, a: crate::object::Atom) -> Result<Fresh<'_>> {
+        self.get(o, a).map(Fresh::new)
+    }
+
     /// `o[key]`.
+    #[inline(always)]
     pub fn get_keyed_b(&mut self, o: Value, key: Value) -> Result<Fresh<'_>> {
         self.get_keyed(o, key).map(Fresh::new)
     }
 
     /// ToObject.
+    #[inline(always)]
     pub fn to_object_b(&mut self, v: Value) -> Result<Fresh<'_>> {
         self.to_object(v).map(|o| Fresh::new(crate::object::object_value(o.ptr())))
     }
 
     /// ToString.
+    #[inline(always)]
     pub fn to_string_b(&mut self, v: Value) -> Result<Fresh<'_>> {
         crate::intrinsics::to_string(self, v).map(Fresh::new)
     }
 
     /// LengthOfArrayLike.
+    #[inline(always)]
     pub fn length_of_b(&mut self, o: Value) -> Result<f64> {
         self.length_of(o)
     }
 
     /// Call `f` with `this` and `args`.
+    #[inline(always)]
     pub fn call_b(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Fresh<'_>> {
         crate::interp::call_function(self, f, this, args).map(Fresh::new)
     }
 
     /// Construct `f` with `args`, `nt` its `new.target`.
+    #[inline(always)]
     pub(crate) fn construct_b(&mut self, f: Value, args: &[Value], nt: Value) -> Result<Fresh<'_>> {
         crate::intrinsics::construct_with(self, f, args, nt).map(Fresh::new)
     }
 
     /// CreateListFromArrayLike of `v`, an object (rooted while it is made:
     /// its getters run).
+    #[inline(always)]
     pub(crate) fn list_b(&mut self, v: Value) -> Result<Fresh<'_, Vec<Value>>> {
         self.handle_scope(|vm| crate::array::apply_list(vm, v)).map(Fresh::new)
     }
 
     /// ToPropertyDescriptor (its getters run).
+    #[inline(always)]
     pub(crate) fn to_descriptor_b(&mut self, v: Value) -> Result<Fresh<'_, Desc>> {
         self.to_descriptor(v).map(Fresh::new)
     }
 
     /// `o.[[GetOwnProperty]](key)` (a proxy's trap runs).
+    #[inline(always)]
     pub(crate) fn own_property_b(&mut self, o: Obj, key: Key) -> Result<Fresh<'_, Option<Desc>>> {
         crate::proxy::get_own_property(self, o, key).map(Fresh::new)
     }
 
     /// `o.[[GetPrototypeOf]]()`.
+    #[inline(always)]
     pub(crate) fn prototype_of_b(&mut self, o: Obj) -> Result<Fresh<'_>> {
         crate::proxy::get_prototype_of(self, o).map(Fresh::new)
     }
 
+    /// GetIterator(`v`): its iterator, an object.
+    #[inline(always)]
+    pub(crate) fn get_iterator_b(&mut self, v: Value) -> Result<Fresh<'_>> {
+        crate::symbol::get_iterator(self, v).map(Fresh::new)
+    }
+
+    /// IteratorStep of `it` with its `next`: the next value, or `None`.
+    #[inline(always)]
+    pub(crate) fn step_b(&mut self, it: Value, next: Value) -> Result<Fresh<'_, Option<Value>>> {
+        crate::symbol::step_with(self, it, next).map(Fresh::new)
+    }
+
     /// `o.[[Get]](key, receiver)`.
+    #[inline(always)]
     pub(crate) fn get_from_b(&mut self, o: Obj, key: Key, receiver: Value) -> Result<Fresh<'_>> {
         let ov = object_value(o.ptr());
         if crate::proxy::chain_has_proxy(self, o) {

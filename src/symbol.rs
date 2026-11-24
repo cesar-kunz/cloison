@@ -9,7 +9,8 @@
 //! once it is a key: see [`symbol_atom`]) and its description in `code`'s
 //! bits (traced: see `gc`).
 
-use crate::interp::{call_function, to_boolean};
+use crate::brand::Scope;
+use crate::interp::to_boolean;
 use crate::object::{Atom, Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
 use crate::raw::{Live, ObjectPtr};
@@ -192,12 +193,12 @@ fn symbol_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Symbol is not a constructor"));
     }
     let d = arg(a, 0);
-    let desc = if d.is_undefined() { d } else { crate::intrinsics::to_string(vm, d)? };
+    let desc = if d.is_undefined() { d } else { vm.to_string_b(d)?.take() };
     Ok(make_symbol(vm, desc, None))
 }
 
 fn symbol_for(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let key = crate::intrinsics::to_string(vm, arg(a, 0))?;
+    let key = vm.to_string_b(arg(a, 0))?.take();
     let units = string_units(key).unwrap_or(&[]).to_vec();
     if let Some(&s) = vm.symbol_registry.get(&units) {
         return Ok(object_value(s));
@@ -236,7 +237,9 @@ fn symbol_description(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `Object.getOwnPropertySymbols(o)`.
 fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = vm.to_object(arg(a, 0))?;
+    // (A primitive's new wrapper, held across a proxy's traps: rooted.)
+    let s = Scope::new(vm);
+    let o = Obj::of(vm.to_object_b(arg(a, 0))?.root(&s).v());
     let keys: Vec<Value> = if vm.proxies_exist && crate::proxy::is_proxy(vm, o) {
         let ks = crate::proxy::own_keys(vm, o)?;
         ks.into_iter()
@@ -494,7 +497,7 @@ fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("Array.prototype iterator called on null or undefined"));
     }
-    Ok(object_value((vm.to_object(this)?).ptr()))
+    Ok(vm.to_object_b(this)?.take())
 }
 
 pub(crate) fn array_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -521,7 +524,7 @@ fn string_iterator(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype[Symbol.iterator] called on null or undefined"));
     }
-    let s = crate::intrinsics::to_string(vm, this)?;
+    let s = vm.to_string_b(this)?.take();
     new_iterator(vm, s, 3, Root::StringIteratorPrototype)
 }
 
@@ -592,16 +595,16 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
             }
         }
     }
-    let target = vm.get_keyed(state, Value::from_i32(0))?;
-    if target.is_undefined() {
-        return Ok(None);
-    }
     // (`target`, which a `next()` its `length`'s getter calls may drop
     // from the state, held across its reads: rooted.)
-    let _rooted = vm.root_scope(&[target]);
-    let i = vm.get_keyed(state, Value::from_i32(1))?.as_number().unwrap_or(0.0);
-    let kind = vm.get_keyed(state, Value::from_i32(2))?.as_number().unwrap_or(1.0) as i32;
-    let o = Obj::of(target);
+    let s = Scope::new(vm);
+    let target = vm.get_keyed_b(state, Value::from_i32(0))?.root(&s);
+    if target.v().is_undefined() {
+        return Ok(None);
+    }
+    let i = vm.get_keyed_b(state, Value::from_i32(1))?.take().as_number().unwrap_or(0.0);
+    let kind = vm.get_keyed_b(state, Value::from_i32(2))?.take().as_number().unwrap_or(1.0) as i32;
+    let o = Obj::of(target.v());
     let len = if o.class() == Class::TypedArray {
         // (Its record made seq-cst: 23.1.5.1.)
         match crate::typed::ta_length_seq_cst(vm, o) {
@@ -613,7 +616,7 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
             }
         }
     } else {
-        vm.length_of(target)?
+        vm.length_of_b(target.v())?
     };
     if i >= len {
         vm.set_keyed(state, Value::from_i32(0), Value::UNDEFINED)?;
@@ -623,9 +626,9 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     let k = Value::number(i);
     let v = match kind {
         0 => k,
-        1 => vm.get_keyed(target, k)?,
+        1 => vm.get_keyed_b(target.v(), k)?.take(),
         _ => {
-            let e = vm.get_keyed(target, k)?;
+            let e = vm.get_keyed_b(target.v(), k)?.take();
             crate::array::new_array_of(vm, &[k, e])?
         }
     };
@@ -634,11 +637,14 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
 
 fn string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let state = iterator_state(this, "%StringIteratorPrototype%.next")?;
-    let target = vm.get_keyed(state, Value::from_i32(0))?;
+    // (The state is an array JS doesn't see, its elements its own: reading
+    // and writing them run no JS. `target`'s units are read before the
+    // index is written.)
+    let i = vm.get_keyed_b(state, Value::from_i32(1))?.take().as_number().unwrap_or(0.0) as usize;
+    let target = vm.get_keyed_b(state, Value::from_i32(0))?.take();
     let Some(u) = string_units(target) else {
         return iter_result(vm, Value::UNDEFINED, true);
     };
-    let i = vm.get_keyed(state, Value::from_i32(1))?.as_number().unwrap_or(0.0) as usize;
     if i >= u.len() {
         vm.set_keyed(state, Value::from_i32(0), Value::UNDEFINED)?;
         return iter_result(vm, Value::UNDEFINED, true);
@@ -661,11 +667,13 @@ pub(crate) fn get_iterator(vm: &mut Vm, v: Value) -> Result<Value> {
     }
     let a = vm.a_sym_iterator;
     // (`v` rooted across a getter: the method's receiver after.)
-    let m = vm.rooted(&[v], |vm| vm.get(v, a))?;
+    let s = Scope::new(vm);
+    let v = s.root(v);
+    let m = vm.get_atom_b(v.v(), a)?.take();
     if !is_callable(m) {
-        return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(v))));
+        return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(v.v()))));
     }
-    let it = call_function(vm, m, v, &[])?;
+    let it = vm.call_b(m, v.v(), &[])?.take();
     if !is_object(it) {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
     }
@@ -696,15 +704,18 @@ pub(crate) fn async_record(vm: &mut Vm, it: Value) -> Result<Value> {
 
 fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     let a_next = vm.a_next;
-    let next = vm.rooted(&[it], |vm| vm.get(it, a_next))?;
-    let o = vm.new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32);
-    for (i, v) in [it, next].into_iter().chain(done).enumerate() {
+    let s = Scope::new(vm);
+    let it = s.root(it);
+    let next = vm.get_atom_b(it.v(), a_next)?.root(&s);
+    let o = vm.mu().new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32).v();
+    let o = crate::object::as_object(o);
+    for (i, v) in [it.v(), next.v()].into_iter().chain(done).enumerate() {
         unsafe {
-            let at = crate::object::Object::inline(o.ptr(), i);
-            crate::heap::store(o.ptr().cast(), at, v);
+            let at = crate::object::Object::inline(o, i);
+            crate::heap::store(o.cast(), at, v);
         }
     }
-    Ok(crate::object::object_value(o.ptr()))
+    Ok(object_value(o))
 }
 
 /// Whether a [`sync_record`]'s last step was done (false once
@@ -758,17 +769,17 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     {
         return crate::builtins::regexp_string_iterator_step(vm, it);
     }
-    let r = call_function(vm, next, it, &[])?;
-    if !is_object(r) {
-        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
+    // (The result rooted across `done`'s getter.)
+    let s = Scope::new(vm);
+    let r = vm.call_b(next, it, &[])?.root(&s);
+    if !is_object(r.v()) {
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r.v()))));
     }
     let (a_done, a_value) = (vm.a_done, vm.a_value);
-    // (The result rooted across `done`'s getter.)
-    let _rooted = vm.root_scope(&[r]);
-    if to_boolean(vm.get(r, a_done)?) {
+    if to_boolean(vm.get_atom_b(r.v(), a_done)?.take()) {
         return Ok(None);
     }
-    vm.get(r, a_value).map(Some)
+    vm.get_atom_b(r.v(), a_value).map(|v| Some(v.take()))
 }
 
 /// IteratorClose after an early exit: `it.return()`, if it has one.
@@ -777,14 +788,16 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
         return Ok(());
     }
     let a_return = vm.a_return;
-    let m = vm.rooted(&[it], |vm| vm.get(it, a_return))?;
+    let s = Scope::new(vm);
+    let it = s.root(it);
+    let m = vm.get_atom_b(it.v(), a_return)?.take();
     if m.is_undefined() || m.is_null() {
         return Ok(());
     }
     if !is_callable(m) {
         return Err(Error::type_error("iterator.return is not a function"));
     }
-    let r = call_function(vm, m, it, &[])?;
+    let r = vm.call_b(m, it.v(), &[])?.take();
     if !is_object(r) {
         return Err(Error::type_error("Iterator result is not an object"));
     }
@@ -799,32 +812,33 @@ pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -
     // native stack, which pins what it holds; rooted, with each value
     // while `f` runs, in slots of their own.)
     let mut st = [v, Value::UNDEFINED];
+    let s = Scope::new(vm);
+    // (The current value, rooted while `f` runs.)
+    let x_root = s.root(Value::UNDEFINED);
     if unsafe { fast_open(vm, st.as_mut_ptr()) } {
-        return vm.rooted(&[st[0], Value::UNDEFINED], |vm| {
-            let at = vm.handles.len() - 2;
-            loop {
-                let x = unsafe { iterator_next(vm, st.as_mut_ptr())? };
-                if x == Value::HOLE {
-                    return Ok(());
-                }
-                vm.handles[at + 1] = x;
-                if let Err(e) = f(vm, x) {
-                    // (What `f` threw rooted across `return`.)
-                    let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| open_state_close(vm, &st));
-                    return Err(e);
-                }
+        let _iterable = s.root(st[0]);
+        loop {
+            let x = unsafe { iterator_next(vm, st.as_mut_ptr())? };
+            if x == Value::HOLE {
+                return Ok(());
             }
-        });
+            x_root.set(x);
+            if let Err(e) = f(vm, x) {
+                // (What `f` threw rooted across `return`.)
+                let _thrown = s.root(e.1.unwrap_or(Value::UNDEFINED));
+                let _ = open_state_close(vm, &st);
+                return Err(e);
+            }
+        }
     }
-    let it = get_iterator(vm, v)?;
+    let it = vm.get_iterator_b(v)?.root(&s);
     let a_next = vm.a_next;
-    let next = vm.rooted(&[it], |vm| vm.get(it, a_next))?;
-    let _rooted = vm.root_scope(&[it, next, Value::UNDEFINED]);
-    let at = vm.handles.len() - 1;
-    while let Some(x) = step_with(vm, it, next)? {
-        vm.handles[at] = x;
+    let next = vm.get_atom_b(it.v(), a_next)?.root(&s);
+    while let Some(x) = vm.step_b(it.v(), next.v())?.take() {
+        x_root.set(x);
         if let Err(e) = f(vm, x) {
-            let _ = vm.rooted(&[e.1.unwrap_or(Value::UNDEFINED)], |vm| close(vm, it));
+            let _thrown = s.root(e.1.unwrap_or(Value::UNDEFINED));
+            let _ = close(vm, it.v());
             return Err(e);
         }
     }
@@ -835,7 +849,7 @@ pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -
 /// string (what its getter throws thrown).
 pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Result<Option<Vec<u16>>> {
     let a = vm.a_sym_to_string_tag;
-    let t = vm.get(o, a)?;
+    let t = vm.get_atom_b(o, a)?.take();
     Ok(string_units(t).map(|u| u.to_vec()))
 }
 
@@ -1085,7 +1099,7 @@ pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()>
         if fast_open(vm, slots) {
             return Ok(());
         }
-        let it = get_iterator(vm, *slots)?;
+        let it = vm.get_iterator_b(*slots)?.take();
         let r = record(vm, it)?;
         *slots = r;
         *slots.add(1) = Value::UNDEFINED;
@@ -1172,7 +1186,7 @@ pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Option
             return Ok(Some(v));
         }
     }
-    vm.get_keyed(a, Value::number(i as f64)).map(Some)
+    vm.get_keyed_b(a, Value::number(i as f64)).map(|v| Some(v.take()))
 }
 
 /// The next index in an array's `IteratorOpen` state (under 2^32: an
@@ -1243,7 +1257,7 @@ unsafe fn iterator_next_other(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
             _ => {}
         }
         let (it, next) = record_parts(s);
-        Ok(step_with(vm, it, next)?.unwrap_or(Value::HOLE))
+        Ok(vm.step_b(it, next)?.take().unwrap_or(Value::HOLE))
     }
 }
 
@@ -1261,11 +1275,14 @@ pub(crate) fn open_state_close(vm: &mut Vm, a: &[Value]) -> Result<()> {
         Class::String => new_iterator(vm, a[0], 3, Root::StringIteratorPrototype)?,
         _ => new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?,
     };
-    if Obj::of(it).class() == Class::ArrayIterator {
-        let state = Value::from_bits(Obj::of(it).code() as u64);
+    // (A new iterator, held across its state's write: rooted.)
+    let s = Scope::new(vm);
+    let it = s.root(it);
+    if Obj::of(it.v()).class() == Class::ArrayIterator {
+        let state = Value::from_bits(Obj::of(it.v()).code() as u64);
         vm.set_keyed(state, Value::from_i32(1), a[1])?;
     }
-    close(vm, it)
+    close(vm, it.v())
 }
 
 #[cfg(test)]

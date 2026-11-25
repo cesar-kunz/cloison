@@ -102,12 +102,18 @@ It costs nothing measurable on Octane, and turned up four real bugs on
 the way. [docs/gc-branding.md](docs/gc-branding.md) explains it from the
 start.
 
+What the types leave open, a raw value held across a call, a static
+analysis checks on every path, in CI: a rustc driver that follows each
+local holding a cell to where it is rooted
+([docs/gc-hazards.md](docs/gc-hazards.md)).
+
 ## More
 
 - [cloison in depth](docs/README-long.md): how it works, design choices,
   standards support, testing, building, where it falls short
 - [docs/gc.md](docs/gc.md): the collector
 - [docs/gc-branding.md](docs/gc-branding.md): branded cells, the compiler checking GC safety in natives
+- [docs/gc-hazards.md](docs/gc-hazards.md): the static analysis of unrooted cells, every path
 - [docs/object-model.md](docs/object-model.md): objects, shapes, escape analysis
 - [docs/direct-calls.md](docs/direct-calls.md): the call convention
 - [docs/sparse-arrays.md](docs/sparse-arrays.md): sparse arrays and their defaults

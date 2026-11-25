@@ -371,7 +371,7 @@ can't see.
   which the collector scans precisely. Branding doesn't apply there.
 
 The GC hazard analysis (`scripts/gc-hazards.sh`, a CI job; see
-[gc.md](gc.md)) checks the first two statically, on every path: it
+[gc-hazards.md](gc-hazards.md)) checks the first two statically, on every path: it
 follows what a `take()` or a `Raw` gives, a slot's value, a helper's
 result and `this` like any other local, and knows the branded forms
 (a `Scope`'s handles root, a `Fresh` is a call's result, `vm.mu()`'s

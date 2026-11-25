@@ -436,7 +436,7 @@ measurement says the old generation fills with cells that die soon after.
    passed to a callee that holds them across one, or captured by a
    closure that may collect. What it can't see (realm setup runs no JS,
    say) is in its `annotations.txt`; the hazards not fixed yet, in its
-   `baseline.txt`, and CI fails on a new one.
+   `baseline.txt`, and CI fails on a new one ([gc-hazards.md](gc-hazards.md)).
 3. **The VM's own references**: the global object and the builtins'
    prototypes and functions, the string constant table and
    `single_chars`, `Code::constants`, open upvalues, a pending error's

@@ -198,12 +198,13 @@ fn symbol_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn symbol_for(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let key = vm.to_string_b(arg(a, 0))?.take();
-    let units = string_units(key).unwrap_or(&[]).to_vec();
+    let sc_key = Scope::new(vm);
+    let key = vm.to_string_b(arg(a, 0))?.root(&sc_key);
+    let units = string_units(key.peek()).unwrap_or(&[]).to_vec();
     if let Some(&s) = vm.symbol_registry.get(&units) {
         return Ok(object_value(s));
     }
-    let s = make_symbol(vm, key, None);
+    let s = make_symbol(vm, key.peek(), None);
     // (A root of every collection from now on: the registry's symbols live
     // as long as the agent, GlobalSymbolRegistry. Full collections
     // enumerate it, `Vm::registered_symbols`; the log has it for the next
@@ -389,6 +390,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let a_species = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.species"));
     for name in ["Array", "Map", "Set", "Promise", "RegExp", "ArrayBuffer", "SharedArrayBuffer"] {
         let a = vm.intern_name(name);
+        // take: realm setup runs no JS.
         let c = vm.get_atom_b(object_value(g.ptr()), a).map(Fresh::take).unwrap_or(Value::UNDEFINED);
         if is_object(c) {
             define_getter(vm, Obj::of(c), Key::Name(a_species), "[Symbol.species]", return_this);
@@ -433,6 +435,7 @@ pub(crate) fn install(vm: &mut Vm) {
     for (p, method, tag) in [(Proto::Map, "entries", "Map"), (Proto::Set, "values", "Set")] {
         let o = cp[p as usize];
         let a = vm.intern_name(method);
+        // take: realm setup runs no JS.
         let f = vm.get_atom_b(object_value(o.ptr()), a).map(Fresh::take).unwrap_or(Value::UNDEFINED);
         vm.add_property_with(o, a_iter, f, DONT_ENUM);
         to_string_tag(vm, o, tag);
@@ -524,8 +527,9 @@ fn string_iterator(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype[Symbol.iterator] called on null or undefined"));
     }
-    let s = vm.to_string_b(this)?.take();
-    new_iterator(vm, s, 3, Root::StringIteratorPrototype)
+    let sc_s = Scope::new(vm);
+    let s = vm.to_string_b(this)?.root(&sc_s);
+    new_iterator(vm, s.peek(), 3, Root::StringIteratorPrototype)
 }
 
 /// An iterator result object `{value, done}`.
@@ -628,8 +632,9 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
         0 => k,
         1 => vm.get_keyed_b(target.v(), k)?.take(),
         _ => {
-            let e = vm.get_keyed_b(target.v(), k)?.take();
-            crate::array::new_array_of(vm, &[k, e])?
+            let sc_e = Scope::new(vm);
+            let e = vm.get_keyed_b(target.v(), k)?.root(&sc_e);
+            crate::array::new_array_of(vm, &[k, e.peek()])?
         }
     };
     Ok(Some(v))
@@ -641,8 +646,8 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
     // and writing them run no JS. `target`'s units are read before the
     // index is written.)
     let i = vm.get_keyed_b(state, Value::from_i32(1))?.take().as_number().unwrap_or(0.0) as usize;
-    let target = vm.get_keyed_b(state, Value::from_i32(0))?.take();
-    let Some(u) = string_units(target) else {
+    let target = vm.get_keyed_b(state, Value::from_i32(0))?;
+    let Some(u) = string_units(target.peek()) else {
         return iter_result(vm, Value::UNDEFINED, true);
     };
     if i >= u.len() {
@@ -669,15 +674,16 @@ pub(crate) fn get_iterator(vm: &mut Vm, v: Value) -> Result<Value> {
     // (`v` rooted across a getter: the method's receiver after.)
     let s = Scope::new(vm);
     let v = s.root(v);
-    let m = vm.get_atom_b(v.v(), a)?.take();
-    if !is_callable(m) {
+    let sc_m = Scope::new(vm);
+    let m = vm.get_atom_b(v.v(), a)?.root(&sc_m);
+    if !is_callable(m.peek()) {
         return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(v.v()))));
     }
-    let it = vm.call_b(m, v.v(), &[])?.take();
-    if !is_object(it) {
+    let it = vm.call_b(m.peek(), v.v(), &[])?;
+    if !is_object(it.peek()) {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
     }
-    Ok(it)
+    Ok(it.peek())
 }
 
 /// An iterator record for bytecode, which keeps it in a register: the
@@ -790,15 +796,16 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
     let a_return = vm.a_return;
     let s = Scope::new(vm);
     let it = s.root(it);
-    let m = vm.get_atom_b(it.v(), a_return)?.take();
-    if m.is_undefined() || m.is_null() {
+    let sc_m = Scope::new(vm);
+    let m = vm.get_atom_b(it.v(), a_return)?.root(&sc_m);
+    if m.peek().is_undefined() || m.peek().is_null() {
         return Ok(());
     }
-    if !is_callable(m) {
+    if !is_callable(m.peek()) {
         return Err(Error::type_error("iterator.return is not a function"));
     }
-    let r = vm.call_b(m, it.v(), &[])?.take();
-    if !is_object(r) {
+    let r = vm.call_b(m.peek(), it.v(), &[])?;
+    if !is_object(r.peek()) {
         return Err(Error::type_error("Iterator result is not an object"));
     }
     Ok(())
@@ -849,8 +856,8 @@ pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -
 /// string (what its getter throws thrown).
 pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Result<Option<Vec<u16>>> {
     let a = vm.a_sym_to_string_tag;
-    let t = vm.get_atom_b(o, a)?.take();
-    Ok(string_units(t).map(|u| u.to_vec()))
+    let t = vm.get_atom_b(o, a)?;
+    Ok(string_units(t.peek()).map(|u| u.to_vec()))
 }
 
 /// Whether `f` is the current realm's native `n` (by its code's
@@ -1099,8 +1106,9 @@ pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()>
         if fast_open(vm, slots) {
             return Ok(());
         }
-        let it = vm.get_iterator_b(*slots)?.take();
-        let r = record(vm, it)?;
+        let sc_it = Scope::new(vm);
+        let it = vm.get_iterator_b(*slots)?.root(&sc_it);
+        let r = record(vm, it.peek())?;
         *slots = r;
         *slots.add(1) = Value::UNDEFINED;
         Ok(())

@@ -140,11 +140,12 @@ fn canonicalize_locale_list(vm: &mut Vm, locales: Value) -> Result<Vec<String>> 
     while k < len {
         let key = Value::number(k);
         if vm.has_property(o, key)? {
-            let v = vm.get_keyed_b(o, key)?.take();
-            if !is_string(v) && !is_object(v) {
+            let sc_v = Scope::new(vm);
+            let v = vm.get_keyed_b(o, key)?.root(&sc_v);
+            if !is_string(v.peek()) && !is_object(v.peek()) {
                 return Err(Error::type_error("a locale must be a string or an object"));
             }
-            let tag = canonical_tag(&to_rust_string(vm, v)?)?;
+            let tag = canonical_tag(&to_rust_string(vm, v.peek())?)?;
             if !seen.contains(&tag) {
                 seen.push(tag);
             }
@@ -329,11 +330,12 @@ fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
 /// GetOption of a string: undefined, or one of `allowed` (any, if empty).
 fn string_option(vm: &mut Vm, options: Value, name: &str, allowed: &[&str]) -> Result<Option<String>> {
     let a = vm.intern_name(name);
-    let v = vm.get_atom_b(options, a)?.take();
-    if v.is_undefined() {
+    let sc_v = Scope::new(vm);
+    let v = vm.get_atom_b(options, a)?.root(&sc_v);
+    if v.peek().is_undefined() {
         return Ok(None);
     }
-    let s = to_rust_string(vm, v)?;
+    let s = to_rust_string(vm, v.peek())?;
     if !allowed.is_empty() && !allowed.contains(&s.as_str()) {
         return Err(Error::range_error(format!("Value {s} out of range for Intl options property {name}")));
     }
@@ -343,8 +345,8 @@ fn string_option(vm: &mut Vm, options: Value, name: &str, allowed: &[&str]) -> R
 /// GetOption of a boolean.
 fn bool_option(vm: &mut Vm, options: Value, name: &str) -> Result<Option<bool>> {
     let a = vm.intern_name(name);
-    let v = vm.get_atom_b(options, a)?.take();
-    Ok((!v.is_undefined()).then(|| crate::interp::to_boolean(v)))
+    let v = vm.get_atom_b(options, a)?;
+    Ok((!v.peek().is_undefined()).then(|| crate::interp::to_boolean(v.peek())))
 }
 
 /// An array of `strings`.

@@ -85,17 +85,17 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         let mut keys: Vec<Value> = Vec::new();
         let mut i = 0.0;
         while i < len {
-            let v = vm.get_keyed_b(replacer, Value::number(i))?.take();
-            let item = if is_string(v) {
-                Some(v)
-            } else if v.is_number() {
-                let u = to_string_units(v);
+            let v = vm.get_keyed_b(replacer, Value::number(i))?;
+            let item = if is_string(v.peek()) {
+                Some(v.peek())
+            } else if v.peek().is_number() {
+                let u = to_string_units(v.peek());
                 Some(vm.new_string(&u))
-            } else if let Some(p) = wrapped(v)
+            } else if let Some(p) = wrapped(v.peek())
                 && (p.is_number() || is_string(p))
             {
                 // (Its exception stops the operation: no next entry read.)
-                let u = to_string_units(v);
+                let u = to_string_units(v.peek());
                 if vm.conv_failed() {
                     return Err(vm.take_conv_error());
                 }
@@ -182,6 +182,7 @@ fn push_ascii(out: &mut Vec<u16>, s: &str) {
 /// SerializeJSONProperty: `holder[key]` as JSON appended to `out`; false
 /// if it has none (`undefined`, a function).
 fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mut Vec<u16>) -> Result<bool> {
+    // take: given at once to the next call.
     let v = vm.get_keyed_b(holder, key)?.take();
     value(vm, st, PKey::Str(key), holder, v, out)
 }
@@ -303,6 +304,7 @@ fn value_rooted(
             let a = st.a_to_json;
             let held = sc.root(v);
             rooted = v;
+            // take: checked, then given at once to the call.
             let f = vm.get_atom_b(held.v(), a)?.take();
             if is_callable(f) {
                 let k = key.string(vm);
@@ -330,10 +332,10 @@ fn value_rooted(
     }
     if is_raw_json(v) {
         let a_raw = vm.intern_name("rawJSON");
-        let raw = vm.get_atom_b(v, a_raw)?.take();
+        let raw = vm.get_atom_b(v, a_raw)?;
         // (Past the longest string: thrown before a long text is read.)
-        check_string_len(out.len() + string_len(raw).unwrap_or(0))?;
-        out.extend_from_slice(&to_string_units(raw));
+        check_string_len(out.len() + string_len(raw.peek()).unwrap_or(0))?;
+        out.extend_from_slice(&to_string_units(raw.peek()));
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
         }

@@ -590,6 +590,7 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
             // (The key across the value's getter.)
             let step = Scope::new(vm);
             let k = vm.get_keyed_b(item, Value::from_i32(0))?.root(&step);
+            // take: given at once to the next call.
             let v = vm.get_keyed_b(item, Value::from_i32(1))?.take();
             vm.call_b(adder.v(), o.v(), &[k.v(), v])?.take();
         } else {
@@ -1236,6 +1237,7 @@ fn each_key(
         if to_boolean(vm.get_atom_b(r.v(), a_done)?.take()) {
             return Ok(true);
         }
+        // take: given at once to the next call.
         let v = vm.get_atom_b(r.v(), a_value)?.take();
         if !f(vm, normalize(v))? {
             crate::symbol::close(vm, it.v())?;

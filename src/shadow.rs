@@ -203,8 +203,9 @@ fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 args.push(w);
             }
             let this = wrap_in(vm, target_realm, this)?;
-            let v = vm.call_b(target, this, &args)?.take();
-            wrap(vm, v)
+            let sc_v = Scope::new(vm);
+            let v = vm.call_b(target, this, &args)?.root(&sc_v);
+            wrap(vm, v.peek())
         })
     })();
     match r {

@@ -114,12 +114,12 @@ fn species_constructor_raw(vm: &mut Vm, o: Value, default: Value) -> Result<Valu
         return Err(Error::type_error("object.constructor is not an object"));
     }
     let a_species = vm.a_sym_species;
-    let s = vm.get_atom_b(c.v(), a_species)?.take();
-    if s.is_undefined() || s.is_null() {
+    let s = vm.get_atom_b(c.v(), a_species)?;
+    if s.peek().is_undefined() || s.peek().is_null() {
         return Ok(default);
     }
-    if crate::intrinsics::is_constructor(s) {
-        return Ok(s);
+    if crate::intrinsics::is_constructor(s.peek()) {
+        return Ok(s.peek());
     }
     Err(Error::type_error("object.constructor[Symbol.species] is not a constructor"))
 }
@@ -434,9 +434,10 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut max = None;
     if is_object(options) {
         let a_max = vm.intern_name("maxByteLength");
-        let m = vm.get_atom_b(options, a_max)?.take();
-        if !m.is_undefined() {
-            max = Some(to_index(vm, m)?);
+        let sc_m = Scope::new(vm);
+        let m = vm.get_atom_b(options, a_max)?.root(&sc_m);
+        if !m.peek().is_undefined() {
+            max = Some(to_index(vm, m.peek())?);
         }
     }
     if max.is_some_and(|m| n > m) {
@@ -513,9 +514,11 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
     let default = object_value((vm.typed_constructors[TypedKind::ALL.len()]).ptr());
-    let c = species_constructor(vm, this, default)?.take();
+    let sc_c = Scope::new(vm);
+    let c = species_constructor(vm, this, default)?.root(&sc_c);
     // (What follows runs no JS: the new buffer held raw.)
-    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c, &[Value::number(n as f64)]))?.take();
+    // take: checked where nothing collects (see below).
+    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c.peek(), &[Value::number(n as f64)]))?.take();
     if !is_class(out, Class::ArrayBuffer) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the species made no ArrayBuffer"));
     }
@@ -739,6 +742,7 @@ fn set_from(vm: &mut Vm, o: Obj, at: usize, src: Value, n: usize) -> Result<()> 
                 continue;
             }
         }
+        // take: given at once to the next call.
         let v = vm.get_keyed_b(src, Value::number(i as f64))?.take();
         set(vm, o, at + i, v)?;
         direct = !k.is_big() && plain(s);
@@ -845,6 +849,7 @@ fn create_from<'a>(vm: &'a mut Vm, c: Value, args: &[Value], n: Option<usize>) -
 }
 
 fn create_from_raw(vm: &mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Result<Obj> {
+    // take: validated where nothing collects, then returned.
     let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c, args))?.take();
     // (Validated where nothing collects.)
     let (o, len) = validate(vm, out)?;
@@ -867,8 +872,10 @@ fn species_create<'a>(vm: &'a mut Vm, exemplar: Obj, args: &[Value], n: Option<u
 fn species_create_raw(vm: &mut Vm, exemplar: Obj, args: &[Value], n: Option<usize>) -> Result<Obj> {
     let k = kind_of(exemplar);
     let default = constructor_of(vm, k)?;
-    let c = species_constructor(vm, object_value(exemplar.ptr()), default)?.take();
-    let o = create_from(vm, c, args, n)?.take();
+    let sc_c = Scope::new(vm);
+    let c = species_constructor(vm, object_value(exemplar.ptr()), default)?.root(&sc_c);
+    // take: checked, then returned.
+    let o = create_from(vm, c.peek(), args, n)?.take();
     if kind_of(o).is_big() != k.is_big() {
         return Err(Error::type_error("The species typed array's content type differs"));
     }
@@ -946,15 +953,17 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         }
         _ => {
             let a_iter = vm.a_sym_iterator;
-            let m = vm.get_atom_b(first, a_iter)?.take();
-            if !m.is_undefined() && !m.is_null() {
-                if !is_callable(m) {
-                    return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m))));
+            let sc_m = Scope::new(vm);
+            let m = vm.get_atom_b(first, a_iter)?.root(&sc_m);
+            if !m.peek().is_undefined() && !m.peek().is_null() {
+                if !is_callable(m.peek()) {
+                    return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m.peek()))));
                 }
                 // (`iterate_with`'s values in `vm.handles`, the `Vec`'s copies
                 // valid in this handle scope, where no cell moves.)
                 return vm.handle_scope(|vm| {
-                    let values = iterate_with(vm, first, m)?.take();
+                    // take: its values in vm.handles (iterate_with's).
+                    let values = iterate_with(vm, first, m.peek())?.take();
                     let sc = Scope::new(vm);
                     let out = vm.fresh(|vm| allocate(vm, k, values.len()))?.root(&sc).v();
                     set_all(vm, Obj::of(out), 0, &values)?;
@@ -1022,16 +1031,18 @@ fn iterate_with_raw(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
     }
     // (Pushed into `vm.handles`, the caller's handle scope's: the values
     // outlive this function, read from the `Vec` while no cell moves.)
-    let it = vm.call_b(m, v, &[])?.take();
-    if !is_object(it) {
+    let sc_it = Scope::new(vm);
+    let it = vm.call_b(m, v, &[])?.root(&sc_it);
+    if !is_object(it.peek()) {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
     }
-    vm.handles.push(it);
+    vm.handles.push(it.peek());
     let a_next = vm.intern_name("next");
-    let next = vm.get_atom_b(it, a_next)?.take();
-    vm.handles.push(next);
+    let sc_next = Scope::new(vm);
+    let next = vm.get_atom_b(it.peek(), a_next)?.root(&sc_next);
+    vm.handles.push(next.peek());
     let mut out = Vec::new();
-    while let Some(x) = vm.step_b(it, next)?.take() {
+    while let Some(x) = vm.step_b(it.peek(), next.peek())?.take() {
         vm.handles.push(x);
         out.push(x);
     }
@@ -1053,16 +1064,17 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("TypedArray.from: the mapping function is not callable"));
     }
     let a_iter = vm.a_sym_iterator;
-    let m = vm.get_atom_b(source, a_iter)?.take();
+    let sc_m = Scope::new(vm);
+    let m = vm.get_atom_b(source, a_iter)?.root(&sc_m);
     // (`iterate_with`'s values in `vm.handles`, the `Vec`'s copies valid in
     // this handle scope, where no cell moves.)
     vm.handle_scope(|vm| {
         let sc = Scope::new(vm);
-        let (values, src) = if !m.is_undefined() && !m.is_null() {
-            if !is_callable(m) {
-                return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m))));
+        let (values, src) = if !m.peek().is_undefined() && !m.peek().is_null() {
+            if !is_callable(m.peek()) {
+                return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m.peek()))));
             }
-            (Some(iterate_with(vm, source, m)?.take()), Value::UNDEFINED)
+            (Some(iterate_with(vm, source, m.peek())?.take()), Value::UNDEFINED)
         } else {
             // (A wrapper held across getters: rooted, until the scope ends.)
             (None, vm.to_object_b(source)?.root(&sc).v())
@@ -1200,8 +1212,8 @@ fn search(vm: &mut Vm, this: Value, a: &[Value], what: &str, back: bool, stop: b
         // (`v`, a BigInt maybe new, the callback's argument: on the VM
         // stack while it runs, nothing collecting after.)
         let v = get(o, i);
-        let r = vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?.take();
-        if to_boolean(r) == stop {
+        let r = vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?;
+        if to_boolean(r.peek()) == stop {
             return Ok(Some((i, v)));
         }
     }
@@ -1345,14 +1357,14 @@ pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
     let sep: Vec<u16> = match arg(a, 0) {
         s if s.is_undefined() => vec![b',' as u16],
         s => {
-            let s = vm.to_string_b(s)?.take();
+            let s = vm.to_string_b(s)?;
             // (Its separators alone past the longest string: thrown before
             // a long one is read, as `Array.prototype.join` does.)
-            let n = crate::vm::string_len(s).unwrap_or(0);
+            let n = crate::vm::string_len(s.peek()).unwrap_or(0);
             if len > 1 && (len - 1) as f64 * n as f64 > crate::vm::MAX_STRING_LEN as f64 {
                 return Err(Error::range_error("Invalid string length"));
             }
-            string_units(s).unwrap_or(&[]).to_vec()
+            string_units(s.peek()).unwrap_or(&[]).to_vec()
         }
     };
     let mut out = Vec::new();
@@ -1377,6 +1389,7 @@ fn typed_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let out = species_create(vm, o, &[Value::number(len as f64)], Some(len))?.root(&sc).v();
     for i in 0..len {
         let v = get(o, i);
+        // take: given at once to the next call.
         let r = vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?.take();
         vm.set_keyed(out, Value::number(i as f64), r)?;
     }
@@ -1551,6 +1564,7 @@ fn sort_numbers(vm: &mut Vm, values: &mut Vec<Value>, cmp: Value) -> Result<()> 
                 _ => x > y || (x == 0.0 && y == 0.0 && x.is_sign_positive() && y.is_sign_negative()),
             });
         }
+        // take: given at once to the next call.
         let r = vm.call_b(cmp, Value::UNDEFINED, &[x, y])?.take();
         Ok(number(vm, r)? > 0.0)
     };
@@ -1636,6 +1650,7 @@ fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     // (Its values stored where nothing collects.)
+    // take: filled where nothing collects, then returned.
     let out = create_same(vm, o, len)?.take();
     for i in 0..len {
         put(out, i, get(o, len - 1 - i));
@@ -1653,6 +1668,7 @@ fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !(i >= 0.0 && ta_length(o).is_some_and(|n| i < n as f64)) {
         return Err(Error::range_error("Invalid typed array index"));
     }
+    // take: filled where nothing collects, then returned.
     let out = create_same(vm, o, len)?.take();
     for k in 0..len {
         put(out, k, if k == i as usize { v.v() } else { get(o, k) });
@@ -1676,13 +1692,15 @@ fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     };
     // (The species the kind's own constructor: its view at once.)
     let default = constructor_of(vm, k)?;
-    let c = species_constructor(vm, this, default)?.take();
-    if c == default {
+    let sc_c = Scope::new(vm);
+    let c = species_constructor(vm, this, default)?.root(&sc_c);
+    if c.peek() == default {
         return on_buffer(vm, k, b, begin, n);
     }
     let mut args = vec![object_value(b.ptr()), Value::number(begin as f64)];
     args.extend(n.map(|n| Value::number(n as f64)));
-    let out = create_from(vm, c, &args, None)?.take();
+    // take: checked, then returned.
+    let out = create_from(vm, c.peek(), &args, None)?.take();
     if kind_of(out).is_big() != k.is_big() {
         return Err(Error::type_error("The species typed array's content type differs"));
     }
@@ -1703,10 +1721,12 @@ fn typed_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
         if v.v().is_undefined() || v.v().is_null() {
             continue;
         }
-        let f = vm.get_atom_b(v.v(), a_tls)?.take();
-        let s = vm.call_b(f, v.v(), &[])?.take();
-        let s = vm.to_string_b(s)?.take();
-        out.extend_from_slice(string_units(s).unwrap_or(&[]));
+        let sc_f = Scope::new(vm);
+        let f = vm.get_atom_b(v.v(), a_tls)?.root(&sc_f);
+        let sc_s = Scope::new(vm);
+        let s = vm.call_b(f.peek(), v.v(), &[])?.root(&sc_s);
+        let s = vm.to_string_b(s.peek())?;
+        out.extend_from_slice(string_units(s.peek()).unwrap_or(&[]));
     }
     Ok(vm.new_string(&out))
 }

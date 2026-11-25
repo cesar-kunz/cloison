@@ -1306,11 +1306,11 @@ impl Vm {
             d.get = Some(g);
         }
         if has(self, a_set)? {
-            let s = self.get_atom_b(v, a_set)?.take();
-            if !s.is_undefined() && !is_callable(s) {
+            let s = self.get_atom_b(v, a_set)?;
+            if !s.peek().is_undefined() && !is_callable(s.peek()) {
                 return Err(Error::type_error("Setter must be a function"));
             }
-            d.set = Some(s);
+            d.set = Some(s.peek());
         }
         if d.is_accessor() && d.is_data() {
             return Err(Error::type_error(
@@ -1671,6 +1671,7 @@ fn descriptors(vm: &mut Vm, props: Value) -> Result<Fresh<'_, Vec<(Key, Desc)>>>
 }
 
 fn descriptors_raw(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
+    // take: pushed to vm.handles below; nothing between collects.
     let po = vm.to_obj_b(props)?.take();
     let mut out = Vec::new();
     // (Each descriptor's values in `vm.handles` while the next are read, the
@@ -1684,7 +1685,9 @@ fn descriptors_raw(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
             if d.enumerable != Some(true) {
                 continue;
             }
+            // take: given at once to the next call.
             let v = vm.get_key_b(object_value(po.ptr()), key)?.take();
+            // take: its values pushed to vm.handles at once.
             let d = vm.to_descriptor_b(v)?.take();
             for v in [d.value, d.get, d.set].into_iter().flatten() {
                 vm.handles.push(v);
@@ -1783,18 +1786,21 @@ fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
 
 /// `Object.getOwnPropertyNames(o)`.
 fn object_get_own_property_names(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    // take: given at once to the next call.
     let o = vm.to_obj_b(arg(a, 0))?.take();
     keys_array(vm, o, true)
 }
 
 /// `Object.keys(o)`: its own enumerable keys.
 fn object_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    // take: given at once to the next call.
     let o = vm.to_obj_b(arg(a, 0))?.take();
     keys_array(vm, o, false)
 }
 
 /// `Object.getPrototypeOf(o)`.
 fn object_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    // take: given at once to the next call.
     let o = vm.to_obj_b(arg(a, 0))?.take();
     crate::proxy::get_prototype_of(vm, o)
 }
@@ -1979,6 +1985,7 @@ fn assign_from(vm: &mut Vm, t: Value, so: Obj) -> Result<()> {
 /// `Object.values(o)` (`entries`: `Object.entries(o)`): the own
 /// enumerable string-keyed properties' values, or `[key, value]` pairs.
 fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
+    // take: rooted below with out; the plain path doesn't collect.
     let o = vm.to_obj_b(arg(a, 0))?.take();
     let ov = object_value(o.ptr());
     // A plain object's data properties, read from their slots: nothing
@@ -2011,6 +2018,7 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
         if d.enumerable != Some(true) {
             continue;
         }
+        // take: stored in the pair where nothing collects.
         let v = vm.get_key_b(ov, key)?.take();
         // (The pair made, and filled, where nothing collects.)
         let item = if entries {
@@ -2140,6 +2148,7 @@ fn object_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `Object.prototype.hasOwnProperty(key)`.
 fn object_has_own_property(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let key = vm.to_key(arg(a, 0));
+    // take: given at once to the next call.
     let o = vm.to_obj_b(this)?.take();
     if vm.proxies_exist {
         return Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some()));
@@ -2189,6 +2198,7 @@ fn object_is_prototype_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
 /// `Object.prototype.propertyIsEnumerable(key)`.
 fn object_property_is_enumerable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let key = crate::intrinsics::to_property_key(vm, arg(a, 0))?;
+    // take: given at once to the lookup, which roots what it holds.
     let o = vm.to_obj_b(this)?.take();
     Ok(Value::from_bool(crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true))))
 }
@@ -2198,12 +2208,14 @@ fn object_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Valu
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("Object.prototype.toLocaleString called on null or undefined"));
     }
-    let f = vm.get_atom_b(this, vm.a_to_string)?.take();
-    vm.call_b(f, this, &[]).map(Fresh::take)
+    let sc_f = Scope::new(vm);
+    let f = vm.get_atom_b(this, vm.a_to_string)?.root(&sc_f);
+    vm.call_b(f.peek(), this, &[]).map(Fresh::take)
 }
 
 /// `Object.prototype.__proto__`'s getter.
 fn object_get_proto(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    // take: given at once to the next call.
     let o = Obj::of(vm.to_object_b(this)?.take());
     vm.prototype_of_b(o).map(Fresh::take)
 }
@@ -2261,6 +2273,7 @@ fn lookup_accessor_half(vm: &mut Vm, this: Value, a: &[Value], setter: bool) -> 
     let p = sc.root(o);
     while p.v().is_cell() {
         let po = Obj::of(p.v());
+        // take: used at once: its getter given to the call, or its value returned.
         let (d, next) = match vm.own_property_b(po, key)?.take() {
             Some(d) => (Some(d), Value::NULL),
             None => (None, vm.prototype_of_b(Obj::of(p.v()))?.take()),

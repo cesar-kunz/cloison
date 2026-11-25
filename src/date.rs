@@ -4,7 +4,7 @@
 //! library's `localtime_r` (its `tm_gmtoff`), so it follows the machine's
 //! time zone, and the spec's own calendar arithmetic does the rest.
 
-use crate::brand::Fresh;
+use crate::brand::{Fresh, Scope};
 use crate::raw::ObjectPtr;
 use std::ffi::CStr;
 
@@ -346,11 +346,12 @@ pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: &[Value]) -> Result
     };
     for name in order {
         let a = vm.intern_name(name);
-        let m = vm.get_atom_b(this, a)?.take();
-        if crate::props::is_callable(m) {
-            let r = vm.call_b(m, this, &[])?.take();
-            if !crate::props::is_object(r) {
-                return Ok(r);
+        let sc_m = Scope::new(vm);
+        let m = vm.get_atom_b(this, a)?.root(&sc_m);
+        if crate::props::is_callable(m.peek()) {
+            let r = vm.call_b(m.peek(), this, &[])?;
+            if !crate::props::is_object(r.peek()) {
+                return Ok(r.peek());
             }
         }
     }
@@ -716,8 +717,9 @@ fn to_json(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         return Ok(Value::NULL);
     }
     let a = vm.intern_name("toISOString");
-    let f = vm.get_atom_b(this, a)?.take();
-    vm.call_b(f, this, &[]).map(Fresh::take)
+    let sc_f = Scope::new(vm);
+    let f = vm.get_atom_b(this, a)?.root(&sc_f);
+    vm.call_b(f.peek(), this, &[]).map(Fresh::take)
 }
 
 // ---- Parsing ----

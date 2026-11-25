@@ -9068,6 +9068,7 @@ fn array_push_generic(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value>
     // (`args`, maybe a Rust caller's only, and `this`'s object rooted
     // across the getters and setters.)
     vm.rooted(args, |vm| {
+        // take: rooted at once by the closure.
         let this = object_value(vm.to_obj_b(this)?.take().ptr());
         vm.rooted(&[this], |vm| array_push_generic_of(vm, this, args))
     })

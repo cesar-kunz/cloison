@@ -574,6 +574,7 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: Obj, key: Key) -> Result<Option<D
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
         let k = trap_key(vm, key);
+        // take: rooted below; the check between doesn't collect.
         let r = vm.call_b(f, h, &[t, k])?.take();
         if !r.is_undefined() && !is_object(r) {
             return Err(Error::type_error(
@@ -773,6 +774,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: Obj) -> Result<Vec<Key>> {
         return own_keys(vm, Obj::of(t));
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
+        // take: rooted by the closure below; the check between doesn't collect.
         let r = vm.call_b(f, h, &[t])?.take();
         if !is_object(r) {
             return Err(Error::type_error("The proxy's 'ownKeys' trap returned a non-object"));
@@ -783,6 +785,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: Obj) -> Result<Vec<Key>> {
             let mut keys = Vec::new();
             let mut i = 0.0;
             while i < n {
+                // take: checked, then given at once to to_property_key.
                 let k = vm.get_keyed_b(r, Value::number(i))?.take();
                 if !crate::vm::is_string(k) && !crate::symbol::is_symbol(k) {
                     return Err(Error::type_error(
@@ -862,6 +865,7 @@ pub(crate) fn get_prototype_of(vm: &mut Vm, o: Obj) -> Result<Value> {
         return get_prototype_of(vm, Obj::of(t));
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
+        // take: rooted by the closure below; the check between doesn't collect.
         let r = vm.call_b(f, h, &[t])?.take();
         if !is_object(r) && !r.is_null() {
             return Err(Error::type_error("The proxy's 'getPrototypeOf' trap returned neither an object nor null"));

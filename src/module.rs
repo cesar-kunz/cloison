@@ -1313,8 +1313,8 @@ fn import_attributes(
             return Err(Error::type_error("The second argument of import() must be an object"));
         }
         let a_with = vm.intern_name("with");
-        let attrs = vm.get_atom_b(options, a_with)?.take();
-        attrs_root.set(attrs);
+        let attrs = vm.get_atom_b(options, a_with)?;
+        attrs_root.set(attrs.peek());
         let attrs = attrs_root;
         if !attrs.peek().is_undefined() {
             if !crate::props::is_object(attrs.peek()) {
@@ -1329,14 +1329,15 @@ fn import_attributes(
                 if !crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true)) {
                     continue;
                 }
-                let v = vm.get_key_b(attrs.peek(), key)?.take();
-                if !is_string(v) {
+                let sc_v = Scope::new(vm);
+                let v = vm.get_key_b(attrs.peek(), key)?.root(&sc_v);
+                if !is_string(v.peek()) {
                     return Err(Error::type_error("Import attribute values must be strings"));
                 }
                 let k = vm.key_string(key);
                 if string_units(k) == Some(&"type".encode_utf16().collect::<Vec<u16>>()[..]) {
-                    ty = v;
-                    found.set(v);
+                    ty = v.peek();
+                    found.set(v.peek());
                 }
             }
         }

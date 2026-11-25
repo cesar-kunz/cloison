@@ -18,6 +18,7 @@
 //! ([`Vm::run_event_loop`]), between promise jobs ([`poll`]) and once
 //! they have run out.
 
+use crate::brand::Scope;
 use crate::raw::ObjectPtr;
 use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicUsize, Ordering::SeqCst};
@@ -471,9 +472,10 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut max = None;
     if is_object(options) {
         let a_max = vm.intern_name("maxByteLength");
-        let m = vm.get_atom_b(options, a_max)?.take();
-        if !m.is_undefined() {
-            max = Some(to_index(vm, m)?);
+        let sc_m = Scope::new(vm);
+        let m = vm.get_atom_b(options, a_max)?.root(&sc_m);
+        if !m.peek().is_undefined() {
+            max = Some(to_index(vm, m.peek())?);
         }
     }
     if max.is_some_and(|m| n > m) {
@@ -573,8 +575,9 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
     let default = object_value(vm.shared.constructor);
-    let c = species_constructor(vm, this, default)?.take();
-    let out = crate::intrinsics::construct(vm, c, &[Value::number(n as f64)])?;
+    let sc_c = Scope::new(vm);
+    let c = species_constructor(vm, this, default)?.root(&sc_c);
+    let out = crate::intrinsics::construct(vm, c.peek(), &[Value::number(n as f64)])?;
     if !is_class(out, Class::SharedArrayBuffer) {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the species made no SharedArrayBuffer"));
     }

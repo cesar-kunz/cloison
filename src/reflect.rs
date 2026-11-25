@@ -66,6 +66,7 @@ fn reflect_apply(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(f) {
         return Err(Error::type_error("Reflect.apply target is not a function"));
     }
+    // take: given at once to the call, which copies it to the VM stack.
     let args = list(vm, arg(a, 2))?.take();
     vm.call_b(f, arg(a, 1), &args).map(Fresh::take)
 }
@@ -79,6 +80,7 @@ fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_constructor(nt) {
         return Err(Error::type_error("Reflect.construct newTarget is not a constructor"));
     }
+    // take: given at once to the call, which copies it to the VM stack.
     let args = list(vm, arg(a, 1))?.take();
     vm.construct_b(f, &args, nt).map(Fresh::take)
 }

@@ -75,5 +75,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: python3 -I scripts/unsafe-count.py
+      # Every raw value taken out of a branded result and bound to a name
+      # says why it is safe (`// take:`): the borrow checker can't see it.
+      - run: python3 -I scripts/brand-takes.py
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features intl -- -D warnings

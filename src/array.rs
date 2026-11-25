@@ -279,8 +279,8 @@ fn species_create_raw(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
     }
     if crate::props::is_object(c.v()) {
         let a_species = vm.a_sym_species;
-        let species = vm.get_atom_b(c.v(), a_species)?.take();
-        c.set(if species.is_null() { Value::UNDEFINED } else { species });
+        let species = vm.get_atom_b(c.v(), a_species)?;
+        c.set(if species.peek().is_null() { Value::UNDEFINED } else { species.peek() });
     }
     let c = c.v();
     if c.is_undefined() || (c.is_cell() && as_object(c) == vm.array_fn) {
@@ -341,9 +341,9 @@ fn spreadable(vm: &mut Vm, v: Value) -> Result<bool> {
         return Ok(false);
     }
     let a = vm.a_sym_spreadable;
-    let s = vm.get_atom_b(v, a)?.take();
-    if !s.is_undefined() {
-        return Ok(to_boolean(s));
+    let s = vm.get_atom_b(v, a)?;
+    if !s.peek().is_undefined() {
+        return Ok(to_boolean(s.peek()));
     }
     crate::proxy::is_array(vm, v)
 }
@@ -368,6 +368,7 @@ fn flatten(
         if i >= len {
             break;
         }
+        // take: given at once to the callback, or rooted below.
         let (has, mut v) = element(vm, source, i)?.take();
         if has {
             if let Some((f, that)) = f {
@@ -486,6 +487,7 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
             }
             // (A plain array's element in place; a number's digits
             // without a string of its own.)
+            // take: used at once; nothing collects.
             let v = if dense(vm, Obj::of(o)) { element(vm, o, i)?.take().1 } else { get(vm, o, i)?.take() };
             if string_len(v).is_some() {
                 // (Past the longest string: thrown before its units are read.)
@@ -538,9 +540,10 @@ pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
     // (A wrapper `o` held across the getter: rooted.)
     let sc = Scope::new(vm);
     let o = vm.to_object_b(this)?.root(&sc).v();
-    let f = vm.get_atom_b(o, a_join)?.take();
-    if is_callable(f) {
-        return vm.call_b(f, o, &[]).map(Fresh::take);
+    let sc_f = Scope::new(vm);
+    let f = vm.get_atom_b(o, a_join)?.root(&sc_f);
+    if is_callable(f.peek()) {
+        return vm.call_b(f.peek(), o, &[]).map(Fresh::take);
     }
     // (The intrinsic, not whatever `Object.prototype.toString` is now.)
     crate::builtins::object_to_string(vm, o, &[])
@@ -566,16 +569,17 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> R
             if i > 0.0 {
                 out.push(b',' as u16);
             }
-            let v = get(vm, o, i)?.take();
-            if !v.is_undefined() && !v.is_null() {
-                cur.set(v);
-                let f = vm.get_atom_b(cur.v(), a_tls)?.take();
-                if !is_callable(f) {
+            let v = get(vm, o, i)?;
+            if !v.peek().is_undefined() && !v.peek().is_null() {
+                cur.set(v.peek());
+                let sc_f = Scope::new(vm);
+                let f = vm.get_atom_b(cur.v(), a_tls)?.root(&sc_f);
+                if !is_callable(f.peek()) {
                     return Err(Error::type_error("toLocaleString is not a function"));
                 }
-                let s = vm.call_b(f, cur.v(), &[])?.take();
-                check_string_len(out.len() + string_len(s).unwrap_or(0))?;
-                out.extend(to_string_units(s));
+                let s = vm.call_b(f.peek(), cur.v(), &[])?;
+                check_string_len(out.len() + string_len(s.peek()).unwrap_or(0))?;
+                out.extend(to_string_units(s.peek()));
                 if vm.conv_failed() {
                     return Err(vm.take_conv_error());
                 }
@@ -651,6 +655,7 @@ fn concat_into(vm: &mut Vm, o: Value, out: Value, a: &[Value]) -> Result<()> {
             if i >= len {
                 break;
             }
+            // take: given at once to the next call.
             let (has, v) = element(vm, item, i)?.take();
             if has {
                 create(vm, out, n, v)?;
@@ -770,6 +775,7 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let first = get(vm, o, 0.0)?.root(&sc).v();
     let mut k = 1.0;
     while k < len {
+        // take: given at once to the next call.
         let (has, v) = element(vm, o, k)?.take();
         if has {
             put(vm, o, k - 1.0, v)?;
@@ -813,6 +819,7 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         let mut k = len;
         while k > 0.0 {
+            // take: given at once to the next call.
             let (has, v) = element(vm, o, k - 1.0)?.take();
             if has {
                 put(vm, o, k + n - 1.0, v)?;
@@ -883,6 +890,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if i >= end {
             break;
         }
+        // take: given at once to the next call.
         let (has, v) = element(vm, o, i)?.take();
         if has {
             create(vm, out, n, v)?;
@@ -955,6 +963,7 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
     let mut k = 0.0;
     while k < del {
+        // take: given at once to the next call.
         let (has, v) = element(vm, o, start + k)?.take();
         if has {
             create(vm, removed, k, v)?;
@@ -965,6 +974,7 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if n < del {
         let mut k = start;
         while k < len - del {
+            // take: given at once to the next call.
             let (has, v) = element(vm, o, k + del)?.take();
             if has {
                 put(vm, o, k + n, v)?;
@@ -981,6 +991,7 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     } else if n > del {
         let mut k = len - del;
         while k > start {
+            // take: given at once to the next call.
             let (has, v) = element(vm, o, k + del - 1.0)?.take();
             if has {
                 put(vm, o, k + n - 1.0, v)?;
@@ -1018,6 +1029,7 @@ fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             if i >= len {
                 break;
             }
+            // take: pushed to vm.handles at once.
             let (has, v) = element(vm, o, i)?.take();
             if has {
                 vm.handles.push(v);
@@ -1142,6 +1154,7 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
         if k >= len {
             break;
         }
+        // take: compared at once.
         let (has, v) = element(vm, o, k)?.take();
         if has && strict_equals(v, x) {
             return Ok(Value::number(k));
@@ -1166,6 +1179,7 @@ pub(crate) fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Resu
         if k < 0.0 {
             break;
         }
+        // take: compared at once.
         let (has, v) = element(vm, o, k)?.take();
         if has && strict_equals(v, x) {
             // (`-0` as `+0`.)
@@ -1197,8 +1211,9 @@ pub(crate) fn array_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
         if k >= len {
             break;
         }
-        let v = get(vm, o, k)?.take();
-        let same = same_value(v, x) || v.as_number().is_some_and(|d| d == 0.0 && x.as_number() == Some(0.0));
+        let v = get(vm, o, k)?;
+        let same =
+            same_value(v.peek(), x) || v.peek().as_number().is_some_and(|d| d == 0.0 && x.as_number() == Some(0.0));
         if same {
             return Ok(Value::TRUE);
         }
@@ -1243,9 +1258,11 @@ fn each_rooted(
         if i >= len {
             break;
         }
+        // take: rooted in cur on the next line.
         let (has, v) = element(vm, o, i)?.take();
         if has {
             cur.set(v);
+            // take: given at once to the next call.
             let r = vm.call_b(f, that, &[v, Value::number(i), o])?.take();
             if !on(vm, i, v, r)? {
                 break;
@@ -1314,9 +1331,10 @@ pub(crate) fn array_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
     let that = arg(a, 1);
     let mut i = 0.0;
     while i < len {
+        // take: the call's argument, alive in its frame; nothing collects after.
         let v = get(vm, o, i)?.take();
-        let r = vm.call_b(f, that, &[v, Value::number(i), o])?.take();
-        if to_boolean(r) {
+        let r = vm.call_b(f, that, &[v, Value::number(i), o])?;
+        if to_boolean(r.peek()) {
             return Ok(v);
         }
         i += 1.0;
@@ -1331,9 +1349,10 @@ pub(crate) fn array_find_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<
     let that = arg(a, 1);
     let mut i = 0.0;
     while i < len {
+        // take: the call's argument, alive in its frame; nothing collects after.
         let v = get(vm, o, i)?.take();
-        let r = vm.call_b(f, that, &[v, Value::number(i), o])?.take();
-        if to_boolean(r) {
+        let r = vm.call_b(f, that, &[v, Value::number(i), o])?;
+        if to_boolean(r.peek()) {
             return Ok(Value::number(i));
         }
         i += 1.0;
@@ -1359,6 +1378,7 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], right: bool) -> Result<Value> {
             if !in_range(k) {
                 break;
             }
+            // take: rooted as the accumulator below; nothing between collects.
             let (has, v) = element(vm, o, k)?.take();
             k += step;
             if has {
@@ -1376,6 +1396,7 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], right: bool) -> Result<Value> {
         if !in_range(k) {
             break;
         }
+        // take: given at once to the next call.
         let (has, v) = element(vm, o, k)?.take();
         if has {
             acc.set(vm.call_b(f, Value::UNDEFINED, &[acc.v(), v, Value::number(k), o])?.take());
@@ -1441,6 +1462,7 @@ pub(crate) fn array_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result
         1.0
     };
     while count > 0.0 {
+        // take: given at once to the next call.
         let (has, v) = element(vm, o, from)?.take();
         if has {
             put(vm, o, to, v)?;
@@ -1665,8 +1687,8 @@ fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // An iterable: its values (into `this`'s new object, if a constructor).
     if !items.is_undefined() && !items.is_null() {
         let a_iter = vm.a_sym_iterator;
-        let m = vm.get_atom_b(items, a_iter)?.take();
-        if !m.is_undefined() && !m.is_null() && (custom || !is_string(items)) {
+        let m = vm.get_atom_b(items, a_iter)?;
+        if !m.peek().is_undefined() && !m.peek().is_null() && (custom || !is_string(items)) {
             let sc = Scope::new(vm);
             let out = if custom {
                 vm.fresh(|vm| crate::intrinsics::construct(vm, this, &[]))?.root(&sc).v()
@@ -1694,6 +1716,7 @@ fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let out = vm.fresh(|vm| crate::intrinsics::construct(vm, this, &[Value::number(len)]))?.root(&sc).v();
         let mut i = 0.0;
         while i < len {
+            // take: given at once to the map function, or to create.
             let v = get(vm, o, i)?.take();
             let v = if mapfn.is_undefined() { v } else { vm.call_b(mapfn, that, &[v, Value::number(i)])?.take() };
             create(vm, out, i, v)?;
@@ -1728,6 +1751,7 @@ fn array_from_list(vm: &mut Vm, items: Value, out: Value, mapfn: Value, that: Va
     let (o, len) = this_rooted(vm, &sc, items)?;
     let mut i = 0.0;
     while i < len {
+        // take: given at once to the map function, or to create.
         let v = get(vm, o, i)?.take();
         let v = if mapfn.is_undefined() { v } else { vm.call_b(mapfn, that, &[v, Value::number(i)])?.take() };
         create(vm, out, i, v)?;
@@ -1756,6 +1780,7 @@ pub(crate) fn apply_list(vm: &mut Vm, list: Value) -> Result<Vec<Value>> {
     let mut out = Vec::with_capacity(len as usize);
     let mut i = 0.0;
     while i < len {
+        // take: pushed to vm.handles on the next line.
         let v = get(vm, list, i)?.take();
         vm.handles.push(v);
         out.push(v);
@@ -1785,9 +1810,10 @@ fn find_last(vm: &mut Vm, this: Value, a: &[Value], index: bool) -> Result<Value
     let that = arg(a, 1);
     let mut i = len - 1.0;
     while i >= 0.0 {
+        // take: the call's argument, alive in its frame; nothing collects after.
         let v = get(vm, o, i)?.take();
-        let r = vm.call_b(f, that, &[v, Value::number(i), o])?.take();
-        if to_boolean(r) {
+        let r = vm.call_b(f, that, &[v, Value::number(i), o])?;
+        if to_boolean(r.peek()) {
             return Ok(if index { Value::number(i) } else { v });
         }
         i -= 1.0;

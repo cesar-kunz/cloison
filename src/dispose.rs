@@ -58,8 +58,9 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     link_constructor(vm, sc, sep);
     // (Its prototype is `Error`, as the other kinds'.)
     let a_error = vm.intern_name("Error");
-    let error = vm.get_atom_b(object_value(g.ptr()), a_error)?.take();
-    vm.set_prototype_of(sc, error);
+    let sc_error = Scope::new(vm);
+    let error = vm.get_atom_b(object_value(g.ptr()), a_error)?.root(&sc_error);
+    vm.set_prototype_of(sc, error.peek());
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = str_value(vm, "SuppressedError");
     vm.add_property_with(sep, a_name, name, DONT_ENUM);
@@ -515,9 +516,10 @@ fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
 /// one.
 fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let a = vm.intern_name("return");
-    let m = vm.get_atom_b(this, a)?.take();
-    if !m.is_undefined() && !m.is_null() {
-        vm.call_b(m, this, &[])?.take();
+    let sc_m = Scope::new(vm);
+    let m = vm.get_atom_b(this, a)?.root(&sc_m);
+    if !m.peek().is_undefined() && !m.peek().is_null() {
+        vm.call_b(m.peek(), this, &[])?.take();
     }
     Ok(Value::UNDEFINED)
 }
@@ -527,11 +529,12 @@ fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn async_iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let r = (|| -> Result<Value> {
         let a = vm.intern_name("return");
-        let m = vm.get_atom_b(this, a)?.take();
-        if m.is_undefined() || m.is_null() {
+        let sc_m = Scope::new(vm);
+        let m = vm.get_atom_b(this, a)?.root(&sc_m);
+        if m.peek().is_undefined() || m.peek().is_null() {
             return Ok(Value::UNDEFINED);
         }
-        vm.call_b(m, this, &[]).map(Fresh::take)
+        vm.call_b(m.peek(), this, &[]).map(Fresh::take)
     })();
     match r {
         Err(e) => rejected(vm, e),

@@ -212,8 +212,9 @@ fn bound_compare(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // (`x`, a new string maybe, held across `y`'s conversion: rooted.)
     let sc = Scope::new(vm);
     let x = vm.to_string_b(arg(a, 0))?.root(&sc).v();
-    let y = vm.to_string_b(arg(a, 1))?.take();
-    let ord = vm.intl.collators[h].compare(string_units(x).unwrap_or(&[]), string_units(y).unwrap_or(&[]));
+    let sc_y = Scope::new(vm);
+    let y = vm.to_string_b(arg(a, 1))?.root(&sc_y);
+    let ord = vm.intl.collators[h].compare(string_units(x).unwrap_or(&[]), string_units(y.peek()).unwrap_or(&[]));
     Ok(Value::from_i32(ord as i32))
 }
 

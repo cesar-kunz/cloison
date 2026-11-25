@@ -267,6 +267,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         if code.uses_new_target {
             vm.new_target = nt;
         }
+        // take: only new_target is reset before its use.
         let r = vm.call_b(f, this, args).map(Fresh::take);
         vm.new_target = Value::EMPTY;
         let r = r?;
@@ -296,9 +297,10 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         // (`r`, held across the getter: rooted.)
         let sc = Scope::new(vm);
         let _r = sc.root(r);
-        let proto = vm.get_atom_b(nt, a)?.take();
-        if crate::props::is_object(proto) {
-            vm.set_prototype_of(Obj::of(r), proto);
+        let sc_proto = Scope::new(vm);
+        let proto = vm.get_atom_b(nt, a)?.root(&sc_proto);
+        if crate::props::is_object(proto.peek()) {
+            vm.set_prototype_of(Obj::of(r), proto.peek());
         } else if !vm.realms.is_empty() {
             // (The builtin's prototype of `nt`'s realm.)
             let own = unsafe { (*Obj::of(r).shape()).proto };
@@ -885,6 +887,7 @@ fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
         {
             continue;
         }
+        // take: given at once to the next call.
         let v = vm.get_key_b(object_value(src.ptr()), key)?.take();
         vm.create_data_property(out, key, v)?;
     }
@@ -1333,13 +1336,14 @@ fn with_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(Value::FALSE);
     }
     let au = vm.intern_name(&format!("{}Symbol.unscopables", crate::symbol::SYMBOL_MARK));
+    // take: rooted below once an object; the check doesn't collect.
     let u = vm.get_atom_b(o, au)?.take();
     if crate::props::is_object(u) {
         // (`u`, a getter's maybe, held across its proxy traps: rooted.)
         let sc = Scope::new(vm);
         let u = sc.root(u);
-        let blocked = vm.get_keyed_b(u.peek(), k)?.take();
-        return Ok(Value::from_bool(!crate::interp::to_boolean(blocked)));
+        let blocked = vm.get_keyed_b(u.peek(), k)?;
+        return Ok(Value::from_bool(!crate::interp::to_boolean(blocked.peek())));
     }
     Ok(Value::TRUE)
 }
@@ -1455,8 +1459,9 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
         let r = match mode {
             crate::generator::THROW | crate::generator::RETURN => {
                 let atom = vm.intern_name(if mode == crate::generator::THROW { "throw" } else { "return" });
-                let m = vm.get_atom_b(it, atom)?.take();
-                if m.is_undefined() || m.is_null() {
+                let sc_m = Scope::new(vm);
+                let m = vm.get_atom_b(it, atom)?.root(&sc_m);
+                if m.peek().is_undefined() || m.peek().is_null() {
                     if mode == crate::generator::RETURN {
                         crate::symbol::set_sync_done(record, true);
                         return crate::promise::iter_result_promise(vm, received.unwrap_or(Value::UNDEFINED), record);
@@ -1464,7 +1469,7 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
                     crate::symbol::close(vm, it)?;
                     return Err(Error::type_error("The iterator does not provide a 'throw' method"));
                 }
-                vm.call_b(m, it, args)?.take()
+                vm.call_b(m.peek(), it, args)?.take()
             }
             _ => vm.call_b(next, it, args)?.take(),
         };
@@ -1477,10 +1482,11 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
         let a_done = vm.a_done;
         let done = crate::interp::to_boolean(vm.get_atom_b(r, a_done)?.take());
         let a_value = vm.a_value;
-        let v = vm.get_atom_b(r, a_value)?.take();
+        let sc_v = Scope::new(vm);
+        let v = vm.get_atom_b(r, a_value)?.root(&sc_v);
         crate::symbol::set_sync_done(record, done);
         let close = if done || mode == crate::generator::RETURN { Value::UNDEFINED } else { it };
-        crate::promise::async_from_sync(vm, v, record, close)
+        crate::promise::async_from_sync(vm, v.peek(), record, close)
     };
     match step(vm) {
         Ok(p) => Ok(p),
@@ -1526,14 +1532,15 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchr
             crate::generator::RETURN => return crate::symbol::iter_result(vm, received, true),
             crate::generator::THROW if asynchronous => {
                 let a_return = vm.intern_name("return");
-                let close = vm.get_atom_b(it, a_return)?.take();
-                if !close.is_undefined() && !close.is_null() {
-                    if !crate::props::is_callable(close) {
+                let sc_close = Scope::new(vm);
+                let close = vm.get_atom_b(it, a_return)?.root(&sc_close);
+                if !close.peek().is_undefined() && !close.peek().is_null() {
+                    if !crate::props::is_callable(close.peek()) {
                         return Err(Error::type_error("iterator.return is not a function"));
                     }
-                    let r = vm.call_b(close, it, &[])?.take();
+                    let r = vm.call_b(close.peek(), it, &[])?;
                     crate::symbol::set_sync_done(record, true);
-                    return Ok(r);
+                    return Ok(r.peek());
                 }
                 return Err(Error::type_error("The iterator does not provide a 'throw' method"));
             }
@@ -1612,6 +1619,7 @@ fn copy_data_properties(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         if !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true)) {
             continue;
         }
+        // take: given at once to the next call.
         let v = vm.get_key_b(object_value(src.ptr()), key)?.take();
         vm.create_data_property(target, key, v)?;
     }
@@ -1805,8 +1813,8 @@ fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
     // (A wrapper `o`, the receiver of its prototypes' traps: rooted.)
     let sc = Scope::new(vm);
     let o = vm.to_obj_b(v)?.root(&sc).v();
-    let m = vm.get_atom_b(o, a)?.take();
-    Ok((!m.is_undefined() && !m.is_null()).then_some(m))
+    let m = vm.get_atom_b(o, a)?;
+    Ok((!m.peek().is_undefined() && !m.peek().is_null()).then_some(m.peek()))
 }
 
 /// A `for await`'s iterable `[v]`: whether it has no async iterator, its
@@ -1825,11 +1833,12 @@ fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(m) {
         return Err(Error::type_error("Symbol.asyncIterator is not a function"));
     }
-    let it = vm.call_b(m, a[0], &[])?.take();
-    if !crate::props::is_object(it) {
+    let sc_it = Scope::new(vm);
+    let it = vm.call_b(m, a[0], &[])?.root(&sc_it);
+    if !crate::props::is_object(it.peek()) {
         return Err(Error::type_error("Result of the Symbol.asyncIterator method is not an object"));
     }
-    crate::symbol::async_record(vm, it)
+    crate::symbol::async_record(vm, it.peek())
 }
 
 /// `[record, sync]`: `iterator.next()`, by the `next` the record read (a
@@ -1873,11 +1882,12 @@ fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     }
     let it = iterator_of(a[0]);
     let a_return = vm.intern_name("return");
-    let m = vm.get_atom_b(it, a_return)?.take();
-    if m.is_undefined() || m.is_null() {
+    let sc_m = Scope::new(vm);
+    let m = vm.get_atom_b(it, a_return)?.root(&sc_m);
+    if m.peek().is_undefined() || m.peek().is_null() {
         return Ok(Value::HOLE);
     }
-    vm.call_b(m, it, &[]).map(Fresh::take)
+    vm.call_b(m.peek(), it, &[]).map(Fresh::take)
 }
 
 /// What `[r, sync, record]`, a `for await`'s iterator's `return()` gave,

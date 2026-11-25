@@ -694,11 +694,26 @@ pub(crate) fn define_property(vm: &mut Vm, o: Obj, key: Key, d: &Desc) -> Result
     proxy_define(vm, o, key, d)
 }
 
+/// [`proxy_define`] forwarding to its target `t`, not a proxy: `t`
+/// rooted, as the define may run JS (an array's `length` converted, a
+/// typed array's element) that revokes the proxy, or the trap's getter
+/// did, `t` then held here only. Out of line: the forwarding frame a
+/// chain of proxies repeats stays small.
+#[inline(never)]
+fn define_on_target(vm: &mut Vm, t: Value, key: Key, d: &Desc) -> Result<bool> {
+    let held = Scope::new(vm);
+    let [t] = held.roots([t]);
+    define_property(vm, t.obj(), key, d)
+}
+
 /// A proxy's `[[DefineOwnProperty]]`.
 pub(crate) fn proxy_define(vm: &mut Vm, o: Obj, key: Key, d: &Desc) -> Result<bool> {
     let (t, h, f) = trap_of(vm, o, "defineProperty")?;
     let Some(f) = f else {
-        return define_property(vm, Obj::of(t), key, d);
+        if !is_proxy(vm, Obj::of(t)) {
+            return define_on_target(vm, t, key, d);
+        }
+        return proxy_define(vm, Obj::of(t), key, d);
     };
     trapped(vm, t, h, f, |vm, t, h, f| {
         // (`d`'s values, maybe a Rust caller's only, rooted across the

@@ -1334,8 +1334,14 @@ fn function_bind(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     }
     let target = Obj::of(this);
     let args = a.get(1..).unwrap_or(&[]);
-    let proto =
-        if vm.proxies_exist { crate::proxy::get_prototype_of(vm, target)? } else { target.shape().live().proto };
+    // (Held across the `length` and `name` reads, which may run JS: a
+    // proxy's `getPrototypeOf` may give one nothing else holds.)
+    let sc = Scope::new(vm);
+    let proto = sc.root(if vm.proxies_exist {
+        crate::proxy::get_prototype_of(vm, target)?
+    } else {
+        target.shape().live().proto
+    });
     // Its `length` (what the target's leaves) and `name` ("bound …"): the
     // target's code's, where it has neither as a property of its own
     // making (nor deleted them); as read otherwise.
@@ -1389,6 +1395,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
         let name = vm.mu().new_string(&units).raw();
         vm.handles.push(name.v());
+        let proto = proto.v();
         let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + nslots) as u32);
         let own = vm.root_shape(Class::Native, proto, BOUND_OWN as u32);
         let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(full.live())) };

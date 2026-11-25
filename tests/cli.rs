@@ -435,3 +435,33 @@ fn a_waiter_no_one_can_notify_ends_the_event_loop() {
         }
     }
 }
+
+/// An `Intl` locale list given as a primitive (CanonicalizeLocaleList's
+/// ToObject, a new wrapper) is read through getters whose values'
+/// `toString` collects, the wrapper held only by the native meanwhile:
+/// rooted, it's still there at the next element's read (it crashed under
+/// `CLOISON_GC_NO_NATIVE_ROOTS=drop` and a collection at each safepoint).
+#[cfg(feature = "intl")]
+#[test]
+fn an_intl_locale_list_wrapper_lives_across_its_getters() {
+    let src = r#"
+function churn() { var junk = []; for (var j = 0; j < 20000; j++) junk.push({ j: j, s: "s" + j }); return junk.length; }
+Object.defineProperty(Number.prototype, "length", { get() { return 2; } });
+Object.defineProperty(Number.prototype, "0", { get() { return { toString() { churn(); return "en-US"; } }; } });
+Object.defineProperty(Number.prototype, "1", { get() { if (!(this instanceof Number)) throw new Error("receiver"); return "en-GB"; } });
+var out = [];
+for (var i = 0; i < 5; i++) out.push(Intl.Collator.supportedLocalesOf(5 + i).join("+"));
+print(out.join(" "));
+"#;
+    let out = cloison("intl-locales", src)
+        .env("CLOISON_GC_NO_NATIVE_ROOTS", "drop")
+        .env("CLOISON_GC_STRESS", "1")
+        .env("CLOISON_GC_STW", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?} {}", out.status, String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().next(),
+        Some("en-US+en-GB en-US+en-GB en-US+en-GB en-US+en-GB en-US+en-GB")
+    );
+}

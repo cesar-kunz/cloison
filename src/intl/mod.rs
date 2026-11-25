@@ -13,6 +13,7 @@ mod collator;
 mod icu;
 mod segmenter;
 
+use crate::brand::Scope;
 use crate::raw::Live;
 use std::collections::HashMap;
 
@@ -128,7 +129,9 @@ fn canonicalize_locale_list(vm: &mut Vm, locales: Value) -> Result<Vec<String>> 
         seen.push(canonical_tag(&to_rust_string(vm, locales)?)?);
         return Ok(seen);
     }
-    let o = object_value((vm.to_obj_b(locales)?.take()).ptr());
+    // (`o`, a primitive's new wrapper maybe, held across its getters: rooted.)
+    let sc = Scope::new(vm);
+    let o = vm.to_obj_b(locales)?.root(&sc).v();
     let len = vm.length_of(o)?;
     if vm.conv_failed() {
         return Err(vm.take_conv_error());

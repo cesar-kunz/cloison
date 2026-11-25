@@ -276,7 +276,7 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
         vm.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let proto = object_value(vm.shared.prototype);
-    let o = vm.new_object_with(Class::SharedArrayBuffer, proto, 0);
+    let o = vm.mu().new_object_with(Class::SharedArrayBuffer, proto, 0).obj();
     unsafe {
         (*o.ptr()).elems = bytes_of(b).cast();
         o.set_elems_len((*b).len.load(SeqCst) as u32);
@@ -911,7 +911,7 @@ fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(Obj, TypedKind
 /// `{async, value}`: what `Atomics.waitAsync` returns.
 fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     let op = object_value(vm.object_prototype);
-    let r = vm.new_plain(op);
+    let r = vm.mu().new_plain(op).obj();
     let a_async = vm.intern_name("async");
     let a_value = vm.intern_name("value");
     vm.add_property(r, a_async, Value::from_bool(async_));
@@ -1041,7 +1041,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    let sp = vm.new_plain(op);
+    let sp = vm.mu().new_plain(op).obj();
     vm.shared.prototype = sp.ptr();
     let c = vm.define_native(g, "SharedArrayBuffer", shared_ctor, 1, any, true);
     vm.shared.constructor = c.ptr();
@@ -1051,7 +1051,7 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, sp, "maxByteLength", shared_max_byte_length);
     vm.define_natives(sp, &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
 
-    let atomics = vm.new_plain(op);
+    let atomics = vm.mu().new_plain(op).obj();
     let a_atomics = vm.intern_name("Atomics");
     vm.add_property_with(g, a_atomics, object_value(atomics.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(

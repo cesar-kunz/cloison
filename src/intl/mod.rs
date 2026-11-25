@@ -64,7 +64,7 @@ fn root(vm: &Vm, r: Root) -> Obj {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    let intl = vm.new_plain(op);
+    let intl = vm.mu().new_plain(op).obj();
     let a = vm.intern_name("Intl");
     vm.add_property_with(g, a, object_value(intl.ptr()), DONT_ENUM);
     crate::symbol::to_string_tag(vm, intl, "Intl");
@@ -311,7 +311,7 @@ fn resolve_locale(
 /// CoerceOptionsToObject.
 fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
-        return Ok(object_value(vm.new_plain(Value::NULL).ptr()));
+        return Ok(vm.mu().new_plain(Value::NULL).v());
     }
     Ok(object_value((vm.to_obj_b(v)?.take()).ptr()))
 }
@@ -319,7 +319,7 @@ fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
 /// GetOptionsObject.
 fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
-        return Ok(object_value(vm.new_plain(Value::NULL).ptr()));
+        return Ok(vm.mu().new_plain(Value::NULL).v());
     }
     if is_object(v) {
         return Ok(v);
@@ -351,7 +351,7 @@ fn bool_option(vm: &mut Vm, options: Value, name: &str) -> Result<Option<bool>> 
 
 /// An array of `strings`.
 fn string_array(vm: &mut Vm, strings: &[String]) -> Result<Value> {
-    let arr = vm.new_array();
+    let arr = vm.mu().new_array().v();
     for s in strings {
         let v = crate::temporal::string(vm, s);
         crate::vm::array_push(vm, arr, &[v])?;

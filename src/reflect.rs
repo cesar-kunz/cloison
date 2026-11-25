@@ -37,7 +37,7 @@ fn list(vm: &mut Vm, v: Value) -> Result<Fresh<'_, Vec<Value>>> {
 
 pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
-    let r = vm.new_plain(op);
+    let r = vm.mu().new_plain(op).obj();
     vm.define_natives(
         r,
         &[

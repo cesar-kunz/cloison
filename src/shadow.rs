@@ -40,7 +40,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let any = crate::jit::Ty::Any;
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    let proto = vm.new_plain(op);
+    let proto = vm.mu().new_plain(op).obj();
     let c = vm.define_native(g, "ShadowRealm", shadow_realm_ctor, 0, any, true);
     crate::builtins::link_constructor(vm, c, proto);
     vm.define_natives(proto, &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
@@ -59,7 +59,7 @@ fn shadow_realm_ctor(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let callee = vm.callee_obj();
     let default = object_value(root(vm, Root::Prototype).ptr());
     let proto = vm.take_new_target(callee, default)?;
-    let o = vm.new_plain(proto);
+    let o = vm.mu().new_plain(proto).obj();
     let r = crate::realm::create(vm);
     let k = hidden_key(vm);
     let d = Desc::data(Value::from_i32(r as i32), false, false, false);
@@ -182,7 +182,7 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
     let d = Desc::data(Value::number(len), false, false, true);
     vm.define_own_property(Obj::of(f), Key::Name(a_length), &d)?;
     let name = vm.get_atom_b(target, a_name)?;
-    let name = if is_string(name.peek()) { name.peek() } else { vm.new_string(&[]) };
+    let name = if is_string(name.peek()) { name.peek() } else { vm.mu().new_string(&[]).v() };
     let d = Desc::data(name, false, false, true);
     vm.define_own_property(Obj::of(f), Key::Name(a_name), &d)?;
     Ok(())

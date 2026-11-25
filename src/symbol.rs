@@ -142,7 +142,7 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     }
     let atom = name.map(|n| vm.intern_name(&n));
     let proto = object_value(root(vm, Root::SymbolPrototype).ptr());
-    let o = vm.new_object_with(Class::Symbol, proto, 0);
+    let o = vm.mu().new_object_with(Class::Symbol, proto, 0).obj();
     unsafe {
         (*o.ptr()).code = desc.to_bits() as *const crate::vm::Code;
         o.set_elems_len(atom.map_or(NO_ATOM, |a| a.0));
@@ -172,7 +172,7 @@ pub(crate) fn symbol_string(v: Value) -> Vec<u16> {
 pub(crate) fn symbol_string_value(vm: &mut Vm, v: Value) -> Result<Value> {
     crate::vm::check_string_len(crate::vm::string_len(description(v)).unwrap_or(0) + 8)?;
     let u = symbol_string(v);
-    Ok(vm.new_string(&u))
+    Ok(vm.mu().new_string(&u).v())
 }
 
 /// The symbol `this` is (a symbol, or a `Symbol` wrapper).
@@ -252,7 +252,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value>
     } else {
         own_symbol_keys(vm, o)
     };
-    let out = vm.new_array();
+    let out = vm.mu().new_array().v();
     for s in keys {
         crate::vm::array_push(vm, out, &[s])?;
     }
@@ -306,7 +306,7 @@ pub(crate) fn to_string_tag(vm: &mut Vm, o: Obj, tag: &str) {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    let sp = vm.new_plain(op);
+    let sp = vm.mu().new_plain(op).obj();
     vm.symbol_roots = vec![sp];
     let ctor = vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true);
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
@@ -342,7 +342,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let _ = vm.define_own_property(unsafe { Obj::from_ptr(dp) }, Key::Name(a_tp), &d);
     // `Array.prototype[Symbol.unscopables]`: what `with` over an array
     // doesn't find (ES2015 on).
-    let u = vm.new_plain(Value::NULL);
+    let u = vm.mu().new_plain(Value::NULL).obj();
     for name in [
         "at",
         "copyWithin",
@@ -398,19 +398,19 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 
     // Iterators.
-    let ip = vm.new_plain(op);
+    let ip = vm.mu().new_plain(op).obj();
     vm.symbol_roots.push(ip);
     let a_iter = vm.a_sym_iterator;
     define_symbol_native(vm, ip, a_iter, "[Symbol.iterator]", return_this, 0);
-    let aip = vm.new_plain(object_value(ip.ptr()));
+    let aip = vm.mu().new_plain(object_value(ip.ptr())).obj();
     vm.symbol_roots.push(aip);
     vm.define_natives(aip, &[("next", array_iterator_next as NativeFn, 0)]);
     to_string_tag(vm, aip, "Array Iterator");
-    let sip = vm.new_plain(object_value(ip.ptr()));
+    let sip = vm.mu().new_plain(object_value(ip.ptr())).obj();
     vm.symbol_roots.push(sip);
     vm.define_natives(sip, &[("next", string_iterator_next as NativeFn, 0)]);
     to_string_tag(vm, sip, "String Iterator");
-    let rsip = vm.new_plain(object_value(ip.ptr()));
+    let rsip = vm.mu().new_plain(object_value(ip.ptr())).obj();
     vm.symbol_roots.push(rsip);
     vm.define_natives(rsip, &[("next", crate::builtins::regexp_string_iterator_next as NativeFn, 0)]);
     to_string_tag(vm, rsip, "RegExp String Iterator");
@@ -491,7 +491,7 @@ fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Va
 /// value) inheriting from `proto`, its state the hidden array `state`.
 pub(crate) fn iterator_with_state(vm: &mut Vm, class: Class, proto: Root, state: Value) -> Value {
     let p = object_value(root(vm, proto).ptr());
-    let it = vm.new_object_with(class, p, 0);
+    let it = vm.mu().new_object_with(class, p, 0).obj();
     unsafe { (*it.ptr()).code = state.to_bits() as *const crate::vm::Code };
     object_value(it.ptr())
 }
@@ -544,7 +544,10 @@ pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value
         vm.store_field(o, 1, Value::from_bool(done));
         return Ok(object_value(o.ptr()));
     }
-    let o = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
+    let o = {
+        let arg = object_value(vm.object_prototype);
+        vm.mu().new_plain(arg).v()
+    };
     let (a_value, a_done) = (vm.a_value, vm.a_done);
     vm.create_data_property(o, Key::Name(a_value), value)?;
     vm.create_data_property(o, Key::Name(a_done), Value::from_bool(done))?;
@@ -659,7 +662,7 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> 
         if (0xD800..0xDC00).contains(&c) && u.get(i + 1).is_some_and(|d| (0xDC00..0xE000).contains(d)) { 2 } else { 1 };
     let piece: Vec<u16> = u[i..i + n].to_vec();
     vm.set_keyed(state, Value::from_i32(1), Value::from_i32((i + n) as i32))?;
-    let s = vm.new_string(&piece);
+    let s = vm.mu().new_string(&piece).v();
     iter_result(vm, s, false)
 }
 
@@ -1248,7 +1251,7 @@ unsafe fn iterator_next_other(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
                 *slots.add(1) = Value::from_i32((i + 1 + pair as usize) as i32);
                 return Ok(if pair {
                     let piece = [c, u[i + 1]];
-                    vm.new_string(&piece)
+                    vm.mu().new_string(&piece).v()
                 } else {
                     vm.single_char(c)
                 });
@@ -1302,7 +1305,7 @@ mod tests {
     #[test]
     fn array_states_step_past_int32_indices() {
         let mut vm = Vm::new();
-        let a = vm.new_array();
+        let a = vm.mu().new_array().v();
         let top = 2f64.powi(31);
         for (k, x) in [(top - 1.0, 1), (top, 2)] {
             vm.set_keyed(a, Value::number(k), Value::from_i32(x)).unwrap();

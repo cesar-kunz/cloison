@@ -83,6 +83,9 @@
 //! caller's `regs`. Neither touches the native stack, so JS recursion
 //! depth is bounded by the VM stack, not Rust's.
 
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#![allow(clippy::disallowed_methods)]
 use crate::bigint::BinOp as BigOp;
 use crate::bytecode::Op;
 use crate::jit::VmRun;

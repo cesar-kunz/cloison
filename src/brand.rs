@@ -106,6 +106,8 @@
 //! let _ = h.v();
 //! # }
 //! ```
+// (Mu is where the VM's allocators are called: see clippy.toml.)
+#![allow(clippy::disallowed_methods)]
 use std::marker::PhantomData;
 
 use crate::object::{Obj, object_value};
@@ -252,8 +254,15 @@ pub struct Gc<'a> {
 
 impl<'a> Gc<'a> {
     /// The value, for a call that doesn't collect.
+    #[inline(always)]
     pub fn v(self) -> Value {
         self.v
+    }
+
+    /// The object, for a call that doesn't collect.
+    #[inline(always)]
+    pub(crate) fn obj(self) -> Obj {
+        Obj::of(self.v)
     }
 
     /// Rooted in `s`, until it ends.
@@ -272,6 +281,7 @@ pub struct Mu<'a> {
 
 impl<'a> Mu<'a> {
     /// `f` with the VM: what makes and reads cells, never collecting.
+    #[inline(always)]
     fn with<T>(&self, f: impl FnOnce(&mut Vm) -> T) -> T {
         // SAFETY: `Mu<'a>` holds the VM's exclusive borrow for `'a` (its
         // `PhantomData`), and lends it to one `f` at a time; a `Gc` is a
@@ -281,6 +291,7 @@ impl<'a> Mu<'a> {
 
     /// A new object of `class` inheriting from `proto`, room for
     /// `capacity` slots.
+    #[inline(always)]
     pub(crate) fn new_object_with(&self, class: crate::object::Class, proto: Value, capacity: u32) -> Gc<'a> {
         let o = self.with(|vm| vm.new_object_with(class, proto, capacity));
         Gc { v: object_value(o.ptr()), _vm: PhantomData }
@@ -294,16 +305,44 @@ impl<'a> Mu<'a> {
     }
 
     /// A new array.
+    #[inline(always)]
     pub fn new_array(&self) -> Gc<'a> {
         Gc { v: self.with(Vm::new_array), _vm: PhantomData }
     }
 
     /// A new string of `units`.
+    #[inline(always)]
     pub fn new_string(&self, units: &[u16]) -> Gc<'a> {
         Gc { v: self.with(|vm| vm.new_string(units)), _vm: PhantomData }
     }
 
+    /// A new string of `len` units, `fill` writing them.
+    #[inline(always)]
+    pub(crate) fn new_string_with(&self, len: usize, fill: impl FnOnce(&mut [u16])) -> Gc<'a> {
+        Gc { v: self.with(|vm| vm.new_string_with(len, fill)), _vm: PhantomData }
+    }
+
+    /// A new plain object inheriting from `proto`.
+    #[inline(always)]
+    pub(crate) fn new_plain(&self, proto: Value) -> Gc<'a> {
+        Gc { v: object_value(self.with(|vm| vm.new_plain(proto)).ptr()), _vm: PhantomData }
+    }
+
+    /// The wrapper object of primitive `v` (ToObject's).
+    #[inline(always)]
+    pub(crate) fn new_wrapper(&self, v: Value) -> Gc<'a> {
+        Gc { v: self.with(|vm| vm.new_wrapper(v)), _vm: PhantomData }
+    }
+
+    /// A new array of `n` elements, `at` making each: it allocates, never
+    /// collects (as [`Mu::make`]'s).
+    #[inline(always)]
+    pub(crate) fn array_of_with(&self, n: usize, at: impl FnMut(&mut Vm, usize) -> Value) -> Gc<'a> {
+        Gc { v: self.with(|vm| vm.array_of_with(n, at)), _vm: PhantomData }
+    }
+
     /// FromPropertyDescriptor: a new object of `d`'s fields.
+    #[inline(always)]
     pub(crate) fn from_descriptor(&self, d: &Desc) -> Gc<'a> {
         Gc { v: self.with(|vm| vm.from_descriptor(d)), _vm: PhantomData }
     }

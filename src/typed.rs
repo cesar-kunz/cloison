@@ -63,7 +63,7 @@ fn arg(a: &[Value], i: usize) -> Value {
 
 fn str_value(vm: &mut Vm, s: &str) -> Value {
     let u: Vec<u16> = s.encode_utf16().collect();
-    vm.new_string(&u)
+    vm.mu().new_string(&u).v()
 }
 
 /// ToNumber, with what its `valueOf` threw.
@@ -182,7 +182,7 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
         return Err(Error::range_error("Array buffer allocation failed"));
     }
     let abp = object_value(vm.array_buffer_prototype);
-    let o = vm.new_object_with(Class::ArrayBuffer, abp, 0);
+    let o = vm.mu().new_object_with(Class::ArrayBuffer, abp, 0).obj();
     unsafe {
         (*o.ptr()).elems = vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast();
         o.set_elems_len(n as u32);
@@ -307,7 +307,7 @@ pub(crate) fn make_view(
     if class == Class::TypedArray {
         note_proto(vm, k as u8, proto);
     }
-    let o = vm.new_object_with(class, proto, 0);
+    let o = vm.mu().new_object_with(class, proto, 0).obj();
     unsafe {
         // (A `DataView`'s `kind` is its inline capacity, as other objects'.)
         if class == Class::TypedArray {
@@ -1728,7 +1728,7 @@ fn typed_to_locale_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value
         let s = vm.to_string_b(s.peek())?;
         out.extend_from_slice(string_units(s.peek()).unwrap_or(&[]));
     }
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 /// `keys()`, `values()` and `entries()` (`K`: 0, 1, 2): an array iterator
@@ -1755,7 +1755,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    let abp = vm.new_plain(op);
+    let abp = vm.mu().new_plain(op).obj();
     vm.array_buffer_prototype = abp.ptr();
     let ab = vm.define_native(g, "ArrayBuffer", array_buffer_ctor, 1, any, true);
     link_constructor(vm, ab, abp);
@@ -1778,7 +1778,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.define_native(ab, "isView", buffer_is_view, 1, any, false);
 
     // `%TypedArray%` (abstract) and its prototype, the concrete kinds'.
-    let shared = vm.new_plain(op);
+    let shared = vm.mu().new_plain(op).obj();
     vm.typed_array_prototype = shared.ptr();
     let ta = vm.native_function("TypedArray", typed_array_abstract, 0, any, true);
     link_constructor(vm, ta, shared);
@@ -1842,7 +1842,7 @@ pub(crate) fn install(vm: &mut Vm) {
     ];
     let a_bpe = vm.intern_name("BYTES_PER_ELEMENT");
     for (k, kind) in TypedKind::ALL.iter().enumerate() {
-        let proto = vm.new_plain(object_value(shared.ptr()));
+        let proto = vm.mu().new_plain(object_value(shared.ptr())).obj();
         let c = vm.define_native(g, kind.name(), CTORS[k], 3, any, true);
         link_constructor(vm, c, proto);
         vm.set_prototype_of(c, object_value(ta.ptr()));
@@ -1866,7 +1866,7 @@ pub(crate) fn install_symbols(vm: &mut Vm) {
     let values = vm.get(object_value(shared.ptr()), a_values).unwrap_or(Value::UNDEFINED);
     let a_iter = vm.a_sym_iterator;
     vm.add_property_with(shared, a_iter, values, DONT_ENUM);
-    let holder = vm.new_plain(Value::NULL);
+    let holder = vm.mu().new_plain(Value::NULL).obj();
     let tag = vm.define_native(holder, "get [Symbol.toStringTag]", typed_to_string_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
     vm.define_accessor(shared, a_tag, Some(object_value(tag.ptr())), None, DONT_ENUM);

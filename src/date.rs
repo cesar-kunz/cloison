@@ -384,13 +384,13 @@ fn num(d: f64) -> Value {
 
 fn str_value(vm: &mut Vm, s: &str) -> Value {
     let u: Vec<u16> = s.encode_utf16().collect();
-    vm.new_string(&u)
+    vm.mu().new_string(&u).v()
 }
 
 /// A new `Date` of time value `t`.
 fn new_date(vm: &mut Vm, t: f64) -> Value {
     let dp = object_value(vm.date_prototype);
-    let o = vm.new_object_with(Class::Date, dp, 0);
+    let o = vm.mu().new_object_with(Class::Date, dp, 0).obj();
     unsafe { (*o.ptr()).code = t.to_bits() as *const Code };
     object_value(o.ptr())
 }

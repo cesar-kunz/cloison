@@ -244,7 +244,7 @@ fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
     if n > u32::MAX as f64 {
         return Err(Error::range_error("Invalid array length"));
     }
-    let a = vm.new_array();
+    let a = vm.mu().new_array().v();
     if n > 0.0 {
         vm.set_array_length(Obj::of(a), Value::number(n))?;
     }
@@ -410,7 +410,7 @@ fn array_flat_map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 /// A new array of `values`.
 pub(crate) fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
-    let a = vm.new_array();
+    let a = vm.mu().new_array().v();
     array_push(vm, a, values)?;
     Ok(a)
 }
@@ -470,7 +470,7 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value>
     drop(sc);
     // A cycle (an array holding itself) joins as empty, as the engines do.
     if joining(vm, o) {
-        return Ok(vm.new_string(&[]));
+        return Ok(vm.mu().new_string(&[]).v());
     }
     // (Its separators alone past the longest string: thrown before any
     // element is read, as a far array's length may be 2^32 - 1.)
@@ -555,7 +555,7 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: Args<'_>) -> R
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
     if joining(vm, o) {
-        return Ok(vm.new_string(&[]));
+        return Ok(vm.mu().new_string(&[]).v());
     }
     vm.handle_scope(|vm| {
         vm.handles.extend([Value::HOLE, o]);
@@ -1740,7 +1740,7 @@ fn array_from_list(vm: &mut Vm, items: Value, out: Value, mapfn: Value, that: Va
         while i < u.len() {
             let c = u[i];
             let pair = (0xD800..0xDC00).contains(&c) && i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]);
-            let s = if pair { vm.new_string(&u[i..i + 2]) } else { vm.single_char(c) };
+            let s = if pair { vm.mu().new_string(&u[i..i + 2]).v() } else { vm.single_char(c) };
             i += if pair { 2 } else { 1 };
             let v = if mapfn.is_undefined() { s } else { vm.call_b(mapfn, that, &[s, Value::number(n)])?.take() };
             create(vm, out, n, v)?;

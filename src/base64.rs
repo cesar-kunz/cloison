@@ -278,7 +278,10 @@ fn written(vm: &mut Vm, o: Obj, d: Decoded) -> Result<Value> {
     if let Some(e) = d.error {
         return Err(e);
     }
-    let r = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
+    let r = {
+        let arg = object_value(vm.object_prototype);
+        vm.mu().new_plain(arg).v()
+    };
     let (a_read, a_written) = (vm.intern_name("read"), vm.intern_name("written"));
     vm.create_data_property(r, Key::Name(a_read), Value::number(d.read as f64))?;
     vm.create_data_property(r, Key::Name(a_written), Value::number(d.bytes.len() as f64))?;
@@ -331,7 +334,7 @@ fn to_base64(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
             out.extend(std::iter::repeat_n(b'=' as u16, 3 - c.len()));
         }
     }
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 fn to_hex(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -340,5 +343,5 @@ fn to_hex(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let digits = b"0123456789abcdef";
     let out: Vec<u16> =
         bytes.iter().flat_map(|&b| [digits[(b >> 4) as usize] as u16, digits[(b & 15) as usize] as u16]).collect();
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }

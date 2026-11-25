@@ -265,7 +265,7 @@ fn rec_mut(vm: &mut Vm, m: usize) -> &mut Record {
 
 fn string(vm: &mut Vm, s: &str) -> Value {
     let u: Vec<u16> = s.encode_utf16().collect();
-    vm.new_string(&u)
+    vm.mu().new_string(&u).v()
 }
 
 /// A SyntaxError (an early one, of a module's text or its links).
@@ -345,13 +345,16 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
     };
     let m = vm.modules.records.len();
     let mut info = ModuleInfo::default();
-    let env = object_value(vm.new_plain(Value::NULL).ptr());
+    let env = vm.mu().new_plain(Value::NULL).v();
     let source = if kind == Kind::Bytes { String::new() } else { String::from_utf8_lossy(&bytes).into_owned() };
     let mut source_object = Value::UNDEFINED;
     if kind == Kind::Js {
         info = crate::js::module_info(&source, m as i32).map_err(|e| syntax(format!("{path}:{e}")))?;
     } else if kind == Kind::HostSource {
-        source_object = object_value(vm.new_plain(vm.modules.abstract_source[1]).ptr());
+        source_object = {
+            let arg = vm.modules.abstract_source[1];
+            vm.mu().new_plain(arg).v()
+        };
     } else {
         let v = match kind {
             Kind::Json => {
@@ -360,7 +363,7 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
             }
             Kind::Text => {
                 let u: Vec<u16> = source.encode_utf16().collect();
-                vm.new_string(&u)
+                vm.mu().new_string(&u).v()
             }
             _ => crate::typed::immutable_bytes(vm, &bytes)?,
         };
@@ -544,12 +547,12 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     // The target: what the proxy's invariants check its traps against
     // (a deferred namespace's `"then"` is an ordinary property's key: it
     // has none).
-    let target = vm.new_plain(Value::NULL);
+    let target = vm.mu().new_plain(Value::NULL).obj();
     for name in &names {
         if deferred && name.as_slice() == "then".encode_utf16().collect::<Vec<u16>>().as_slice() {
             continue;
         }
-        let s = vm.new_string(name);
+        let s = vm.mu().new_string(name).v();
         let key = crate::intrinsics::to_property_key(vm, s)?;
         vm.define_own_property(target, key, &Desc::data(Value::UNDEFINED, true, true, false))?;
     }
@@ -557,7 +560,7 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     let a_tag = vm.a_sym_to_string_tag;
     vm.define_own_property(target, Key::Name(a_tag), &Desc::data(tag, false, false, false))?;
     vm.prevent_extensions(target);
-    let handler = vm.new_plain(Value::NULL);
+    let handler = vm.mu().new_plain(Value::NULL).obj();
     let traps = [
         Template::Get,
         Template::Set,
@@ -741,11 +744,11 @@ fn ns_own_keys(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let then: Vec<u16> = "then".encode_utf16().collect();
     let names: Vec<Vec<u16>> =
         rec(vm, m).exports.iter().map(|(n, _)| n.clone()).filter(|n| !deferred || *n != then).collect();
-    let out = vm.new_array();
+    let out = vm.mu().new_array().v();
     vm.handle_scope(|vm| {
         vm.handles.push(out);
         for n in names {
-            let s = vm.new_string(&n);
+            let s = vm.mu().new_string(&n).v();
             crate::vm::array_push(vm, out, &[s])?;
         }
         let tag = vm.key_value(Key::Name(vm.a_sym_to_string_tag));
@@ -1374,7 +1377,7 @@ fn import_job(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
             // (Each one's evaluation awaited, as by `Promise.all`, with no
             // `then` called.)
             let deps = async_dependencies(vm, m, &mut Vec::new());
-            let count = vm.new_array();
+            let count = vm.mu().new_array().v();
             // (`count`, then `done`, rooted across the evaluations, which
             // run the modules.)
             let done = vm.rooted(&[count], |vm| {
@@ -1437,7 +1440,7 @@ fn defer_done(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
 pub(crate) fn install(vm: &mut Vm, host: Obj) {
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
-    let proto = vm.new_plain(op);
+    let proto = vm.mu().new_plain(op).obj();
     let c = vm.native_function("AbstractModuleSource", abstract_source_ctor, 0, any, true);
     crate::builtins::link_constructor(vm, c, proto);
     let a = vm.intern_name("AbstractModuleSource");
@@ -1449,7 +1452,7 @@ pub(crate) fn install(vm: &mut Vm, host: Obj) {
 /// `symbol::install`).
 pub(crate) fn install_symbols(vm: &mut Vm) {
     let Some(&proto) = vm.modules.abstract_source.get(1) else { return };
-    let holder = vm.new_plain(Value::NULL);
+    let holder = vm.mu().new_plain(Value::NULL).obj();
     let f = vm.define_native(holder, "get [Symbol.toStringTag]", abstract_source_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
     vm.define_accessor(Obj::of(proto), a_tag, Some(object_value(f.ptr())), None, crate::object::DONT_ENUM);
@@ -1474,7 +1477,7 @@ fn abstract_source_tag(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 pub(crate) fn import_meta(vm: &mut Vm, m: Value) -> Result<Value> {
     let m = m.as_i32_unchecked() as usize;
     if rec(vm, m).meta.is_undefined() {
-        let o = object_value(vm.new_plain(Value::NULL).ptr());
+        let o = vm.mu().new_plain(Value::NULL).v();
         rec_mut(vm, m).meta = o;
     }
     Ok(rec(vm, m).meta)

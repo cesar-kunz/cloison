@@ -14,7 +14,7 @@ use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, s
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    let json = vm.new_plain(op);
+    let json = vm.mu().new_plain(op).obj();
     let a_json = vm.intern_name("JSON");
     vm.add_property_with(g, a_json, object_value(json.ptr()), DONT_ENUM);
     vm.define_natives(
@@ -90,7 +90,7 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                 Some(v.peek())
             } else if v.peek().is_number() {
                 let u = to_string_units(v.peek());
-                Some(vm.new_string(&u))
+                Some(vm.mu().new_string(&u).v())
             } else if let Some(p) = wrapped(v.peek())
                 && (p.is_number() || is_string(p))
             {
@@ -99,7 +99,7 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                 if vm.conv_failed() {
                     return Err(vm.take_conv_error());
                 }
-                Some(vm.new_string(&u))
+                Some(vm.mu().new_string(&u).v())
             } else {
                 None
             };
@@ -119,7 +119,7 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             space = Value::number(to_number(space));
         } else if is_string(p) {
             let u = to_string_units(space);
-            space = vm.new_string(&u);
+            space = vm.mu().new_string(&u).v();
         }
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
@@ -135,13 +135,13 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         let op = object_value(vm.object_prototype);
         // (The holder and key a `toJSON` or replacer gets: rooted.)
         let sc = Scope::new(vm);
-        let wrapper = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+        let wrapper = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
         let empty = vm.mu().new_string(&[]).root(&sc).v();
         let a_empty = vm.intern_name("");
         vm.create_data_property(wrapper, Key::Name(a_empty), arg(a, 0))?;
         let mut out = Vec::new();
         Ok(match property(vm, &mut st, empty, wrapper, &mut out)? {
-            true => vm.new_string(&out),
+            true => vm.mu().new_string(&out).v(),
             false => Value::UNDEFINED,
         })
     })
@@ -161,7 +161,7 @@ impl PKey {
     fn string(self, vm: &mut Vm) -> Value {
         match self {
             PKey::Str(s) => s,
-            PKey::Num(i) => vm.new_string(&to_string_units(Value::number(i))),
+            PKey::Num(i) => vm.mu().new_string(&to_string_units(Value::number(i))).v(),
             PKey::Name(a) => vm.atom_string(a),
         }
     }
@@ -321,7 +321,7 @@ fn value_rooted(
             v = Value::number(to_number(v));
         } else if is_string(p) {
             let u = to_string_units(v);
-            v = vm.new_string(&u);
+            v = vm.mu().new_string(&u).v();
         } else if !crate::symbol::is_symbol(p) {
             // (A boolean's or a BigInt's; a symbol's stays an object.)
             v = p;
@@ -595,7 +595,7 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let (v, record) = parse_text(vm, &u, true)?;
         let sc = Scope::new(vm);
         let op = object_value(vm.object_prototype);
-        let root = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+        let root = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
         let empty = vm.intern_name("");
         vm.create_data_property(root, Key::Name(empty), v)?;
         let key = vm.mu().new_string(&[]).root(&sc).v();
@@ -658,7 +658,7 @@ fn internalize(
     let sc = Scope::new(vm);
     let v = vm.get_keyed_b(holder, name)?.root(&sc).v();
     let op = object_value(vm.object_prototype);
-    let context = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+    let context = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
     internalize_value(vm, reviver, holder, name, v, context, record, text, a_source)
 }
 
@@ -679,7 +679,7 @@ fn internalize_value(
     if let Some(&Record { kind: RecordKind::Source(start, end), .. }) = record
         && !is_object(v)
     {
-        let source = vm.new_string(&text[start..end]);
+        let source = vm.mu().new_string(&text[start..end]).v();
         vm.create_data_property(context, Key::Name(a_source), source)?;
     }
     if is_object(v) {
@@ -739,8 +739,8 @@ fn json_raw_json(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::new_syntax("JSON.rawJSON: not a primitive's JSON text"));
     }
     parse_text(vm, &u, false)?;
-    let o = vm.new_plain(Value::NULL);
-    let s = vm.new_string(&u);
+    let o = vm.mu().new_plain(Value::NULL).obj();
+    let s = vm.mu().new_string(&u).v();
     let a_raw = vm.intern_name("rawJSON");
     vm.create_data_property(object_value(o.ptr()), Key::Name(a_raw), s)?;
     unsafe { (*o.ptr()).flags |= RAW_JSON };
@@ -821,7 +821,10 @@ impl<'a> Parser<'a> {
         let (v, container) = match self.peek().map(|c| c as u8 as char) {
             Some('{') if self.peek() < Some(128) => {
                 self.i += 1;
-                let o = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
+                let o = {
+                    let arg = object_value(vm.object_prototype);
+                    vm.mu().new_plain(arg).v()
+                };
                 if !self.eat(b'}') {
                     loop {
                         self.space();
@@ -859,7 +862,7 @@ impl<'a> Parser<'a> {
             }
             Some('[') if self.peek() < Some(128) => {
                 self.i += 1;
-                let arr = vm.new_array();
+                let arr = vm.mu().new_array().v();
                 let ao = Obj::of(arr);
                 let mut n = 0;
                 if !self.eat(b']') {
@@ -883,7 +886,7 @@ impl<'a> Parser<'a> {
             }
             Some('"') if self.peek() < Some(128) => {
                 let s = self.string()?;
-                (vm.new_string(&s), None)
+                (vm.mu().new_string(&s).v(), None)
             }
             Some('t') if self.peek() < Some(128) => (self.word("true", Value::TRUE)?, None),
             Some('f') if self.peek() < Some(128) => (self.word("false", Value::FALSE)?, None),

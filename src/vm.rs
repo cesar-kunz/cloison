@@ -1524,6 +1524,7 @@ impl Vm {
     }
 
     /// A VM on `heap`.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub fn with_heap(heap: Heap) -> Vm {
         // Zeroed, so fresh pages from the kernel, touched only as frames
         // reach them (a frame sets its registers when pushed); filling it
@@ -1801,6 +1802,7 @@ impl Vm {
 
     /// Make the current realm's intrinsics: its global object, the
     /// builtins.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn init_realm(&mut self) {
         let vm = self;
         vm.object_prototype = vm.new_object_with(Class::Plain, Value::NULL, 4).ptr();
@@ -2974,6 +2976,7 @@ impl Vm {
     }
 
     /// A plain object with prototype `proto`.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn new_plain(&mut self, proto: Value) -> Obj {
         self.check_own(proto, "Vm::new_object");
         self.new_object_with(Class::Plain, proto, 4)
@@ -4110,6 +4113,7 @@ impl Vm {
     }
 
     /// A wrapper object for primitive `v` (see `Class::Wrapper`).
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn new_wrapper(&mut self, v: Value) -> Value {
         let proto = if v.is_number() {
             self.number_prototype
@@ -4229,6 +4233,7 @@ impl Vm {
     /// property with attributes `attrs` (`ACCESSOR` added). An existing
     /// accessor keeps the function a descriptor leaves out; an existing
     /// data property becomes an accessor.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn define_accessor(&mut self, o: Obj, name: Atom, get: Option<Value>, set: Option<Value>, attrs: u8) {
         let s = o.shape().live();
         let old = s.lookup(name).filter(|&k| s.attrs()[k as usize] & ACCESSOR != 0);
@@ -6113,6 +6118,7 @@ impl Vm {
 
     /// [`Vm::for_in_keys`] in a run: what a proxy's trap throws left as a
     /// conversion's error (see `conv_error`).
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn for_in_key_array(&mut self, v: Value) -> Value {
         // (Through a proxy's traps: what they throw, a conversion's error.)
         if v.is_cell() && crate::proxy::chain_has_proxy(self, Obj::of(v)) {
@@ -6184,12 +6190,14 @@ impl Vm {
     ///
     /// For a string known to fit: past [`MAX_STRING_LEN`] units, see
     /// [`Vm::new_string_with`]. [`Vm::try_new_string`] throws instead.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn new_string(&mut self, units: &[u16]) -> Value {
         self.new_string_with(units.len(), |out| out.copy_from_slice(units))
     }
 
     /// [`Vm::new_string`], or a RangeError past [`MAX_STRING_LEN`] units
     /// (2^30, the longest string): for a string of any length.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn try_new_string(&mut self, units: &[u16]) -> Result<Value> {
         check_string_len(units.len())?;
         Ok(self.new_string(units))
@@ -6197,6 +6205,7 @@ impl Vm {
 
     /// [`Vm::new_string_with`], or a RangeError past [`MAX_STRING_LEN`]
     /// units (`fill` not called).
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn try_new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Result<Value> {
         check_string_len(len)?;
         Ok(self.new_string_with(len, fill))
@@ -6272,6 +6281,7 @@ impl Vm {
     /// operation to throw as a conversion's (as `new_cons`'s).
     #[cold]
     #[inline(never)]
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     fn string_too_long(&mut self) -> Value {
         // (Nothing would throw it: an embedder's string, made before a
         // run or after.)
@@ -6288,6 +6298,7 @@ impl Vm {
     /// collection began, if [`Vm::short_strings`] still has it, else a new
     /// one. For substrings: a scanner's identifiers repeat (TypeScript's
     /// live strings were 223,000 of 7,000 distinct contents).
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn short_string(&mut self, units: &[u16]) -> Value {
         if !(2..=SHORT_STRING_UNITS).contains(&units.len()) {
             return self.new_string(units);
@@ -6308,6 +6319,7 @@ impl Vm {
 
     /// The string of the one code unit `c` (below 256, the string
     /// constant: shared).
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn single_char(&mut self, c: u16) -> Value {
         if c >= 256 {
             return self.new_string(&[c]);
@@ -6389,6 +6401,7 @@ impl Vm {
     }
 
     /// The string constant with `units`, shared by equal ones.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn string_constant(&mut self, units: &[u16]) -> Value {
         if let Some(&v) = self.strings.get(units) {
             return v;
@@ -6454,6 +6467,7 @@ impl Vm {
     }
 
     /// Give new closure `f` its `prototype` object; `f` as a value.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     fn closure_prototype(&mut self, f: Obj) -> Value {
         // (Live in a marking under way: the closure may be allocated
         // black, untraced.)
@@ -6732,6 +6746,7 @@ impl Vm {
     /// no cache of one reads stale elements.
     #[cold]
     #[inline(never)]
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     fn keep_mapped(&mut self, m: &MappedArgs) {
         let (o, env) = (m.o, m.scope.0);
         let mut kept = Vec::new();
@@ -6879,6 +6894,7 @@ impl Vm {
     }
 
     /// A native function object.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub(crate) fn native_function(
         &mut self,
         name: &str,
@@ -8621,7 +8637,7 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
 /// `Array(…)` and `new Array(…)`: `Array(n)` has length `n` (holes), any
 /// other arguments are the elements.
 fn array_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
-    let a = vm.new_array();
+    let a = vm.mu().new_array().v();
     let o = Obj::of(a);
     let elems: Vec<Value> = match &*args {
         [n] if n.is_number() => {
@@ -8837,7 +8853,7 @@ fn number_to_fixed(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         if f == 0 { format!("{sign}{int}") } else { format!("{sign}{int}.{frac}") }
     };
     let units: Vec<u16> = s.encode_utf16().collect();
-    Ok(vm.new_string(&units))
+    Ok(vm.mu().new_string(&units).v())
 }
 
 /// ToIntegerOrInfinity of an optional argument (its conversion's errors
@@ -8970,7 +8986,7 @@ fn number_to_precision(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         }
     };
     let units: Vec<u16> = s.encode_utf16().collect();
-    Ok(vm.new_string(&units))
+    Ok(vm.mu().new_string(&units).v())
 }
 
 /// `Number.prototype.toString(radix)` (2 to 36, 10 by default).
@@ -8983,7 +8999,7 @@ pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: Args<'_>) -> 
         return Err(Error::range_error("toString() radix must be between 2 and 36"));
     }
     let units: Vec<u16> = crate::builtins::radix_string(this_number(this)?, radix as u32).encode_utf16().collect();
-    Ok(vm.new_string(&units))
+    Ok(vm.mu().new_string(&units).v())
 }
 
 fn object_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
@@ -8992,7 +9008,7 @@ fn object_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
         Some(&v) if !v.is_undefined() && !v.is_null() => Ok(object_value(vm.to_obj_b(v)?.take().ptr())),
         _ => {
             let op = object_value(vm.object_prototype);
-            Ok(object_value(vm.new_plain(op).ptr()))
+            Ok(vm.mu().new_plain(op).v())
         }
     }
 }
@@ -9696,6 +9712,7 @@ impl Local {
 
     /// A new string of `units` (UTF-16 code units). Panics past
     /// [`MAX_STRING_LEN`] units: [`Local::try_string`] throws instead.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub fn string(vm: &mut Vm, units: &[u16]) -> Local {
         let v = vm.new_string(units);
         vm.local(v)
@@ -9717,6 +9734,7 @@ impl Local {
     }
 
     /// A new plain object with prototype `proto` (an object or null).
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub fn object(vm: &mut Vm, proto: Local) -> Local {
         let proto = vm.host_value(proto, "Local::object");
         assert!(
@@ -9728,6 +9746,7 @@ impl Local {
     }
 
     /// A new empty array.
+    #[allow(clippy::disallowed_methods)] // (The VM's core: it roots what it makes itself.)
     pub fn array(vm: &mut Vm) -> Local {
         let v = vm.new_array();
         vm.local(v)
@@ -10144,7 +10163,7 @@ mod tests {
     /// (a builder that didn't check), which leaves the RangeError for its
     /// caller to throw: `fill` isn't called.
     fn too_long(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
-        Ok(vm.new_string_with(MAX_STRING_LEN + 1, |_| unreachable!()))
+        Ok(vm.mu().new_string_with(MAX_STRING_LEN + 1, |_| unreachable!()).v())
     }
 
     /// `new_string_with`'s backstop (#65): from a native, a RangeError its
@@ -10176,7 +10195,7 @@ out.join();"#;
     #[should_panic(expected = "outside a run")]
     fn strings_past_the_longest_panic_outside_a_run() {
         let mut vm = Vm::new();
-        vm.new_string_with(MAX_STRING_LEN + 1, |_| unreachable!());
+        let _ = vm.mu().new_string_with(MAX_STRING_LEN + 1, |_| unreachable!());
     }
 
     use std::panic::{AssertUnwindSafe, catch_unwind};

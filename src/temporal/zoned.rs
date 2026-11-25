@@ -111,7 +111,7 @@ fn round_options(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
         return Err(type_err("options parameter is required"));
     }
     if is_string(v) {
-        let o = object_value(vm.new_plain(Value::NULL).ptr());
+        let o = vm.mu().new_plain(Value::NULL).v();
         let a = vm.intern_name(name);
         vm.add_property(Obj::of(o), a, v);
         return Ok(o);
@@ -683,7 +683,7 @@ fn to_temporal_instant(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 
 pub(crate) fn install_now(vm: &mut Vm, temporal: Obj) {
     let op = object_value(vm.object_prototype);
-    let now = vm.new_plain(op);
+    let now = vm.mu().new_plain(op).obj();
     let a = vm.intern_name("Now");
     vm.add_property_with(temporal, a, object_value(now.ptr()), crate::object::DONT_ENUM);
     vm.define_natives(

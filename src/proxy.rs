@@ -188,7 +188,7 @@ pub(crate) fn private_holder(vm: &mut Vm, p: Obj, make: bool) -> Option<Obj> {
     if !make {
         return None;
     }
-    let h = vm.new_plain(Value::NULL);
+    let h = vm.mu().new_plain(Value::NULL).obj();
     set_slot(p, 2, object_value(h.ptr()));
     Some(h)
 }
@@ -216,7 +216,10 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         (*r).code = vm.proxy_codes[2];
     }
     set_slot(unsafe { Obj::from_ptr(r) }, 0, p);
-    let out = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
+    let out = {
+        let arg = object_value(vm.object_prototype);
+        vm.mu().new_plain(arg).v()
+    };
     let (a_proxy, a_revoke) = (vm.intern_name("proxy"), vm.intern_name("revoke"));
     vm.create_data_property(out, Key::Name(a_proxy), p)?;
     vm.create_data_property(out, Key::Name(a_revoke), object_value(r))?;
@@ -732,7 +735,10 @@ fn define_trapped(
 
 /// A descriptor object of just the fields `d` has.
 fn from_partial_descriptor(vm: &mut Vm, d: &Desc) -> Value {
-    let o = object_value((vm.new_plain(object_value(vm.object_prototype))).ptr());
+    let o = {
+        let arg = object_value(vm.object_prototype);
+        vm.mu().new_plain(arg).v()
+    };
     // (Rooted as its properties are added.)
     {
         let held = Scope::new(vm);

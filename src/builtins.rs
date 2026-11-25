@@ -141,7 +141,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
 
     // `Boolean`, a conversion; booleans' methods.
-    let bp = vm.new_object_with(Class::Wrapper, object_value(op.ptr()), 4);
+    let bp = vm.mu().new_object_with(Class::Wrapper, object_value(op.ptr()), 4).obj();
     unsafe { (*bp.ptr()).code = Value::FALSE.to_bits() as *const crate::vm::Code };
     vm.boolean_prototype = bp.ptr();
     let boolean = vm.define_native(g, "Boolean", boolean_fn, 1, any, true);
@@ -236,7 +236,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     crate::date::install(vm);
     // The test262 host hooks (`$262`), as a shell has them.
-    let host = vm.new_plain(object_value(op.ptr()));
+    let host = vm.mu().new_plain(object_value(op.ptr())).obj();
     let a_host = vm.intern_name("$262");
     vm.add_property_with(g, a_host, object_value(host.ptr()), DONT_ENUM);
     let a_global = vm.intern_name("global");
@@ -273,7 +273,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let mut error_ctor = Value::UNDEFINED;
     for (k, kind) in ERROR_KINDS.iter().enumerate() {
         let parent = vm.error_prototypes.first().copied().unwrap_or(op);
-        let proto = vm.new_plain(object_value(parent.ptr()));
+        let proto = vm.mu().new_plain(object_value(parent.ptr())).obj();
         let c = vm.define_native(g, kind, CTORS[k], 1, any, true);
         link_constructor(vm, c, proto);
         // (The kinds' constructors inherit `Error`.)
@@ -283,9 +283,9 @@ pub(crate) fn install(vm: &mut Vm) {
         } else {
             vm.set_prototype_of(c, error_ctor);
         }
-        let name = vm.new_string(&kind.encode_utf16().collect::<Vec<_>>());
+        let name = vm.mu().new_string(&kind.encode_utf16().collect::<Vec<_>>()).v();
         vm.add_property_with(proto, a_name, name, DONT_ENUM);
-        let empty = vm.new_string(&[]);
+        let empty = vm.mu().new_string(&[]).v();
         vm.add_property_with(proto, a_message, empty, DONT_ENUM);
         if k == 0 {
             vm.define_native(proto, "toString", error_to_string, 0, any, false);
@@ -394,12 +394,12 @@ fn string(vm: &mut Vm, u: &[u16]) -> Value {
     if let [c] = u {
         return vm.single_char(*c);
     }
-    vm.new_string(u)
+    vm.mu().new_string(u).v()
 }
 
 pub(crate) fn str_value(vm: &mut Vm, s: &str) -> Value {
     let u: Vec<u16> = s.encode_utf16().collect();
-    vm.new_string(&u)
+    vm.mu().new_string(&u).v()
 }
 
 fn num(d: f64) -> Value {
@@ -412,7 +412,7 @@ fn num(d: f64) -> Value {
 fn string_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let construct = vm.is_construct();
     let s = match a.first() {
-        None => vm.new_string(&[]),
+        None => vm.mu().new_string(&[]).v(),
         Some(&v) if is_string(v) => v,
         // (`String(symbol)` is its description; `new String(symbol)` throws.)
         Some(&v) if crate::symbol::is_symbol(v) && !construct => {
@@ -423,10 +423,10 @@ fn string_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
             if vm.conv_thrown {
                 return Err(vm.take_conv_error());
             }
-            vm.new_string(&u)
+            vm.mu().new_string(&u).v()
         }
     };
-    Ok(if construct { vm.new_wrapper(s) } else { s })
+    Ok(if construct { vm.mu().new_wrapper(s).v() } else { s })
 }
 
 /// `String.fromCharCode(…codes)`: each ToUint16.
@@ -464,7 +464,7 @@ fn string_char_code_at(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn string_char_at(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(&a, 0);
-    Ok(if i >= 0.0 && (i as usize) < u.len() { vm.single_char(u[i as usize]) } else { vm.new_string(&[]) })
+    Ok(if i >= 0.0 && (i as usize) < u.len() { vm.single_char(u[i as usize]) } else { vm.mu().new_string(&[]).v() })
 }
 
 fn find(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
@@ -565,11 +565,15 @@ fn ascii_case(vm: &mut Vm, this: Value, u: &[u16], from: u8, to: u8) -> Option<V
         return Some(this_string(vm, this, u));
     }
     let shift = to.wrapping_sub(from);
-    Some(vm.new_string_with(u.len(), |out| {
-        for (o, &c) in out.iter_mut().zip(u) {
-            *o = c.wrapping_add(if c.wrapping_sub(from) < 26 { shift } else { 0 });
-        }
-    }))
+    Some(
+        vm.mu()
+            .new_string_with(u.len(), |out| {
+                for (o, &c) in out.iter_mut().zip(u) {
+                    *o = c.wrapping_add(if c.wrapping_sub(from) < 26 { shift } else { 0 });
+                }
+            })
+            .v(),
+    )
 }
 
 /// `u` with `f` (`to_lowercase`, `to_uppercase`) applied to its runs of
@@ -684,7 +688,7 @@ fn string_repeat(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if n * u.len() as f64 > (1u64 << 30) as f64 {
         return Err(Error::range_error("Invalid string length"));
     }
-    Ok(vm.new_string(&u.repeat(n as usize)))
+    Ok(vm.mu().new_string(&u.repeat(n as usize)).v())
 }
 
 /// `padStart` (`start`) and `padEnd`.
@@ -714,7 +718,7 @@ fn pad(vm: &mut Vm, this: Value, a: &[Value], start: bool) -> Result<Value> {
         o.extend(f);
         o
     };
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 fn string_pad_start(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -787,7 +791,7 @@ fn string_to_well_formed(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value>
             _ => i += 1,
         }
     }
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 /// `normalize(form)`: the string in Unicode normalization form `form`
@@ -922,7 +926,7 @@ fn split_key(this: Value, a: &[Value]) -> Option<(u64, u64, usize)> {
 /// A new array of the elements of `from`, an array `split` made (plain,
 /// of the array shape with its elements' type).
 fn array_copy(vm: &mut Vm, from: Value) -> Value {
-    let arr = vm.new_array();
+    let arr = vm.mu().new_array().v();
     let (o, from) = (Obj::of(arr), Obj::of(from));
     let n = from.elems_len() as usize;
     if n > 0 {
@@ -950,7 +954,7 @@ fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     match a.first() {
         Some(v) if !v.is_undefined() => {
             let sep = units(*v);
-            let arr = vm.new_array();
+            let arr = vm.mu().new_array().v();
             let mut n = 0;
             vm.rooted(&[arr], |vm| {
                 if sep.is_empty() {
@@ -975,7 +979,7 @@ fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             Ok(arr)
         }
         _ => {
-            let arr = vm.new_array();
+            let arr = vm.mu().new_array().v();
             if limit > 0 {
                 let v = {
                     let sc = Scope::new(vm);
@@ -1010,7 +1014,7 @@ fn append(vm: &mut Vm, arr: Value, v: Value) {
 
 /// `this` as a string value (itself if one).
 fn this_string(vm: &mut Vm, this: Value, u: &[u16]) -> Value {
-    if is_string(this) { this } else { vm.new_string(u) }
+    if is_string(this) { this } else { vm.mu().new_string(u).v() }
 }
 
 fn string_concat(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -1020,7 +1024,7 @@ fn string_concat(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         u.extend_from_slice(&units(v));
         check_string_len(u.len())?;
     }
-    Ok(vm.new_string(&u))
+    Ok(vm.mu().new_string(&u).v())
 }
 
 pub(crate) fn string_to_string(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -1356,7 +1360,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     vm.handle_scope(|vm| {
         let list = if many { crate::array::new_array_of(vm, a.get(1..).unwrap_or(&[]))? } else { Value::EMPTY };
         vm.handles.push(list);
-        let name = vm.new_string(&units);
+        let name = vm.mu().new_string(&units).v();
         vm.handles.push(name);
         let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + nslots) as u32);
         let own = vm.root_shape(Class::Native, proto, BOUND_OWN as u32);
@@ -1470,7 +1474,7 @@ pub(crate) fn function_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Resul
         && !bound
         && let Some(u) = code.text_units()
     {
-        return Ok(vm.new_string(&u));
+        return Ok(vm.mu().new_string(&u).v());
     }
     let name = if bound { String::new() } else { code.name.clone() };
     Ok(str_value(vm, &format!("function {name}() {{ [native code] }}")))
@@ -1569,7 +1573,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         }
     }
     let op = object_value(vm.object_prototype);
-    let o = vm.new_plain(op);
+    let o = vm.mu().new_plain(op).obj();
     let a_length = vm.a_length;
     vm.add_property_with(o, a_length, Value::from_i32(values.len() as i32), DONT_ENUM);
     let a_iter = vm.a_sym_iterator;
@@ -1638,13 +1642,13 @@ fn number_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
             if crate::bigint::is_bigint(p) { num(crate::bigint::big_of(p).to_f64()) } else { p }
         }
     };
-    Ok(if construct { vm.new_wrapper(n) } else { n })
+    Ok(if construct { vm.mu().new_wrapper(n).v() } else { n })
 }
 
 fn boolean_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let construct = vm.is_construct();
     let b = Value::from_bool(crate::interp::to_boolean(arg(&a, 0)));
-    Ok(if construct { vm.new_wrapper(b) } else { b })
+    Ok(if construct { vm.mu().new_wrapper(b).v() } else { b })
 }
 
 fn this_boolean(this: Value) -> Result<bool> {
@@ -1786,7 +1790,7 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<
         let mut u: Vec<u16> = "[object ".encode_utf16().collect();
         u.extend_from_slice(&t);
         u.push(b']' as u16);
-        return Ok(vm.new_string(&u));
+        return Ok(vm.mu().new_string(&u).v());
     }
     Ok(str_value(vm, &format!("[object {tag}]")))
 }
@@ -2196,7 +2200,7 @@ fn unescape_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         out.push(u[i]);
         i += 1;
     }
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 /// `encodeURI…`: UTF-8 bytes as `%XX`, but for `keep`'s characters.
@@ -2211,7 +2215,7 @@ fn encode(vm: &mut Vm, a: &[Value], keep: &[u8]) -> Result<Value> {
     let escaped = |c: u16| c >= 128 || !plain[c as usize];
     // Nothing to escape (a key, a file's name): the string itself.
     let Some(first) = u.iter().position(|&c| escaped(c)) else {
-        return Ok(if is_string(v) { v } else { vm.new_string(&u) });
+        return Ok(if is_string(v) { v } else { vm.mu().new_string(&u).v() });
     };
     let mut out = Vec::with_capacity(u.len() + 16);
     out.extend_from_slice(&u[..first]);
@@ -2288,7 +2292,7 @@ fn decode(vm: &mut Vm, a: &[Value], reserved: &[u8]) -> Result<Value> {
         out.extend(s.encode_utf16());
         i += 3 * n;
     }
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 fn decode_uri_component(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -2394,14 +2398,14 @@ fn regexp_escape(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         }
         i += n;
     }
-    Ok(vm.new_string(&out))
+    Ok(vm.mu().new_string(&out).v())
 }
 
 fn install_regexps(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
-    let rp = vm.new_plain(op);
+    let rp = vm.mu().new_plain(op).obj();
     vm.regexp_prototype = rp.ptr();
     let c = vm.define_native(g, "RegExp", regexp_ctor, 2, any, true);
     link_constructor(vm, c, rp);
@@ -2463,7 +2467,7 @@ pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: Args<'_>) 
     if this.is_cell() && as_object(this) == vm.regexp_prototype {
         return Ok(match K {
             0 => str_value(vm, "(?:)"),
-            1 => vm.new_string(&[]),
+            1 => vm.mu().new_string(&[]).v(),
             _ => Value::UNDEFINED,
         });
     }
@@ -2577,7 +2581,7 @@ pub(crate) fn regexp_literal(vm: &mut Vm, pattern: Value, flags: Value) -> Resul
 /// `RegExp.prototype.source` reads).
 fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) -> Value {
     let proto = object_value(vm.regexp_prototype);
-    let o = vm.new_object_with(Class::RegExp, proto, 3);
+    let o = vm.mu().new_object_with(Class::RegExp, proto, 3).obj();
     unsafe { (*o.ptr()).code = re.cast() };
     let props = [(vm.a_last_index, Value::from_i32(0)), (vm.a_regexp_source, source)];
     // The shape with both found once: then only their stores.
@@ -2861,13 +2865,13 @@ fn legacy_part(vm: &mut Vm, range: impl FnOnce(&[Option<(usize, usize)>], usize)
     vm.legacy_match.1 = caps;
     match r {
         Some((a, b)) => string(vm, &s[a..b]),
-        None => vm.new_string(&[]),
+        None => vm.mu().new_string(&[]).v(),
     }
 }
 
 fn legacy_input_get(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     legacy_this(vm, this)?;
-    Ok(if vm.legacy_input.is_cell() { vm.legacy_input } else { vm.new_string(&[]) })
+    Ok(if vm.legacy_input.is_cell() { vm.legacy_input } else { vm.mu().new_string(&[]).v() })
 }
 
 /// SetLegacyRegExpStaticProperty of `input`.
@@ -2907,7 +2911,7 @@ fn legacy_paren<const N: usize>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result
 
 /// The legacy static accessors on `RegExp` (`c`).
 fn install_legacy(vm: &mut Vm, c: Obj) {
-    let holder = vm.new_plain(Value::NULL);
+    let holder = vm.mu().new_plain(Value::NULL).obj();
     let native = |vm: &mut Vm, name: &str, f: NativeFn, n: u32| {
         object_value((vm.define_native(holder, name, f, n, Ty::Any, false)).ptr())
     };
@@ -2965,7 +2969,7 @@ fn match_array(
     s: &[u16],
     input: Value,
 ) -> Result<Value> {
-    let arr = vm.new_array();
+    let arr = vm.mu().new_array().v();
     let o = Obj::of(arr);
     vm.reserve_elems(o, caps.len());
     // The groups straight into its elements, the length counting each
@@ -3019,11 +3023,11 @@ fn match_array(
 fn match_indices(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>]) -> Result<Value> {
     let pair = |vm: &mut Vm, c: Option<(usize, usize)>| -> Result<Value> {
         let Some((a, b)) = c else { return Ok(Value::UNDEFINED) };
-        let p = vm.new_array();
+        let p = vm.mu().new_array().v();
         crate::vm::array_push(vm, p, &[Value::from_i32(a as i32), Value::from_i32(b as i32)])?;
         Ok(p)
     };
-    let indices = vm.new_array();
+    let indices = vm.mu().new_array().v();
     for &c in caps {
         let p = pair(vm, c)?;
         crate::vm::array_push(vm, indices, &[p])?;
@@ -3031,7 +3035,7 @@ fn match_indices(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, 
     let groups = if re.names.is_empty() {
         Value::UNDEFINED
     } else {
-        let groups = object_value(vm.new_plain(Value::NULL).ptr());
+        let groups = vm.mu().new_plain(Value::NULL).v();
         for (k, (name, _)) in re.names.iter().enumerate() {
             if re.names[..k].iter().any(|(n, _)| n == name) {
                 continue;
@@ -3056,7 +3060,7 @@ fn group_match(names: &[(String, usize)], name: &str, caps: &[Option<(usize, usi
 /// A match's named groups: a null-prototype object of their matches
 /// (`undefined` where a group didn't match), in their names' first order.
 fn named_groups(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>], s: &[u16]) -> Result<Value> {
-    let groups = object_value(vm.new_plain(Value::NULL).ptr());
+    let groups = vm.mu().new_plain(Value::NULL).v();
     for (k, (name, _)) in re.names.iter().enumerate() {
         if re.names[..k].iter().any(|(n, _)| n == name) {
             continue;
@@ -3255,7 +3259,7 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
         if vm.conv_thrown {
             return Err(vm.take_conv_error());
         }
-        let mut args = vec![vm.new_string(&u)];
+        let mut args = vec![vm.mu().new_string(&u).v()];
         args.extend_from_slice(a.get(1..).unwrap_or(&[]));
         // (On the VM stack: `f` runs `this`'s `toString` before it reads
         // them, and a `Vec` is no root.)
@@ -3375,7 +3379,7 @@ fn match_with(vm: &mut Vm, s: &[u16], rv: Value, input: Value) -> Result<Value> 
     if found.is_empty() {
         return Ok(Value::NULL);
     }
-    let arr = vm.new_array();
+    let arr = vm.mu().new_array().v();
     crate::vm::array_push(vm, arr, &found)?;
     Ok(arr)
 }
@@ -3664,7 +3668,7 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
         Some(v) if !v.is_undefined() => crate::interp::to_int32(to_number(v)) as u32 as usize,
         _ => usize::MAX,
     };
-    let arr = vm.new_array();
+    let arr = vm.mu().new_array().v();
     if limit == 0 {
         return Ok(arr);
     }
@@ -3678,7 +3682,7 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
     let mut caps = crate::regexp::Captures::new();
     if s.is_empty() {
         if !re.exec_into(s, 0, &mut caps) {
-            let v = vm.new_string(&[]);
+            let v = vm.mu().new_string(&[]).v();
             push(vm, v);
         }
     } else {
@@ -3788,7 +3792,7 @@ fn error_stack_get(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
         s.extend(": ".encode_utf16());
         s.extend_from_slice(u);
     }
-    Ok(vm.new_string(&s))
+    Ok(vm.mu().new_string(&s).v())
 }
 
 /// `set Error.prototype.stack`: a string `v` as the receiver's own `stack`
@@ -3822,11 +3826,11 @@ fn error_stack_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 /// nothing pending, see `Vm::new_string_with`).
 pub(crate) fn make_error(vm: &mut Vm, k: usize, message: Option<&[u16]>) -> Value {
     let proto = vm.error_prototypes[k];
-    let o = vm.new_plain(object_value(proto.ptr()));
+    let o = vm.mu().new_plain(object_value(proto.ptr())).obj();
     unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
         let a = vm.intern_name("message");
-        let m = vm.new_string(&m[..m.len().min(crate::vm::MAX_STRING_LEN)]);
+        let m = vm.mu().new_string(&m[..m.len().min(crate::vm::MAX_STRING_LEN)]).v();
         vm.add_property_with(o, a, m, DONT_ENUM);
     }
     object_value(o.ptr())
@@ -3844,7 +3848,7 @@ pub(crate) fn caught(vm: &mut Vm, e: &Error) -> Value {
     }
     let mut u: Vec<u16> = e.0.encode_utf16().collect();
     u.truncate(crate::vm::MAX_STRING_LEN);
-    vm.new_string(&u)
+    vm.mu().new_string(&u).v()
 }
 
 /// `Error.prototype.toString`: `name: message`, or either alone if the
@@ -4134,7 +4138,7 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
     set_last_index(vm, r, 0.0)?;
     let su = string_units(s).unwrap_or(&[]).to_vec();
-    let out = vm.new_array();
+    let out = vm.mu().new_array().v();
     let mut n = 0;
     // (`out` rooted across `exec`'s calls.)
     let held = Scope::new(vm);
@@ -4151,7 +4155,7 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
             let _held = sc.roots([res]);
             get_units(vm, res, "0")
         }?;
-        let mv = vm.new_string(&m);
+        let mv = vm.mu().new_string(&m).v();
         crate::vm::array_push(vm, out, &[mv])?;
         n += 1;
         if m.is_empty() {
@@ -4258,7 +4262,7 @@ fn substitution(
             }
             0x3C if !named.is_undefined() => match t[i + 2..].iter().position(|&c| c == b'>' as u16) {
                 Some(k) => {
-                    let name = vm.new_string(&t[i + 2..i + 2 + k]);
+                    let name = vm.mu().new_string(&t[i + 2..i + 2 + k]).v();
                     let key = crate::intrinsics::to_property_key(vm, name)?;
                     let sc_v = Scope::new(vm);
                     let v = vm.get_key_b(named, key)?.root(&sc_v);
@@ -4358,11 +4362,11 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
                     // (Each string in the handles as it is made: a `Vec` is no
                     // root.)
                     let v = vm.handle_scope(|vm| {
-                        let mut args = vec![vm.new_string(&matched)];
+                        let mut args = vec![vm.mu().new_string(&matched).v()];
                         vm.handles.push(args[0]);
                         for c in &caps {
                             let v = match c {
-                                Some(u) => vm.new_string(u),
+                                Some(u) => vm.mu().new_string(u).v(),
                                 None => Value::UNDEFINED,
                             };
                             vm.handles.push(v);
@@ -4533,13 +4537,13 @@ fn rx_split(vm: &mut Vm, r: Value, s: Value, limit: Value) -> Result<Value> {
         if !flags_have(&flags, b'y') {
             flags.push(b'y' as u16);
         }
-        let fv = vm.new_string(&flags);
+        let fv = vm.mu().new_string(&flags).v();
         Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv])?, unicode))
     })?;
     let out = {
         let sc = Scope::new(vm);
         let _held = sc.roots([splitter]);
-        vm.new_array()
+        vm.mu().new_array().v()
     };
     {
         let sc = Scope::new(vm);
@@ -4588,7 +4592,7 @@ fn rx_split_with(vm: &mut Vm, s: Value, limit: Value, splitter: Value, out: Valu
             q = advance(&su, q as f64, unicode) as usize;
             continue;
         }
-        let part = vm.new_string(&su[p..q]);
+        let part = vm.mu().new_string(&su[p..q]).v();
         crate::vm::array_push(vm, out, &[part])?;
         n += 1.0;
         if n == lim {
@@ -4607,7 +4611,7 @@ fn rx_split_with(vm: &mut Vm, s: Value, limit: Value, splitter: Value, out: Valu
         }
         q = p;
     }
-    let part = vm.new_string(&su[p.min(size)..]);
+    let part = vm.mu().new_string(&su[p.min(size)..]).v();
     crate::vm::array_push(vm, out, &[part])?;
     Ok(out)
 }
@@ -4623,7 +4627,7 @@ fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     // across the getters and conversion after.)
     let (matcher, flags) = vm.rooted(&[c], |vm| {
         let flags = get_units(vm, r, "flags")?;
-        let fv = vm.new_string(&flags);
+        let fv = vm.mu().new_string(&flags).v();
         Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv])?, flags))
     })?;
     let held = Scope::new(vm);

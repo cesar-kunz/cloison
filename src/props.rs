@@ -356,7 +356,7 @@ impl Vm {
         let name = unsafe { &(*f.code()).name };
         let name = if name.starts_with('<') { "" } else { name.as_str() };
         let u = crate::js::lex::to_units(name);
-        self.new_string(&u)
+        self.mu().new_string(&u).v()
     }
 
     /// The string a string object (a wrapper) or a string `o` holds.
@@ -600,7 +600,7 @@ impl Vm {
     /// A new array of `values` (on the native stack, which the collector
     /// scans): its elements' type found once, then each only written.
     pub(crate) fn array_of(&mut self, values: &[Value]) -> Value {
-        let a = self.new_array();
+        let a = self.mu().new_array().v();
         if values.is_empty() {
             return a;
         }
@@ -624,7 +624,7 @@ impl Vm {
 
     /// A new array of the `n` values `at` gives (it may allocate).
     pub(crate) fn array_of_with(&mut self, n: usize, mut at: impl FnMut(&mut Vm, usize) -> Value) -> Value {
-        let a = self.new_array();
+        let a = self.mu().new_array().v();
         let o = Obj::of(a);
         self.reserve_elems(o, n);
         for i in 0..n {
@@ -1357,7 +1357,7 @@ impl Vm {
     }
 
     fn descriptor_object(&mut self, d: &Desc, proto: Value) -> Value {
-        let o = self.new_plain(proto);
+        let o = self.mu().new_plain(proto).obj();
         let fields: [(Atom, Option<Value>); 6] = [
             (self.a_value, d.value),
             (self.a_writable, d.writable.map(Value::from_bool)),
@@ -1383,7 +1383,7 @@ impl Vm {
         if v.is_undefined() || v.is_null() {
             return Err(Error::type_error(format!("Cannot convert {} to object", crate::vm::shown(v))));
         }
-        Ok(Obj::of(self.new_wrapper(v)))
+        Ok(Obj::of(self.mu().new_wrapper(v).v()))
     }
 
     /// ToPropertyKey of `v`.
@@ -1726,7 +1726,7 @@ fn object_create(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::type_error("Object prototype may only be an Object or null"));
     }
     let sc = Scope::new(vm);
-    let o = vm.mu().make(|vm| object_value(vm.new_plain(proto).ptr())).root(&sc).v();
+    let o = vm.mu().make(|vm| vm.mu().new_plain(proto).v()).root(&sc).v();
     if !arg(&a, 1).is_undefined() {
         let descs = descriptors(vm, arg(&a, 1))?.root(&sc);
         define_all(vm, Obj::of(o), &descs)?;
@@ -1763,13 +1763,16 @@ fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
     if vm.plain_named(o) {
         let slots = vm.listed_slots(o, all, false).unwrap_or_default();
         // (The shape read at each: a string made may collect, not change it.)
-        return Ok(vm.array_of_with(slots.len(), |vm, i| {
-            let a = o.shape().live().keys()[slots[i] as usize];
-            vm.atom_string(a)
-        }));
+        return Ok(vm
+            .mu()
+            .array_of_with(slots.len(), |vm, i| {
+                let a = o.shape().live().keys()[slots[i] as usize];
+                vm.atom_string(a)
+            })
+            .v());
     }
     let keys = vm.own_keys(o);
-    let arr = vm.new_array();
+    let arr = vm.mu().new_array().v();
     let mut values = Vec::with_capacity(keys.len());
     vm.handle_scope(|vm| {
         for (key, enumerable) in keys {
@@ -1993,16 +1996,22 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
     if vm.plain_named(o)
         && let Some(slots) = vm.listed_slots(o, false, true)
     {
-        return Ok(vm.array_of_with(slots.len(), |vm, i| {
-            let k = slots[i];
-            let value = |o: Obj| o.field(k);
-            if !entries {
-                return value(o);
-            }
-            let name = vm.atom_string(o.shape().live().keys()[k as usize]);
-            let pair = [name, value(o)];
-            vm.array_of(&pair)
-        }));
+        return Ok(vm
+            .mu()
+            .array_of_with(slots.len(), |vm, i| {
+                let k = slots[i];
+                let value = |o: Obj| o.field(k);
+                if !entries {
+                    return value(o);
+                }
+                let name = vm.atom_string(o.shape().live().keys()[k as usize]);
+                let pair = [name, value(o)];
+                // (Within `array_of_with`'s maker, where nothing collects.)
+                #[allow(clippy::disallowed_methods)]
+                let pair = vm.array_of(&pair);
+                pair
+            })
+            .v());
     }
     // (A wrapper `o`, and `out`, held across getters: rooted.)
     let sc = Scope::new(vm);
@@ -2023,7 +2032,7 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
         // (The pair made, and filled, where nothing collects.)
         let item = if entries {
             let k = vm.key_string(key);
-            let pair = vm.new_array();
+            let pair = vm.mu().new_array().v();
             crate::vm::array_push(vm, pair, &[k, v])?;
             pair
         } else {
@@ -2049,7 +2058,7 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: Args<'_>) -> Re
     let sc = Scope::new(vm);
     let o = Obj::of(vm.to_object_b(arg(&a, 0))?.root(&sc).v());
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
     for key in crate::proxy::own_keys(vm, o)? {
         if let Some(d) = vm.own_property_b(o, key)?.take() {
             // (Its object made where nothing collects; defined on a new
@@ -2072,7 +2081,7 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // and conversion after it: rooted.)
     let sc = Scope::new(vm);
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
     crate::symbol::iterate(vm, it, |vm, entry| {
         if !is_object(entry) {
             return Err(Error::type_error(format!(
@@ -2126,7 +2135,7 @@ pub(crate) fn group_by(
 /// `Object.groupBy(items, callback)`: a null-prototype object of arrays.
 fn object_group_by(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
-    let out = vm.mu().make(|vm| object_value(vm.new_plain(Value::NULL).ptr())).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(Value::NULL).v()).root(&sc).v();
     group_by(vm, &a, |vm, key, v| {
         let key = crate::intrinsics::to_property_key(vm, key)?;
         // (`out` has no prototype and only these arrays: reading, defining
@@ -2134,7 +2143,7 @@ fn object_group_by(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         let group = match vm.own_property(Obj::of(out), key) {
             Some(_) => vm.get_key_b(out, key)?.take(),
             None => {
-                let g = vm.new_array();
+                let g = vm.mu().new_array().v();
                 vm.create_data_property(out, key, g)?;
                 g
             }

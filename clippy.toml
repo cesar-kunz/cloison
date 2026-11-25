@@ -1,0 +1,16 @@
+# A cell a native allocates is a `Gc` (brand.rs): it can't be held across a
+# call that may collect without the compiler seeing it. The VM's core, which
+# roots its values itself, allows these (`#![allow(clippy::disallowed_methods)]`).
+disallowed-methods = [
+    { path = "cloison::vm::Vm::new_array", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::new_string", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::new_plain", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::new_object_with", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::array_of", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::array_of_with", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::new_string_with", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::new_string_raw", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::new_wrapper", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::new_cons", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "cloison::vm::Vm::from_descriptor", reason = "allocate through vm.mu(), which gives a Gc" },
+]

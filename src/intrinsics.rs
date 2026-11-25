@@ -156,7 +156,7 @@ pub(crate) fn to_string(vm: &mut Vm, v: Value) -> Result<Value> {
     if vm.conv_thrown {
         return Err(vm.take_conv_error());
     }
-    Ok(vm.new_string(&units))
+    Ok(vm.mu().new_string(&units).v())
 }
 
 /// ToPropertyKey, its errors thrown.
@@ -262,7 +262,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
             vm.construct_this(o)
         } else {
             let proto = prototype_of_target(vm, nt)?;
-            object_value(vm.new_plain(proto).ptr())
+            vm.mu().new_plain(proto).v()
         };
         if code.uses_new_target {
             vm.new_target = nt;
@@ -382,7 +382,7 @@ fn template(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             crate::vm::push_string(&mut units, s)?;
         }
     }
-    Ok(vm.new_string(&units))
+    Ok(vm.mu().new_string(&units).v())
 }
 
 /// A template literal's substitution `[e]` as its ToString, before the
@@ -422,8 +422,8 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (strings, raw) = if a.len() == 3 && crate::props::is_object(a[1]) {
         (a[1], a[2])
     } else {
-        let strings = vm.new_array();
-        let raw = vm.new_array();
+        let strings = vm.mu().new_array().v();
+        let raw = vm.mu().new_array().v();
         for pair in a[1..].chunks(2) {
             crate::vm::array_push(vm, strings, &[pair[0]])?;
             crate::vm::array_push(vm, raw, &[pair[1]])?;
@@ -548,7 +548,7 @@ fn class_setup(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         (p.peek(), h)
     };
-    let proto = object_value(vm.new_plain(proto_parent).ptr());
+    let proto = vm.mu().new_plain(proto_parent).v();
     let a_constructor = vm.intern_name("constructor");
     let d = Desc::data(f, true, false, true);
     vm.define_own_property(Obj::of(proto), Key::Name(a_constructor), &d)?;
@@ -593,7 +593,7 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
         let s = vm.to_string_b(k)?;
         crate::vm::push_string(&mut units, s.peek())?;
     }
-    let name = vm.new_string(&units);
+    let name = vm.mu().new_string(&units).v();
     let a_name = vm.a_name;
     let d = Desc::data(name, false, false, true);
     vm.define_own_property(Obj::of(f), Key::Name(a_name), &d)?;
@@ -827,7 +827,7 @@ fn pattern_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// An array pattern's rest: `[iterator]`'s remaining values.
 fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let out = vm.new_array();
+    let out = vm.mu().new_array().v();
     if a[0].is_undefined() {
         return Ok(out);
     }
@@ -880,7 +880,7 @@ fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
     };
     let sc = Scope::new(vm);
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| object_value(vm.new_plain(op).ptr())).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
     for key in crate::proxy::own_keys(vm, src)? {
         if excluded.contains(&key)
             || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
@@ -977,7 +977,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     if a.get(5) == Some(&Value::TRUE) && !own_strict && declared.iter().any(|&n| vm.atom_name(n) == "arguments") {
         return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None, 0));
     }
-    let local = object_value(vm.new_plain(Value::NULL).ptr());
+    let local = vm.mu().new_plain(Value::NULL).v();
     // (Declared in the function's scope object, under the scope objects
     // of the other bindings it sees: see `Gen::call`.)
     let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
@@ -1161,7 +1161,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // `parse::parse_pass`.)
     let decl = a[6];
     let local = if own_strict || !crate::props::is_object(decl) {
-        object_value(vm.new_plain(Value::NULL).ptr())
+        vm.mu().new_plain(Value::NULL).v()
     } else {
         Value::UNDEFINED
     };
@@ -1230,7 +1230,7 @@ fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) 
     let mut made = Vec::new();
     for i in 0..=scopes.len() {
         if places.contains(&i) {
-            let s = object_value(vm.new_plain(Value::NULL).ptr());
+            let s = vm.mu().new_plain(Value::NULL).v();
             vm.handles.push(s);
             bound_accessors(vm, s, carrier, &bindings, i)?;
             made.push(s);
@@ -1308,7 +1308,7 @@ fn eval_env(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// a prototype drops every function's compiled code.)
 fn null_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let capacity = a[0].as_number().unwrap_or(0.0) as u32;
-    Ok(object_value(vm.new_object_with(crate::object::Class::Plain, Value::NULL, capacity).ptr()))
+    Ok(vm.mu().new_object_with(crate::object::Class::Plain, Value::NULL, capacity).v())
 }
 
 /// ToObject: `[v]` (a `with` statement's object).
@@ -1932,7 +1932,7 @@ fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let o = if crate::props::is_object(a[3]) {
         a[3]
     } else {
-        let o = object_value(vm.new_plain(Value::NULL).ptr());
+        let o = vm.mu().new_plain(Value::NULL).v();
         bound_accessors(vm, o, bindings, &site_bindings(a[2]).2, place)?;
         o
     };
@@ -2153,7 +2153,7 @@ fn annex_b_start(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             continue;
         }
         if record.is_undefined() {
-            record = object_value(vm.new_plain(Value::NULL).ptr());
+            record = vm.mu().new_plain(Value::NULL).v();
         }
         vm.create_data_property(record, Key::Name(name), Value::TRUE)?;
     }

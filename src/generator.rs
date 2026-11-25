@@ -124,8 +124,8 @@ pub(crate) fn create(vm: &mut Vm, f: Obj) -> Result<Value> {
         if crate::props::is_object(p.peek()) { p.peek() } else { object_value((vm.symbol_roots[root as usize]).ptr()) };
     let code = f.code();
     let n = cells_for(code.live().kind) + code.live().nregs as usize;
-    let queue = if is_async { vm.new_array() } else { Value::UNDEFINED };
-    let g = vm.new_object_with(Class::Generator, proto, 0);
+    let queue = if is_async { vm.mu().new_array().v() } else { Value::UNDEFINED };
+    let g = vm.mu().new_object_with(Class::Generator, proto, 0).obj();
     let st = vm.heap.alloc_values(n);
     let mut cells = vec![
         Value::from_i32(SUSPENDED_START),
@@ -472,16 +472,16 @@ fn generator_throw(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 /// `%GeneratorPrototype%`: next, return, throw; its iterator itself.
 pub(crate) fn install(vm: &mut Vm) {
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
-    let gp = vm.new_plain(object_value(ip.ptr()));
+    let gp = vm.mu().new_plain(object_value(ip.ptr())).obj();
     vm.symbol_roots.push(gp);
     // `%AsyncIteratorPrototype%` (its async iterator itself) and
     // `%AsyncGeneratorPrototype%`.
     let op = object_value(vm.object_prototype);
-    let aip = vm.new_plain(op);
+    let aip = vm.mu().new_plain(op).obj();
     let a_async_iterator = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     let f = vm.native_function("[Symbol.asyncIterator]", return_this, 0, crate::jit::Ty::Any, false);
     vm.add_property_with(aip, a_async_iterator, object_value(f.ptr()), DONT_ENUM);
-    let agp = vm.new_plain(object_value(aip.ptr()));
+    let agp = vm.mu().new_plain(object_value(aip.ptr())).obj();
     vm.symbol_roots.push(agp);
     vm.define_natives(
         agp,
@@ -525,7 +525,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ("AsyncGeneratorFunction", crate::builtins::async_generator_function_ctor, agp.ptr()),
     ] {
         let generator = !instances.is_null();
-        let proto = vm.new_plain(fp);
+        let proto = vm.mu().new_plain(fp).obj();
         vm.symbol_roots.push(proto);
         let c = vm.native_function(name, ctor, 1, crate::jit::Ty::Any, true);
         vm.symbol_roots.push(c);

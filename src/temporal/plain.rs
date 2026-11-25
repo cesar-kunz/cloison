@@ -96,7 +96,7 @@ fn round_options(vm: &mut Vm, v: Value) -> Result<Value> {
         return Err(type_err("options parameter is required"));
     }
     if is_string(v) {
-        let o = object_value(vm.new_plain(Value::NULL).ptr());
+        let o = vm.mu().new_plain(Value::NULL).v();
         let a = vm.intern_name("smallestUnit");
         vm.add_property(Obj::of(o), a, v);
         return Ok(o);

@@ -122,7 +122,7 @@ pub(crate) fn slots(v: Value) -> Option<Slots> {
 /// A new object of `slots`'s class (its intrinsic prototype).
 pub(crate) fn create(vm: &mut Vm, slots: Slots) -> Value {
     let proto = object_value(vm.temporal.protos[slots.kind() as usize]);
-    let o = vm.new_object_with(Class::Temporal, proto, 0);
+    let o = vm.mu().new_object_with(Class::Temporal, proto, 0).obj();
     let bytes = vm.heap.alloc_bytes(size_of::<Slots>());
     unsafe {
         bytes.cast::<Slots>().write_unaligned(slots);
@@ -158,7 +158,7 @@ pub(crate) fn arg(a: &[Value], i: usize) -> Value {
 
 pub(crate) fn string(vm: &mut Vm, s: &str) -> Value {
     let u: Vec<u16> = s.encode_utf16().collect();
-    vm.new_string(&u)
+    vm.mu().new_string(&u).v()
 }
 
 fn range(msg: impl Into<String>) -> Error {
@@ -250,7 +250,7 @@ pub(crate) fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
         let o = match vm.temporal.no_options {
             Some(o) => o,
             None => {
-                let o = vm.new_plain(Value::NULL).ptr();
+                let o = vm.mu().new_plain(Value::NULL).obj().ptr();
                 *vm.temporal.no_options.insert(o)
             }
         };
@@ -802,7 +802,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    let temporal = vm.new_plain(op);
+    let temporal = vm.mu().new_plain(op).obj();
     let a = vm.intern_name("Temporal");
     vm.add_property_with(g, a, object_value(temporal.ptr()), crate::object::DONT_ENUM);
     crate::symbol::to_string_tag(vm, temporal, "Temporal");
@@ -819,7 +819,7 @@ pub(crate) fn install(vm: &mut Vm) {
         duration::spec(),
     ];
     for spec in specs {
-        let proto = vm.new_plain(op);
+        let proto = vm.mu().new_plain(op).obj();
         let c = vm.define_native(temporal, spec.name, spec.ctor, spec.length, any, true);
         crate::builtins::link_constructor(vm, c, proto);
         vm.define_natives(c, spec.statics);

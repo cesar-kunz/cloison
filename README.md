@@ -30,6 +30,9 @@ copy-and-patch JIT, in one small static binary.
   ECharts, Sass, MathJax and more; interpreted, the fastest interpreter
   measured: 1.09× V8's Ignition, 2.9× SpiderMonkey's interpreter.
 - **A generational, concurrent collector** that evacuates fragmented blocks.
+- **GC safety in the Rust code checked by the compiler**: an object held
+  across a call that may collect without being rooted is a compile error
+  ([how](#gc-safety-the-compiler-checks)).
 - **Numbers match V8's bit for bit** (fdlibm `Math`, shortest round-trip
   printing), but for `pow`, within one ulp of it.
 - **Linux** (x86-64, arm64) and **macOS** on Apple silicon; nightly Rust,
@@ -67,6 +70,37 @@ and KetteVM:
 - [Real web apps](docs/bench/webapps.md): 15 open-source applications, time and what is still slow
 - [Memory](docs/bench/memory.md): sizes, startup, peak RSS
 - [V8's tiers](docs/octane-tiers.md): cloison against Ignition, Sparkplug, Maglev and Turbofan over time
+
+## GC safety the compiler checks
+
+The collector runs inside the engine's Rust code: a built-in such as
+`Array.prototype.map` calls back into JavaScript, which may collect. An
+object the Rust code holds in a local across such a call must be rooted,
+or it may be freed while still in use. In cloison the type system tracks
+this, in the manner of [gc-arena](https://github.com/kyren/gc-arena):
+
+```rust
+let raw = vm.get_b(o, "raw")?;        // a Fresh value: it still borrows the VM
+let n = vm.length_of(o)?;             // error[E0499]: may collect while `raw` is held
+```
+
+```rust
+let s = Scope::new(vm);
+let raw = vm.get_b(o, "raw")?.root(&s); // rooted: safe across any call
+let n = vm.length_of(o)?;
+```
+
+- what a call that may collect returns, and every new object or string,
+  borrows the VM until it is rooted or used, so holding one across the
+  next call doesn't compile;
+- built-ins receive their arguments as a type only rooted values can
+  become;
+- the few places that take a raw value out for speed say why it is safe,
+  and CI checks that each says so.
+
+It costs nothing measurable on Octane, and turned up four real bugs on
+the way. [docs/gc-branding.md](docs/gc-branding.md) explains it from the
+start.
 
 ## More
 

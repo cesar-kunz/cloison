@@ -7,7 +7,6 @@ use super::iso::{self, DateTime, IsoDate, RoundingMode, Time, Unit};
 use super::*;
 use crate::brand::Args;
 use crate::brand::Fresh;
-use crate::object::Obj;
 
 // ---- Shared getters ----
 
@@ -102,11 +101,11 @@ fn round_options_raw(vm: &mut Vm, v: Value) -> Result<Value> {
         return Err(type_err("options parameter is required"));
     }
     if is_string(v) {
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let o = vm.mu().new_plain(Value::NULL).v();
-        let a = vm.intern_name("smallestUnit");
-        vm.add_property(Obj::of(o), a, v);
-        return Ok(o);
+        let mu = vm.mu();
+        let o = mu.new_plain(Value::NULL);
+        let a = mu.intern_name("smallestUnit");
+        mu.add_property(o, a, v);
+        return Ok(o.v());
     }
     options_object(vm, v).map(Fresh::take)
 }

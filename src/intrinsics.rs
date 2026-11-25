@@ -443,13 +443,13 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     } else {
         let sc_strings = Scope::new(vm);
         let strings = vm.mu().new_array().root(&sc_strings);
-        // take: only calls that don't collect follow (allocation, stores, filling it).
-        let raw = vm.mu().new_array().v();
+        // raw: only calls that don't collect follow (allocation, stores, filling it).
+        let raw = vm.mu().new_array().raw();
         for pair in a[1..].chunks(2) {
             crate::vm::array_push(vm, strings.v(), &[pair[0]])?;
-            crate::vm::array_push(vm, raw, &[pair[1]])?;
+            crate::vm::array_push(vm, raw.v(), &[pair[1]])?;
         }
-        (strings.v(), raw)
+        (strings.v(), raw.v())
     };
     vm.seal(Obj::of(raw), true);
     let a_raw = vm.intern_name("raw");
@@ -615,10 +615,10 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
         let s = vm.to_string_b(k)?;
         crate::vm::push_string(&mut units, s.peek())?;
     }
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let name = vm.mu().new_string(&units).v();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let name = vm.mu().new_string(&units).raw();
     let a_name = vm.a_name;
-    let d = Desc::data(name, false, false, true);
+    let d = Desc::data(name.v(), false, false, true);
     vm.define_own_property(Obj::of(f), Key::Name(a_name), &d)?;
     Ok(())
 }

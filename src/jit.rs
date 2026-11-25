@@ -18017,6 +18017,8 @@ pub(crate) unsafe fn vm_run(
     pc: usize,
     acc: Value,
 ) -> VmRun {
+    #[cfg(feature = "gc-check")]
+    crate::brand::may_collect(vm);
     let r = unsafe { vm_run_(vm, code, regs, pc, acc) };
     if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) {
         let how = match &r {

@@ -141,14 +141,14 @@ pub(crate) fn install(vm: &mut Vm) {
     );
 
     // `Boolean`, a conversion; booleans' methods.
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let bp = vm.mu().new_object_with(Class::Wrapper, object_value(op.ptr()), 4).obj();
-    unsafe { (*bp.ptr()).code = Value::FALSE.to_bits() as *const crate::vm::Code };
-    vm.boolean_prototype = bp.ptr();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let bp = vm.mu().new_object_with(Class::Wrapper, object_value(op.ptr()), 4).raw_obj();
+    unsafe { (*bp.v().ptr()).code = Value::FALSE.to_bits() as *const crate::vm::Code };
+    vm.boolean_prototype = bp.v().ptr();
     let boolean = vm.define_native(g, "Boolean", boolean_fn, 1, any, true);
-    link_constructor(vm, boolean, bp);
-    vm.define_native(bp, "toString", boolean_to_string, 0, any, false);
-    vm.define_native(bp, "valueOf", boolean_value_of, 0, any, false);
+    link_constructor(vm, boolean, bp.v());
+    vm.define_native(bp.v(), "toString", boolean_to_string, 0, any, false);
+    vm.define_native(bp.v(), "valueOf", boolean_value_of, 0, any, false);
 
     crate::props::install(vm);
 
@@ -237,14 +237,14 @@ pub(crate) fn install(vm: &mut Vm) {
 
     crate::date::install(vm);
     // The test262 host hooks (`$262`), as a shell has them.
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let host = vm.mu().new_plain(object_value(op.ptr())).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let host = vm.mu().new_plain(object_value(op.ptr())).raw_obj();
     let a_host = vm.intern_name("$262");
-    vm.add_property_with(g, a_host, object_value(host.ptr()), DONT_ENUM);
+    vm.add_property_with(g, a_host, object_value(host.v().ptr()), DONT_ENUM);
     let a_global = vm.intern_name("global");
-    vm.add_property_with(host, a_global, object_value(g.ptr()), DONT_ENUM);
+    vm.add_property_with(host.v(), a_global, object_value(g.ptr()), DONT_ENUM);
     vm.define_natives(
-        host,
+        host.v(),
         &[
             ("evalScript", eval_script as NativeFn, 1),
             ("gc", host_gc, 0),
@@ -252,8 +252,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("createRealm", crate::realm::host_create_realm, 0),
         ],
     );
-    crate::agent::install(vm, host);
-    crate::module::install(vm, host);
+    crate::agent::install(vm, host.v());
+    crate::module::install(vm, host.v());
     crate::typed::install(vm);
     crate::collections::install(vm);
     install_regexps(vm);
@@ -275,10 +275,10 @@ pub(crate) fn install(vm: &mut Vm) {
     let mut error_ctor = Value::UNDEFINED;
     for (k, kind) in ERROR_KINDS.iter().enumerate() {
         let parent = vm.error_prototypes.first().copied().unwrap_or(op);
-        // take: only calls that don't collect follow (allocation, stores, filling it).
-        let proto = vm.mu().new_plain(object_value(parent.ptr())).obj();
+        // raw: only calls that don't collect follow (allocation, stores, filling it).
+        let proto = vm.mu().new_plain(object_value(parent.ptr())).raw_obj();
         let c = vm.define_native(g, kind, CTORS[k], 1, any, true);
-        link_constructor(vm, c, proto);
+        link_constructor(vm, c, proto.v());
         // (The kinds' constructors inherit `Error`.)
         if k == 0 {
             error_ctor = object_value(c.ptr());
@@ -286,20 +286,26 @@ pub(crate) fn install(vm: &mut Vm) {
         } else {
             vm.set_prototype_of(c, error_ctor);
         }
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let name = vm.mu().new_string(&kind.encode_utf16().collect::<Vec<_>>()).v();
-        vm.add_property_with(proto, a_name, name, DONT_ENUM);
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let empty = vm.mu().new_string(&[]).v();
-        vm.add_property_with(proto, a_message, empty, DONT_ENUM);
+        // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+        let name = vm.mu().new_string(&kind.encode_utf16().collect::<Vec<_>>()).raw();
+        vm.add_property_with(proto.v(), a_name, name.v(), DONT_ENUM);
+        // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+        let empty = vm.mu().new_string(&[]).raw();
+        vm.add_property_with(proto.v(), a_message, empty.v(), DONT_ENUM);
         if k == 0 {
-            vm.define_native(proto, "toString", error_to_string, 0, any, false);
+            vm.define_native(proto.v(), "toString", error_to_string, 0, any, false);
             let get = vm.native_function("get stack", error_stack_get, 0, any, false);
             let set = vm.native_function("set stack", error_stack_set, 1, any, false);
             let a_stack = vm.intern_name("stack");
-            vm.define_accessor(proto, a_stack, Some(object_value(get.ptr())), Some(object_value(set.ptr())), DONT_ENUM);
+            vm.define_accessor(
+                proto.v(),
+                a_stack,
+                Some(object_value(get.ptr())),
+                Some(object_value(set.ptr())),
+                DONT_ENUM,
+            );
         }
-        vm.error_prototypes.push(proto);
+        vm.error_prototypes.push(proto.v());
     }
 
     // (After the errors: `AggregateError` inherits `Error.prototype`.)
@@ -931,9 +937,9 @@ fn split_key(this: Value, a: &[Value]) -> Option<(u64, u64, usize)> {
 /// A new array of the elements of `from`, an array `split` made (plain,
 /// of the array shape with its elements' type).
 fn array_copy(vm: &mut Vm, from: Value) -> Value {
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let arr = vm.mu().new_array().v();
-    let (o, from) = (Obj::of(arr), Obj::of(from));
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let arr = vm.mu().new_array().raw();
+    let (o, from) = (Obj::of(arr.v()), Obj::of(from));
     let n = from.elems_len() as usize;
     if n > 0 {
         vm.reserve_elems(o, n);
@@ -942,7 +948,7 @@ fn array_copy(vm: &mut Vm, from: Value) -> Value {
         // SAFETY: within the capacity `reserve_elems` made above.
         unsafe { o.set_elems_len(n as u32) };
     }
-    arr
+    arr.v()
 }
 
 fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -1380,9 +1386,9 @@ fn function_bind(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         // take: rooted in `vm.handles` at once.
         let list = if many { crate::array::new_array_of(vm, a.get(1..).unwrap_or(&[]))?.take() } else { Value::EMPTY };
         vm.handles.push(list);
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let name = vm.mu().new_string(&units).v();
-        vm.handles.push(name);
+        // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+        let name = vm.mu().new_string(&units).raw();
+        vm.handles.push(name.v());
         let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + nslots) as u32);
         let own = vm.root_shape(Class::Native, proto, BOUND_OWN as u32);
         let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(full.live())) };
@@ -1594,17 +1600,17 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         }
     }
     let op = object_value(vm.object_prototype);
-    // take: only allocation and stores into it follow: nothing collects.
-    let o = vm.mu().new_plain(op).obj();
+    // raw: only allocation and stores into it follow: nothing collects.
+    let o = vm.mu().new_plain(op).raw_obj();
     let a_length = vm.a_length;
-    vm.add_property_with(o, a_length, Value::from_i32(values.len() as i32), DONT_ENUM);
+    vm.add_property_with(o.v(), a_length, Value::from_i32(values.len() as i32), DONT_ENUM);
     let a_iter = vm.a_sym_iterator;
     let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
     if let Some(f) = values_fn {
-        vm.add_property_with(o, a_iter, object_value(f.ptr()), DONT_ENUM);
+        vm.add_property_with(o.v(), a_iter, object_value(f.ptr()), DONT_ENUM);
     }
     let mark = vm.intern_name(ARGUMENTS_MARK);
-    vm.add_property_with(o, mark, Value::TRUE, DONT_ENUM);
+    vm.add_property_with(o.v(), mark, Value::TRUE, DONT_ENUM);
     let a_callee = vm.intern_name("callee");
     let thrower = vm.throw_type_error_fn();
     let d = crate::props::Desc {
@@ -1614,8 +1620,8 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         configurable: Some(false),
         ..Default::default()
     };
-    let _ = vm.define_own_property(o, crate::vm::Key::Name(a_callee), &d);
-    let ov = object_value(o.ptr());
+    let _ = vm.define_own_property(o.v(), crate::vm::Key::Name(a_callee), &d);
+    let ov = object_value(o.v().ptr());
     // Defined, not set: a prototype's setter for an index isn't called.
     for (i, &v) in values.iter().enumerate() {
         let _ = vm.create_data_property(ov, crate::vm::Key::Index(i as u32), v);
@@ -1625,7 +1631,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
     // which moves its slots). Its own shape is unique, `callee` defined
     // on it: the next ones get one of transitions, with the same keys and
     // attributes, shared.
-    let t = o.shape().live();
+    let t = o.v().shape().live();
     if !t.dictionary && t.keys() == [a_length, a_iter, mark, a_callee] {
         let mut s = vm.root_shape(Class::Plain, op, 4);
         for k in 0..4 {
@@ -1636,7 +1642,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         // `Vm::fixed_shapes`.)
         if (0..4).all(|k| e.live().location(k) == t.location(k)) {
             vm.strict_arguments_shape = e;
-            vm.strict_arguments_callee = o.slot_value(t.location(3));
+            vm.strict_arguments_callee = o.v().slot_value(t.location(3));
         }
     }
     ov
@@ -2427,20 +2433,20 @@ fn install_regexps(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let rp = vm.mu().new_plain(op).obj();
-    vm.regexp_prototype = rp.ptr();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let rp = vm.mu().new_plain(op).raw_obj();
+    vm.regexp_prototype = rp.v().ptr();
     let c = vm.define_native(g, "RegExp", regexp_ctor, 2, any, true);
-    link_constructor(vm, c, rp);
+    link_constructor(vm, c, rp.v());
     vm.define_native(c, "escape", regexp_escape, 1, any, false);
     vm.regexp_constructor = c.ptr();
     install_legacy(vm, c);
     vm.define_natives(
-        rp,
+        rp.v(),
         &[("exec", regexp_exec as NativeFn, 1), ("test", regexp_test, 1), ("toString", regexp_to_string, 0)],
     );
     vm.regexp_atoms[0] = vm.intern_name("exec");
-    vm.regexp_fns[0] = as_object(vm.get_atom_b(object_value(rp.ptr()), vm.regexp_atoms[0]).unwrap().take());
+    vm.regexp_fns[0] = as_object(vm.get_atom_b(object_value(rp.v().ptr()), vm.regexp_atoms[0]).unwrap().take());
     // `[Symbol.match]` and the others: the String methods', the RegExp
     // the pattern.
     let symbols: [(&str, NativeFn, u32); 5] = [
@@ -2453,15 +2459,15 @@ fn install_regexps(vm: &mut Vm) {
     for (k, (name, f, n)) in symbols.into_iter().enumerate() {
         let fo = vm.native_function(&format!("[Symbol.{name}]"), f, n, Ty::Any, false);
         let a = vm.intern_name(&format!("{}Symbol.{name}", crate::symbol::SYMBOL_MARK));
-        vm.add_property_with(rp, a, object_value(fo.ptr()), DONT_ENUM);
+        vm.add_property_with(rp.v(), a, object_value(fo.ptr()), DONT_ENUM);
         vm.regexp_fns[1 + k] = fo.ptr();
         vm.regexp_atoms[1 + k] = a;
     }
     // The flags and the source are accessors of the prototype (an
     // instance has only `lastIndex`: `regexp_object`); `flags`' getter and
     // those it calls noted after the methods, for `pristine`.
-    vm.define_native(rp, "compile", regexp_compile, 2, Ty::Any, false);
-    getter(vm, rp, "source", regexp_get::<0>);
+    vm.define_native(rp.v(), "compile", regexp_compile, 2, Ty::Any, false);
+    getter(vm, rp.v(), "source", regexp_get::<0>);
     let flag_getters: [(&str, NativeFn); 9] = [
         ("flags", regexp_get::<1>),
         ("global", regexp_get::<2>),
@@ -2474,7 +2480,7 @@ fn install_regexps(vm: &mut Vm) {
         ("unicodeSets", regexp_get::<9>),
     ];
     for (k, (name, f)) in flag_getters.into_iter().enumerate() {
-        vm.regexp_fns[6 + k] = (getter(vm, rp, name, f)).ptr();
+        vm.regexp_fns[6 + k] = (getter(vm, rp.v(), name, f)).ptr();
         vm.regexp_atoms[6 + k] = vm.intern_name(name);
     }
 }
@@ -2602,10 +2608,10 @@ fn regexp_literal_raw(vm: &mut Vm, pattern: Value, flags: Value) -> Result<Value
         }
         None => {
             let (p, f) = (units(pattern).into_owned(), String::from_utf16_lossy(&units(flags)));
-            // take: nothing collects before its last use.
-            let made = new_regexp(vm, &p, &f)?.take();
-            vm.regexp_literals.insert(key, regexp_of(made).unwrap());
-            return Ok(made);
+            // raw: nothing collects before its last use.
+            let made = new_regexp(vm, &p, &f)?.raw();
+            vm.regexp_literals.insert(key, regexp_of(made.v()).unwrap());
+            return Ok(made.v());
         }
     };
     Ok(regexp_object(vm, re, pattern))
@@ -2615,33 +2621,33 @@ fn regexp_literal_raw(vm: &mut Vm, pattern: Value, flags: Value) -> Result<Value
 /// `RegExp.prototype.source` reads).
 fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) -> Value {
     let proto = object_value(vm.regexp_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let o = vm.mu().new_object_with(Class::RegExp, proto, 3).obj();
-    unsafe { (*o.ptr()).code = re.cast() };
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let o = vm.mu().new_object_with(Class::RegExp, proto, 3).raw_obj();
+    unsafe { (*o.v().ptr()).code = re.cast() };
     let props = [(vm.a_last_index, Value::from_i32(0)), (vm.a_regexp_source, source)];
     // The shape with both found once: then only their stores.
-    let root = o.shape();
+    let root = o.v().shape();
     if vm.regexp_shapes.0 == root {
         // SAFETY: the cached shape is a RegExp's with these two slots, and
         // `o` was made with room for three in the object. (Not
         // `set_shape`: its checks cost 0.5% instructions on Octane's
         // RegExp, which makes one of these per literal evaluated.)
-        unsafe { crate::object::set_shape_unchecked(o.ptr(), vm.regexp_shapes.1) };
+        unsafe { crate::object::set_shape_unchecked(o.v().ptr(), vm.regexp_shapes.1) };
         for (slot, (_, v)) in props.into_iter().enumerate() {
-            vm.store_field(o, slot as u32, v);
+            vm.store_field(o.v(), slot as u32, v);
         }
-        note_realm(vm, o);
-        return object_value(o.ptr());
+        note_realm(vm, o.v());
+        return object_value(o.v().ptr());
     }
     for (a, v) in props {
         let attrs = if a == vm.a_last_index { DONT_ENUM | DONT_DELETE } else { DONT_ENUM | READ_ONLY | DONT_DELETE };
-        vm.add_property_with(o, a, v, attrs);
+        vm.add_property_with(o.v(), a, v, attrs);
     }
-    if !root.live().unique && !o.shape().live().unique {
-        vm.regexp_shapes = (root, o.shape());
+    if !root.live().unique && !o.v().shape().live().unique {
+        vm.regexp_shapes = (root, o.v().shape());
     }
-    note_realm(vm, o);
-    object_value(o.ptr())
+    note_realm(vm, o.v());
+    object_value(o.v().ptr())
 }
 
 /// A `RegExp`'s realm, if not the first (see `realm`): a hidden key's
@@ -3017,9 +3023,9 @@ fn match_array_raw(
     s: &[u16],
     input: Value,
 ) -> Result<Value> {
-    // take: only allocation and stores into it follow: nothing collects.
-    let arr = vm.mu().new_array().v();
-    let o = Obj::of(arr);
+    // raw: only allocation and stores into it follow: nothing collects.
+    let arr = vm.mu().new_array().raw();
+    let o = Obj::of(arr.v());
     vm.reserve_elems(o, caps.len());
     // The groups straight into its elements, the length counting each
     // (a collection while a string is made sees them), then the shape
@@ -3063,9 +3069,9 @@ fn match_array_raw(
         let sc_indices = Scope::new(vm);
         let indices = match_indices(vm, re, caps)?.root(&sc_indices);
         let a_indices = vm.intern_name("indices");
-        vm.create_data_property(arr, crate::vm::Key::Name(a_indices), indices.peek())?;
+        vm.create_data_property(arr.v(), crate::vm::Key::Name(a_indices), indices.peek())?;
     }
-    Ok(arr)
+    Ok(arr.v())
 }
 
 /// A `d` match's `indices`: each group's `[start, end]` (`undefined` if it
@@ -3078,35 +3084,35 @@ fn match_indices<'v>(vm: &'v mut Vm, re: &crate::regexp::Regex, caps: &[Option<(
 fn match_indices_raw(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>]) -> Result<Value> {
     let pair = |vm: &mut Vm, c: Option<(usize, usize)>| -> Result<Value> {
         let Some((a, b)) = c else { return Ok(Value::UNDEFINED) };
-        // take: only calls that don't collect follow (allocation, stores, filling it).
-        let p = vm.mu().new_array().v();
-        crate::vm::array_push(vm, p, &[Value::from_i32(a as i32), Value::from_i32(b as i32)])?;
-        Ok(p)
+        // raw: only calls that don't collect follow (allocation, stores, filling it).
+        let p = vm.mu().new_array().raw();
+        crate::vm::array_push(vm, p.v(), &[Value::from_i32(a as i32), Value::from_i32(b as i32)])?;
+        Ok(p.v())
     };
-    // take: only allocation and stores into it follow: nothing collects.
-    let indices = vm.mu().new_array().v();
+    // raw: only allocation and stores into it follow: nothing collects.
+    let indices = vm.mu().new_array().raw();
     for &c in caps {
         let p = pair(vm, c)?;
-        crate::vm::array_push(vm, indices, &[p])?;
+        crate::vm::array_push(vm, indices.v(), &[p])?;
     }
     let groups = if re.names.is_empty() {
         Value::UNDEFINED
     } else {
-        // take: only allocation and stores into it follow: nothing collects.
-        let groups = vm.mu().new_plain(Value::NULL).v();
+        // raw: only allocation and stores into it follow: nothing collects.
+        let groups = vm.mu().new_plain(Value::NULL).raw();
         for (k, (name, _)) in re.names.iter().enumerate() {
             if re.names[..k].iter().any(|(n, _)| n == name) {
                 continue;
             }
             let p = pair(vm, group_match(&re.names, name, caps))?;
             let key = vm.intern_name(name);
-            vm.create_data_property(groups, crate::vm::Key::Name(key), p)?;
+            vm.create_data_property(groups.v(), crate::vm::Key::Name(key), p)?;
         }
-        groups
+        groups.v()
     };
     let a_groups = vm.intern_name("groups");
-    vm.create_data_property(indices, crate::vm::Key::Name(a_groups), groups)?;
-    Ok(indices)
+    vm.create_data_property(indices.v(), crate::vm::Key::Name(a_groups), groups)?;
+    Ok(indices.v())
 }
 
 /// The match of the group named `name` (of those of that name, in
@@ -3133,8 +3139,8 @@ fn named_groups_raw(
     caps: &[Option<(usize, usize)>],
     s: &[u16],
 ) -> Result<Value> {
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let groups = vm.mu().new_plain(Value::NULL).v();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let groups = vm.mu().new_plain(Value::NULL).raw();
     for (k, (name, _)) in re.names.iter().enumerate() {
         if re.names[..k].iter().any(|(n, _)| n == name) {
             continue;
@@ -3144,9 +3150,9 @@ fn named_groups_raw(
             None => Value::UNDEFINED,
         };
         let key = vm.intern_name(name);
-        vm.create_data_property(groups, crate::vm::Key::Name(key), v)?;
+        vm.create_data_property(groups.v(), crate::vm::Key::Name(key), v)?;
     }
-    Ok(groups)
+    Ok(groups.v())
 }
 
 fn regexp_exec(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -3472,10 +3478,10 @@ fn match_with_raw(vm: &mut Vm, s: &[u16], rv: Value, input: Value) -> Result<Val
     if found.is_empty() {
         return Ok(Value::NULL);
     }
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let arr = vm.mu().new_array().v();
-    crate::vm::array_push(vm, arr, &found)?;
-    Ok(arr)
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let arr = vm.mu().new_array().raw();
+    crate::vm::array_push(vm, arr.v(), &found)?;
+    Ok(arr.v())
 }
 
 fn string_search(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -3768,15 +3774,15 @@ fn regexp_split_raw(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Op
         Some(v) if !v.is_undefined() => crate::interp::to_int32(to_number(v)) as u32 as usize,
         _ => usize::MAX,
     };
-    // take: only allocation and stores into it follow: nothing collects.
-    let arr = vm.mu().new_array().v();
+    // raw: only allocation and stores into it follow: nothing collects.
+    let arr = vm.mu().new_array().raw();
     if limit == 0 {
-        return Ok(arr);
+        return Ok(arr.v());
     }
     // The pieces so far, appended as they are made (see `split_fast`).
     let mut n = 0;
     let mut push = |vm: &mut Vm, v: Value| {
-        append(vm, arr, v);
+        append(vm, arr.v(), v);
         n += 1;
         n == limit
     };
@@ -3834,7 +3840,7 @@ fn regexp_split_raw(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Op
             push(vm, v);
         }
     }
-    Ok(arr)
+    Ok(arr.v())
 }
 
 // ---- Errors ----
@@ -3855,9 +3861,9 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Valu
     if crate::props::is_object(options) {
         let a_cause = vm.intern_name("cause");
         if vm.has_key(options, crate::vm::Key::Name(a_cause))? {
-            // take: stored at once; nothing between collects.
-            let cause = vm.get_atom_b(options, a_cause)?.take();
-            vm.add_property_with(Obj::of(e), a_cause, cause, DONT_ENUM);
+            // raw: stored at once; nothing between collects.
+            let cause = vm.get_atom_b(options, a_cause)?.raw();
+            vm.add_property_with(Obj::of(e), a_cause, cause.v(), DONT_ENUM);
         }
     }
     Ok(e)
@@ -3928,16 +3934,15 @@ fn error_stack_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 /// nothing pending, see `Vm::new_string_with`).
 pub(crate) fn make_error(vm: &mut Vm, k: usize, message: Option<&[u16]>) -> Value {
     let proto = vm.error_prototypes[k];
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_plain(object_value(proto.ptr())).obj();
-    unsafe { (*o.ptr()).flags |= crate::object::ERROR };
+    let mu = vm.mu();
+    let o = mu.new_plain(object_value(proto.ptr()));
+    unsafe { (*o.obj().ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
-        let a = vm.intern_name("message");
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let m = vm.mu().new_string(&m[..m.len().min(crate::vm::MAX_STRING_LEN)]).v();
-        vm.add_property_with(o, a, m, DONT_ENUM);
+        let a = mu.intern_name("message");
+        let m = mu.new_string(&m[..m.len().min(crate::vm::MAX_STRING_LEN)]);
+        mu.add_property_with(o, a, m.v(), DONT_ENUM);
     }
-    object_value(o.ptr())
+    o.v()
 }
 
 /// The value a `catch` gets for a runtime error `e`: an error object of

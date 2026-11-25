@@ -43,29 +43,29 @@ const WORD: usize = Granularity::Word as usize;
 
 pub(super) fn install(vm: &mut Vm, intl: Obj) {
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let proto = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let proto = vm.mu().new_plain(op).raw_obj();
     let c = vm.define_native(intl, "Segmenter", segmenter_ctor, 0, crate::jit::Ty::Any, true);
-    crate::builtins::link_constructor(vm, c, proto);
+    crate::builtins::link_constructor(vm, c, proto.v());
     vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
-    vm.define_natives(proto, &[("resolvedOptions", resolved_options as NativeFn, 0), ("segment", segment, 1)]);
-    crate::symbol::to_string_tag(vm, proto, "Intl.Segmenter");
-    vm.intl_roots[Root::SegmenterPrototype as usize] = proto.ptr();
+    vm.define_natives(proto.v(), &[("resolvedOptions", resolved_options as NativeFn, 0), ("segment", segment, 1)]);
+    crate::symbol::to_string_tag(vm, proto.v(), "Intl.Segmenter");
+    vm.intl_roots[Root::SegmenterPrototype as usize] = proto.v().ptr();
 
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let segments = vm.mu().new_plain(op).obj();
-    vm.define_natives(segments, &[("containing", containing as NativeFn, 1)]);
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let segments = vm.mu().new_plain(op).raw_obj();
+    vm.define_natives(segments.v(), &[("containing", containing as NativeFn, 1)]);
     let iterator = vm.native_function("[Symbol.iterator]", segments_iterator, 0, crate::jit::Ty::Any, false);
     let a = vm.a_sym_iterator;
-    vm.add_property_with(segments, a, object_value(iterator.ptr()), DONT_ENUM);
-    vm.intl_roots[Root::SegmentsPrototype as usize] = segments.ptr();
+    vm.add_property_with(segments.v(), a, object_value(iterator.ptr()), DONT_ENUM);
+    vm.intl_roots[Root::SegmentsPrototype as usize] = segments.v().ptr();
 
     let ip = object_value((vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize]).ptr());
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let iterators = vm.mu().new_plain(ip).obj();
-    vm.define_natives(iterators, &[("next", iterator_next as NativeFn, 0)]);
-    crate::symbol::to_string_tag(vm, iterators, "Segmenter String Iterator");
-    vm.intl_roots[Root::SegmentIteratorPrototype as usize] = iterators.ptr();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let iterators = vm.mu().new_plain(ip).raw_obj();
+    vm.define_natives(iterators.v(), &[("next", iterator_next as NativeFn, 0)]);
+    crate::symbol::to_string_tag(vm, iterators.v(), "Segmenter String Iterator");
+    vm.intl_roots[Root::SegmentIteratorPrototype as usize] = iterators.v().ptr();
 }
 
 /// `new Intl.Segmenter(locales, options)`.
@@ -106,14 +106,14 @@ fn supported_locales_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = require(this, Kind::Segmenter, "Intl.Segmenter.prototype.resolvedOptions")?;
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let r = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let r = vm.mu().new_plain(op).raw_obj();
     let a = vm.intern_name("locale");
-    vm.add_property(r, a, slot(o, LOCALE));
+    vm.add_property(r.v(), a, slot(o, LOCALE));
     let granularity = crate::temporal::string(vm, GRANULARITIES[granularity(o)]);
     let a = vm.intern_name("granularity");
-    vm.add_property(r, a, granularity);
-    Ok(object_value(r.ptr()))
+    vm.add_property(r.v(), a, granularity);
+    Ok(object_value(r.v().ptr()))
 }
 
 /// `Intl.Segmenter.prototype.segment(string)`: a Segments object
@@ -226,9 +226,9 @@ fn iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (length, word_like) = breaker(vm, o).first(&units[start..]);
     let end = start + length;
     crate::promise::set_slot(o, AT, Value::number(end as f64));
-    // take: nothing collects before its last use.
-    let data = segment_data(vm, o, start, end, word_like)?.take();
-    crate::symbol::iter_result(vm, data, false).map(Fresh::take)
+    // raw: nothing collects before its last use.
+    let data = segment_data(vm, o, start, end, word_like)?.raw();
+    crate::symbol::iter_result(vm, data.v(), false).map(Fresh::take)
 }
 
 fn granularity(o: Obj) -> usize {
@@ -253,17 +253,17 @@ fn segment_data_raw(vm: &mut Vm, o: Obj, start: usize, end: usize, word_like: bo
     let string = slot(o, STRING);
     let segment = crate::builtins::part(vm, string, string_units(string).unwrap_or(&[]), start, end);
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let r = vm.mu().new_plain(op).obj();
-    let a = vm.intern_name("segment");
-    vm.add_property(r, a, segment);
-    let a = vm.intern_name("index");
-    vm.add_property(r, a, Value::number(start as f64));
-    let a = vm.intern_name("input");
-    vm.add_property(r, a, slot(o, STRING));
+    let mu = vm.mu();
+    let r = mu.new_plain(op);
+    let a = mu.intern_name("segment");
+    mu.add_property(r, a, segment);
+    let a = mu.intern_name("index");
+    mu.add_property(r, a, Value::number(start as f64));
+    let a = mu.intern_name("input");
+    mu.add_property(r, a, slot(o, STRING));
     if granularity(o) == WORD {
-        let a = vm.intern_name("isWordLike");
-        vm.add_property(r, a, Value::from_bool(word_like));
+        let a = mu.intern_name("isWordLike");
+        mu.add_property(r, a, Value::from_bool(word_like));
     }
-    Ok(object_value(r.ptr()))
+    Ok(r.v())
 }

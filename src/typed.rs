@@ -187,19 +187,19 @@ fn new_buffer_max_raw(vm: &mut Vm, n: usize, max: Option<usize>) -> Result<Obj> 
         return Err(Error::range_error("Array buffer allocation failed"));
     }
     let abp = object_value(vm.array_buffer_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let o = vm.mu().new_object_with(Class::ArrayBuffer, abp, 0).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let o = vm.mu().new_object_with(Class::ArrayBuffer, abp, 0).raw_obj();
     unsafe {
-        (*o.ptr()).elems = vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast();
-        o.set_elems_len(n as u32);
+        (*o.v().ptr()).elems = vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast();
+        o.v().set_elems_len(n as u32);
         if let Some(max) = max {
-            o.set_flags(o.flags() | RESIZABLE);
-            *Object::aux(o.ptr()) = max as u32;
+            o.v().set_flags(o.v().flags() | RESIZABLE);
+            *Object::aux(o.v().ptr()) = max as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o.ptr()).code = object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code;
+            (*o.v().ptr()).code = object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code;
         }
     }
-    Ok(o)
+    Ok(o.v())
 }
 
 /// A `Uint8Array` of `bytes`, on an immutable buffer (a bytes module's
@@ -332,29 +332,29 @@ fn make_view_raw(
     if class == Class::TypedArray {
         note_proto(vm, k as u8, proto);
     }
-    // take: only allocation and stores into it follow: nothing collects.
-    let o = vm.mu().new_object_with(class, proto, 0).obj();
+    // raw: only allocation and stores into it follow: nothing collects.
+    let o = vm.mu().new_object_with(class, proto, 0).raw_obj();
     unsafe {
         // (A `DataView`'s `kind` is its inline capacity, as other objects'.)
         if class == Class::TypedArray {
-            (*o.ptr()).kind = k as u8;
+            (*o.v().ptr()).kind = k as u8;
         }
-        (*o.ptr()).elems = b.elems().cast::<u8>().add(offset).cast();
-        (*o.ptr()).code = b.ptr().cast();
-        *Object::aux(o.ptr()) = len.map_or(TRACKING, |n| n as u32);
-        (*o.ptr()).elems_len =
-            if class == Class::TypedArray { ta_length(o) } else { view_byte_length(o) }.unwrap_or(0) as u32;
+        (*o.v().ptr()).elems = b.elems().cast::<u8>().add(offset).cast();
+        (*o.v().ptr()).code = b.ptr().cast();
+        *Object::aux(o.v().ptr()) = len.map_or(TRACKING, |n| n as u32);
+        (*o.v().ptr()).elems_len =
+            if class == Class::TypedArray { ta_length(o.v()) } else { view_byte_length(o.v()) }.unwrap_or(0) as u32;
         if is_immutable(b) {
-            o.set_flags(o.flags() | IMMUTABLE_VIEW);
+            o.v().set_flags(o.v().flags() | IMMUTABLE_VIEW);
         }
     }
     // (A fixed-length view's length can't change: its buffer never
     // shrinks, so it stays in bounds. One longer than `i32::MAX` is
     // fixed-length, no resizable buffer being that long (`MAX_RESIZABLE`):
     // its length stays one compiled code can't box, or 0 once detached.)
-    let long = class == Class::TypedArray && o.elems_len() > i32::MAX as u32;
+    let long = class == Class::TypedArray && o.v().elems_len() > i32::MAX as u32;
     if long || len.is_none() && is_resizable(b) && crate::shared::is_shared(b) {
-        unsafe { (*o.ptr()).flags |= RUNTIME_LENGTH };
+        unsafe { (*o.v().ptr()).flags |= RUNTIME_LENGTH };
         // (Compiled code that read a known typed array's length unchecked
         // dropped: see `jit`'s `Prop::Length`.)
         if !vm.checked_length_views {
@@ -362,8 +362,8 @@ fn make_view_raw(
             vm.bump_code_epoch();
         }
     }
-    register(vm, b, object_value(o.ptr()))?;
-    Ok(object_value(o.ptr()))
+    register(vm, b, object_value(o.v().ptr()))?;
+    Ok(object_value(o.v().ptr()))
 }
 
 /// View `o`'s buffer's length read from its block if it tracks a
@@ -472,10 +472,10 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     }
     let c = vm.typed_constructors[TypedKind::ALL.len()];
     let proto = vm.take_new_target(c, object_value(vm.array_buffer_prototype))?;
-    // take: nothing collects before its last use.
-    let o = new_buffer_max(vm, n, max)?.take();
-    vm.set_prototype_of(o, proto);
-    Ok(object_value(o.ptr()))
+    // raw: nothing collects before its last use.
+    let o = new_buffer_max(vm, n, max)?.raw();
+    vm.set_prototype_of(o.v(), proto);
+    Ok(object_value(o.v().ptr()))
 }
 
 fn buffer_byte_length(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -545,12 +545,12 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc_c = Scope::new(vm);
     let c = species_constructor(vm, this, default)?.root(&sc_c);
     // (What follows runs no JS: the new buffer held raw.)
-    // take: checked where nothing collects (see below).
-    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c.peek(), &[Value::number(n as f64)]))?.take();
-    if !is_class(out, Class::ArrayBuffer) {
+    // raw: checked where nothing collects (see below).
+    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c.peek(), &[Value::number(n as f64)]))?.raw();
+    if !is_class(out.v(), Class::ArrayBuffer) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the species made no ArrayBuffer"));
     }
-    let o = Obj::of(out);
+    let o = Obj::of(out.v());
     if is_detached(o) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the new buffer is detached"));
     }
@@ -571,7 +571,7 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         let count = n.min(current - first);
         unsafe { std::ptr::copy(b.elems().cast::<u8>().add(first), o.elems().cast::<u8>(), count) };
     }
-    Ok(out)
+    Ok(out.v())
 }
 
 /// `transfer(newLength)` (`fixed`: `transferToFixedLength`): a new buffer
@@ -639,11 +639,11 @@ fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value
     if first + n > b.elems_len() as usize {
         return Err(Error::range_error("ArrayBuffer.prototype.sliceToImmutable: the buffer shrank"));
     }
-    // take: nothing collects before its last use.
-    let out = new_buffer_max(vm, n, None)?.take();
-    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>().add(first), out.elems().cast::<u8>(), n) };
-    make_immutable(vm, out);
-    Ok(object_value(out.ptr()))
+    // raw: nothing collects before its last use.
+    let out = new_buffer_max(vm, n, None)?.raw();
+    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>().add(first), out.v().elems().cast::<u8>(), n) };
+    make_immutable(vm, out.v());
+    Ok(object_value(out.v().ptr()))
 }
 
 fn buffer_immutable(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -885,10 +885,10 @@ fn create_from<'a>(vm: &'a mut Vm, c: Value, args: &[Value], n: Option<usize>) -
 }
 
 fn create_from_raw(vm: &mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Result<Obj> {
-    // take: validated where nothing collects, then returned.
-    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c, args))?.take();
+    // raw: validated where nothing collects, then returned.
+    let out = vm.fresh(|vm| crate::intrinsics::construct(vm, c, args))?.raw();
     // (Validated where nothing collects.)
-    let (o, len) = validate(vm, out)?;
+    let (o, len) = validate(vm, out.v())?;
     // (With `n`, the caller writes into it.)
     if n.is_some() {
         writable_view(o)?;
@@ -1702,12 +1702,12 @@ fn typed_to_sorted(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn typed_to_reversed(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     // (Its values stored where nothing collects.)
-    // take: filled where nothing collects, then returned.
-    let out = create_same(vm, o, len)?.take();
+    // raw: filled where nothing collects, then returned.
+    let out = create_same(vm, o, len)?.raw();
     for i in 0..len {
-        put(out, i, get(o, len - 1 - i));
+        put(out.v(), i, get(o, len - 1 - i));
     }
-    Ok(object_value(out.ptr()))
+    Ok(object_value(out.v().ptr()))
 }
 
 fn typed_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -1720,12 +1720,12 @@ fn typed_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !(i >= 0.0 && ta_length(o).is_some_and(|n| i < n as f64)) {
         return Err(Error::range_error("Invalid typed array index"));
     }
-    // take: filled where nothing collects, then returned.
-    let out = create_same(vm, o, len)?.take();
+    // raw: filled where nothing collects, then returned.
+    let out = create_same(vm, o, len)?.raw();
     for k in 0..len {
-        put(out, k, if k == i as usize { v.v() } else { get(o, k) });
+        put(out.v(), k, if k == i as usize { v.v() } else { get(o, k) });
     }
-    Ok(object_value(out.ptr()))
+    Ok(object_value(out.v().ptr()))
 }
 
 fn typed_subarray(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -1807,18 +1807,18 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let abp = vm.mu().new_plain(op).obj();
-    vm.array_buffer_prototype = abp.ptr();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let abp = vm.mu().new_plain(op).raw_obj();
+    vm.array_buffer_prototype = abp.v().ptr();
     let ab = vm.define_native(g, "ArrayBuffer", array_buffer_ctor, 1, any, true);
-    link_constructor(vm, ab, abp);
-    getter(vm, abp, "byteLength", buffer_byte_length);
-    getter(vm, abp, "maxByteLength", buffer_max_byte_length);
-    getter(vm, abp, "resizable", buffer_resizable);
-    getter(vm, abp, "detached", buffer_detached);
-    getter(vm, abp, "immutable", buffer_immutable);
+    link_constructor(vm, ab, abp.v());
+    getter(vm, abp.v(), "byteLength", buffer_byte_length);
+    getter(vm, abp.v(), "maxByteLength", buffer_max_byte_length);
+    getter(vm, abp.v(), "resizable", buffer_resizable);
+    getter(vm, abp.v(), "detached", buffer_detached);
+    getter(vm, abp.v(), "immutable", buffer_immutable);
     vm.define_natives(
-        abp,
+        abp.v(),
         &[
             ("slice", buffer_slice as NativeFn, 2),
             ("resize", buffer_resize, 1),
@@ -1831,14 +1831,14 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.define_native(ab, "isView", buffer_is_view, 1, any, false);
 
     // `%TypedArray%` (abstract) and its prototype, the concrete kinds'.
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let shared = vm.mu().new_plain(op).obj();
-    vm.typed_array_prototype = shared.ptr();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let shared = vm.mu().new_plain(op).raw_obj();
+    vm.typed_array_prototype = shared.v().ptr();
     let ta = vm.native_function("TypedArray", typed_array_abstract, 0, any, true);
-    link_constructor(vm, ta, shared);
+    link_constructor(vm, ta, shared.v());
     vm.define_natives(ta, &[("from", typed_from as NativeFn, 1), ("of", typed_of, 0)]);
     vm.define_natives(
-        shared,
+        shared.v(),
         &[
             ("at", typed_at as NativeFn, 1),
             ("copyWithin", typed_copy_within, 2),
@@ -1871,15 +1871,15 @@ pub(crate) fn install(vm: &mut Vm) {
             ("with", typed_with, 2),
         ],
     );
-    vm.define_native(shared, "values", typed_values, 0, any, false);
+    vm.define_native(shared.v(), "values", typed_values, 0, any, false);
     // (`toString` is `Array.prototype.toString` itself.)
     let a_to_string = vm.intern_name("toString");
     let to_string = vm.get(object_value(vm.array_prototype), a_to_string).unwrap_or(Value::UNDEFINED);
-    vm.add_property_with(shared, a_to_string, to_string, DONT_ENUM);
-    getter(vm, shared, "buffer", typed_buffer);
-    getter(vm, shared, "byteLength", typed_byte_length);
-    getter(vm, shared, "byteOffset", typed_byte_offset);
-    getter(vm, shared, "length", typed_length_getter);
+    vm.add_property_with(shared.v(), a_to_string, to_string, DONT_ENUM);
+    getter(vm, shared.v(), "buffer", typed_buffer);
+    getter(vm, shared.v(), "byteLength", typed_byte_length);
+    getter(vm, shared.v(), "byteOffset", typed_byte_offset);
+    getter(vm, shared.v(), "length", typed_length_getter);
     const CTORS: [NativeFn; 12] = [
         typed_ctor::<0>,
         typed_ctor::<1>,
@@ -1896,15 +1896,15 @@ pub(crate) fn install(vm: &mut Vm) {
     ];
     let a_bpe = vm.intern_name("BYTES_PER_ELEMENT");
     for (k, kind) in TypedKind::ALL.iter().enumerate() {
-        // take: only calls that don't collect follow (allocation, stores, filling it).
-        let proto = vm.mu().new_plain(object_value(shared.ptr())).obj();
+        // raw: only calls that don't collect follow (allocation, stores, filling it).
+        let proto = vm.mu().new_plain(object_value(shared.v().ptr())).raw_obj();
         let c = vm.define_native(g, kind.name(), CTORS[k], 3, any, true);
-        link_constructor(vm, c, proto);
+        link_constructor(vm, c, proto.v());
         vm.set_prototype_of(c, object_value(ta.ptr()));
         let size = Value::from_i32(kind.size() as i32);
         vm.add_property_with(c, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
-        vm.add_property_with(proto, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
-        vm.typed_prototypes.push(proto);
+        vm.add_property_with(proto.v(), a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
+        vm.typed_prototypes.push(proto.v());
         vm.typed_constructors.push(c);
     }
     vm.typed_constructors.push(ab);
@@ -1921,9 +1921,10 @@ pub(crate) fn install_symbols(vm: &mut Vm) {
     let values = vm.get(object_value(shared.ptr()), a_values).unwrap_or(Value::UNDEFINED);
     let a_iter = vm.a_sym_iterator;
     vm.add_property_with(shared, a_iter, values, DONT_ENUM);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let holder = vm.mu().new_plain(Value::NULL).obj();
-    let tag = vm.define_native(holder, "get [Symbol.toStringTag]", typed_to_string_tag, 0, crate::jit::Ty::Any, false);
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let holder = vm.mu().new_plain(Value::NULL).raw_obj();
+    let tag =
+        vm.define_native(holder.v(), "get [Symbol.toStringTag]", typed_to_string_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
     vm.define_accessor(shared, a_tag, Some(object_value(tag.ptr())), None, DONT_ENUM);
     let abp = vm.array_buffer_prototype;

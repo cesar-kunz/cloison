@@ -142,20 +142,20 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     }
     let atom = name.map(|n| vm.intern_name(&n));
     let proto = object_value(root(vm, Root::SymbolPrototype).ptr());
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let o = vm.mu().new_object_with(Class::Symbol, proto, 0).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let o = vm.mu().new_object_with(Class::Symbol, proto, 0).raw_obj();
     unsafe {
-        (*o.ptr()).code = desc.to_bits() as *const crate::vm::Code;
-        o.set_elems_len(atom.map_or(NO_ATOM, |a| a.0));
+        (*o.v().ptr()).code = desc.to_bits() as *const crate::vm::Code;
+        o.v().set_elems_len(atom.map_or(NO_ATOM, |a| a.0));
         // (Its class's root shape takes no element store: see
         // `Vm::root_shape`. Not a unique shape of its own, which would
         // never be freed.)
-        o.set_flags(o.flags() | crate::object::NOT_EXTENSIBLE);
+        o.v().set_flags(o.v().flags() | crate::object::NOT_EXTENSIBLE);
     }
     if let Some(a) = atom {
-        vm.symbols.insert(a, o.ptr());
+        vm.symbols.insert(a, o.v().ptr());
     }
-    object_value(o.ptr())
+    object_value(o.v().ptr())
 }
 
 /// `Symbol.prototype.toString` of symbol `v`: `Symbol(description)`.
@@ -258,12 +258,12 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value>
     } else {
         own_symbol_keys(vm, o)
     };
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let out = vm.mu().new_array().v();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let out = vm.mu().new_array().raw();
     for s in keys {
-        crate::vm::array_push(vm, out, &[s])?;
+        crate::vm::array_push(vm, out.v(), &[s])?;
     }
-    Ok(out)
+    Ok(out.v())
 }
 
 /// `o`'s own symbol-keyed properties' symbols, in order.
@@ -313,14 +313,14 @@ pub(crate) fn to_string_tag(vm: &mut Vm, o: Obj, tag: &str) {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let sp = vm.mu().new_plain(op).obj();
-    vm.symbol_roots = vec![sp];
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let sp = vm.mu().new_plain(op).raw_obj();
+    vm.symbol_roots = vec![sp.v()];
     let ctor = vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true);
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-    let d = Desc::data(object_value(sp.ptr()), false, false, false);
+    let d = Desc::data(object_value(sp.v().ptr()), false, false, false);
     let _ = vm.define_own_property(ctor, Key::Name(a_p), &d);
-    vm.add_property_with(sp, a_c, object_value(ctor.ptr()), DONT_ENUM);
+    vm.add_property_with(sp.v(), a_c, object_value(ctor.ptr()), DONT_ENUM);
     for &w in WELL_KNOWN {
         let desc_units: Vec<u16> = format!("Symbol.{w}").encode_utf16().collect();
         let desc = vm.string_constant(&desc_units);
@@ -350,8 +350,8 @@ pub(crate) fn install(vm: &mut Vm) {
     let _ = vm.define_own_property(unsafe { Obj::from_ptr(dp) }, Key::Name(a_tp), &d);
     // `Array.prototype[Symbol.unscopables]`: what `with` over an array
     // doesn't find (ES2015 on).
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let u = vm.mu().new_plain(Value::NULL).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let u = vm.mu().new_plain(Value::NULL).raw_obj();
     for name in [
         "at",
         "copyWithin",
@@ -371,21 +371,21 @@ pub(crate) fn install(vm: &mut Vm) {
         "values",
     ] {
         let a = vm.intern_name(name);
-        vm.add_property_with(u, a, Value::TRUE, 0);
+        vm.add_property_with(u.v(), a, Value::TRUE, 0);
     }
     let a_unscopables = vm.intern_name(&format!("{SYMBOL_MARK}Symbol.unscopables"));
-    let d = Desc::data(object_value(u.ptr()), false, false, true);
+    let d = Desc::data(object_value(u.v().ptr()), false, false, true);
     let ap = vm.array_prototype_obj();
     let _ = vm.define_own_property(ap, Key::Name(a_unscopables), &d);
     vm.define_natives(ctor, &[("for", symbol_for as NativeFn, 1), ("keyFor", symbol_key_for, 1)]);
-    vm.define_natives(sp, &[("toString", symbol_to_string as NativeFn, 0), ("valueOf", symbol_value_of, 0)]);
+    vm.define_natives(sp.v(), &[("toString", symbol_to_string as NativeFn, 0), ("valueOf", symbol_value_of, 0)]);
     let a_description = vm.intern_name("description");
-    define_getter(vm, sp, Key::Name(a_description), "description", symbol_description);
+    define_getter(vm, sp.v(), Key::Name(a_description), "description", symbol_description);
     let tp = vm.a_sym_to_primitive;
     let f = vm.native_function("[Symbol.toPrimitive]", symbol_value_of, 1, crate::jit::Ty::Any, false);
     let d = Desc::data(object_value(f.ptr()), false, false, true);
-    let _ = vm.define_own_property(sp, Key::Name(tp), &d);
-    to_string_tag(vm, sp, "Symbol");
+    let _ = vm.define_own_property(sp.v(), Key::Name(tp), &d);
+    to_string_tag(vm, sp.v(), "Symbol");
     let object_ctor = {
         let a = vm.intern_name("Object");
         vm.get_atom_b(object_value(g.ptr()), a).map(Fresh::take)
@@ -412,21 +412,21 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.symbol_roots.push(ip.obj());
     let a_iter = vm.a_sym_iterator;
     define_symbol_native(vm, ip.obj(), a_iter, "[Symbol.iterator]", return_this, 0);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let aip = vm.mu().new_plain(object_value(ip.obj().ptr())).obj();
-    vm.symbol_roots.push(aip);
-    vm.define_natives(aip, &[("next", array_iterator_next as NativeFn, 0)]);
-    to_string_tag(vm, aip, "Array Iterator");
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let sip = vm.mu().new_plain(object_value(ip.obj().ptr())).obj();
-    vm.symbol_roots.push(sip);
-    vm.define_natives(sip, &[("next", string_iterator_next as NativeFn, 0)]);
-    to_string_tag(vm, sip, "String Iterator");
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let rsip = vm.mu().new_plain(object_value(ip.obj().ptr())).obj();
-    vm.symbol_roots.push(rsip);
-    vm.define_natives(rsip, &[("next", crate::builtins::regexp_string_iterator_next as NativeFn, 0)]);
-    to_string_tag(vm, rsip, "RegExp String Iterator");
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let aip = vm.mu().new_plain(object_value(ip.obj().ptr())).raw_obj();
+    vm.symbol_roots.push(aip.v());
+    vm.define_natives(aip.v(), &[("next", array_iterator_next as NativeFn, 0)]);
+    to_string_tag(vm, aip.v(), "Array Iterator");
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let sip = vm.mu().new_plain(object_value(ip.obj().ptr())).raw_obj();
+    vm.symbol_roots.push(sip.v());
+    vm.define_natives(sip.v(), &[("next", string_iterator_next as NativeFn, 0)]);
+    to_string_tag(vm, sip.v(), "String Iterator");
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let rsip = vm.mu().new_plain(object_value(ip.obj().ptr())).raw_obj();
+    vm.symbol_roots.push(rsip.v());
+    vm.define_natives(rsip.v(), &[("next", crate::builtins::regexp_string_iterator_next as NativeFn, 0)]);
+    to_string_tag(vm, rsip.v(), "RegExp String Iterator");
 
     let ap = vm.array_prototype_obj();
     vm.define_natives(ap, &[("keys", array_keys as NativeFn, 0), ("entries", array_entries, 0)]);
@@ -501,9 +501,9 @@ fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Fr
 }
 
 fn new_iterator_raw(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Value> {
-    // take: nothing collects before its last use.
-    let state = crate::array::new_array_of(vm, &[target, Value::from_i32(0), Value::from_i32(kind)])?.take();
-    Ok(iterator_with_state(vm, Class::ArrayIterator, proto, state))
+    // raw: nothing collects before its last use.
+    let state = crate::array::new_array_of(vm, &[target, Value::from_i32(0), Value::from_i32(kind)])?.raw();
+    Ok(iterator_with_state(vm, Class::ArrayIterator, proto, state.v()))
 }
 
 /// An object of `class` (one whose `code` bits the collector traces as a
@@ -701,9 +701,9 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> 
         if (0xD800..0xDC00).contains(&c) && u.get(i + 1).is_some_and(|d| (0xDC00..0xE000).contains(d)) { 2 } else { 1 };
     let piece: Vec<u16> = u[i..i + n].to_vec();
     vm.set_keyed(state, Value::from_i32(1), Value::from_i32((i + n) as i32))?;
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let s = vm.mu().new_string(&piece).v();
-    iter_result(vm, s, false).map(Fresh::take)
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let s = vm.mu().new_string(&piece).raw();
+    iter_result(vm, s.v(), false).map(Fresh::take)
 }
 
 // ---- The protocol ----
@@ -1358,13 +1358,13 @@ mod tests {
     #[test]
     fn array_states_step_past_int32_indices() {
         let mut vm = Vm::new();
-        // take: a test's; no JS runs while it is held (no setters on the way).
-        let a = vm.mu().new_array().v();
+        // raw: a test's; no JS runs while it is held (no setters on the way).
+        let a = vm.mu().new_array().raw();
         let top = 2f64.powi(31);
         for (k, x) in [(top - 1.0, 1), (top, 2)] {
-            vm.set_keyed(a, Value::number(k), Value::from_i32(x)).unwrap();
+            vm.set_keyed(a.v(), Value::number(k), Value::from_i32(x)).unwrap();
         }
-        let mut st = [a, Value::number(top - 1.0)];
+        let mut st = [a.v(), Value::number(top - 1.0)];
         let got: Vec<u64> =
             (0..3).map(|_| unsafe { iterator_next(&mut vm, st.as_mut_ptr()).unwrap() }.to_bits()).collect();
         assert_eq!(got, [Value::from_i32(1).to_bits(), Value::from_i32(2).to_bits(), Value::HOLE.to_bits()]);

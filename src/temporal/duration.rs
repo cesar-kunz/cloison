@@ -8,7 +8,6 @@ use super::iso::{self, DateTime, IsoDate, RoundingMode, TIME_DURATION_MAX, Time,
 use super::*;
 use crate::brand::Args;
 use crate::brand::Fresh;
-use crate::object::Obj;
 
 /// A duration's fields: years, months, weeks, days, hours, minutes,
 /// seconds, milliseconds, microseconds, nanoseconds.
@@ -1002,11 +1001,11 @@ fn options_or_string_raw(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
         return Err(type_err("options parameter is required"));
     }
     if is_string(v) {
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let o = vm.mu().new_plain(Value::NULL).v();
-        let a = vm.intern_name(name);
-        vm.add_property(Obj::of(o), a, v);
-        return Ok(o);
+        let mu = vm.mu();
+        let o = mu.new_plain(Value::NULL);
+        let a = mu.intern_name(name);
+        mu.add_property(o, a, v);
+        return Ok(o.v());
     }
     options_object(vm, v).map(Fresh::take)
 }

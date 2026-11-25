@@ -421,10 +421,10 @@ pub(crate) fn new_array_of<'v>(vm: &'v mut Vm, values: &[Value]) -> Result<Fresh
 }
 
 fn new_array_of_raw(vm: &mut Vm, values: &[Value]) -> Result<Value> {
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let a = vm.mu().new_array().v();
-    array_push(vm, a, values)?;
-    Ok(a)
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let a = vm.mu().new_array().raw();
+    array_push(vm, a.v(), values)?;
+    Ok(a.v())
 }
 
 /// `CreateDataPropertyOrThrow(o, i, v)`.
@@ -1343,13 +1343,15 @@ pub(crate) fn array_find(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value>
     let (o, len) = this_rooted(vm, &sc, this)?;
     let f = callback(&a, "find")?;
     let that = arg(&a, 1);
+    // (Each element, the result if accepted, rooted across the callback:
+    // its argument slot it may overwrite.)
+    let v = sc.root(Value::UNDEFINED);
     let mut i = 0.0;
     while i < len {
-        // take: the call's argument, alive in its frame; nothing collects after.
-        let v = get(vm, o, i)?.take();
-        let r = vm.call_b(f, that, &[v, Value::number(i), o])?;
+        v.set(get(vm, o, i)?.take());
+        let r = vm.call_b(f, that, &[v.v(), Value::number(i), o])?;
         if to_boolean(r.peek()) {
-            return Ok(v);
+            return Ok(v.v());
         }
         i += 1.0;
     }
@@ -1363,7 +1365,7 @@ pub(crate) fn array_find_index(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<
     let that = arg(&a, 1);
     let mut i = 0.0;
     while i < len {
-        // take: the call's argument, alive in its frame; nothing collects after.
+        // take: given at once to the call, which copies it to the VM stack.
         let v = get(vm, o, i)?.take();
         let r = vm.call_b(f, that, &[v, Value::number(i), o])?;
         if to_boolean(r.peek()) {
@@ -1828,13 +1830,15 @@ fn find_last(vm: &mut Vm, this: Value, a: &[Value], index: bool) -> Result<Value
     let (o, len) = this_rooted(vm, &sc, this)?;
     let f = callback(a, if index { "findLastIndex" } else { "findLast" })?;
     let that = arg(a, 1);
+    // (Each element, the result if accepted, rooted across the callback:
+    // its argument slot it may overwrite.)
+    let v = sc.root(Value::UNDEFINED);
     let mut i = len - 1.0;
     while i >= 0.0 {
-        // take: the call's argument, alive in its frame; nothing collects after.
-        let v = get(vm, o, i)?.take();
-        let r = vm.call_b(f, that, &[v, Value::number(i), o])?;
+        v.set(get(vm, o, i)?.take());
+        let r = vm.call_b(f, that, &[v.v(), Value::number(i), o])?;
         if to_boolean(r.peek()) {
-            return Ok(if index { Value::number(i) } else { v });
+            return Ok(if index { Value::number(i) } else { v.v() });
         }
         i -= 1.0;
     }

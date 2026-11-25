@@ -54,9 +54,9 @@ pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
     for _ in 0..9 {
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let p = vm.mu().new_plain(op).obj();
-        vm.collection_prototypes.push(p);
+        // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+        let p = vm.mu().new_plain(op).raw_obj();
+        vm.collection_prototypes.push(p.v());
     }
     let protos = vm.collection_prototypes.clone();
     let ctors: [(&str, NativeFn); 4] =
@@ -370,10 +370,10 @@ fn new_index_raw(vm: &mut Vm, e: Obj, s: usize, n: usize) -> Result<Value> {
             ix[b] = Value::from_i32(j as i32);
         }
     }
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let a = vm.mu().new_array().v();
-    array_push(vm, a, &ix)?;
-    Ok(a)
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let a = vm.mu().new_array().raw();
+    array_push(vm, a.v(), &ix)?;
+    Ok(a.v())
 }
 
 /// The position of `key`'s entry in collection `o`, if it has one.
@@ -421,10 +421,10 @@ fn new_entries_raw(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Obj> {
     }
     let count = (kv.len() - BASE) / s;
     kv[COUNT] = Value::from_i32(count as i32);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let fresh = vm.mu().new_array().v();
-    array_push(vm, fresh, &kv)?;
-    let e = Obj::of(fresh);
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let fresh = vm.mu().new_array().raw();
+    array_push(vm, fresh.v(), &kv)?;
+    let e = Obj::of(fresh.v());
     let ix = new_index(vm, e, s, (count * 2).next_power_of_two().max(8))?;
     put(e, INDEX, ix.peek());
     Ok(e)
@@ -487,21 +487,21 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Fresh<'_, O
 
 fn new_collection_raw(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
     let s = if matches!(class, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
-    // take: nothing collects before its last use.
-    let e = new_entries(vm, None, s)?.take();
+    // raw: nothing collects before its last use.
+    let e = new_entries(vm, None, s)?.raw();
     let p = object_value((vm.collection_prototypes[proto as usize]).ptr());
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let o = vm.mu().new_object_with(class, p, 0).obj();
-    hold_entries(o, object_value(e.ptr()));
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let o = vm.mu().new_object_with(class, p, 0).raw_obj();
+    hold_entries(o.v(), object_value(e.v().ptr()));
     if class != Class::WeakRef {
-        vm.collections.push(o.ptr());
+        vm.collections.push(o.v().ptr());
     }
     // (The collector's to find: see `Vm::ephemerons`.)
     if matches!(class, Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
-        vm.weak_tables.push(o.ptr());
-        weaken(o);
+        vm.weak_tables.push(o.v().ptr());
+        weaken(o.v());
     }
-    Ok(o)
+    Ok(o.v())
 }
 
 /// A new weak set for the runtime's own use, never seen by scripts (a
@@ -579,21 +579,21 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     let f = vm.callee_obj();
     let default = object_value((vm.collection_prototypes[proto as usize]).ptr());
     let p = vm.take_new_target(f, default)?;
-    // take: nothing collects before its last use.
-    let c = new_collection(vm, class, proto)?.take();
+    // raw: nothing collects before its last use.
+    let c = new_collection(vm, class, proto)?.raw();
     if p != default {
-        vm.set_prototype_of(c, p);
+        vm.set_prototype_of(c.v(), p);
     }
     let iterable = arg(a, 0);
     if iterable.is_undefined() || iterable.is_null() {
-        return Ok(object_value(c.ptr()));
+        return Ok(object_value(c.v().ptr()));
     }
     let pairs = matches!(class, Class::Map | Class::WeakMap);
     let a_adder = vm.intern_name(if pairs { "set" } else { "add" });
     // (The collection across the adder's getter and the iteration, the
     // adder across the iteration.)
     let sc = Scope::new(vm);
-    let o = sc.root(object_value(c.ptr()));
+    let o = sc.root(object_value(c.v().ptr()));
     let adder = vm.get_atom_b(o.v(), a_adder)?.root(&sc);
     if !is_callable(adder.v()) {
         return Err(Error::type_error(format!(
@@ -627,12 +627,12 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
 /// `{ value, done }`.
 fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let r = vm.mu().new_plain(op).obj();
-    let (a_value, a_done) = (vm.intern_name("value"), vm.intern_name("done"));
-    vm.add_property(r, a_value, value);
-    vm.add_property(r, a_done, Value::from_bool(done));
-    object_value(r.ptr())
+    let mu = vm.mu();
+    let r = mu.new_plain(op);
+    let (a_value, a_done) = (mu.intern_name("value"), mu.intern_name("done"));
+    mu.add_property(r, a_value, value);
+    mu.add_property(r, a_done, Value::from_bool(done));
+    r.v()
 }
 
 /// An iterator over collection `o`'s entries from the start.
@@ -864,10 +864,10 @@ fn step_raw(vm: &mut Vm, it: Obj) -> Result<Option<Value>> {
             0 => k,
             1 => v,
             _ => {
-                // take: only calls that don't collect follow (allocation, stores, filling it).
-                let pair = vm.mu().new_array().v();
-                array_push(vm, pair, &[k, v])?;
-                pair
+                // raw: only calls that don't collect follow (allocation, stores, filling it).
+                let pair = vm.mu().new_array().raw();
+                array_push(vm, pair.v(), &[k, v])?;
+                pair.v()
             }
         };
         return Ok(Some(value));

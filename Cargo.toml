@@ -12,10 +12,12 @@ acc-i32 = []
 # ECMA-402's `Intl` (`Intl.Collator` and `Intl.Segmenter` so far), on ICU4X,
 # its locale data read at runtime from a blob (see docs/intl.md).
 intl = ["dep:icu_collator", "dep:icu_locale_core", "dep:icu_provider", "dep:icu_provider_blob", "dep:icu_segmenter"]
-# Each `brand::Scope` checks, as it ends, that only its own roots are
-# above where it began: a value pushed to `vm.handles` by hand after it
-# would be dropped with them. Off by default: it deepens recursive frames.
-scope-check = []
+# Run-time checks of what the branded cells' types can't see (see
+# docs/gc-branding.md): each `brand::Scope` checks, as it ends, that only
+# its own roots are above where it began; a `brand::Raw` value, that no
+# point that may collect passed since it was taken; a `brand::Mu`, that
+# none passes in its work. Off by default: it deepens recursive frames.
+gc-check = []
 
 [dependencies]
 libc = "0.2"

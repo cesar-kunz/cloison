@@ -40,16 +40,16 @@ pub(crate) fn install(vm: &mut Vm) {
     let any = crate::jit::Ty::Any;
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let proto = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let proto = vm.mu().new_plain(op).raw_obj();
     let c = vm.define_native(g, "ShadowRealm", shadow_realm_ctor, 0, any, true);
-    crate::builtins::link_constructor(vm, c, proto);
-    vm.define_natives(proto, &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
-    crate::symbol::to_string_tag(vm, proto, "ShadowRealm");
+    crate::builtins::link_constructor(vm, c, proto.v());
+    vm.define_natives(proto.v(), &[("evaluate", evaluate as NativeFn, 1), ("importValue", import_value, 2)]);
+    crate::symbol::to_string_tag(vm, proto.v(), "ShadowRealm");
     let wrapped = vm.native_function("", wrapped_call, 0, any, false);
     let imported = vm.native_function("", imported, 1, any, false);
     let failed = vm.native_function("", import_failed, 1, any, false);
-    vm.shadow_roots = vec![proto, wrapped, imported, failed];
+    vm.shadow_roots = vec![proto.v(), wrapped, imported, failed];
 }
 
 /// `new ShadowRealm()`: a new realm, its global object the host's.

@@ -600,12 +600,12 @@ impl Vm {
     /// A new array of `values` (on the native stack, which the collector
     /// scans): its elements' type found once, then each only written.
     pub(crate) fn array_of(&mut self, values: &[Value]) -> Value {
-        // take: only calls that don't collect follow (allocation, stores, filling it).
-        let a = self.mu().new_array().v();
+        // raw: only calls that don't collect follow (allocation, stores, filling it).
+        let a = self.mu().new_array().raw();
         if values.is_empty() {
-            return a;
+            return a.v();
         }
-        let o = Obj::of(a);
+        let o = Obj::of(a.v());
         unsafe {
             self.reserve_elems(o, values.len());
             let s = o.shape().live();
@@ -620,14 +620,14 @@ impl Vm {
             }
             o.set_elems_len(values.len() as u32);
         }
-        a
+        a.v()
     }
 
     /// A new array of the `n` values `at` gives (it may allocate).
     pub(crate) fn array_of_with(&mut self, n: usize, mut at: impl FnMut(&mut Vm, usize) -> Value) -> Value {
-        // take: only allocation and stores into it follow: nothing collects.
-        let a = self.mu().new_array().v();
-        let o = Obj::of(a);
+        // raw: only allocation and stores into it follow: nothing collects.
+        let a = self.mu().new_array().raw();
+        let o = Obj::of(a.v());
         self.reserve_elems(o, n);
         for i in 0..n {
             let v = at(self, i);
@@ -636,7 +636,7 @@ impl Vm {
             // SAFETY: within the capacity `reserve_elems` made above.
             unsafe { o.set_elems_len(i as u32 + 1) };
         }
-        a
+        a.v()
     }
 
     /// A key as a property-access key value (an index as a number).
@@ -1359,8 +1359,6 @@ impl Vm {
     }
 
     fn descriptor_object(&mut self, d: &Desc, proto: Value) -> Value {
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let o = self.mu().new_plain(proto).obj();
         let fields: [(Atom, Option<Value>); 6] = [
             (self.a_value, d.value),
             (self.a_writable, d.writable.map(Value::from_bool)),
@@ -1369,12 +1367,14 @@ impl Vm {
             (self.a_enumerable, d.enumerable.map(Value::from_bool)),
             (self.a_configurable, d.configurable.map(Value::from_bool)),
         ];
+        let mu = self.mu();
+        let o = mu.new_plain(proto);
         for (a, v) in fields {
             if let Some(v) = v {
-                self.add_property(o, a, v);
+                mu.add_property(o, a, v);
             }
         }
-        object_value(o.ptr())
+        o.v()
     }
 
     /// ToObject: a `TypeError` for `undefined` and `null`, a wrapper for
@@ -1780,8 +1780,8 @@ fn keys_array_raw(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
             .v());
     }
     let keys = vm.own_keys(o);
-    // take: only allocation and stores into it follow: nothing collects.
-    let arr = vm.mu().new_array().v();
+    // raw: only allocation and stores into it follow: nothing collects.
+    let arr = vm.mu().new_array().raw();
     let mut values = Vec::with_capacity(keys.len());
     vm.handle_scope(|vm| {
         for (key, enumerable) in keys {
@@ -1791,9 +1791,9 @@ fn keys_array_raw(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
                 values.push(s);
             }
         }
-        crate::vm::array_push(vm, arr, &values)
+        crate::vm::array_push(vm, arr.v(), &values)
     })?;
-    Ok(arr)
+    Ok(arr.v())
 }
 
 /// `Object.getOwnPropertyNames(o)`.
@@ -2036,19 +2036,19 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
         if d.enumerable != Some(true) {
             continue;
         }
-        // take: stored in the pair where nothing collects.
-        let v = vm.get_key_b(ov, key)?.take();
+        // raw: stored in the pair where nothing collects.
+        let v = vm.get_key_b(ov, key)?.raw();
         // (The pair made, and filled, where nothing collects.)
         let item = if entries {
             let k = vm.key_string(key);
-            // take: only calls that don't collect follow (allocation, stores, filling it).
-            let pair = vm.mu().new_array().v();
-            crate::vm::array_push(vm, pair, &[k, v])?;
+            // raw: only calls that don't collect follow (allocation, stores, filling it).
+            let pair = vm.mu().new_array().raw();
+            crate::vm::array_push(vm, pair.v(), &[k, v.v()])?;
             pair
         } else {
             v
         };
-        vm.create_data_property(out, Key::Index(n), item)?;
+        vm.create_data_property(out, Key::Index(n), item.v())?;
         n += 1;
     }
     Ok(out)
@@ -2073,9 +2073,9 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: Args<'_>) -> Re
         if let Some(d) = vm.own_property_b(o, key)?.take() {
             // (Its object made where nothing collects; defined on a new
             // ordinary object, which runs no JS.)
-            // take: only calls that don't collect follow (allocation, stores, filling it).
-            let dv = vm.mu().from_descriptor(&d).v();
-            vm.create_data_property(out.v(), key, dv)?;
+            // raw: only calls that don't collect follow (allocation, stores, filling it).
+            let dv = vm.mu().from_descriptor(&d).raw();
+            vm.create_data_property(out.v(), key, dv.v())?;
         }
     }
     Ok(out.v())
@@ -2154,10 +2154,10 @@ fn object_group_by(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         let group = match vm.own_property(Obj::of(out.v()), key) {
             Some(_) => vm.get_key_b(out.v(), key)?.take(),
             None => {
-                // take: only calls that don't collect follow (allocation, stores, filling it).
-                let g = vm.mu().new_array().v();
-                vm.create_data_property(out.v(), key, g)?;
-                g
+                // raw: only calls that don't collect follow (allocation, stores, filling it).
+                let g = vm.mu().new_array().raw();
+                vm.create_data_property(out.v(), key, g.v())?;
+                g.v()
             }
         };
         crate::vm::array_push(vm, group, &[v])?;

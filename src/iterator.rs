@@ -112,14 +112,14 @@ pub(crate) fn install(vm: &mut Vm) {
         );
     }
 
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let hp = vm.mu().new_plain(object_value(ip.ptr())).obj();
-    vm.define_natives(hp, &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
-    crate::symbol::to_string_tag(vm, hp, "Iterator Helper");
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let wp = vm.mu().new_plain(object_value(ip.ptr())).obj();
-    vm.define_natives(wp, &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
-    vm.iterator_roots = vec![c, hp, wp];
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let hp = vm.mu().new_plain(object_value(ip.ptr())).raw_obj();
+    vm.define_natives(hp.v(), &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
+    crate::symbol::to_string_tag(vm, hp.v(), "Iterator Helper");
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let wp = vm.mu().new_plain(object_value(ip.ptr())).raw_obj();
+    vm.define_natives(wp.v(), &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
+    vm.iterator_roots = vec![c, hp.v(), wp.v()];
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -294,15 +294,15 @@ fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: V
 }
 
 fn new_helper_raw(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: Value) -> Result<Value> {
-    // take: only allocation follows until the helper holds it.
+    // raw: only allocation follows until the helper holds it.
     let state = crate::array::new_array_of(
         vm,
         &[Value::from_i32(kind), Value::from_i32(START), it, next, f, count, Value::UNDEFINED, Value::UNDEFINED],
     )?
-    .take();
+    .raw();
     let proto = vm.iterator_roots[if kind == WRAP { WRAP_PROTOTYPE } else { HELPER_PROTOTYPE }];
     let o = vm.mu().new_object_with(Class::IteratorHelper, object_value(proto.ptr()), 0);
-    unsafe { (*o.obj().ptr()).code = state.to_bits() as *const crate::vm::Code };
+    unsafe { (*o.obj().ptr()).code = state.v().to_bits() as *const crate::vm::Code };
     Ok(object_value(o.obj().ptr()))
 }
 
@@ -381,10 +381,14 @@ fn step_raw(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
         }
         FILTER => {
             let mut count = count;
+            // (Each value, the result if selected, rooted across the
+            // predicate: its argument slot it may overwrite.)
+            let sc = Scope::new(vm);
+            let held = sc.root(Value::UNDEFINED);
             loop {
-                // take: the predicate's argument while it runs (its frame roots it); nothing
-                // collects between its return and ours.
+                // take: rooted on the next line.
                 let Some(v) = step_value(vm, it, next)?.take() else { return Ok(None) };
+                held.set(v);
                 let selected = match vm.call_b(f, Value::UNDEFINED, &[v, Value::number(count)]) {
                     Ok(s) => s.take(),
                     Err(e) => return close_throw(vm, it, e),
@@ -392,7 +396,7 @@ fn step_raw(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 count += 1.0;
                 set(vm, state, COUNT, Value::number(count))?;
                 if to_boolean(selected) {
-                    return Ok(Some(v));
+                    return Ok(Some(held.v()));
                 }
             }
         }
@@ -802,9 +806,14 @@ fn for_each(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 /// `some`'s, `every`'s and `find`'s: the first value `f` says `want` of.
 fn search(vm: &mut Vm, this: Value, a: &[Value], want: bool, what: &str) -> Result<Option<Value>> {
     let f = arg(a, 0);
+    // (Each value, the result if found, rooted across the predicate: its
+    // argument slot it may overwrite.)
+    let sc = Scope::new(vm);
+    let held = sc.root(Value::UNDEFINED);
     each(vm, this, Some(f), what, |vm, v, k| {
+        held.set(v);
         let r = vm.call_b(f, Value::UNDEFINED, &[v, Value::number(k)])?;
-        Ok((to_boolean(r.peek()) == want).then_some(v))
+        Ok((to_boolean(r.peek()) == want).then_some(held.v()))
     })
 }
 
@@ -1266,18 +1275,18 @@ fn zip_results_raw(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
     let mismatch = || Error::type_error("Iterator.zip: the iterators' lengths differ (strict mode)");
     let mut results = Vec::with_capacity(n as usize);
     for i in 0..n {
-        // take: an element of the zip's own arrays, which no JS sees.
-        let it = vm.get_keyed_b(iters, Value::from_i32(i))?.take();
-        if it.is_null() {
+        // raw: an element of the zip's own arrays, which no JS sees.
+        let it = vm.get_keyed_b(iters, Value::from_i32(i))?.raw();
+        if it.v().is_null() {
             // take: pushed to vm.handles on the next line.
             let v = vm.get_keyed_b(padding, Value::from_i32(i))?.take();
             vm.handles.push(v);
             results.push(v);
             continue;
         }
-        // take: an element of the zip's own arrays, which no JS sees.
-        let next = vm.get_keyed_b(nexts, Value::from_i32(i))?.take();
-        match step_value(vm, it, next).map(Fresh::transpose) {
+        // raw: an element of the zip's own arrays, which no JS sees.
+        let next = vm.get_keyed_b(nexts, Value::from_i32(i))?.raw();
+        match step_value(vm, it.v(), next.v()).map(Fresh::transpose) {
             Ok(Some(v)) => {
                 // take: pushed to vm.handles on the next line.
                 let v = v.take();

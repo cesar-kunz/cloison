@@ -37,10 +37,10 @@ fn list(vm: &mut Vm, v: Value) -> Result<Fresh<'_, Vec<Value>>> {
 
 pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let r = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let r = vm.mu().new_plain(op).raw_obj();
     vm.define_natives(
-        r,
+        r.v(),
         &[
             ("apply", reflect_apply as NativeFn, 3),
             ("construct", reflect_construct, 2),
@@ -59,7 +59,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
     let g = vm.global_obj();
     let a = vm.intern_name("Reflect");
-    vm.add_property_with(g, a, object_value(r.ptr()), DONT_ENUM);
+    vm.add_property_with(g, a, object_value(r.v().ptr()), DONT_ENUM);
 }
 
 fn reflect_apply(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -142,9 +142,9 @@ pub(crate) fn reflect_own_keys(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Val
     let s = Scope::new(vm);
     let out = vm.mu().new_array().root(&s);
     for key in keys {
-        // take: only calls that don't collect follow (allocation, stores, filling it).
-        let k = vm.mu().key_string(key).v();
-        crate::vm::array_push(vm, out.v(), &[k])?;
+        // raw: only calls that don't collect follow (allocation, stores, filling it).
+        let k = vm.mu().key_string(key).raw();
+        crate::vm::array_push(vm, out.v(), &[k.v()])?;
     }
     Ok(out.v())
 }

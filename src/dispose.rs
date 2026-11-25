@@ -172,9 +172,9 @@ const RESOURCES: usize = 2;
 /// A new capability's state: `[async, disposed, resources]`.
 #[inline(always)]
 pub(crate) fn new_state(vm: &mut Vm, async_: bool) -> Result<Fresh<'_>> {
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let resources = vm.mu().new_array().v();
-    crate::array::new_array_of(vm, &[Value::from_bool(async_), Value::FALSE, resources])
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let resources = vm.mu().new_array().raw();
+    crate::array::new_array_of(vm, &[Value::from_bool(async_), Value::FALSE, resources.v()])
 }
 
 /// Whether capability `state` has no resources.
@@ -254,13 +254,13 @@ fn thrown_raw(vm: &mut Vm, e: Error) -> Result<Value> {
 /// message (DisposeResources').
 fn suppressed_error(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
     let proto = root(vm, Root::SuppressedErrorPrototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_plain(proto).obj();
-    unsafe { (*o.ptr()).flags |= crate::object::ERROR };
-    let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
-    vm.add_property_with(o, a_error, error, DONT_ENUM);
-    vm.add_property_with(o, a_suppressed, suppressed, DONT_ENUM);
-    object_value(o.ptr())
+    let mu = vm.mu();
+    let o = mu.new_plain(proto);
+    unsafe { (*o.obj().ptr()).flags |= crate::object::ERROR };
+    let (a_error, a_suppressed) = (mu.intern_name("error"), mu.intern_name("suppressed"));
+    mu.add_property_with(o, a_error, error, DONT_ENUM);
+    mu.add_property_with(o, a_suppressed, suppressed, DONT_ENUM);
+    o.v()
 }
 
 /// DisposeResources, synchronously, of capability `state`'s resources
@@ -410,17 +410,17 @@ fn suppressed_error_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         _ => None,
     };
     let proto = root(vm, Root::SuppressedErrorPrototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_plain(proto).obj();
-    unsafe { (*o.ptr()).flags |= crate::object::ERROR };
+    let mu = vm.mu();
+    let o = mu.new_plain(proto);
+    unsafe { (*o.obj().ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
-        let a_message = vm.intern_name("message");
-        vm.add_property_with(o, a_message, m, DONT_ENUM);
+        let a_message = mu.intern_name("message");
+        mu.add_property_with(o, a_message, m, DONT_ENUM);
     }
-    let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
-    vm.add_property_with(o, a_error, arg(&a, 0), DONT_ENUM);
-    vm.add_property_with(o, a_suppressed, arg(&a, 1), DONT_ENUM);
-    Ok(object_value(o.ptr()))
+    let (a_error, a_suppressed) = (mu.intern_name("error"), mu.intern_name("suppressed"));
+    mu.add_property_with(o, a_error, arg(&a, 0), DONT_ENUM);
+    mu.add_property_with(o, a_suppressed, arg(&a, 1), DONT_ENUM);
+    Ok(o.v())
 }
 
 // ---- DisposableStack and AsyncDisposableStack ----
@@ -501,14 +501,14 @@ fn stack_defer<const ASYNC: bool>(vm: &mut Vm, this: Value, a: Args<'_>) -> Resu
 /// resources, this one disposed.
 fn stack_move<const ASYNC: bool>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = live_state(this, ASYNC, "move")?;
-    // take: nothing collects before its last use.
-    let out = new_stack(vm, ASYNC)?.take();
-    let to = Value::from_bits(Obj::of(out).code() as u64);
+    // raw: nothing collects before its last use.
+    let out = new_stack(vm, ASYNC)?.raw();
+    let to = Value::from_bits(Obj::of(out.v()).code() as u64);
     put(to, RESOURCES, elem(state, RESOURCES));
     let empty = vm.mu().new_array();
     put(state, RESOURCES, empty.v());
     put(state, DISPOSED, Value::TRUE);
-    Ok(out)
+    Ok(out.v())
 }
 
 fn stack_disposed<const ASYNC: bool>(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {

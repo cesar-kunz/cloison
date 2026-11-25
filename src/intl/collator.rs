@@ -58,15 +58,15 @@ impl Flags {
 
 pub(super) fn install(vm: &mut Vm, intl: Obj) {
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let proto = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let proto = vm.mu().new_plain(op).raw_obj();
     let c = vm.define_native(intl, "Collator", collator_ctor, 0, crate::jit::Ty::Any, true);
-    crate::builtins::link_constructor(vm, c, proto);
+    crate::builtins::link_constructor(vm, c, proto.v());
     vm.define_natives(c, &[("supportedLocalesOf", supported_locales_of as NativeFn, 1)]);
-    crate::builtins::getter(vm, proto, "compare", compare_getter);
-    vm.define_natives(proto, &[("resolvedOptions", resolved_options as NativeFn, 0)]);
-    crate::symbol::to_string_tag(vm, proto, "Intl.Collator");
-    vm.intl_roots[Root::CollatorPrototype as usize] = proto.ptr();
+    crate::builtins::getter(vm, proto.v(), "compare", compare_getter);
+    vm.define_natives(proto.v(), &[("resolvedOptions", resolved_options as NativeFn, 0)]);
+    crate::symbol::to_string_tag(vm, proto.v(), "Intl.Collator");
+    vm.intl_roots[Root::CollatorPrototype as usize] = proto.v().ptr();
     vm.intl_roots[Root::Compare as usize] = vm.native_function("", bound_compare, 2, crate::jit::Ty::Any, false).ptr();
 }
 
@@ -225,8 +225,8 @@ fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_collator(this, "resolvedOptions")?;
     let f = Flags::unpack(slot(o, FLAGS).as_i32_unchecked());
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let r = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let r = vm.mu().new_plain(op).raw_obj();
     let usage = if f.search { "search" } else { "sort" };
     let strings = [
         ("locale", None),
@@ -246,9 +246,9 @@ fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
             _ => unreachable!(),
         };
         let a = vm.intern_name(name);
-        vm.add_property(r, a, v);
+        vm.add_property(r.v(), a, v);
     }
-    Ok(object_value(r.ptr()))
+    Ok(object_value(r.v().ptr()))
 }
 
 /// `Intl.Collator.supportedLocalesOf(locales, options)`.

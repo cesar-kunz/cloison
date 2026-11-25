@@ -152,6 +152,14 @@ impl<'a, T: Rootable + Copy> Fresh<'a, T> {
     pub fn peek(&self) -> T {
         self.v
     }
+
+    /// The value, raw, where nothing collects until its last use (see
+    /// [`Raw`]).
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn raw(self) -> Raw<T> {
+        Raw::new(self.v)
+    }
 }
 
 impl<'a, T: Rootable> Fresh<'a, Option<T>> {
@@ -295,6 +303,105 @@ impl<'a> Gc<'a> {
     pub fn root<'s>(self, s: &'s Scope) -> Handle<'s> {
         s.root(self.v)
     }
+
+    /// The value, raw, where nothing collects until its last use (see
+    /// [`Raw`]).
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn raw(self) -> Raw {
+        Raw::new(self.v)
+    }
+
+    /// The object, raw, where nothing collects until its last use.
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn raw_obj(self) -> Raw<Obj> {
+        Raw::new(Obj::of(self.v))
+    }
+}
+
+/// A value taken raw from a [`Fresh`] or a [`Gc`] where the code after
+/// it, up to its last use, doesn't collect: what the borrow checker
+/// can't follow (the calls between are the VM's own, not [`Mu`]'s). With
+/// the `gc-check` feature it is checked: each use ([`Raw::v`]) panics if
+/// a point that may collect passed since it was taken (a safepoint, JS
+/// run, a collection; see [`may_collect`]).
+#[derive(Clone, Copy)]
+pub struct Raw<T = Value> {
+    v: T,
+    /// (`gc-check`: the points that may collect so far when it was taken,
+    /// and where.)
+    #[cfg(feature = "gc-check")]
+    at: u64,
+    #[cfg(feature = "gc-check")]
+    from: &'static std::panic::Location<'static>,
+}
+
+impl<T: Copy> Raw<T> {
+    #[inline(always)]
+    #[track_caller]
+    fn new(v: T) -> Raw<T> {
+        Raw {
+            v,
+            #[cfg(feature = "gc-check")]
+            at: collect_points(),
+            #[cfg(feature = "gc-check")]
+            from: std::panic::Location::caller(),
+        }
+    }
+
+    /// The value, nothing having collected since it was taken (checked
+    /// with `gc-check`).
+    #[inline(always)]
+    #[track_caller]
+    pub fn v(self) -> T {
+        #[cfg(feature = "gc-check")]
+        if collect_points() != self.at {
+            raw_used_late(self.from, std::panic::Location::caller());
+        }
+        self.v
+    }
+}
+
+/// (`gc-check`: this thread's points that may collect so far, its VMs'.)
+#[cfg(feature = "gc-check")]
+fn collect_points() -> u64 {
+    COLLECT_POINTS.with(|c| c.get())
+}
+
+#[cfg(feature = "gc-check")]
+thread_local! {
+    static COLLECT_POINTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "gc-check")]
+#[cold]
+#[inline(never)]
+fn raw_used_late(from: &std::panic::Location<'_>, at: &std::panic::Location<'_>) {
+    if !std::thread::panicking() {
+        panic!("a Raw value taken at {from} used at {at}, after a point that may collect");
+    }
+}
+
+/// `gc-check`: a point that may collect (a safepoint, JS about to run, a
+/// collection asked for): counted, for [`Raw`]'s check, and never inside a
+/// [`Mu`]'s own work.
+#[cfg(feature = "gc-check")]
+#[inline(always)]
+pub(crate) fn may_collect(vm: &mut Vm) {
+    COLLECT_POINTS.with(|c| c.set(c.get() + 1));
+    if vm.no_collect != 0 {
+        collects_in_mu();
+    }
+}
+
+#[cfg(feature = "gc-check")]
+#[cold]
+#[inline(never)]
+fn collects_in_mu() {
+    if !std::thread::panicking() {
+        panic!("a point that may collect, inside a Mu's work (where nothing collects)");
+    }
 }
 
 /// The VM where nothing collects (gc-arena's `Mutation<'gc>`): cells made
@@ -312,7 +419,19 @@ impl<'a> Mu<'a> {
         // SAFETY: `Mu<'a>` holds the VM's exclusive borrow for `'a` (its
         // `PhantomData`), and lends it to one `f` at a time; a `Gc` is a
         // value, no borrow of the VM's.
-        f(unsafe { &mut *self.vm })
+        let vm = unsafe { &mut *self.vm };
+        // (`gc-check`: no point that may collect while `f` runs.)
+        // (An unwinding, out of memory, leaves it counted up: the run's end
+        // resets it, see `RunState`.)
+        #[cfg(feature = "gc-check")]
+        {
+            vm.no_collect += 1;
+            let r = f(vm);
+            vm.no_collect -= 1;
+            r
+        }
+        #[cfg(not(feature = "gc-check"))]
+        f(vm)
     }
 
     /// A new object of `class` inheriting from `proto`, room for
@@ -373,6 +492,32 @@ impl<'a> Mu<'a> {
         Gc { v: self.with(|vm| vm.from_descriptor(d)), _vm: PhantomData }
     }
 
+    /// The atom of name `s` (a new one interned: its string made).
+    #[inline(always)]
+    pub(crate) fn intern_name(&self, s: &str) -> crate::object::Atom {
+        self.with(|vm| vm.intern_name(s))
+    }
+
+    /// `o`, a cell made here, given property `name` (not one it has),
+    /// `value`: an object filled where nothing collects (no setter
+    /// consulted, its own property added).
+    #[inline(always)]
+    pub(crate) fn add_property(&self, o: Gc<'a>, name: crate::object::Atom, value: Value) {
+        self.with(|vm| vm.add_property(o.obj(), name, value));
+    }
+
+    /// [`Mu::add_property`] with attributes `attrs`.
+    #[inline(always)]
+    pub(crate) fn add_property_with(&self, o: Gc<'a>, name: crate::object::Atom, value: Value, attrs: u8) {
+        self.with(|vm| vm.add_property_with(o.obj(), name, value, attrs));
+    }
+
+    /// [`Mu::add_property_with`] of each name with its value.
+    #[inline(always)]
+    pub(crate) fn add_properties(&self, o: Gc<'a>, names: &[crate::object::Atom], values: &[Value], attrs: u8) {
+        self.with(|vm| vm.add_properties(o.obj(), names, values, attrs));
+    }
+
     /// A key as a property key value: a string (an index's made) or a
     /// symbol.
     pub(crate) fn key_string(&self, key: Key) -> Gc<'a> {
@@ -392,26 +537,26 @@ impl<'a> Mu<'a> {
 #[must_use]
 pub struct Scope {
     vm: *mut Vm,
-    /// `vm.handles`' depth where it began; with the `scope-check` feature, with
+    /// `vm.handles`' depth where it began; with the `gc-check` feature, with
     /// `vm.scope_roots` then in its high half (the struct no bigger: deep
     /// recursions' frames as release's).
     depth: usize,
 }
 
-/// (`scope-check`: `Scope::depth`'s low half, the handles' depth.)
-#[cfg(feature = "scope-check")]
+/// (`gc-check`: `Scope::depth`'s low half, the handles' depth.)
+#[cfg(feature = "gc-check")]
 const LOW: usize = u32::MAX as usize;
 
 impl Scope {
     /// A scope from `vm.handles`' current depth.
     #[inline(always)]
     pub fn new(vm: &mut Vm) -> Scope {
-        #[cfg(feature = "scope-check")]
+        #[cfg(feature = "gc-check")]
         let depth = {
             debug_assert!(vm.handles.len() <= LOW && vm.scope_roots <= LOW);
             vm.handles.len() | vm.scope_roots << 32
         };
-        #[cfg(not(feature = "scope-check"))]
+        #[cfg(not(feature = "gc-check"))]
         let depth = vm.handles.len();
         Scope { depth, vm }
     }
@@ -419,9 +564,9 @@ impl Scope {
     /// The handles' depth where it began.
     #[inline(always)]
     fn base(&self) -> usize {
-        #[cfg(feature = "scope-check")]
+        #[cfg(feature = "gc-check")]
         return self.depth & LOW;
-        #[cfg(not(feature = "scope-check"))]
+        #[cfg(not(feature = "gc-check"))]
         self.depth
     }
 
@@ -430,7 +575,7 @@ impl Scope {
     pub fn roots<const N: usize>(&self, vs: [Value; N]) -> [Handle<'_>; N] {
         // SAFETY: as `root`.
         let at = unsafe {
-            #[cfg(feature = "scope-check")]
+            #[cfg(feature = "gc-check")]
             {
                 (*self.vm).scope_roots += N;
             }
@@ -455,7 +600,7 @@ impl Scope {
         // SAFETY: the scope doesn't outlive its VM, and nothing else
         // borrows `handles` while it is pushed to.
         let slot = unsafe {
-            #[cfg(feature = "scope-check")]
+            #[cfg(feature = "gc-check")]
             {
                 (*self.vm).scope_roots += 1;
             }
@@ -466,11 +611,11 @@ impl Scope {
         Handle { vm: self.vm, slot, _s: PhantomData }
     }
 
-    /// With `scope-check`, as it ends: only its own roots (and its inner
+    /// With `gc-check`, as it ends: only its own roots (and its inner
     /// scopes', ended) above where it began. A value pushed to
     /// `vm.handles` by hand after it began would be dropped with them, its
     /// root gone while its pusher still counts on it.
-    #[cfg(feature = "scope-check")]
+    #[cfg(feature = "gc-check")]
     #[inline(always)]
     fn check_own(&self, vm: &mut Vm) {
         let then = self.depth >> 32;
@@ -483,7 +628,7 @@ impl Scope {
 }
 
 /// [`Scope::check_own`]'s failure.
-#[cfg(feature = "scope-check")]
+#[cfg(feature = "gc-check")]
 #[cold]
 #[inline(never)]
 fn unrooted_pushes(n: usize) {
@@ -497,7 +642,7 @@ impl Drop for Scope {
     fn drop(&mut self) {
         // SAFETY: as `root`.
         let vm = unsafe { &mut *self.vm };
-        #[cfg(feature = "scope-check")]
+        #[cfg(feature = "gc-check")]
         self.check_own(vm);
         vm.handles.truncate(self.base());
     }

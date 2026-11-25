@@ -14,12 +14,12 @@ use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, s
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let json = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let json = vm.mu().new_plain(op).raw_obj();
     let a_json = vm.intern_name("JSON");
-    vm.add_property_with(g, a_json, object_value(json.ptr()), DONT_ENUM);
+    vm.add_property_with(g, a_json, object_value(json.v().ptr()), DONT_ENUM);
     vm.define_natives(
-        json,
+        json.v(),
         &[
             ("stringify", json_stringify as NativeFn, 3),
             ("parse", json_parse, 2),
@@ -874,22 +874,22 @@ impl<'a> Parser<'a> {
                         if !self.eat(b':') {
                             return Err(self.error());
                         }
-                        // take: parsing only allocates, nothing collects (and
+                        // raw: parsing only allocates, nothing collects (and
                         // no Scope here: its end would drop the records' roots).
-                        let v = self.value(vm)?.take();
+                        let v = self.value(vm)?.raw();
                         // (A name the object has, stored in its slot, a
                         // new one added: no string of it, no descriptor.)
                         match property_key(vm, &k) {
                             Key::Name(a) => {
                                 let ob = Obj::of(o);
                                 match ob.shape().live().lookup(a) {
-                                    Some(slot) => vm.store_field(ob, slot, v),
+                                    Some(slot) => vm.store_field(ob, slot, v.v()),
                                     None => {
-                                        vm.add_property_keyed(ob, a, v);
+                                        vm.add_property_keyed(ob, a, v.v());
                                     }
                                 }
                             }
-                            key => vm.create_data_property(o, key, v)?,
+                            key => vm.create_data_property(o, key, v.v())?,
                         }
                         if self.track {
                             keys.push(k.into_owned());
@@ -906,18 +906,18 @@ impl<'a> Parser<'a> {
             }
             Some('[') if self.peek() < Some(128) => {
                 self.i += 1;
-                // take: parsing only allocates, nothing collects (and no
+                // raw: parsing only allocates, nothing collects (and no
                 // Scope here: its end would drop the records' roots).
-                let arr = vm.mu().new_array().v();
-                let ao = Obj::of(arr);
+                let arr = vm.mu().new_array().raw();
+                let ao = Obj::of(arr.v());
                 let mut n = 0;
                 if !self.eat(b']') {
                     loop {
-                        // take: nothing collects before its last use.
-                        let v = self.value(vm)?.take();
+                        // raw: nothing collects before its last use.
+                        let v = self.value(vm)?.raw();
                         // (Pushed: traced from here on.)
                         vm.reserve_elems(ao, n + 1);
-                        vm.store_element(ao, n, v);
+                        vm.store_element(ao, n, v.v());
                         n += 1;
                         // SAFETY: within the capacity `reserve_elems` made above.
                         unsafe { ao.set_elems_len(n as u32) };
@@ -929,7 +929,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                (arr, Some(false))
+                (arr.v(), Some(false))
             }
             Some('"') if self.peek() < Some(128) => {
                 let s = self.string()?;

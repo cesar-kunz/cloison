@@ -122,14 +122,14 @@ pub(crate) fn slots(v: Value) -> Option<Slots> {
 /// A new object of `slots`'s class (its intrinsic prototype).
 pub(crate) fn create(vm: &mut Vm, slots: Slots) -> Value {
     let proto = object_value(vm.temporal.protos[slots.kind() as usize]);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_object_with(Class::Temporal, proto, 0).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let o = vm.mu().new_object_with(Class::Temporal, proto, 0).raw_obj();
     let bytes = vm.heap.alloc_bytes(size_of::<Slots>());
     unsafe {
         bytes.cast::<Slots>().write_unaligned(slots);
-        (*o.ptr()).elems = bytes.cast();
+        (*o.v().ptr()).elems = bytes.cast();
     }
-    object_value(o.ptr())
+    object_value(o.v().ptr())
 }
 
 fn this_slots(this: Value, kind: Kind) -> Result<Slots> {
@@ -838,18 +838,18 @@ pub(crate) fn install(vm: &mut Vm) {
         duration::spec(),
     ];
     for spec in specs {
-        // take: only calls that don't collect follow (allocation, stores, filling it).
-        let proto = vm.mu().new_plain(op).obj();
+        // raw: only calls that don't collect follow (allocation, stores, filling it).
+        let proto = vm.mu().new_plain(op).raw_obj();
         let c = vm.define_native(temporal.obj(), spec.name, spec.ctor, spec.length, any, true);
-        crate::builtins::link_constructor(vm, c, proto);
+        crate::builtins::link_constructor(vm, c, proto.v());
         vm.define_natives(c, spec.statics);
         for &(name, f) in spec.getters {
-            crate::builtins::getter(vm, proto, name, f);
+            crate::builtins::getter(vm, proto.v(), name, f);
         }
-        vm.define_natives(proto, spec.methods);
-        vm.define_natives(proto, &[("valueOf", value_of as NativeFn, 0)]);
-        crate::symbol::to_string_tag(vm, proto, &format!("Temporal.{}", spec.name));
-        vm.temporal.protos[spec.kind as usize] = proto.ptr();
+        vm.define_natives(proto.v(), spec.methods);
+        vm.define_natives(proto.v(), &[("valueOf", value_of as NativeFn, 0)]);
+        crate::symbol::to_string_tag(vm, proto.v(), &format!("Temporal.{}", spec.name));
+        vm.temporal.protos[spec.kind as usize] = proto.v().ptr();
         vm.temporal.ctors[spec.kind as usize] = c.ptr();
     }
     zoned::install_now(vm, temporal.obj());

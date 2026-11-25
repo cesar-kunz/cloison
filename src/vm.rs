@@ -1133,10 +1133,14 @@ pub struct Vm {
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
-    /// (The `scope-check` feature: how many of `handles` live Scopes rooted, for their
+    /// (The `gc-check` feature: how many of `handles` live Scopes rooted, for their
     /// check that nothing else was pushed above them; see `brand::Scope`.)
-    #[cfg(feature = "scope-check")]
+    #[cfg(feature = "gc-check")]
     pub(crate) scope_roots: usize,
+    /// (`gc-check`: how many `Mu`s' work, where no point may collect, is
+    /// under way; see `brand::may_collect`.)
+    #[cfg(feature = "gc-check")]
+    pub(crate) no_collect: u32,
     /// How many of `handles` are the slots of the host's open handle
     /// scopes (`crate::handles`): always a prefix, as the host takes them
     /// only between runs and operations, which truncate `handles` to no
@@ -1635,8 +1639,10 @@ impl Vm {
             open_upvalues: Vec::new(),
             type_names: [None; 11],
             handles: Vec::new(),
-            #[cfg(feature = "scope-check")]
+            #[cfg(feature = "gc-check")]
             scope_roots: 0,
+            #[cfg(feature = "gc-check")]
+            no_collect: 0,
             host_slots: 0,
             globals: Default::default(),
             host_error: None,
@@ -8644,9 +8650,9 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
 /// `Array(…)` and `new Array(…)`: `Array(n)` has length `n` (holes), any
 /// other arguments are the elements.
 fn array_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
-    // take: filled where nothing collects, then returned.
-    let a = vm.mu().new_array().v();
-    let o = Obj::of(a);
+    // raw: filled where nothing collects, then returned.
+    let a = vm.mu().new_array().raw();
+    let o = Obj::of(a.v());
     let elems: Vec<Value> = match &*args {
         [n] if n.is_number() => {
             let len = n.as_number().unwrap();
@@ -8655,7 +8661,7 @@ fn array_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
             }
             if vm.density.goes_far(0, len as usize, false) {
                 crate::far::make_far(vm, o, len as u32);
-                return Ok(a);
+                return Ok(a.v());
             }
             vec![Value::EMPTY; len as usize]
         }
@@ -8672,7 +8678,7 @@ fn array_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
     }
     // SAFETY: within the capacity `reserve_elems` made above.
     unsafe { o.set_elems_len(elems.len() as u32) };
-    Ok(a)
+    Ok(a.v())
 }
 
 /// Whether native `f` is a [`Code::leaf`]: `Math`'s functions of numbers
@@ -10125,6 +10131,11 @@ impl Drop for RunState {
         if self.outer {
             vm.heap.gc.stack_base = 0;
             vm.pause_marker();
+            // (A `Mu`'s work unwound: none is left.)
+            #[cfg(feature = "gc-check")]
+            {
+                vm.no_collect = 0;
+            }
         }
     }
 }

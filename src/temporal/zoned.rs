@@ -123,11 +123,11 @@ fn round_options_raw(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
         return Err(type_err("options parameter is required"));
     }
     if is_string(v) {
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let o = vm.mu().new_plain(Value::NULL).v();
-        let a = vm.intern_name(name);
-        vm.add_property(Obj::of(o), a, v);
-        return Ok(o);
+        let mu = vm.mu();
+        let o = mu.new_plain(Value::NULL);
+        let a = mu.intern_name(name);
+        mu.add_property(o, a, v);
+        return Ok(o.v());
     }
     options_object(vm, v).map(Fresh::take)
 }
@@ -710,12 +710,12 @@ fn to_temporal_instant(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 
 pub(crate) fn install_now(vm: &mut Vm, temporal: Obj) {
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let now = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let now = vm.mu().new_plain(op).raw_obj();
     let a = vm.intern_name("Now");
-    vm.add_property_with(temporal, a, object_value(now.ptr()), crate::object::DONT_ENUM);
+    vm.add_property_with(temporal, a, object_value(now.v().ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
-        now,
+        now.v(),
         &[
             ("instant", now_instant as NativeFn, 0),
             ("plainDateTimeISO", now_date_time, 0),
@@ -725,7 +725,7 @@ pub(crate) fn install_now(vm: &mut Vm, temporal: Obj) {
             ("zonedDateTimeISO", now_zoned, 0),
         ],
     );
-    crate::symbol::to_string_tag(vm, now, "Temporal.Now");
+    crate::symbol::to_string_tag(vm, now.v(), "Temporal.Now");
     let dp = vm.date_prototype;
     vm.define_natives(unsafe { Obj::from_ptr(dp) }, &[("toTemporalInstant", to_temporal_instant as NativeFn, 0)]);
 }

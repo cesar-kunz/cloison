@@ -131,8 +131,8 @@ fn create_raw(vm: &mut Vm, f: Obj) -> Result<Value> {
     let n = cells_for(code.live().kind) + code.live().nregs as usize;
     // take: stored into the generator below; only allocation between.
     let queue = if is_async { vm.mu().new_array().v() } else { Value::UNDEFINED };
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let g = vm.mu().new_object_with(Class::Generator, proto, 0).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let g = vm.mu().new_object_with(Class::Generator, proto, 0).raw_obj();
     let st = vm.heap.alloc_values(n);
     let mut cells = vec![
         Value::from_i32(SUSPENDED_START),
@@ -148,9 +148,9 @@ fn create_raw(vm: &mut Vm, f: Obj) -> Result<Value> {
         for (k, &v) in cells.iter().enumerate() {
             *st.add(k) = v;
         }
-        crate::heap::store_young(g.ptr().cast(), &raw mut (*g.ptr()).code, st as *const Code);
+        crate::heap::store_young(g.v().ptr().cast(), &raw mut (*g.v().ptr()).code, st as *const Code);
     }
-    Ok(object_value(g.ptr()))
+    Ok(object_value(g.v().ptr()))
 }
 
 /// Keep frame `regs` (of `code`, at offset `pc` to go on from) in
@@ -500,13 +500,13 @@ pub(crate) fn install(vm: &mut Vm) {
     // `%AsyncIteratorPrototype%` (its async iterator itself) and
     // `%AsyncGeneratorPrototype%`.
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let aip = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let aip = vm.mu().new_plain(op).raw_obj();
     let a_async_iterator = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     let f = vm.native_function("[Symbol.asyncIterator]", return_this, 0, crate::jit::Ty::Any, false);
-    vm.add_property_with(aip, a_async_iterator, object_value(f.ptr()), DONT_ENUM);
+    vm.add_property_with(aip.v(), a_async_iterator, object_value(f.ptr()), DONT_ENUM);
     let sc_agp = Scope::new(vm);
-    let agp = vm.mu().new_plain(object_value(aip.ptr())).root(&sc_agp);
+    let agp = vm.mu().new_plain(object_value(aip.v().ptr())).root(&sc_agp);
     vm.symbol_roots.push(agp.obj());
     vm.define_natives(
         agp.obj(),

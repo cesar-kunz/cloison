@@ -300,16 +300,65 @@ it. Such code takes the value and pushes it, with its reason
 (`// take: pushed to vm.handles on the next line.`), rather than
 rooting it in a `Scope` of its own.
 
-The `scope-check` cargo feature checks this at run time: each `Scope`,
-as it ends, panics if anything but its own roots is above where it
-began. CI runs the tests and the drop+stress scripts with it. It is off
-by default because it deepens recursive frames: a 10,000-deep proxy
-chain then overflows a test thread's stack in a debug-assertions build.
+The `gc-check` cargo feature (see below) checks this at run time: each
+`Scope`, as it ends, panics if anything but its own roots is above
+where it began. It is off by default because it deepens recursive
+frames: a 10,000-deep proxy chain then overflows a test thread's stack
+in a debug-assertions build.
+
+## "Nothing collects here": `Raw`, and `Mu` blocks
+
+The weakest `take()`s were those whose reason was "nothing collects
+before its last use": a new object filled in, a value checked and
+returned. The claim is about every call in between, and an edit can
+make it false without anything noticing. Two ways now check it.
+
+**Statically, a `Mu` block.** When everything between is allocation and
+filling in the new object, the code runs on `vm.mu()` alone:
+
+```rust
+let mu = vm.mu();
+let r = mu.new_plain(op);
+let (a_value, a_done) = (mu.intern_name("value"), mu.intern_name("done"));
+mu.add_property(r, a_value, value);
+mu.add_property(r, a_done, Value::from_bool(done));
+r.v()
+```
+
+While `mu` and `r` live, the VM is borrowed: a call that may collect
+there doesn't compile. `Mu` offers only what never collects (allocation,
+`intern_name`, adding a property to a cell it made).
+
+**At run time, a `Raw` value.** Where the calls between are the VM's own
+(defining natives, `array_push` onto a new array, a realm's setup), the
+value is taken as a `Raw` (`.raw()`, `.raw_obj()`, with a `// raw:`
+reason), read with `.v()`. With the `gc-check` feature, the VM counts
+the points where a collection may happen: every safepoint, every entry
+into JS (interpreted or compiled) and every forced collection. A `Raw`
+remembers the count when taken, and each `.v()` panics if it changed.
+The same feature makes every point that may collect panic while a `Mu`
+does its own work, which checks `Mu`'s methods themselves, and runs the
+`Scope` check above. CI runs the tests and the drop+stress scripts with
+it.
+
+What it found at once: `find`, `findLast`, `Iterator.prototype.filter`
+and `Iterator.prototype.find` returned their element after the callback
+ran, a collection in between, on the reasoning that the callback's frame
+kept it alive as its argument. It was alive, but through another copy:
+`call_b` copies a Rust caller's arguments to the VM stack, and the
+callee's frame (whose parameter it may overwrite) is built past them.
+The element is rooted across the callback now, not counting on that.
+
+A value taken and then rooted later ("rooted below") stays a `take()`:
+after its root, its raw uses are safe for another reason, which `Raw`
+can't see.
 
 ## What isn't checked yet
 
-- **The `take()`s and raw `Gc` values**: each one reviewed and given a
-  reason, checked by CI to be there.
+- **The `take()`s**: each one reviewed and given a reason, checked by
+  CI to be there. (The "nothing collects" ones are `Raw` values or `Mu`
+  blocks now, see above; `Raw` is checked only on the paths the tests
+  run.)
 - **Raw values that never came from a `Fresh` or a `Gc`**:
   - a value read from an object's slot;
   - what a module's allocating helper returns (`str_value`,

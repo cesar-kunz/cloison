@@ -497,10 +497,10 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::range_error("Array buffer allocation failed"));
     }
     let b = new_block(n, room).ok_or_else(|| Error::range_error("Array buffer allocation failed"))?;
-    // take: nothing collects before its last use.
-    let o = new_shared(vm, b, max.is_some())?.take();
-    vm.set_prototype_of(Obj::of(o), proto);
-    Ok(o)
+    // raw: nothing collects before its last use.
+    let o = new_shared(vm, b, max.is_some())?.raw();
+    vm.set_prototype_of(Obj::of(o.v()), proto);
+    Ok(o.v())
 }
 
 /// `get buffer.byteLength`: its length read seq-cst (25.2.5.1), which
@@ -926,13 +926,13 @@ fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Fresh<'_>> {
 
 fn wait_result_raw(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let r = vm.mu().new_plain(op).obj();
-    let a_async = vm.intern_name("async");
-    let a_value = vm.intern_name("value");
-    vm.add_property(r, a_async, Value::from_bool(async_));
-    vm.add_property(r, a_value, value);
-    Ok(object_value(r.ptr()))
+    let mu = vm.mu();
+    let r = mu.new_plain(op);
+    let a_async = mu.intern_name("async");
+    let a_value = mu.intern_name("value");
+    mu.add_property(r, a_async, Value::from_bool(async_));
+    mu.add_property(r, a_value, value);
+    Ok(r.v())
 }
 
 fn atomics_wait(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -1057,23 +1057,23 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let sp = vm.mu().new_plain(op).obj();
-    vm.shared.prototype = sp.ptr();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let sp = vm.mu().new_plain(op).raw_obj();
+    vm.shared.prototype = sp.v().ptr();
     let c = vm.define_native(g, "SharedArrayBuffer", shared_ctor, 1, any, true);
     vm.shared.constructor = c.ptr();
-    crate::builtins::link_constructor(vm, c, sp);
-    getter(vm, sp, "byteLength", shared_byte_length);
-    getter(vm, sp, "growable", shared_growable);
-    getter(vm, sp, "maxByteLength", shared_max_byte_length);
-    vm.define_natives(sp, &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
+    crate::builtins::link_constructor(vm, c, sp.v());
+    getter(vm, sp.v(), "byteLength", shared_byte_length);
+    getter(vm, sp.v(), "growable", shared_growable);
+    getter(vm, sp.v(), "maxByteLength", shared_max_byte_length);
+    vm.define_natives(sp.v(), &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
 
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let atomics = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let atomics = vm.mu().new_plain(op).raw_obj();
     let a_atomics = vm.intern_name("Atomics");
-    vm.add_property_with(g, a_atomics, object_value(atomics.ptr()), crate::object::DONT_ENUM);
+    vm.add_property_with(g, a_atomics, object_value(atomics.v().ptr()), crate::object::DONT_ENUM);
     vm.define_natives(
-        atomics,
+        atomics.v(),
         &[
             ("add", atomics_add as NativeFn, 3),
             ("and", atomics_and, 3),
@@ -1091,7 +1091,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("xor", atomics_xor, 3),
         ],
     );
-    vm.shared_atomics = atomics.ptr();
+    vm.shared_atomics = atomics.v().ptr();
 }
 
 /// `[@@toStringTag]`s (see `typed::install_symbols`).

@@ -526,22 +526,22 @@ pub(crate) fn big_of(v: Value) -> Big {
 /// A new BigInt of `b`.
 pub(crate) fn new_bigint(vm: &mut Vm, b: Big) -> Value {
     let proto = if vm.bigint_prototype.is_null() { Value::NULL } else { object_value(vm.bigint_prototype) };
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_object_with(Class::BigInt, proto, 0).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let o = vm.mu().new_object_with(Class::BigInt, proto, 0).raw_obj();
     unsafe {
-        *Object::aux(o.ptr()) = b.neg as u32;
+        *Object::aux(o.v().ptr()) = b.neg as u32;
         if !b.mag.is_empty() {
             let p = vm.heap.alloc_bytes(4 * b.mag.len().next_multiple_of(2)).cast::<u32>();
             std::ptr::copy_nonoverlapping(b.mag.as_ptr(), p, b.mag.len());
-            (*o.ptr()).elems = p.cast();
+            (*o.v().ptr()).elems = p.cast();
         }
-        o.set_elems_len(b.mag.len() as u32);
+        o.v().set_elems_len(b.mag.len() as u32);
         // (Its class's root shape takes no element store: see
         // `Vm::root_shape`. Not a unique shape of its own, which would
         // never be freed.)
-        o.set_flags(o.flags() | crate::object::NOT_EXTENSIBLE);
+        o.v().set_flags(o.v().flags() | crate::object::NOT_EXTENSIBLE);
     }
-    object_value(o.ptr())
+    object_value(o.v().ptr())
 }
 
 /// A new BigInt of 64 bits `bits` (two's complement if `signed`), for
@@ -791,21 +791,21 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let proto = vm.mu().new_plain(op).obj();
-    vm.bigint_prototype = proto.ptr();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let proto = vm.mu().new_plain(op).raw_obj();
+    vm.bigint_prototype = proto.v().ptr();
     let c = vm.define_native(g, "BigInt", bigint_fn, 1, any, true);
-    crate::builtins::link_constructor(vm, c, proto);
+    crate::builtins::link_constructor(vm, c, proto.v());
     vm.define_natives(c, &[("asIntN", bigint_as_int_n as crate::vm::NativeFn, 2), ("asUintN", bigint_as_uint_n, 2)]);
     vm.define_natives(
-        proto,
+        proto.v(),
         &[
             ("toString", bigint_to_string as crate::vm::NativeFn, 0),
             ("toLocaleString", bigint_to_locale_string, 0),
             ("valueOf", bigint_value_of, 0),
         ],
     );
-    crate::symbol::to_string_tag(vm, proto, "BigInt");
+    crate::symbol::to_string_tag(vm, proto.v(), "BigInt");
 }
 
 fn arg(a: &[Value], i: usize) -> Value {

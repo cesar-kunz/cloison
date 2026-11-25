@@ -2364,6 +2364,8 @@ impl Vm {
     /// frame's registers (or null).
     #[inline(always)]
     pub(crate) fn safepoint(&mut self, regs: *mut Value) {
+        #[cfg(feature = "gc-check")]
+        crate::brand::may_collect(self);
         if self.heap.requested.load(std::sync::atomic::Ordering::Relaxed) && self.heap.gc.stack_base != 0 {
             self.collect(regs);
         }
@@ -2381,6 +2383,8 @@ impl Vm {
     /// From a native: the running frame's registers are found through the
     /// native stack, as at a native's safepoint.
     pub(crate) fn collect_full_now(&mut self) {
+        #[cfg(feature = "gc-check")]
+        crate::brand::may_collect(self);
         if self.heap.gc.stack_base == 0 {
             return;
         }

@@ -1500,22 +1500,23 @@ fn defer_done(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
 pub(crate) fn install(vm: &mut Vm, host: Obj) {
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let proto = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let proto = vm.mu().new_plain(op).raw_obj();
     let c = vm.native_function("AbstractModuleSource", abstract_source_ctor, 0, any, true);
-    crate::builtins::link_constructor(vm, c, proto);
+    crate::builtins::link_constructor(vm, c, proto.v());
     let a = vm.intern_name("AbstractModuleSource");
     vm.add_property_with(host, a, object_value(c.ptr()), crate::object::DONT_ENUM);
-    vm.modules.abstract_source = vec![object_value(c.ptr()), object_value(proto.ptr())];
+    vm.modules.abstract_source = vec![object_value(c.ptr()), object_value(proto.v().ptr())];
 }
 
 /// `[@@toStringTag]` of `%AbstractModuleSource%.prototype` (see
 /// `symbol::install`).
 pub(crate) fn install_symbols(vm: &mut Vm) {
     let Some(&proto) = vm.modules.abstract_source.get(1) else { return };
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let holder = vm.mu().new_plain(Value::NULL).obj();
-    let f = vm.define_native(holder, "get [Symbol.toStringTag]", abstract_source_tag, 0, crate::jit::Ty::Any, false);
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let holder = vm.mu().new_plain(Value::NULL).raw_obj();
+    let f =
+        vm.define_native(holder.v(), "get [Symbol.toStringTag]", abstract_source_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
     vm.define_accessor(Obj::of(proto), a_tag, Some(object_value(f.ptr())), None, crate::object::DONT_ENUM);
 }

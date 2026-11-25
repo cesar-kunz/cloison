@@ -5602,6 +5602,8 @@ pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Va
 pub(crate) unsafe fn drive_from(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value, unwinding: bool) -> Value {
     // (JS the runtime runs, a generator resumed, a script: not the atoms of
     // a native calling it, see `Vm::held_atoms`.)
+    #[cfg(feature = "gc-check")]
+    crate::brand::may_collect(vm);
     vm.run_js(|vm| unsafe { drive_js(vm, pc, acc, regs, unwinding) })
 }
 

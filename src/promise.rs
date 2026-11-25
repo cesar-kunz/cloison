@@ -90,10 +90,10 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let proto = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let proto = vm.mu().new_plain(op).raw_obj();
     let c = vm.define_native(g, "Promise", promise_ctor, 1, any, true);
-    link_constructor(vm, c, proto);
+    link_constructor(vm, c, proto.v());
     // (One queue for every realm.)
     if vm.job_queue.is_null() {
         vm.job_queue = as_object(vm.mu().new_array().v());
@@ -102,17 +102,17 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // `AggregateError`, as the error kinds are made in `builtins`.
     let ep = object_value((vm.error_prototypes[0]).ptr());
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let aep = vm.mu().new_plain(ep).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let aep = vm.mu().new_plain(ep).raw_obj();
     let ac = vm.define_native(g, "AggregateError", aggregate_error_ctor, 2, any, true);
-    link_constructor(vm, ac, aep);
+    link_constructor(vm, ac, aep.v());
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = string(vm, "AggregateError");
-    vm.add_property_with(aep, a_name, name, DONT_ENUM);
+    vm.add_property_with(aep.v(), a_name, name, DONT_ENUM);
     let empty = string(vm, "");
-    vm.add_property_with(aep, a_message, empty, DONT_ENUM);
+    vm.add_property_with(aep.v(), a_message, empty, DONT_ENUM);
 
-    vm.promise_roots = vec![proto.ptr(), c.ptr(), jobs, aep.ptr(), std::ptr::null_mut()];
+    vm.promise_roots = vec![proto.v().ptr(), c.ptr(), jobs, aep.v().ptr(), std::ptr::null_mut()];
     let templates: [(NativeFn, u32); 14] = [
         (resolve_fn, 1),
         (reject_fn, 1),
@@ -149,7 +149,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     vm.define_natives(
-        proto,
+        proto.v(),
         &[("then", promise_then as NativeFn, 2), ("catch", promise_catch, 1), ("finally", promise_finally, 1)],
     );
 }
@@ -455,14 +455,14 @@ pub(crate) fn set_slot(o: Obj, i: usize, v: Value) {
 /// A new pending promise (of `Promise.prototype`).
 pub(crate) fn new_promise(vm: &mut Vm) -> Value {
     let proto = object_value(root(vm, Root::Prototype).ptr());
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_object_with(Class::Promise, proto, 0).obj();
+    // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
+    let o = vm.mu().new_object_with(Class::Promise, proto, 0).raw_obj();
     let st = vm.heap.alloc_values(3);
     unsafe {
         *st.add(STATE) = Value::from_i32(PENDING);
-        crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).code, st as *const Code);
+        crate::heap::store_young(o.v().ptr().cast(), &raw mut (*o.v().ptr()).code, st as *const Code);
     }
-    object_value(o.ptr())
+    object_value(o.v().ptr())
 }
 
 /// Promise `p`'s state (pending 0, fulfilled 1, rejected 2) and result.
@@ -641,8 +641,8 @@ fn new_capability(vm: &mut Vm, c: Value) -> Result<Cap> {
     // (The executor rooted: its slots are read after the constructor ran.)
     let s = Scope::new(vm);
     let executor = vm.mu().make(|vm| closure(vm, Root::Executor, &[Value::UNDEFINED, Value::UNDEFINED])).root(&s);
-    // take: checked, then returned; the checks don't collect.
-    let promise = construct(vm, c, executor.v())?.take();
+    // raw: checked, then returned; the checks don't collect.
+    let promise = construct(vm, c, executor.v())?.raw();
     let eo = Obj::of(executor.v());
     let (resolve, reject) = (slot(eo, 0), slot(eo, 1));
     if !is_callable(resolve) {
@@ -651,7 +651,7 @@ fn new_capability(vm: &mut Vm, c: Value) -> Result<Cap> {
     if !is_callable(reject) {
         return Err(Error::type_error("Promise reject function is not callable"));
     }
-    Ok(Cap { promise, resolve, reject })
+    Ok(Cap { promise: promise.v(), resolve, reject })
 }
 
 /// `new c(executor)`: a native constructs itself; a bytecode function
@@ -913,10 +913,10 @@ fn perform_reaction(vm: &mut Vm, p: Obj, on_fulfilled: Value, on_rejected: Value
 /// constructor) for the handler's result.
 fn promise_then(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let p = this_promise(this, "Promise.prototype.then")?;
-    // take: given at once to new_capability; only Scope::new between.
-    let c = species_constructor(vm, this)?.take();
+    // raw: given at once to new_capability; only Scope::new between.
+    let c = species_constructor(vm, this)?.raw();
     let s = Scope::new(vm);
-    let cap = vm.fresh(|vm| new_capability(vm, c))?.root(&s);
+    let cap = vm.fresh(|vm| new_capability(vm, c.v()))?.root(&s);
     perform_then(vm, p, arg(&a, 0), arg(&a, 1), &cap.cap())?;
     Ok(cap.promise.v())
 }
@@ -957,10 +957,10 @@ fn promise_finally(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn then_finally(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
-    // take: given at once to promise_resolve_with; only Scope::new between.
-    let result = vm.call_b(on_finally, Value::UNDEFINED, &[])?.take();
+    // raw: given at once to promise_resolve_with; only Scope::new between.
+    let result = vm.call_b(on_finally, Value::UNDEFINED, &[])?.raw();
     let s = Scope::new(vm);
-    let p = promise_resolve_with(vm, c, result)?.root(&s);
+    let p = promise_resolve_with(vm, c, result.v())?.root(&s);
     let thunk = vm.mu().make(|vm| closure(vm, Root::ValueThunk, &[arg(&a, 0)])).root(&s);
     let a_then = vm.a_then;
     // take: given at once to the next call.
@@ -973,10 +973,10 @@ fn then_finally(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 fn catch_finally(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (on_finally, c) = (slot(me, 0), slot(me, 1));
-    // take: given at once to promise_resolve_with; only Scope::new between.
-    let result = vm.call_b(on_finally, Value::UNDEFINED, &[])?.take();
+    // raw: given at once to promise_resolve_with; only Scope::new between.
+    let result = vm.call_b(on_finally, Value::UNDEFINED, &[])?.raw();
     let s = Scope::new(vm);
-    let p = promise_resolve_with(vm, c, result)?.root(&s);
+    let p = promise_resolve_with(vm, c, result.v())?.root(&s);
     let thrower = vm.mu().make(|vm| closure(vm, Root::Thrower, &[arg(&a, 0)])).root(&s);
     let a_then = vm.a_then;
     // take: given at once to the next call.
@@ -1044,11 +1044,11 @@ fn promise_with_resolvers(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value
     let mut cap = vm.fresh(|vm| new_capability(vm, c))?.take();
     materialize(vm, &mut cap);
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_plain(op).obj();
-    let names = [vm.intern_name("promise"), vm.intern_name("resolve"), vm.intern_name("reject")];
-    vm.add_properties(o, &names, &[cap.promise, cap.resolve, cap.reject], 0);
-    Ok(object_value(o.ptr()))
+    let mu = vm.mu();
+    let o = mu.new_plain(op);
+    let names = [mu.intern_name("promise"), mu.intern_name("resolve"), mu.intern_name("reject")];
+    mu.add_properties(o, &names, &[cap.promise, cap.resolve, cap.reject], 0);
+    Ok(o.v())
 }
 
 /// `Promise.try(f, …args)`: a promise for `f(…args)`, rejected if it
@@ -1408,12 +1408,12 @@ fn settled_reject(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 
 fn settled_result(vm: &mut Vm, status: &str, key: &str, v: Value) -> Value {
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let o = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let o = vm.mu().new_plain(op).raw_obj();
     let names = [vm.intern_name("status"), vm.intern_name(key)];
     let status = string(vm, status);
-    vm.add_properties(o, &names, &[status, v], 0);
-    object_value(o.ptr())
+    vm.add_properties(o.v(), &names, &[status, v], 0);
+    object_value(o.v().ptr())
 }
 
 /// `any`'s reject element function.
@@ -1429,18 +1429,17 @@ fn any_element(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 /// A new `AggregateError` of `errors` (an array), with `message` if given.
 fn new_aggregate_error(vm: &mut Vm, errors: Value, message: Option<&[u16]>) -> Value {
     let proto = object_value(root(vm, Root::AggregateErrorPrototype).ptr());
-    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-    let o = vm.mu().new_plain(proto).obj();
-    unsafe { (*o.ptr()).flags |= crate::object::ERROR };
+    let mu = vm.mu();
+    let o = mu.new_plain(proto);
+    unsafe { (*o.obj().ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
-        let a = vm.intern_name("message");
-        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
-        let m = vm.mu().new_string(m).v();
-        vm.add_property_with(o, a, m, DONT_ENUM);
+        let a = mu.intern_name("message");
+        let m = mu.new_string(m);
+        mu.add_property_with(o, a, m.v(), DONT_ENUM);
     }
-    let a = vm.intern_name("errors");
-    vm.add_property_with(o, a, errors, DONT_ENUM);
-    object_value(o.ptr())
+    let a = mu.intern_name("errors");
+    mu.add_property_with(o, a, errors, DONT_ENUM);
+    o.v()
 }
 
 /// `any`'s rejection: every promise was rejected.

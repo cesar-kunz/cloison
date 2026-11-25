@@ -65,14 +65,14 @@ fn root(vm: &Vm, r: Root) -> Obj {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let intl = vm.mu().new_plain(op).obj();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let intl = vm.mu().new_plain(op).raw_obj();
     let a = vm.intern_name("Intl");
-    vm.add_property_with(g, a, object_value(intl.ptr()), DONT_ENUM);
-    crate::symbol::to_string_tag(vm, intl, "Intl");
+    vm.add_property_with(g, a, object_value(intl.v().ptr()), DONT_ENUM);
+    crate::symbol::to_string_tag(vm, intl.v(), "Intl");
     vm.intl_roots = vec![std::ptr::null_mut(); 5];
-    collator::install(vm, intl);
-    segmenter::install(vm, intl);
+    collator::install(vm, intl.v());
+    segmenter::install(vm, intl.v());
 }
 
 fn data_error(e: String) -> Error {
@@ -368,11 +368,11 @@ fn string_array<'v>(vm: &'v mut Vm, strings: &[String]) -> Result<Fresh<'v>> {
 }
 
 fn string_array_raw(vm: &mut Vm, strings: &[String]) -> Result<Value> {
-    // take: only calls that don't collect follow (allocation, stores, filling it).
-    let arr = vm.mu().new_array().v();
+    // raw: only calls that don't collect follow (allocation, stores, filling it).
+    let arr = vm.mu().new_array().raw();
     for s in strings {
         let v = crate::temporal::string(vm, s);
-        crate::vm::array_push(vm, arr, &[v])?;
+        crate::vm::array_push(vm, arr.v(), &[v])?;
     }
-    Ok(arr)
+    Ok(arr.v())
 }

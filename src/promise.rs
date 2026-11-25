@@ -1306,7 +1306,7 @@ fn keyed_result_raw(vm: &mut Vm, keys: Value, values: Value) -> Result<Value> {
     // no prototype: nothing here runs JS, but rooted as the types ask.)
     let s = Scope::new(vm);
     let (keys, values) = (s.root(keys), s.root(values));
-    let o = vm.mu().make(|vm| vm.mu().new_plain(Value::NULL).v()).root(&s);
+    let o = vm.mu().new_plain(Value::NULL).root(&s);
     for i in 0..len(Obj::of(keys.v())) {
         let key = crate::intrinsics::to_property_key(vm, elem(Obj::of(keys.v()), i))?;
         vm.create_data_property(o.v(), key, elem(Obj::of(values.v()), i))?;

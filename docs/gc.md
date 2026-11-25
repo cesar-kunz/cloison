@@ -430,9 +430,9 @@ measurement says the old generation fills with cells that die soon after.
    find the locals their paths reach; `scripts/gc-hazards.sh` looks on
    every path, statically: a rustc driver (tools/gc-hazards) that follows
    each Rust local holding a cell, from where it came (an allocation, a
-   call's result, a parameter) to where it is rooted (`Vm::rooted`,
-   `root_scope`, `vm.handles`, a store into the VM stack or a rooted
-   object), and reports the ones live across a call that may collect,
+   call's result, a parameter) to where it is rooted (a `Scope`'s
+   handle, `Vm::rooted`, `root_scope`, `vm.handles`, a store into the VM
+   stack or a rooted object), and reports the ones live across a call that may collect,
    passed to a callee that holds them across one, or captured by a
    closure that may collect. What it can't see (realm setup runs no JS,
    say) is in its `annotations.txt`; the hazards not fixed yet, in its

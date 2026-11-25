@@ -37,7 +37,7 @@ keys() { awk -F'\t' 'NF { print $2 "\t" $3 }' "$1" | sed -E 's/`_[0-9]+:/`_:/; s
 if [ "${1:-}" = --update ]; then
     {
         echo "# The GC hazards scripts/gc-hazards.sh found and that are not fixed yet: each"
-        echo "# to be fixed (rooted: Vm::rooted, Vm::root_scope) or, if safe, explained"
+        echo "# to be fixed (rooted: a Scope's handle, Vm::rooted) or, if safe, explained"
         echo "# in annotations.txt. Function, then the hazard. (--update rewrites it.)"
         comm -23 <(keys "$out") <(grep -v '^#' "$safe" | sed -E 's/\t# .*$//' | sort -u)
     } > "$baseline"

@@ -353,12 +353,12 @@ A value taken and then rooted later ("rooted below") stays a `take()`:
 after its root, its raw uses are safe for another reason, which `Raw`
 can't see.
 
-## What isn't checked yet
+## What the compiler doesn't check
 
 - **The `take()`s**: each one reviewed and given a reason, checked by
   CI to be there. (The "nothing collects" ones are `Raw` values or `Mu`
-  blocks now, see above; `Raw` is checked only on the paths the tests
-  run.)
+  blocks now, see above; `Raw` is checked at run time only on the paths
+  the tests run.)
 - **Raw values that never came from a `Fresh` or a `Gc`**:
   - a value read from an object's slot;
   - what a module's allocating helper returns (`str_value`,
@@ -370,6 +370,13 @@ can't see.
 - **The interpreter and the JIT**: their values live in the VM stack,
   which the collector scans precisely. Branding doesn't apply there.
 
-CI's stress run stays as the safety net for all of these.
+The GC hazard analysis (`scripts/gc-hazards.sh`, a CI job; see
+[gc.md](gc.md)) checks the first two statically, on every path: it
+follows what a `take()` or a `Raw` gives, a slot's value, a helper's
+result and `this` like any other local, and knows the branded forms
+(a `Scope`'s handles root, a `Fresh` is a call's result, `vm.mu()`'s
+allocations are new ordinary objects). What it finds and was reviewed
+safe is in `tools/gc-hazards/safe.txt`, each with its reason. CI's
+stress run stays the safety net for the paths the tests reach.
 
 [gc-arena]: https://github.com/kyren/gc-arena

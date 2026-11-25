@@ -1729,7 +1729,7 @@ fn object_create(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::type_error("Object prototype may only be an Object or null"));
     }
     let sc = Scope::new(vm);
-    let o = vm.mu().make(|vm| vm.mu().new_plain(proto).v()).root(&sc);
+    let o = vm.mu().new_plain(proto).root(&sc);
     if !arg(&a, 1).is_undefined() {
         let descs = descriptors(vm, arg(&a, 1))?.root(&sc);
         define_all(vm, Obj::of(o.v()), &descs)?;
@@ -2024,8 +2024,8 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
     }
     // (A wrapper `o`, and `out`, held across getters: rooted.)
     let sc = Scope::new(vm);
-    let [_, out] = sc.roots([ov, vm.mu().new_array().v()]);
-    let out = out.v();
+    let _ = sc.root(ov);
+    let out = vm.mu().new_array().root(&sc).v();
     let mut n = 0;
     for key in crate::proxy::own_keys(vm, o)? {
         if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) {
@@ -2068,7 +2068,7 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: Args<'_>) -> Re
     let sc = Scope::new(vm);
     let o = Obj::of(vm.to_object_b(arg(&a, 0))?.root(&sc).v());
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+    let out = vm.mu().new_plain(op).root(&sc);
     for key in crate::proxy::own_keys(vm, o)? {
         if let Some(d) = vm.own_property_b(o, key)?.take() {
             // (Its object made where nothing collects; defined on a new
@@ -2092,7 +2092,7 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // and conversion after it: rooted.)
     let sc = Scope::new(vm);
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+    let out = vm.mu().new_plain(op).root(&sc);
     crate::symbol::iterate(vm, it, |vm, entry| {
         if !is_object(entry) {
             return Err(Error::type_error(format!(
@@ -2146,7 +2146,7 @@ pub(crate) fn group_by(
 /// `Object.groupBy(items, callback)`: a null-prototype object of arrays.
 fn object_group_by(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(Value::NULL).v()).root(&sc);
+    let out = vm.mu().new_plain(Value::NULL).root(&sc);
     group_by(vm, &a, |vm, key, v| {
         let key = crate::intrinsics::to_property_key(vm, key)?;
         // (`out` has no prototype and only these arrays: reading, defining

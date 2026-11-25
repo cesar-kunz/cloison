@@ -911,7 +911,7 @@ fn object_rest_of_raw(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
     };
     let sc = Scope::new(vm);
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+    let out = vm.mu().new_plain(op).root(&sc);
     for key in crate::proxy::own_keys(vm, src)? {
         if excluded.contains(&key)
             || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))

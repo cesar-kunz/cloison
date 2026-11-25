@@ -136,7 +136,7 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         let op = object_value(vm.object_prototype);
         // (The holder and key a `toJSON` or replacer gets: rooted.)
         let sc = Scope::new(vm);
-        let wrapper = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+        let wrapper = vm.mu().new_plain(op).root(&sc);
         let empty = vm.mu().new_string(&[]).root(&sc);
         let a_empty = vm.intern_name("");
         vm.create_data_property(wrapper.v(), Key::Name(a_empty), arg(a, 0))?;
@@ -596,7 +596,7 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let (v, record) = parse_text(vm, &u, true)?;
         let sc = Scope::new(vm);
         let op = object_value(vm.object_prototype);
-        let root = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+        let root = vm.mu().new_plain(op).root(&sc);
         let empty = vm.intern_name("");
         vm.create_data_property(root.v(), Key::Name(empty), v)?;
         let key = vm.mu().new_string(&[]).root(&sc);
@@ -677,7 +677,7 @@ fn internalize_raw(
     let sc = Scope::new(vm);
     let v = vm.get_keyed_b(holder, name)?.root(&sc).v();
     let op = object_value(vm.object_prototype);
-    let context = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+    let context = vm.mu().new_plain(op).root(&sc);
     internalize_value(vm, reviver, holder, name, v, context.v(), record, text, a_source).map(Fresh::take)
 }
 

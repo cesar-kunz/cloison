@@ -38,6 +38,13 @@ plain vm::Vm::new_object_with
 plain vm::Vm::new_plain
 plain vm::Vm::new_array
 plain array::new_array_of
+# (And as allocated through `vm.mu()`, the modules' way: `Mu::with` is
+# generic over its closure, which the result's kind doesn't cross.)
+plain brand::Mu::<'a>::new_object_with
+plain brand::Mu::<'a>::new_plain
+plain brand::Mu::<'a>::new_array
+plain brand::Mu::<'a>::array_of_with
+plain array::new_array_of_raw
 # `exotic-gc <function> <argument>`: collects only through that argument
 # being exotic (a proxy's traps, an array's `length` converted): not when
 # it is a new ordinary object. Defining a property on an ordinary object
@@ -66,6 +73,9 @@ internal iterator::state_of
 internal-gc vm::Vm::get_keyed 1
 internal-gc vm::Vm::set_keyed 1
 internal-holds vm::Vm::get_keyed 1
+# (And their branded forms, the modules' way.)
+internal-gc brand::<impl vm::Vm>::get_keyed_b 1
+internal-holds brand::<impl vm::Vm>::get_keyed_b 1
 
 # --- From the triage (2026-11-23) ---
 # A code emitter: its `dyn FnMut` is a closure that pushes bytes.

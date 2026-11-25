@@ -147,16 +147,21 @@ fn get_tag(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
 
 fn set_constructor(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let key = Key::Name(vm.intern_name("constructor"));
-    ignoring_prototype(vm, this, key, arg(&a, 0))
+    ignoring_prototype(vm, this, key, arg(&a, 0)).map(Fresh::take)
 }
 
 fn set_tag(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let key = Key::Name(vm.a_sym_to_string_tag);
-    ignoring_prototype(vm, this, key, arg(&a, 0))
+    ignoring_prototype(vm, this, key, arg(&a, 0)).map(Fresh::take)
 }
 
 /// SetterThatIgnoresPrototypeProperties(this, `Iterator.prototype`, key, v).
-fn ignoring_prototype(vm: &mut Vm, this: Value, key: Key, v: Value) -> Result<Value> {
+#[inline(always)]
+fn ignoring_prototype(vm: &mut Vm, this: Value, key: Key, v: Value) -> Result<Fresh<'_>> {
+    ignoring_prototype_raw(vm, this, key, v).map(Fresh::new)
+}
+
+fn ignoring_prototype_raw(vm: &mut Vm, this: Value, key: Key, v: Value) -> Result<Value> {
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
     if !is_object(this) {
         return Err(Error::type_error("Iterator.prototype setter called on a non-object"));
@@ -175,32 +180,38 @@ fn ignoring_prototype(vm: &mut Vm, this: Value, key: Key, v: Value) -> Result<Va
 // ---- The protocol ----
 
 /// `it.next` (GetIteratorDirect's).
-fn next_method(vm: &mut Vm, it: Value) -> Result<Value> {
+#[inline(always)]
+fn next_method(vm: &mut Vm, it: Value) -> Result<Fresh<'_>> {
     let a = vm.intern_name("next");
-    vm.get_atom_b(it, a).map(Fresh::take)
+    vm.get_atom_b(it, a)
 }
 
 /// IteratorStepValue: the next value, `None` when done.
-fn step_value(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
-    let r = step_result(vm, it, next)?;
-    match r {
+#[inline(always)]
+fn step_value(vm: &mut Vm, it: Value, next: Value) -> Result<Fresh<'_, Option<Value>>> {
+    step_value_raw(vm, it, next).map(Fresh::new)
+}
+
+fn step_value_raw(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
+    // (`r`, the call's result only, the receiver after a proxy's handler
+    // ran: rooted.)
+    let sc = Scope::new(vm);
+    match step_result(vm, it, next)?.root(&sc) {
         Some(r) => {
             let a_value = vm.a_value;
-            // (`r`, the call's result only, the receiver after a proxy's
-            // handler ran: rooted.)
-            {
-                let held = Scope::new(vm);
-                let _held = held.roots([r]);
-                vm.get_atom_b(r, a_value).map(Fresh::take)
-            }
-            .map(Some)
+            vm.get_atom_b(r.v(), a_value).map(|v| Some(v.take()))
         }
         None => Ok(None),
     }
 }
 
 /// IteratorStep: the result object, `None` when done.
-fn step_result(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
+#[inline(always)]
+fn step_result(vm: &mut Vm, it: Value, next: Value) -> Result<Fresh<'_, Option<Value>>> {
+    step_result_raw(vm, it, next).map(Fresh::new)
+}
+
+fn step_result_raw(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
     let sc_r = Scope::new(vm);
     let r = vm.call_b(next, it, &[])?.root(&sc_r);
     if !is_object(r.peek()) {
@@ -228,7 +239,12 @@ fn close_throw<T>(vm: &mut Vm, it: Value, e: Error) -> Result<T> {
 }
 
 /// GetMethod(v, @@iterator).
-fn iterator_method(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+fn iterator_method(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    iterator_method_raw(vm, v).map(Fresh::new)
+}
+
+fn iterator_method_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     let a = vm.a_sym_iterator;
     let m = vm.get_atom_b(v, a)?;
     if m.peek().is_undefined() || m.peek().is_null() {
@@ -243,7 +259,12 @@ fn iterator_method(vm: &mut Vm, v: Value) -> Result<Value> {
 /// GetIteratorFlattenable(v): its iterator (`v` itself if it has no
 /// `@@iterator`), and that iterator's `next`. A primitive is a TypeError
 /// (but a string, with `strings`).
-fn flattenable(vm: &mut Vm, v: Value, strings: bool) -> Result<(Value, Value)> {
+#[inline(always)]
+fn flattenable(vm: &mut Vm, v: Value, strings: bool) -> Result<Fresh<'_, (Value, Value)>> {
+    flattenable_raw(vm, v, strings).map(Fresh::new)
+}
+
+fn flattenable_raw(vm: &mut Vm, v: Value, strings: bool) -> Result<(Value, Value)> {
     if !is_object(v) && !(strings && crate::vm::is_string(v)) {
         return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(v))));
     }
@@ -251,8 +272,9 @@ fn flattenable(vm: &mut Vm, v: Value, strings: bool) -> Result<(Value, Value)> {
     // read; `it` across its `next`'s: rooted.)
     let held = Scope::new(vm);
     let _rooted = held.roots([v]);
-    let m = iterator_method(vm, v)?;
-    let it = if m.is_undefined() { v } else { vm.call_b(m, v, &[])?.take() };
+    let sc_m = Scope::new(vm);
+    let m = iterator_method(vm, v)?.root(&sc_m);
+    let it = if m.peek().is_undefined() { v } else { vm.call_b(m.peek(), v, &[])?.take() };
     if !is_object(it) {
         return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(it))));
     }
@@ -261,16 +283,23 @@ fn flattenable(vm: &mut Vm, v: Value, strings: bool) -> Result<(Value, Value)> {
         let _held = held.roots([it]);
         next_method(vm, it)
     }?;
-    Ok((it, next))
+    Ok((it, next.peek()))
 }
 
 // ---- Helpers ----
 
-fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: Value) -> Result<Value> {
+#[inline(always)]
+fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: Value) -> Result<Fresh<'_>> {
+    new_helper_raw(vm, kind, it, next, f, count).map(Fresh::new)
+}
+
+fn new_helper_raw(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: Value) -> Result<Value> {
+    // take: only allocation follows until the helper holds it.
     let state = crate::array::new_array_of(
         vm,
         &[Value::from_i32(kind), Value::from_i32(START), it, next, f, count, Value::UNDEFINED, Value::UNDEFINED],
-    )?;
+    )?
+    .take();
     let proto = vm.iterator_roots[if kind == WRAP { WRAP_PROTOTYPE } else { HELPER_PROTOTYPE }];
     let o = vm.mu().new_object_with(Class::IteratorHelper, object_value(proto.ptr()), 0);
     unsafe { (*o.obj().ptr()).code = state.to_bits() as *const crate::vm::Code };
@@ -288,7 +317,6 @@ fn state_of(this: Value, wrap: bool, what: &str) -> Result<Value> {
     }
     Err(Error::type_error(format!("{what} called on an incompatible receiver")))
 }
-
 fn get(vm: &mut Vm, state: Value, i: i32) -> Result<Value> {
     vm.get_keyed_b(state, Value::from_i32(i)).map(Fresh::take)
 }
@@ -306,18 +334,20 @@ fn helper_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = state_of(this, false, "Iterator Helper next")?;
     match int(get(vm, state, STATE)?) {
         RUNNING => return Err(Error::type_error("Generator is already running")),
-        DONE => return iter_result(vm, Value::UNDEFINED, true),
+        DONE => return iter_result(vm, Value::UNDEFINED, true).map(Fresh::take),
         _ => {}
     }
     set(vm, state, STATE, Value::from_i32(RUNNING))?;
-    match step(vm, state) {
+    // take: given to iter_result, which only allocates, after a store into
+    // the helper's own state, which runs no JS.
+    match step(vm, state).map(Fresh::take) {
         Ok(Some(v)) => {
             set(vm, state, STATE, Value::from_i32(SUSPENDED))?;
-            iter_result(vm, v, false)
+            iter_result(vm, v, false).map(Fresh::take)
         }
         Ok(None) => {
             set(vm, state, STATE, Value::from_i32(DONE))?;
-            iter_result(vm, Value::UNDEFINED, true)
+            iter_result(vm, Value::UNDEFINED, true).map(Fresh::take)
         }
         Err(e) => {
             set(vm, state, STATE, Value::from_i32(DONE))?;
@@ -327,13 +357,19 @@ fn helper_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 }
 
 /// A helper's closure run to its next `yield` (the value), or to its end.
-fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
+#[inline(always)]
+fn step(vm: &mut Vm, state: Value) -> Result<Fresh<'_, Option<Value>>> {
+    step_raw(vm, state).map(Fresh::new)
+}
+
+fn step_raw(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
     let kind = int(get(vm, state, KIND)?);
     let (it, next, f) = (get(vm, state, ITER)?, get(vm, state, NEXT)?, get(vm, state, FUNC)?);
     let count = get(vm, state, COUNT)?.as_number().unwrap_or(0.0);
     match kind {
         MAP => {
-            let Some(v) = step_value(vm, it, next)? else { return Ok(None) };
+            // take: given at once to the call, which roots its arguments.
+            let Some(v) = step_value(vm, it, next)?.take() else { return Ok(None) };
             // take: returned; set stores into the helper's own state, which runs no JS.
             let mapped = vm.call_b(f, Value::UNDEFINED, &[v, Value::number(count)]).map(Fresh::take);
             let mapped = match mapped {
@@ -346,7 +382,9 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
         FILTER => {
             let mut count = count;
             loop {
-                let Some(v) = step_value(vm, it, next)? else { return Ok(None) };
+                // take: the predicate's argument while it runs (its frame roots it); nothing
+                // collects between its return and ours.
+                let Some(v) = step_value(vm, it, next)?.take() else { return Ok(None) };
                 let selected = match vm.call_b(f, Value::UNDEFINED, &[v, Value::number(count)]) {
                     Ok(s) => s.take(),
                     Err(e) => return close_throw(vm, it, e),
@@ -366,7 +404,7 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
             if count != f64::INFINITY {
                 set(vm, state, COUNT, Value::number(count - 1.0))?;
             }
-            step_value(vm, it, next)
+            step_value(vm, it, next).map(Fresh::take)
         }
         DROP => {
             let mut left = count;
@@ -375,11 +413,11 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                     left -= 1.0;
                     set(vm, state, COUNT, Value::number(left))?;
                 }
-                if step_result(vm, it, next)?.is_none() {
+                if step_result(vm, it, next)?.peek().is_none() {
                     return Ok(None);
                 }
             }
-            step_value(vm, it, next)
+            step_value(vm, it, next).map(Fresh::take)
         }
         FLAT_MAP => {
             let mut count = count;
@@ -387,18 +425,22 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 let inner = get(vm, state, INNER)?;
                 if !inner.is_undefined() {
                     let inner_next = get(vm, state, INNER_NEXT)?;
-                    match step_value(vm, inner, inner_next) {
-                        Ok(Some(v)) => return Ok(Some(v)),
+                    match step_value(vm, inner, inner_next).map(Fresh::transpose) {
+                        Ok(Some(v)) => return Ok(Some(v.peek())),
                         Ok(None) => set(vm, state, INNER, Value::UNDEFINED)?,
                         Err(e) => return close_throw(vm, it, e),
                     }
                     continue;
                 }
-                let Some(v) = step_value(vm, it, next)? else { return Ok(None) };
-                let flattened = vm
-                    .call_b(f, Value::UNDEFINED, &[v, Value::number(count)])
-                    .map(Fresh::take)
-                    .and_then(|mapped| flattenable(vm, mapped, false));
+                // take: given at once to the call, which roots its arguments.
+                let Some(v) = step_value(vm, it, next)?.take() else { return Ok(None) };
+                // take: given at once to flattenable, which roots it.
+                let mapped = vm.call_b(f, Value::UNDEFINED, &[v, Value::number(count)]).map(Fresh::take);
+                let flattened = match mapped {
+                    Ok(mapped) => flattenable(vm, mapped, false).map(Fresh::take),
+                    Err(e) => Err(e),
+                };
+                // take: stored into the helper's own state, which runs no JS.
                 let (inner, inner_next) = match flattened {
                     Ok(r) => r,
                     Err(e) => return close_throw(vm, it, e),
@@ -416,37 +458,41 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
             let buffer = get(vm, state, INNER)?;
             loop {
                 let len = vm.length_of(buffer)?;
-                let Some(v) = step_value(vm, it, next)? else {
+                let sc_v = Scope::new(vm);
+                let Some(v) = step_value(vm, it, next)?.root(&sc_v) else {
                     // (`chunks`' last, or with "allow-partial" a partial
                     // window, then done.)
                     let partial =
                         if kind == CHUNKS { true } else { count != 0.0 && len < f.as_number().unwrap_or(0.0) };
                     if len > 0.0 && partial {
                         set(vm, state, INNER_NEXT, Value::TRUE)?;
-                        return copy(vm, buffer, 0.0).map(Some);
+                        return copy(vm, buffer, 0.0).map(|c| Some(c.take()));
                     }
                     return Ok(None);
                 };
                 let size = f.as_number().unwrap_or(1.0);
                 if kind == CHUNKS {
-                    crate::vm::array_push(vm, buffer, &[v])?;
+                    crate::vm::array_push(vm, buffer, &[v.v()])?;
                     if len + 1.0 == size {
-                        let out = copy(vm, buffer, 0.0)?;
-                        let fresh = crate::array::new_array_of(vm, &[])?;
+                        let sc_out = Scope::new(vm);
+                        let out = copy(vm, buffer, 0.0)?.root(&sc_out);
+                        // take: stored in the helper's state at once.
+                        let fresh = crate::array::new_array_of(vm, &[])?.take();
                         set(vm, state, INNER, fresh)?;
-                        return Ok(Some(out));
+                        return Ok(Some(out.v()));
                     }
                 } else {
-                    let buffer = if len == size { copy(vm, buffer, 1.0)? } else { buffer };
-                    crate::vm::array_push(vm, buffer, &[v])?;
+                    let sc_b = Scope::new(vm);
+                    let buffer = if len == size { copy(vm, buffer, 1.0)?.root(&sc_b).v() } else { buffer };
+                    crate::vm::array_push(vm, buffer, &[v.v()])?;
                     set(vm, state, INNER, buffer)?;
                     if vm.length_of(buffer)? == size {
-                        return copy(vm, buffer, 0.0).map(Some);
+                        return copy(vm, buffer, 0.0).map(|c| Some(c.take()));
                     }
                 }
             }
         }
-        ZIP => zip_step(vm, state),
+        ZIP => zip_step(vm, state).map(Fresh::take),
         _ => {
             // `concat`: each iterable's values in turn.
             let mut i = count;
@@ -454,8 +500,8 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 let inner = get(vm, state, INNER)?;
                 if !inner.is_undefined() {
                     let inner_next = get(vm, state, INNER_NEXT)?;
-                    match step_value(vm, inner, inner_next)? {
-                        Some(v) => return Ok(Some(v)),
+                    match step_value(vm, inner, inner_next)?.transpose() {
+                        Some(v) => return Ok(Some(v.peek())),
                         None => set(vm, state, INNER, Value::UNDEFINED)?,
                     }
                     continue;
@@ -479,9 +525,10 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 {
                     let sc = Scope::new(vm);
                     let inner = sc.root(inner.peek());
-                    let inner_next = next_method(vm, inner.peek())?;
+                    let sc_inner_next = Scope::new(vm);
+                    let inner_next = next_method(vm, inner.peek())?.root(&sc_inner_next);
                     set(vm, state, INNER, inner.peek())?;
-                    set(vm, state, INNER_NEXT, inner_next)?;
+                    set(vm, state, INNER_NEXT, inner_next.peek())?;
                 }
             }
         }
@@ -496,7 +543,7 @@ fn helper_return(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let kind = int(get(vm, state, KIND)?);
     match int(get(vm, state, STATE)?) {
         RUNNING => return Err(Error::type_error("Generator is already running")),
-        DONE => return iter_result(vm, Value::UNDEFINED, true),
+        DONE => return iter_result(vm, Value::UNDEFINED, true).map(Fresh::take),
         START => {
             set(vm, state, STATE, Value::from_i32(DONE))?;
             if kind == ZIP {
@@ -505,7 +552,7 @@ fn helper_return(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
                 let it = get(vm, state, ITER)?;
                 close(vm, it)?;
             }
-            return iter_result(vm, Value::UNDEFINED, true);
+            return iter_result(vm, Value::UNDEFINED, true).map(Fresh::take);
         }
         _ => {}
     }
@@ -526,7 +573,7 @@ fn helper_return(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     };
     set(vm, state, STATE, Value::from_i32(DONE))?;
     r?;
-    iter_result(vm, Value::UNDEFINED, true)
+    iter_result(vm, Value::UNDEFINED, true).map(Fresh::take)
 }
 
 /// `%WrapForValidIteratorPrototype%.next()`: the wrapped iterator's.
@@ -545,7 +592,7 @@ fn wrap_return(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let sc_m = Scope::new(vm);
     let m = vm.get_atom_b(it, a_return)?.root(&sc_m);
     if m.peek().is_undefined() || m.peek().is_null() {
-        return iter_result(vm, Value::UNDEFINED, true);
+        return iter_result(vm, Value::UNDEFINED, true).map(Fresh::take);
     }
     vm.call_b(m.peek(), it, &[]).map(Fresh::take)
 }
@@ -555,17 +602,14 @@ fn wrap_return(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 /// `Iterator.from(o)`: `o`'s iterator, wrapped unless it inherits from
 /// `Iterator.prototype`.
 fn from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
-    let (it, next) = flattenable(vm, arg(&a, 0), true)?;
-    let c = object_value((vm.iterator_roots[CONSTRUCTOR]).ptr());
     // (A proxy's `getPrototypeOf` may collect: both rooted.)
-    if {
-        let held = Scope::new(vm);
-        let _held = held.roots([it, next]);
-        vm.instance_of(it, c)
-    }? {
-        return Ok(it);
+    let sc = Scope::new(vm);
+    let (it, next) = flattenable(vm, arg(&a, 0), true)?.root(&sc);
+    let c = object_value((vm.iterator_roots[CONSTRUCTOR]).ptr());
+    if vm.instance_of(it.v(), c)? {
+        return Ok(it.v());
     }
-    new_helper(vm, WRAP, it, next, Value::UNDEFINED, Value::UNDEFINED)
+    new_helper(vm, WRAP, it.v(), next.v(), Value::UNDEFINED, Value::UNDEFINED).map(Fresh::take)
 }
 
 /// `Iterator.concat(...items)`: their values in turn (each item an
@@ -578,7 +622,7 @@ fn concat(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         let _held = held.roots([list]);
         concat_list(vm, list, &a)
     }?;
-    new_helper(vm, CONCAT, Value::UNDEFINED, Value::UNDEFINED, list, Value::from_i32(0))
+    new_helper(vm, CONCAT, Value::UNDEFINED, Value::UNDEFINED, list, Value::from_i32(0)).map(Fresh::take)
 }
 
 /// `Iterator.concat`'s items' `@@iterator` methods, each with its item,
@@ -588,11 +632,12 @@ fn concat_list(vm: &mut Vm, list: Value, a: &[Value]) -> Result<()> {
         if !is_object(item) {
             return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(item))));
         }
-        let m = iterator_method(vm, item)?;
-        if m.is_undefined() {
+        let sc_m = Scope::new(vm);
+        let m = iterator_method(vm, item)?.root(&sc_m);
+        if m.peek().is_undefined() {
             return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(item))));
         }
-        crate::vm::array_push(vm, list, &[m, item])?;
+        crate::vm::array_push(vm, list, &[m.peek(), item])?;
     }
     Ok(())
 }
@@ -619,8 +664,9 @@ fn callable_arg(vm: &mut Vm, it: Value, f: Value) -> Result<Value> {
 fn lazy(vm: &mut Vm, this: Value, a: &[Value], kind: i32, what: &str) -> Result<Value> {
     let it = this_object(this, what)?;
     let f = callable_arg(vm, it, arg(a, 0))?;
-    let next = next_method(vm, it)?;
-    new_helper(vm, kind, it, next, f, Value::from_i32(0))
+    let sc = Scope::new(vm);
+    let next = next_method(vm, it)?.root(&sc);
+    new_helper(vm, kind, it, next.v(), f, Value::from_i32(0)).map(Fresh::take)
 }
 
 fn map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -651,8 +697,9 @@ fn limited(vm: &mut Vm, this: Value, a: &[Value], kind: i32, what: &str) -> Resu
     if limit < 0.0 || limit.is_finite() && limit > 9007199254740991.0 {
         return close_throw(vm, it, Error::range_error(format!("{d} is out of range")));
     }
-    let next = next_method(vm, it)?;
-    new_helper(vm, kind, it, next, Value::UNDEFINED, Value::number(limit))
+    let sc_next = Scope::new(vm);
+    let next = next_method(vm, it)?.root(&sc_next);
+    new_helper(vm, kind, it, next.peek(), Value::UNDEFINED, Value::number(limit)).map(Fresh::take)
 }
 
 fn take(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -677,12 +724,14 @@ fn each(
     if let Some(f) = f {
         callable_arg(vm, it, f)?;
     }
-    let next = next_method(vm, it)?;
+    let sc_next = Scope::new(vm);
+    let next = next_method(vm, it)?.root(&sc_next);
     // (`next`, and the result found, held across calls: rooted.)
     let held = Scope::new(vm);
-    let _rooted = held.roots([next]);
+    let _rooted = held.roots([next.peek()]);
     let mut counter = 0.0;
-    while let Some(v) = step_value(vm, it, next)? {
+    // take: given at once to `each`, which roots what it keeps.
+    while let Some(v) = step_value(vm, it, next.peek())?.take() {
         match each(vm, v, counter) {
             Ok(Some(r)) => {
                 {
@@ -703,23 +752,26 @@ fn each(
 fn reduce(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let it = this_object(this, "reduce")?;
     let f = callable_arg(vm, it, arg(&a, 0))?;
-    let next = next_method(vm, it)?;
+    let sc_next = Scope::new(vm);
+    let next = next_method(vm, it)?.root(&sc_next);
     // (`next`, and the accumulator in a slot of its own, held across the
     // calls: rooted.)
     let held = Scope::new(vm);
-    let _rooted = held.roots([next, Value::UNDEFINED]);
+    let _rooted = held.roots([next.peek(), Value::UNDEFINED]);
     let slot = vm.handles.len() - 1;
     let mut counter = if a.len() >= 2 {
         vm.handles[slot] = a[1];
         0.0
     } else {
-        match step_value(vm, it, next)? {
+        // take: kept in `vm.handles[slot]` at once.
+        match step_value(vm, it, next.peek())?.take() {
             Some(v) => vm.handles[slot] = v,
             None => return Err(Error::type_error("Reduce of empty iterator with no initial value")),
         }
         1.0
     };
-    while let Some(v) = step_value(vm, it, next)? {
+    // take: given at once to the call, which roots its arguments.
+    while let Some(v) = step_value(vm, it, next.peek())?.take() {
         let acc = vm.handles[slot];
         vm.handles[slot] = match vm.call_b(f, Value::UNDEFINED, &[acc, v, Value::number(counter)]) {
             Ok(r) => r.take(),
@@ -769,7 +821,12 @@ fn find(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 }
 
 /// A copy of array `a` from index `from` on (`CreateArrayFromList`).
-fn copy(vm: &mut Vm, a: Value, from: f64) -> Result<Value> {
+#[inline(always)]
+fn copy(vm: &mut Vm, a: Value, from: f64) -> Result<Fresh<'_>> {
+    copy_raw(vm, a, from).map(Fresh::new)
+}
+
+fn copy_raw(vm: &mut Vm, a: Value, from: f64) -> Result<Value> {
     let sc_out = Scope::new(vm);
     let out = vm.mu().new_array().root(&sc_out);
     let len = vm.length_of(a)?;
@@ -862,13 +919,16 @@ fn size_arg(vm: &mut Vm, it: Value, v: Value) -> Result<f64> {
 fn chunks(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let it = this_object(this, "chunks")?;
     let size = size_arg(vm, it, arg(&a, 0))?;
-    let next = next_method(vm, it)?;
-    let h = new_helper(vm, CHUNKS, it, next, Value::number(size), Value::from_i32(0))?;
-    let state = Value::from_bits(Obj::of(h).code() as u64);
-    let buffer = crate::array::new_array_of(vm, &[])?;
-    set(vm, state, INNER, buffer)?;
+    let sc_next = Scope::new(vm);
+    let next = next_method(vm, it)?.root(&sc_next);
+    let sc_h = Scope::new(vm);
+    let h = new_helper(vm, CHUNKS, it, next.peek(), Value::number(size), Value::from_i32(0))?.root(&sc_h);
+    let state = Value::from_bits(Obj::of(h.peek()).code() as u64);
+    let sc_buffer = Scope::new(vm);
+    let buffer = crate::array::new_array_of(vm, &[])?.root(&sc_buffer);
+    set(vm, state, INNER, buffer.peek())?;
     set(vm, state, INNER_NEXT, Value::FALSE)?;
-    Ok(h)
+    Ok(h.peek())
 }
 
 /// `windows(size, undersized)`: arrays of each `size` consecutive values
@@ -884,13 +944,16 @@ fn windows(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     } else {
         return close_throw(vm, it, Error::type_error("undersized must be \"only-full\" or \"allow-partial\""));
     };
-    let next = next_method(vm, it)?;
-    let h = new_helper(vm, WINDOWS, it, next, Value::number(size), Value::from_i32(partial as i32))?;
-    let state = Value::from_bits(Obj::of(h).code() as u64);
-    let buffer = crate::array::new_array_of(vm, &[])?;
-    set(vm, state, INNER, buffer)?;
+    let sc_next = Scope::new(vm);
+    let next = next_method(vm, it)?.root(&sc_next);
+    let sc_h = Scope::new(vm);
+    let h = new_helper(vm, WINDOWS, it, next.peek(), Value::number(size), Value::from_i32(partial as i32))?.root(&sc_h);
+    let state = Value::from_bits(Obj::of(h.peek()).code() as u64);
+    let sc_buffer = Scope::new(vm);
+    let buffer = crate::array::new_array_of(vm, &[])?.root(&sc_buffer);
+    set(vm, state, INNER, buffer.peek())?;
     set(vm, state, INNER_NEXT, Value::FALSE)?;
-    Ok(h)
+    Ok(h.peek())
 }
 
 // ---- Iterator.zip ----
@@ -945,23 +1008,46 @@ fn close_list(vm: &mut Vm, iters: &[Value], mut c: Result<()>) -> Result<()> {
 
 /// A zip helper of `iters` (with their `next`s), its results arrays or
 /// (with `keys`) objects of those keys.
-fn new_zip(vm: &mut Vm, iters: &[(Value, Value)], keys: Value, mode: i32, padding: &[Value]) -> Result<Value> {
+#[inline(always)]
+fn new_zip<'v>(
+    vm: &'v mut Vm,
+    iters: &[(Value, Value)],
+    keys: Value,
+    mode: i32,
+    padding: &[Value],
+) -> Result<Fresh<'v>> {
+    new_zip_raw(vm, iters, keys, mode, padding).map(Fresh::new)
+}
+
+fn new_zip_raw(vm: &mut Vm, iters: &[(Value, Value)], keys: Value, mode: i32, padding: &[Value]) -> Result<Value> {
     let its: Vec<Value> = iters.iter().map(|p| p.0).collect();
     let nexts: Vec<Value> = iters.iter().map(|p| p.1).collect();
-    let (its, nexts) = (crate::array::new_array_of(vm, &its)?, crate::array::new_array_of(vm, &nexts)?);
-    let h = new_helper(vm, ZIP, its, nexts, keys, Value::from_i32(mode))?;
-    let state = Value::from_bits(Obj::of(h).code() as u64);
-    let padding = crate::array::new_array_of(vm, padding)?;
-    let open = crate::array::new_array_of(vm, &vec![Value::TRUE; iters.len()])?;
-    set(vm, state, INNER, padding)?;
-    set(vm, state, INNER_NEXT, open)?;
-    Ok(h)
+    let sc = Scope::new(vm);
+    let its = crate::array::new_array_of(vm, &its)?.root(&sc);
+    let nexts = crate::array::new_array_of(vm, &nexts)?.root(&sc);
+    let h = new_helper(vm, ZIP, its.v(), nexts.v(), keys, Value::from_i32(mode))?.root(&sc);
+    let state = Value::from_bits(Obj::of(h.v()).code() as u64);
+    let padding = crate::array::new_array_of(vm, padding)?.root(&sc);
+    let open = crate::array::new_array_of(vm, &vec![Value::TRUE; iters.len()])?.root(&sc);
+    set(vm, state, INNER, padding.v())?;
+    set(vm, state, INNER_NEXT, open.v())?;
+    Ok(h.v())
 }
 
 /// "longest" mode's padding: `n` values, from iterable `option` (or
 /// `undefined`s), or with `keys` its properties of those keys (the
 /// iterators closed on an error).
-fn zip_padding(vm: &mut Vm, option: Value, keys: Option<&[Key]>, iters: &[(Value, Value)]) -> Result<Vec<Value>> {
+#[inline(always)]
+fn zip_padding<'v>(
+    vm: &'v mut Vm,
+    option: Value,
+    keys: Option<&[Key]>,
+    iters: &[(Value, Value)],
+) -> Result<Fresh<'v, Vec<Value>>> {
+    zip_padding_raw(vm, option, keys, iters).map(Fresh::new)
+}
+
+fn zip_padding_raw(vm: &mut Vm, option: Value, keys: Option<&[Key]>, iters: &[(Value, Value)]) -> Result<Vec<Value>> {
     let n = iters.len();
     let its: Vec<Value> = iters.iter().map(|p| p.0).collect();
     if option.is_undefined() {
@@ -983,7 +1069,8 @@ fn zip_padding(vm: &mut Vm, option: Value, keys: Option<&[Key]>, iters: &[(Value
     }
     let r = (|| {
         let p = crate::symbol::get_iterator(vm, option)?;
-        let next = next_method(vm, p)?;
+        // take: pushed to vm.handles with `p` after.
+        let next = next_method(vm, p)?.take();
         Ok((p, next))
     })();
     let (p, next) = match r {
@@ -996,8 +1083,10 @@ fn zip_padding(vm: &mut Vm, option: Value, keys: Option<&[Key]>, iters: &[(Value
     let mut using = true;
     for _ in 0..n {
         if using {
-            match step_value(vm, p, next) {
+            match step_value(vm, p, next).map(Fresh::transpose) {
                 Ok(Some(v)) => {
+                    // take: pushed to vm.handles on the next line.
+                    let v = v.take();
                     vm.handles.push(v);
                     out.push(v);
                 }
@@ -1030,23 +1119,32 @@ fn zip(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         vm.handles.push(padding);
         let input = crate::symbol::get_iterator(vm, iterables)?;
         vm.handles.push(input);
-        let input_next = next_method(vm, input)?;
+        // take: pushed to vm.handles on the next line.
+        let input_next = next_method(vm, input)?.take();
         vm.handles.push(input_next);
-        zip_iterables(vm, input, input_next, mode, padding)
+        zip_iterables(vm, input, input_next, mode, padding).map(Fresh::take)
     })
 }
 
-fn zip_iterables(vm: &mut Vm, input: Value, input_next: Value, mode: i32, padding: Value) -> Result<Value> {
+#[inline(always)]
+fn zip_iterables(vm: &mut Vm, input: Value, input_next: Value, mode: i32, padding: Value) -> Result<Fresh<'_>> {
+    zip_iterables_raw(vm, input, input_next, mode, padding).map(Fresh::new)
+}
+
+fn zip_iterables_raw(vm: &mut Vm, input: Value, input_next: Value, mode: i32, padding: Value) -> Result<Value> {
     let mut iters: Vec<(Value, Value)> = Vec::new();
     loop {
         let its: Vec<Value> = iters.iter().map(|p| p.0).collect();
-        let v = match step_value(vm, input, input_next) {
+        // take: given at once to flattenable, which roots it.
+        let v = match step_value(vm, input, input_next).map(Fresh::take) {
             Ok(Some(v)) => v,
             Ok(None) => break,
             Err(e) => return close_list(vm, &its, Err(e)).map(|()| Value::UNDEFINED),
         };
         match flattenable(vm, v, false) {
             Ok(p) => {
+                // take: pushed to vm.handles on the next line.
+                let p = p.take();
                 vm.handles.extend([p.0, p.1]);
                 iters.push(p);
             }
@@ -1058,8 +1156,9 @@ fn zip_iterables(vm: &mut Vm, input: Value, input_next: Value, mode: i32, paddin
             }
         }
     }
-    let padding = if mode == LONGEST { zip_padding(vm, padding, None, &iters)? } else { Vec::new() };
-    new_zip(vm, &iters, Value::UNDEFINED, mode, &padding)
+    // take: zip_padding pushes its values to vm.handles, in this handle scope.
+    let padding = if mode == LONGEST { zip_padding(vm, padding, None, &iters)?.take() } else { Vec::new() };
+    new_zip(vm, &iters, Value::UNDEFINED, mode, &padding).map(Fresh::take)
 }
 
 /// `Iterator.zipKeyed(iterables, options)`: as `Iterator.zip` over the
@@ -1090,7 +1189,8 @@ fn zip_keyed(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
                 if v.peek().is_undefined() {
                     return Ok(None);
                 }
-                flattenable(vm, v.peek(), false).map(Some)
+                // take: pushed to vm.handles as the closure returns.
+                flattenable(vm, v.peek(), false).map(|p| Some(p.take()))
             })();
             match r {
                 Ok(Some(p)) => {
@@ -1105,7 +1205,8 @@ fn zip_keyed(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
                 }
             }
         }
-        let padding = if mode == LONGEST { zip_padding(vm, padding, Some(&keys), &iters)? } else { Vec::new() };
+        // take: zip_padding pushes its values to vm.handles, in this handle scope.
+        let padding = if mode == LONGEST { zip_padding(vm, padding, Some(&keys), &iters)?.take() } else { Vec::new() };
         let names: Vec<Value> = keys
             .iter()
             .map(|&k| {
@@ -1114,8 +1215,9 @@ fn zip_keyed(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
             })
             .collect();
         vm.handles.extend(names.iter().copied());
-        let keys = crate::array::new_array_of(vm, &names)?;
-        new_zip(vm, &iters, keys, mode, &padding)
+        let sc_keys = Scope::new(vm);
+        let keys = crate::array::new_array_of(vm, &names)?.root(&sc_keys);
+        new_zip(vm, &iters, keys.peek(), mode, &padding).map(Fresh::take)
     })
 }
 
@@ -1139,11 +1241,21 @@ fn close_all(vm: &mut Vm, state: Value, c: Result<()>) -> Result<()> {
 }
 
 /// A zip's next results (IteratorZip's closure, to its `yield`).
-fn zip_step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
-    vm.handle_scope(|vm| zip_results(vm, state))
+#[inline(always)]
+fn zip_step(vm: &mut Vm, state: Value) -> Result<Fresh<'_, Option<Value>>> {
+    zip_step_raw(vm, state).map(Fresh::new)
 }
 
-fn zip_results(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
+fn zip_step_raw(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
+    vm.handle_scope(|vm| zip_results(vm, state).map(Fresh::take))
+}
+
+#[inline(always)]
+fn zip_results(vm: &mut Vm, state: Value) -> Result<Fresh<'_, Option<Value>>> {
+    zip_results_raw(vm, state).map(Fresh::new)
+}
+
+fn zip_results_raw(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
     let (iters, nexts, keys) = (get(vm, state, ITER)?, get(vm, state, NEXT)?, get(vm, state, FUNC)?);
     let (mode, padding, open) = (int(get(vm, state, COUNT)?), get(vm, state, INNER)?, get(vm, state, INNER_NEXT)?);
     let n = vm.length_of(iters)? as i32;
@@ -1165,8 +1277,10 @@ fn zip_results(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
         }
         // take: an element of the zip's own arrays, which no JS sees.
         let next = vm.get_keyed_b(nexts, Value::from_i32(i))?.take();
-        match step_value(vm, it, next) {
+        match step_value(vm, it, next).map(Fresh::transpose) {
             Ok(Some(v)) => {
+                // take: pushed to vm.handles on the next line.
+                let v = v.take();
                 vm.handles.push(v);
                 results.push(v);
             }
@@ -1187,7 +1301,7 @@ fn zip_results(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                                 vm.get_keyed_b(iters, Value::from_i32(k))?.take(),
                                 vm.get_keyed_b(nexts, Value::from_i32(k))?.take(),
                             );
-                            match step_result(vm, it, next) {
+                            match step_result(vm, it, next).map(Fresh::transpose) {
                                 Err(e) => {
                                     shut(vm, k)?;
                                     return close_all(vm, state, Err(e)).map(|()| None);
@@ -1217,7 +1331,7 @@ fn zip_results(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
         }
     }
     if keys.is_undefined() {
-        return crate::array::new_array_of(vm, &results).map(Some);
+        return crate::array::new_array_of(vm, &results).map(|r| Some(r.take()));
     }
     let sc_o = Scope::new(vm);
     let o = vm.mu().new_plain(Value::NULL).root(&sc_o);

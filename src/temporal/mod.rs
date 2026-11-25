@@ -223,14 +223,20 @@ pub(crate) fn to_rust_string(vm: &mut Vm, v: Value) -> Result<String> {
 }
 
 /// ToPrimitive with hint "string".
-fn to_primitive_string(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+fn to_primitive_string(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    to_primitive_string_raw(vm, v).map(Fresh::new)
+}
+
+fn to_primitive_string_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     let p = crate::interp::to_primitive_string(v);
     if vm.conv_failed() { Err(vm.take_conv_error()) } else { Ok(p) }
 }
 
-fn get(vm: &mut Vm, o: Value, name: &str) -> Result<Value> {
+#[inline(always)]
+fn get<'v>(vm: &'v mut Vm, o: Value, name: &str) -> Result<Fresh<'v>> {
     let a = vm.intern_name(name);
-    vm.get_atom_b(o, a).map(Fresh::take)
+    vm.get_atom_b(o, a)
 }
 
 /// An exact time as a BigInt.
@@ -246,7 +252,12 @@ pub(crate) fn bigint_of(vm: &mut Vm, ns: i128) -> Value {
 /// each time (no code sees it, nor anything adds to it): one made here
 /// would be held by its callers' Rust locals alone while they read
 /// options, which may allocate.
-pub(crate) fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn options_object(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    options_object_raw(vm, v).map(Fresh::new)
+}
+
+fn options_object_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
         let o = match vm.temporal.no_options {
             Some(o) => o,
@@ -273,11 +284,12 @@ pub(crate) fn option(
     allowed: &[&str],
     fallback: Option<usize>,
 ) -> Result<usize> {
-    let v = get(vm, options, name)?;
-    if v.is_undefined() {
+    let sc_v = Scope::new(vm);
+    let v = get(vm, options, name)?.root(&sc_v);
+    if v.peek().is_undefined() {
         return fallback.ok_or_else(|| range(format!("{name} option is required")));
     }
-    let s = to_rust_string(vm, v)?;
+    let s = to_rust_string(vm, v.peek())?;
     allowed
         .iter()
         .position(|&a| a == s)
@@ -334,11 +346,12 @@ pub(crate) fn rounding_mode(vm: &mut Vm, options: Value, fallback: RoundingMode)
 
 /// GetRoundingIncrementOption.
 pub(crate) fn rounding_increment(vm: &mut Vm, options: Value) -> Result<i64> {
-    let v = get(vm, options, "roundingIncrement")?;
-    if v.is_undefined() {
+    let sc_v = Scope::new(vm);
+    let v = get(vm, options, "roundingIncrement")?.root(&sc_v);
+    if v.peek().is_undefined() {
         return Ok(1);
     }
-    let d = to_integer(vm, v)?;
+    let d = to_integer(vm, v.peek())?;
     if !(1.0..=1e9).contains(&d) {
         return Err(range(format!("roundingIncrement must be at least 1 and at most 1e9, not {d}")));
     }
@@ -367,14 +380,15 @@ pub(crate) enum UnitOption {
 
 /// GetTemporalUnitValuedOption (`required`: a RangeError if absent).
 pub(crate) fn unit_option(vm: &mut Vm, options: Value, name: &str, required: bool) -> Result<UnitOption> {
-    let v = get(vm, options, name)?;
-    if v.is_undefined() {
+    let sc_v = Scope::new(vm);
+    let v = get(vm, options, name)?.root(&sc_v);
+    if v.peek().is_undefined() {
         if required {
             return Err(range(format!("{name} option is required")));
         }
         return Ok(UnitOption::Unset);
     }
-    let s = to_rust_string(vm, v)?;
+    let s = to_rust_string(vm, v.peek())?;
     if s == "auto" {
         return Ok(UnitOption::Auto);
     }
@@ -407,18 +421,19 @@ pub(crate) fn validate_unit(value: UnitOption, group: Group, auto_ok: bool) -> R
 
 /// GetTemporalFractionalSecondDigitsOption: `None` for `auto`.
 pub(crate) fn fractional_digits(vm: &mut Vm, options: Value) -> Result<Option<u8>> {
-    let v = get(vm, options, "fractionalSecondDigits")?;
-    if v.is_undefined() {
+    let sc_v = Scope::new(vm);
+    let v = get(vm, options, "fractionalSecondDigits")?.root(&sc_v);
+    if v.peek().is_undefined() {
         return Ok(None);
     }
-    if !v.is_number() {
-        let s = to_rust_string(vm, v)?;
+    if !v.peek().is_number() {
+        let s = to_rust_string(vm, v.peek())?;
         if s != "auto" {
             return Err(range(format!("fractionalSecondDigits must be 'auto' or 0 through 9, not {s}")));
         }
         return Ok(None);
     }
-    let d = v.to_number().floor();
+    let d = v.peek().to_number().floor();
     if !d.is_finite() || !(0.0..=9.0).contains(&d) {
         return Err(range("fractionalSecondDigits must be 'auto' or 0 through 9"));
     }
@@ -495,11 +510,12 @@ pub(crate) fn calendar_with_iso_default(vm: &mut Vm, item: Value) -> Result<()> 
     if slots(item).is_some_and(|s| s.has_calendar()) {
         return Ok(());
     }
-    let c = get(vm, item, "calendar")?;
-    if c.is_undefined() {
+    let sc_c = Scope::new(vm);
+    let c = get(vm, item, "calendar")?.root(&sc_c);
+    if c.peek().is_undefined() {
         return Ok(());
     }
-    to_calendar(vm, c)
+    to_calendar(vm, c.peek())
 }
 
 // ---- Time zones ----

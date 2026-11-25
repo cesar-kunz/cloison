@@ -1356,7 +1356,7 @@ extern "C" fn cloison_rt_create_regexp(a: Value, b: Value) -> u64 {
 
 fn rt_create_regexp(p: Value, f: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    crate::builtins::regexp_literal(vm, p, f).map_or(0, |v| v.to_bits())
+    crate::builtins::regexp_literal(vm, p, f).map(crate::brand::Fresh::take).map_or(0, |v| v.to_bits())
 }
 
 /// `args[0][args[1]] = args[2]` (what `set_keyed` stencils don't store

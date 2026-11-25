@@ -67,7 +67,7 @@ pub(crate) enum Required<'a> {
 /// ToMonthCode: `M01` to `M99`, or `M00L` to `M99L` (as syntax only).
 fn to_month_code(vm: &mut Vm, v: Value) -> Result<(u8, bool)> {
     let p = to_primitive_string(vm, v)?;
-    let s = require_string(p).map_err(|_| type_err("month code must be a string"))?;
+    let s = require_string(p.peek()).map_err(|_| type_err("month code must be a string"))?;
     let b = s.as_bytes();
     let ok = (b.len() == 3 || b.len() == 4 && b[3] == b'L')
         && b[0] == b'M'
@@ -88,8 +88,9 @@ pub(crate) fn prepare(vm: &mut Vm, bag: Value, which: &[Field], required: Requir
     let mut out = Fields::default();
     let mut any = false;
     for f in sorted {
-        let v = get(vm, bag, FIELD_NAMES[f as usize])?;
-        if v.is_undefined() {
+        let sc_v = Scope::new(vm);
+        let v = get(vm, bag, FIELD_NAMES[f as usize])?.root(&sc_v);
+        if v.peek().is_undefined() {
             match &required {
                 Required::Partial => {}
                 Required::Some(req) => {
@@ -108,18 +109,18 @@ pub(crate) fn prepare(vm: &mut Vm, bag: Value, which: &[Field], required: Requir
         }
         any = true;
         match f {
-            Field::Year => out.year = Some(to_integer(vm, v)?),
-            Field::Month => out.month = Some(to_positive_integer(vm, v, "month")?),
-            Field::MonthCode => out.month_code = Some(to_month_code(vm, v)?),
-            Field::Day => out.day = Some(to_positive_integer(vm, v, "day")?),
+            Field::Year => out.year = Some(to_integer(vm, v.peek())?),
+            Field::Month => out.month = Some(to_positive_integer(vm, v.peek(), "month")?),
+            Field::MonthCode => out.month_code = Some(to_month_code(vm, v.peek())?),
+            Field::Day => out.day = Some(to_positive_integer(vm, v.peek(), "day")?),
             Field::Offset => {
-                let p = to_primitive_string(vm, v)?;
-                let s = require_string(p)?;
+                let p = to_primitive_string(vm, v.peek())?;
+                let s = require_string(p.peek())?;
                 parse::parse_offset(&s).map_err(parse_err)?;
                 out.offset = Some(s);
             }
-            Field::TimeZone => out.time_zone = Some(to_time_zone(vm, v)?),
-            _ => out.time[time_index(f).unwrap()] = Some(to_integer(vm, v)?),
+            Field::TimeZone => out.time_zone = Some(to_time_zone(vm, v.peek())?),
+            _ => out.time[time_index(f).unwrap()] = Some(to_integer(vm, v.peek())?),
         }
     }
     if matches!(required, Required::Partial) && !any {
@@ -148,9 +149,10 @@ pub(crate) fn time_record(vm: &mut Vm, bag: Value, partial: bool) -> Result<[Opt
     let mut out = [None; 6];
     let mut any = false;
     for k in order {
-        let v = get(vm, bag, ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"][k])?;
-        if !v.is_undefined() {
-            out[k] = Some(to_integer(vm, v)?);
+        let sc_v = Scope::new(vm);
+        let v = get(vm, bag, ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"][k])?.root(&sc_v);
+        if !v.peek().is_undefined() {
+            out[k] = Some(to_integer(vm, v.peek())?);
             any = true;
         } else if !partial {
             out[k] = Some(0.0);
@@ -326,27 +328,31 @@ pub(crate) fn to_date(vm: &mut Vm, item: Value, options: Value) -> Result<IsoDat
     if is_object(item) {
         match slots(item) {
             Some(Slots::Date(d)) => {
-                let o = options_object(vm, options)?;
-                overflow(vm, o)?;
+                let sc_o = Scope::new(vm);
+                let o = options_object(vm, options)?.root(&sc_o);
+                overflow(vm, o.peek())?;
                 return Ok(d);
             }
             Some(Slots::Zoned(ns, z)) => {
                 let dt = zone(vm, z).date_time_at(ns);
-                let o = options_object(vm, options)?;
-                overflow(vm, o)?;
+                let sc_o = Scope::new(vm);
+                let o = options_object(vm, options)?.root(&sc_o);
+                overflow(vm, o.peek())?;
                 return Ok(dt.date);
             }
             Some(Slots::DateTime(dt)) => {
-                let o = options_object(vm, options)?;
-                overflow(vm, o)?;
+                let sc_o = Scope::new(vm);
+                let o = options_object(vm, options)?.root(&sc_o);
+                overflow(vm, o.peek())?;
                 return Ok(dt.date);
             }
             _ => {}
         }
         calendar_with_iso_default(vm, item)?;
         let f = prepare(vm, item, DATE_FIELDS, Required::Some(&[]))?;
-        let o = options_object(vm, options)?;
-        let ov = overflow(vm, o)?;
+        let sc_o = Scope::new(vm);
+        let o = options_object(vm, options)?.root(&sc_o);
+        let ov = overflow(vm, o.peek())?;
         return date_from_fields(&f, ov);
     }
     let s = require_string(item)?;
@@ -355,8 +361,9 @@ pub(crate) fn to_date(vm: &mut Vm, item: Value, options: Value) -> Result<IsoDat
         return Err(range("Z designator not supported for PlainDate"));
     }
     canonicalize_calendar(r.calendar.as_deref().unwrap_or("iso8601"))?;
-    let o = options_object(vm, options)?;
-    overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, options)?.root(&sc_o);
+    overflow(vm, o.peek())?;
     check_date(r.date())
 }
 
@@ -365,19 +372,22 @@ pub(crate) fn to_date_time(vm: &mut Vm, item: Value, options: Value) -> Result<D
     if is_object(item) {
         match slots(item) {
             Some(Slots::DateTime(dt)) => {
-                let o = options_object(vm, options)?;
-                overflow(vm, o)?;
+                let sc_o = Scope::new(vm);
+                let o = options_object(vm, options)?.root(&sc_o);
+                overflow(vm, o.peek())?;
                 return Ok(dt);
             }
             Some(Slots::Zoned(ns, z)) => {
                 let dt = zone(vm, z).date_time_at(ns);
-                let o = options_object(vm, options)?;
-                overflow(vm, o)?;
+                let sc_o = Scope::new(vm);
+                let o = options_object(vm, options)?.root(&sc_o);
+                overflow(vm, o.peek())?;
                 return Ok(dt);
             }
             Some(Slots::Date(d)) => {
-                let o = options_object(vm, options)?;
-                overflow(vm, o)?;
+                let sc_o = Scope::new(vm);
+                let o = options_object(vm, options)?.root(&sc_o);
+                overflow(vm, o.peek())?;
                 return Ok(DateTime { date: d, time: Time::MIDNIGHT });
             }
             _ => {}
@@ -385,8 +395,9 @@ pub(crate) fn to_date_time(vm: &mut Vm, item: Value, options: Value) -> Result<D
         calendar_with_iso_default(vm, item)?;
         let which: Vec<Field> = DATE_FIELDS.iter().chain(TIME_FIELDS).copied().collect();
         let f = prepare(vm, item, &which, Required::Some(&[]))?;
-        let o = options_object(vm, options)?;
-        let ov = overflow(vm, o)?;
+        let sc_o = Scope::new(vm);
+        let o = options_object(vm, options)?.root(&sc_o);
+        let ov = overflow(vm, o.peek())?;
         let date = date_from_fields(&f, ov)?;
         let time = time_from_fields(&f, ov)?;
         return check_date_time(DateTime { date, time });
@@ -397,8 +408,9 @@ pub(crate) fn to_date_time(vm: &mut Vm, item: Value, options: Value) -> Result<D
         return Err(range("Z designator not supported for PlainDateTime"));
     }
     canonicalize_calendar(r.calendar.as_deref().unwrap_or("iso8601"))?;
-    let o = options_object(vm, options)?;
-    overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, options)?.root(&sc_o);
+    overflow(vm, o.peek())?;
     check_date_time(DateTime { date: r.date(), time: r.time.unwrap_or(Time::MIDNIGHT) })
 }
 
@@ -412,20 +424,23 @@ pub(crate) fn to_time(vm: &mut Vm, item: Value, options: Value) -> Result<Time> 
             _ => None,
         };
         if let Some(t) = t {
-            let o = options_object(vm, options)?;
-            overflow(vm, o)?;
+            let sc_o = Scope::new(vm);
+            let o = options_object(vm, options)?.root(&sc_o);
+            overflow(vm, o.peek())?;
             return Ok(t);
         }
         let rec = time_record(vm, item, false)?;
-        let o = options_object(vm, options)?;
-        let ov = overflow(vm, o)?;
+        let sc_o = Scope::new(vm);
+        let o = options_object(vm, options)?.root(&sc_o);
+        let ov = overflow(vm, o.peek())?;
         return regulate_time(rec.map(|v| v.unwrap_or(0.0)), ov);
     }
     let s = require_string(item)?;
     // (A calendar annotation is ignored, even one not known.)
     let (t, _) = parse::parse_time(&s).map_err(parse_err)?;
-    let o = options_object(vm, options)?;
-    overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, options)?.root(&sc_o);
+    overflow(vm, o.peek())?;
     Ok(t)
 }
 
@@ -438,21 +453,24 @@ pub(crate) fn to_time_or_midnight(vm: &mut Vm, item: Value) -> Result<Time> {
 pub(crate) fn to_year_month(vm: &mut Vm, item: Value, options: Value) -> Result<IsoDate> {
     if is_object(item) {
         if let Some(Slots::YearMonth(d)) = slots(item) {
-            let o = options_object(vm, options)?;
-            overflow(vm, o)?;
+            let sc_o = Scope::new(vm);
+            let o = options_object(vm, options)?.root(&sc_o);
+            overflow(vm, o.peek())?;
             return Ok(d);
         }
         calendar_with_iso_default(vm, item)?;
         let f = prepare(vm, item, &[Field::Year, Field::Month, Field::MonthCode], Required::Some(&[]))?;
-        let o = options_object(vm, options)?;
-        let ov = overflow(vm, o)?;
+        let sc_o = Scope::new(vm);
+        let o = options_object(vm, options)?.root(&sc_o);
+        let ov = overflow(vm, o.peek())?;
         return year_month_from_fields(&f, ov);
     }
     let s = require_string(item)?;
     let (year, month, day, calendar) = parse::parse_year_month(&s).map_err(parse_err)?;
     canonicalize_calendar(calendar.as_deref().unwrap_or("iso8601"))?;
-    let o = options_object(vm, options)?;
-    overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, options)?.root(&sc_o);
+    overflow(vm, o.peek())?;
     check_year_month(IsoDate::new(year, month as i64, day as i64))?;
     Ok(IsoDate::new(year, month as i64, 1))
 }
@@ -461,26 +479,30 @@ pub(crate) fn to_year_month(vm: &mut Vm, item: Value, options: Value) -> Result<
 pub(crate) fn to_month_day(vm: &mut Vm, item: Value, options: Value) -> Result<IsoDate> {
     if is_object(item) {
         if let Some(Slots::MonthDay(d)) = slots(item) {
-            let o = options_object(vm, options)?;
-            overflow(vm, o)?;
+            let sc_o = Scope::new(vm);
+            let o = options_object(vm, options)?.root(&sc_o);
+            overflow(vm, o.peek())?;
             return Ok(d);
         }
         if !slots(item).is_some_and(|s| s.has_calendar()) {
-            let c = get(vm, item, "calendar")?;
-            if !c.is_undefined() {
-                to_calendar(vm, c)?;
+            let sc_c = Scope::new(vm);
+            let c = get(vm, item, "calendar")?.root(&sc_c);
+            if !c.peek().is_undefined() {
+                to_calendar(vm, c.peek())?;
             }
         }
         let f = prepare(vm, item, DATE_FIELDS, Required::Some(&[]))?;
-        let o = options_object(vm, options)?;
-        let ov = overflow(vm, o)?;
+        let sc_o = Scope::new(vm);
+        let o = options_object(vm, options)?.root(&sc_o);
+        let ov = overflow(vm, o.peek())?;
         return month_day_from_fields(&f, ov);
     }
     let s = require_string(item)?;
     let (month, day, ref_year, calendar) = parse::parse_month_day(&s).map_err(parse_err)?;
     canonicalize_calendar(calendar.as_deref().unwrap_or("iso8601"))?;
-    let o = options_object(vm, options)?;
-    overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, options)?.root(&sc_o);
+    overflow(vm, o.peek())?;
     // (The ISO calendar's reference year is 1972, whatever the string's.)
     let _ = ref_year;
     Ok(IsoDate::new(1972, month as i64, day as i64))
@@ -492,7 +514,7 @@ pub(crate) fn to_instant(vm: &mut Vm, item: Value) -> Result<i128> {
     if is_object(item) {
         match slots(item) {
             Some(Slots::Instant(ns) | Slots::Zoned(ns, _)) => return Ok(ns),
-            _ => item = to_primitive_string(vm, item)?,
+            _ => item = to_primitive_string(vm, item)?.take(),
         }
     }
     let s = require_string(item)?;
@@ -514,20 +536,22 @@ pub(crate) fn to_zoned(vm: &mut Vm, item: Value, options: Value) -> Result<(i128
     let (date, time, z, offset, z_flag, match_minutes, d, offset_opt);
     if is_object(item) {
         if let Some(Slots::Zoned(ns, zz)) = slots(item) {
-            let o = options_object(vm, options)?;
-            disambiguation(vm, o)?;
-            offset_option(vm, o, OffsetOption::Reject)?;
-            overflow(vm, o)?;
+            let sc_o = Scope::new(vm);
+            let o = options_object(vm, options)?.root(&sc_o);
+            disambiguation(vm, o.peek())?;
+            offset_option(vm, o.peek(), OffsetOption::Reject)?;
+            overflow(vm, o.peek())?;
             return Ok((ns, zz));
         }
         calendar_with_iso_default(vm, item)?;
         let which: Vec<Field> =
             DATE_FIELDS.iter().chain(TIME_FIELDS).copied().chain([Field::Offset, Field::TimeZone]).collect();
         let f = prepare(vm, item, &which, Required::Some(&[Field::TimeZone]))?;
-        let o = options_object(vm, options)?;
-        d = disambiguation(vm, o)?;
-        offset_opt = offset_option(vm, o, OffsetOption::Reject)?;
-        let ov = overflow(vm, o)?;
+        let sc_o = Scope::new(vm);
+        let o = options_object(vm, options)?.root(&sc_o);
+        d = disambiguation(vm, o.peek())?;
+        offset_opt = offset_option(vm, o.peek(), OffsetOption::Reject)?;
+        let ov = overflow(vm, o.peek())?;
         date = date_from_fields(&f, ov)?;
         time = Some(time_from_fields(&f, ov)?);
         z = f.time_zone.unwrap();
@@ -545,10 +569,11 @@ pub(crate) fn to_zoned(vm: &mut Vm, item: Value, options: Value) -> Result<(i128
         z_flag = r.z;
         offset = r.offset;
         match_minutes = !r.offset.is_some_and(|o| o.sub_minute);
-        let o = options_object(vm, options)?;
-        d = disambiguation(vm, o)?;
-        offset_opt = offset_option(vm, o, OffsetOption::Reject)?;
-        overflow(vm, o)?;
+        let sc_o = Scope::new(vm);
+        let o = options_object(vm, options)?.root(&sc_o);
+        d = disambiguation(vm, o.peek())?;
+        offset_opt = offset_option(vm, o.peek(), OffsetOption::Reject)?;
+        overflow(vm, o.peek())?;
         date = r.date();
         time = r.time;
     }

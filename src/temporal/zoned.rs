@@ -7,6 +7,7 @@ use super::iso::{self, DateTime, RoundingMode, Unit};
 use super::plain::{self, date_getter, time_getter};
 use super::*;
 use crate::brand::Args;
+use crate::brand::Fresh;
 use crate::object::Obj;
 
 /// ToBigInt of `v`, as an exact time in range (a RangeError if not).
@@ -39,7 +40,12 @@ fn this_instant(this: Value) -> Result<i128> {
     }
 }
 
-pub(crate) fn create_instant(vm: &mut Vm, ns: i128) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create_instant(vm: &mut Vm, ns: i128) -> Result<Fresh<'_>> {
+    create_instant_raw(vm, ns).map(Fresh::new)
+}
+
+fn create_instant_raw(vm: &mut Vm, ns: i128) -> Result<Value> {
     Ok(create(vm, Slots::Instant(check_epoch_ns(ns)?)))
 }
 
@@ -48,7 +54,7 @@ fn instant_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(type_err("Constructor Temporal.Instant requires 'new'"));
     }
     let ns = to_epoch_ns(vm, arg(&a, 0))?;
-    create_instant(vm, ns)
+    create_instant(vm, ns).map(Fresh::take)
 }
 
 fn instant_epoch_ms(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -72,7 +78,7 @@ fn instant_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) -> Re
         return Err(range(format!("duration field {} not supported by Temporal.Instant", largest.name())));
     }
     let r = duration::add_instant(ns, duration::to_internal_24h(&d).time)?;
-    create_instant(vm, r)
+    create_instant(vm, r).map(Fresh::take)
 }
 
 fn instant_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -87,8 +93,9 @@ fn instant_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn instant_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Result<Value> {
     let ns = this_instant(this)?;
     let other = fields::to_instant(vm, arg(a, 0))?;
-    let o = options_object(vm, arg(a, 1))?;
-    let s = duration::difference_settings(vm, since, o, Group::Time, &[], Unit::Nanosecond, Unit::Second)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let s = duration::difference_settings(vm, since, o.peek(), Group::Time, &[], Unit::Nanosecond, Unit::Second)?;
     let i = duration::difference_instant(ns, other, s.increment, s.smallest, s.mode)?;
     let mut r = duration::from_internal(&i, s.largest)?;
     if since {
@@ -106,7 +113,12 @@ fn instant_since(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 }
 
 /// `round(roundTo)`'s options: a string the smallest unit.
-fn round_options(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
+#[inline(always)]
+fn round_options<'v>(vm: &'v mut Vm, v: Value, name: &str) -> Result<Fresh<'v>> {
+    round_options_raw(vm, v, name).map(Fresh::new)
+}
+
+fn round_options_raw(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     if v.is_undefined() {
         return Err(type_err("options parameter is required"));
     }
@@ -117,23 +129,24 @@ fn round_options(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
         vm.add_property(Obj::of(o), a, v);
         return Ok(o);
     }
-    options_object(vm, v)
+    options_object(vm, v).map(Fresh::take)
 }
 
 fn instant_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
-    let o = round_options(vm, arg(&a, 0), "smallestUnit")?;
+    let sc_o = Scope::new(vm);
+    let o = round_options(vm, arg(&a, 0), "smallestUnit")?.root(&sc_o);
     // (`o`, maybe made here, rooted while its options are read.)
-    let _rooted = vm.root_scope(&[o]);
-    let increment = rounding_increment(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-    let smallest = unit_option(vm, o, "smallestUnit", true)?;
+    let _rooted = vm.root_scope(&[o.peek()]);
+    let increment = rounding_increment(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::HalfExpand)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", true)?;
     validate_unit(smallest, Group::Time, false)?;
     let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
     let max = (iso::NS_PER_DAY / unit.nanos()) as i64;
     validate_increment(increment, max, true)?;
     let r = iso::round_as_if_positive(ns, unit.nanos() * increment as i128, mode);
-    create_instant(vm, r)
+    create_instant(vm, r).map(Fresh::take)
 }
 
 fn instant_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -156,16 +169,18 @@ fn instant_string(vm: &Vm, ns: i128, z: Option<u32>, precision: iso::Precision) 
 
 fn instant_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let digits = fractional_digits(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::Trunc)?;
-    let smallest = unit_option(vm, o, "smallestUnit", false)?;
-    let tz = get(vm, o, "timeZone")?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let digits = fractional_digits(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::Trunc)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", false)?;
+    let sc_tz = Scope::new(vm);
+    let tz = get(vm, o.peek(), "timeZone")?.root(&sc_tz);
     validate_unit(smallest, Group::Time, false)?;
     if smallest == UnitOption::Unit(Unit::Hour) {
         return Err(range("smallestUnit must be a time unit other than hour"));
     }
-    let z = if tz.is_undefined() { None } else { Some(to_time_zone(vm, tz)?) };
+    let z = if tz.peek().is_undefined() { None } else { Some(to_time_zone(vm, tz.peek())?) };
     let (precision, unit, increment) = seconds_precision(smallest, digits);
     let r = check_epoch_ns(iso::round_as_if_positive(ns, unit.nanos() * increment as i128, mode))?;
     let s = instant_string(vm, r, z, precision);
@@ -181,7 +196,7 @@ fn instant_to_json(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 fn instant_to_zoned(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
     let z = to_time_zone(vm, arg(&a, 0))?;
-    create_zoned(vm, ns, z)
+    create_zoned(vm, ns, z).map(Fresh::take)
 }
 
 fn instant_from_epoch_ms(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -192,17 +207,17 @@ fn instant_from_epoch_ms(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if ms.abs() > 1e16 {
         return Err(range("epoch milliseconds are outside of supported range"));
     }
-    create_instant(vm, ms as i128 * 1_000_000)
+    create_instant(vm, ms as i128 * 1_000_000).map(Fresh::take)
 }
 
 fn instant_from_epoch_ns(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let ns = to_epoch_ns(vm, arg(&a, 0))?;
-    create_instant(vm, ns)
+    create_instant(vm, ns).map(Fresh::take)
 }
 
 fn instant_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let ns = fields::to_instant(vm, arg(&a, 0))?;
-    create_instant(vm, ns)
+    create_instant(vm, ns).map(Fresh::take)
 }
 
 fn instant_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -248,7 +263,12 @@ fn this_zoned(this: Value) -> Result<(i128, u32)> {
     }
 }
 
-pub(crate) fn create_zoned(vm: &mut Vm, ns: i128, z: u32) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create_zoned(vm: &mut Vm, ns: i128, z: u32) -> Result<Fresh<'_>> {
+    create_zoned_raw(vm, ns, z).map(Fresh::new)
+}
+
+fn create_zoned_raw(vm: &mut Vm, ns: i128, z: u32) -> Result<Value> {
     Ok(create(vm, Slots::Zoned(check_epoch_ns(ns)?, z)))
 }
 
@@ -265,7 +285,7 @@ fn zoned_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     }
     let ns: Option<i128> = b.to_string_radix(10).parse().ok();
     match ns {
-        Some(ns) => create_zoned(vm, ns, z),
+        Some(ns) => create_zoned(vm, ns, z).map(Fresh::take),
         None => Err(range("epoch nanoseconds are outside of supported range")),
     }
 }
@@ -318,15 +338,16 @@ fn zoned_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         fields::DATE_FIELDS.iter().chain(fields::TIME_FIELDS).copied().chain([Field::Offset]).collect();
     let partial = fields::prepare(vm, item, &which, Required::Partial)?;
     let merged = fields::merge(&base, &partial);
-    let o = options_object(vm, arg(&a, 1))?;
-    let d = disambiguation(vm, o)?;
-    let offset_opt = offset_option(vm, o, OffsetOption::Prefer)?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 1))?.root(&sc_o);
+    let d = disambiguation(vm, o.peek())?;
+    let offset_opt = offset_option(vm, o.peek(), OffsetOption::Prefer)?;
+    let ov = overflow(vm, o.peek())?;
     let date = fields::date_from_fields(&merged, ov)?;
     let time = fields::time_from_fields(&merged, ov)?;
     let new_off = parse::parse_offset(merged.offset.as_deref().unwrap()).map_err(parse_err)?.ns;
     let r = interpret_offset(vm, date, Some(time), OffsetBehaviour::Option, new_off, z, d, offset_opt, false)?;
-    create_zoned(vm, r, z)
+    create_zoned(vm, r, z).map(Fresh::take)
 }
 
 fn zoned_with_plain_time(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -339,19 +360,19 @@ fn zoned_with_plain_time(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value>
         let time = fields::to_time(vm, t, Value::UNDEFINED)?;
         epoch_ns_for(vm, z, DateTime { date, time }, Disambiguation::Compatible)?
     };
-    create_zoned(vm, r, z)
+    create_zoned(vm, r, z).map(Fresh::take)
 }
 
 fn zoned_with_time_zone(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, _) = this_zoned(this)?;
     let z = to_time_zone(vm, arg(&a, 0))?;
-    create_zoned(vm, ns, z)
+    create_zoned(vm, ns, z).map(Fresh::take)
 }
 
 fn zoned_with_calendar(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     to_calendar(vm, arg(&a, 0))?;
-    create_zoned(vm, ns, z)
+    create_zoned(vm, ns, z).map(Fresh::take)
 }
 
 /// AddDurationToZonedDateTime.
@@ -361,10 +382,11 @@ fn zoned_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) -> Resu
     if subtract {
         d = duration::negated(&d);
     }
-    let o = options_object(vm, arg(a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let r = duration::add_zoned(vm, ns, z, &duration::to_internal(&d), ov)?;
-    create_zoned(vm, r, z)
+    create_zoned(vm, r, z).map(Fresh::take)
 }
 
 fn zoned_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -379,8 +401,9 @@ fn zoned_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn zoned_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let (other, oz) = fields::to_zoned(vm, arg(a, 0), Value::UNDEFINED)?;
-    let o = options_object(vm, arg(a, 1))?;
-    let s = duration::difference_settings(vm, since, o, Group::DateTime, &[], Unit::Nanosecond, Unit::Hour)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let s = duration::difference_settings(vm, since, o.peek(), Group::DateTime, &[], Unit::Nanosecond, Unit::Hour)?;
     let mut r = if !s.largest.is_date() {
         let i = duration::difference_instant(ns, other, s.increment, s.smallest, s.mode)?;
         duration::from_internal(&i, s.largest)?
@@ -412,12 +435,13 @@ fn zoned_since(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn zoned_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let o = round_options(vm, arg(&a, 0), "smallestUnit")?;
+    let sc_o = Scope::new(vm);
+    let o = round_options(vm, arg(&a, 0), "smallestUnit")?.root(&sc_o);
     // (`o`, maybe made here, rooted while its options are read.)
-    let _rooted = vm.root_scope(&[o]);
-    let increment = rounding_increment(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-    let smallest = unit_option(vm, o, "smallestUnit", true)?;
+    let _rooted = vm.root_scope(&[o.peek()]);
+    let increment = rounding_increment(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::HalfExpand)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", true)?;
     if smallest != UnitOption::Unit(Unit::Day) {
         validate_unit(smallest, Group::Time, false)?;
     }
@@ -425,7 +449,7 @@ fn zoned_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let max = duration::max_increment(unit).unwrap_or(1);
     validate_increment(increment, max, max == 1)?;
     if unit == Unit::Nanosecond && increment == 1 {
-        return create_zoned(vm, ns, z);
+        return create_zoned(vm, ns, z).map(Fresh::take);
     }
     let dt = zone(vm, z).date_time_at(ns);
     let r = if unit == Unit::Day {
@@ -450,7 +474,7 @@ fn zoned_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
             false,
         )?
     };
-    create_zoned(vm, r, z)
+    create_zoned(vm, r, z).map(Fresh::take)
 }
 
 fn zoned_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -491,13 +515,14 @@ fn zoned_string(
 
 fn zoned_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let show_calendar = show_calendar(vm, o)?;
-    let digits = fractional_digits(vm, o)?;
-    let show_offset = option(vm, o, "offset", &["auto", "never"], Some(0))? == 0;
-    let mode = rounding_mode(vm, o, RoundingMode::Trunc)?;
-    let smallest = unit_option(vm, o, "smallestUnit", false)?;
-    let show_tz = option(vm, o, "timeZoneName", &["auto", "never", "critical"], Some(0))?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let show_calendar = show_calendar(vm, o.peek())?;
+    let digits = fractional_digits(vm, o.peek())?;
+    let show_offset = option(vm, o.peek(), "offset", &["auto", "never"], Some(0))? == 0;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::Trunc)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", false)?;
+    let show_tz = option(vm, o.peek(), "timeZoneName", &["auto", "never", "critical"], Some(0))?;
     validate_unit(smallest, Group::Time, false)?;
     if smallest == UnitOption::Unit(Unit::Hour) {
         return Err(range("smallestUnit must be a time unit other than hour"));
@@ -517,32 +542,33 @@ fn zoned_start_of_day(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let date = zone(vm, z).date_time_at(ns).date;
     let r = start_of_day(vm, z, date)?;
-    create_zoned(vm, r, z)
+    create_zoned(vm, r, z).map(Fresh::take)
 }
 
 fn zoned_transition(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let o = round_options(vm, arg(&a, 0), "direction")?;
+    let sc_o = Scope::new(vm);
+    let o = round_options(vm, arg(&a, 0), "direction")?.root(&sc_o);
     // (`o`, maybe made here, rooted while its options are read.)
-    let _rooted = vm.root_scope(&[o]);
-    let next = option(vm, o, "direction", &["next", "previous"], None)? == 0;
+    let _rooted = vm.root_scope(&[o.peek()]);
+    let next = option(vm, o.peek(), "direction", &["next", "previous"], None)? == 0;
     let zn = zone(vm, z);
     let t = if next { zn.next_transition(ns) } else { zn.previous_transition(ns) };
     match t {
-        Some(t) => create_zoned(vm, t, z),
+        Some(t) => create_zoned(vm, t, z).map(Fresh::take),
         None => Ok(Value::NULL),
     }
 }
 
 fn zoned_to_instant(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, _) = this_zoned(this)?;
-    create_instant(vm, ns)
+    create_instant(vm, ns).map(Fresh::take)
 }
 
 fn zoned_to_plain_date(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let d = zone(vm, z).date_time_at(ns).date;
-    plain::create_date(vm, d)
+    plain::create_date(vm, d).map(Fresh::take)
 }
 
 fn zoned_to_plain_time(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -554,12 +580,12 @@ fn zoned_to_plain_time(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 fn zoned_to_plain_date_time(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let dt = zone(vm, z).date_time_at(ns);
-    plain::create_date_time(vm, dt)
+    plain::create_date_time(vm, dt).map(Fresh::take)
 }
 
 fn zoned_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = fields::to_zoned(vm, arg(&a, 0), arg(&a, 1))?;
-    create_zoned(vm, ns, z)
+    create_zoned(vm, ns, z).map(Fresh::take)
 }
 
 fn zoned_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -639,7 +665,7 @@ fn now_zone(vm: &mut Vm, v: Value) -> Result<u32> {
 }
 
 fn now_instant(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
-    create_instant(vm, system_ns())
+    create_instant(vm, system_ns()).map(Fresh::take)
 }
 
 fn now_time_zone_id(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
@@ -650,19 +676,19 @@ fn now_time_zone_id(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
 
 fn now_zoned(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let z = now_zone(vm, arg(&a, 0))?;
-    create_zoned(vm, system_ns(), z)
+    create_zoned(vm, system_ns(), z).map(Fresh::take)
 }
 
 fn now_date_time(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let z = now_zone(vm, arg(&a, 0))?;
     let dt = zone(vm, z).date_time_at(system_ns());
-    plain::create_date_time(vm, dt)
+    plain::create_date_time(vm, dt).map(Fresh::take)
 }
 
 fn now_date(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let z = now_zone(vm, arg(&a, 0))?;
     let dt = zone(vm, z).date_time_at(system_ns());
-    plain::create_date(vm, dt.date)
+    plain::create_date(vm, dt.date).map(Fresh::take)
 }
 
 fn now_time(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -679,7 +705,7 @@ fn to_temporal_instant(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if !t.is_finite() {
         return Err(range("invalid date"));
     }
-    create_instant(vm, t as i128 * 1_000_000)
+    create_instant(vm, t as i128 * 1_000_000).map(Fresh::take)
 }
 
 pub(crate) fn install_now(vm: &mut Vm, temporal: Obj) {

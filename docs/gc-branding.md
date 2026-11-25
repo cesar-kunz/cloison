@@ -275,15 +275,41 @@ that rule:
 
 The cost is within 1% on the microbenchmarks and nothing on Octane.
 
+## Modules' own helpers
+
+A module's helpers that may collect return a `Fresh` too, not only the
+VM's calls: an iterator's step (`step_value`), a proxy's trap, a
+promise's capability, a RegExp's `exec`, and so on, 142 of them. Each
+is a branded wrapper with the old name over a private `name_raw` body,
+so callers in other modules only see the branded form:
+
+```rust
+#[inline(always)]
+fn next_method(vm: &mut Vm, it: Value) -> Result<Fresh<'_>> { … }
+```
+
+A pattern binding stays checked with `transpose()` (a fresh `Option`
+as an `Option` of fresh values) or `split()` (a fresh pair). Helpers
+that only read the engine's own slots, or return their argument, stay
+plain.
+
+One trap the compiler doesn't catch: a `Scope` ends by truncating
+`vm.handles` to where it started, so a value pushed to `vm.handles`
+after it, for a later loop or a caller's handle scope, is dropped with
+it. Such code takes the value and pushes it, with its reason
+(`// take: pushed to vm.handles on the next line.`), rather than
+rooting it in a `Scope` of its own.
+
 ## What isn't checked yet
 
 - **The `take()`s and raw `Gc` values**: each one reviewed and given a
   reason, checked by CI to be there.
 - **Raw values that never came from a `Fresh` or a `Gc`**:
   - a value read from an object's slot;
-  - what a module's own helper returns (`str_value`, `closure`, …),
-    which allocates through `vm.mu()` itself but returns a plain
-    `Value`.
+  - what a module's allocating helper returns (`str_value`,
+    `closure`, …), which allocates through `vm.mu()` itself but
+    returns a plain `Value`;
+  - a native's `this`.
 
   These are plain `Value`s and can still be held across a call.
 - **The interpreter and the JIT**: their values live in the VM stack,

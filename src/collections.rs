@@ -14,6 +14,7 @@
 //! collector doesn't trace (`heap::WEAK_VALUES`): it keeps the value of
 //! each entry whose key is live and clears the others (`Vm::ephemerons`).
 
+use crate::brand::Fresh;
 use crate::brand::{Args, Handle, Scope};
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{to_boolean, to_int32, to_number};
@@ -352,7 +353,12 @@ fn current(mut e: Obj, pos: &mut usize, s: usize) -> Obj {
 /// of 2) buckets: an array of int32s, `n`, then each bucket's last entry,
 /// then each entry's previous one in its bucket ([`NONE`] for none). An
 /// entry is numbered by its position: `BASE + number * s`.
-fn new_index(vm: &mut Vm, e: Obj, s: usize, n: usize) -> Result<Value> {
+#[inline(always)]
+fn new_index(vm: &mut Vm, e: Obj, s: usize, n: usize) -> Result<Fresh<'_>> {
+    new_index_raw(vm, e, s, n).map(Fresh::new)
+}
+
+fn new_index_raw(vm: &mut Vm, e: Obj, s: usize, n: usize) -> Result<Value> {
     let total = (len(e) - BASE) / s;
     let mut ix = vec![Value::from_i32(NONE); 1 + n + total];
     ix[0] = Value::from_i32(n as i32);
@@ -399,7 +405,12 @@ pub(crate) fn live_entries(o: Obj) -> usize {
 
 /// A new entries array for entries `s` wide: `entries`' live ones (none if
 /// null), indexed.
-fn new_entries(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Obj> {
+#[inline(always)]
+fn new_entries(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Fresh<'_, Obj>> {
+    new_entries_raw(vm, from, s).map(Fresh::new)
+}
+
+fn new_entries_raw(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Obj> {
     let mut kv = vec![Value::UNDEFINED, Value::UNDEFINED, Value::from_i32(0)];
     if let Some(old) = from {
         for i in (BASE..len(old)).step_by(s) {
@@ -415,7 +426,7 @@ fn new_entries(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Obj> {
     array_push(vm, fresh, &kv)?;
     let e = Obj::of(fresh);
     let ix = new_index(vm, e, s, (count * 2).next_power_of_two().max(8))?;
-    put(e, INDEX, ix);
+    put(e, INDEX, ix.peek());
     Ok(e)
 }
 
@@ -424,8 +435,8 @@ fn new_entries(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Obj> {
 fn move_entries(vm: &mut Vm, o: Obj) -> Result<()> {
     let old = entries(o);
     let fresh = new_entries(vm, Some(old), stride(o))?;
-    put(old, FORWARD, object_value(fresh.ptr()));
-    hold_entries(o, object_value(fresh.ptr()));
+    put(old, FORWARD, object_value(fresh.peek().ptr()));
+    hold_entries(o, object_value(fresh.peek().ptr()));
     weaken(o);
     Ok(())
 }
@@ -448,7 +459,7 @@ fn append(vm: &mut Vm, o: Obj, entry: &[Value]) -> Result<()> {
     let n = int(unsafe { Obj::from_ptr(ix) }, 0) as usize;
     if j >= n {
         let fresh = new_index(vm, e, s, n * 2)?;
-        put(e, INDEX, fresh);
+        put(e, INDEX, fresh.peek());
         return Ok(());
     }
     array_push(vm, object_value(ix), &[Value::from_i32(NONE)])?;
@@ -469,9 +480,15 @@ fn remove(o: Obj, i: usize) {
 }
 
 /// A new, empty collection of class `class`.
-fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
+#[inline(always)]
+fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Fresh<'_, Obj>> {
+    new_collection_raw(vm, class, proto).map(Fresh::new)
+}
+
+fn new_collection_raw(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
     let s = if matches!(class, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
-    let e = new_entries(vm, None, s)?;
+    // take: nothing collects before its last use.
+    let e = new_entries(vm, None, s)?.take();
     let p = object_value((vm.collection_prototypes[proto as usize]).ptr());
     // take: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_object_with(class, p, 0).obj();
@@ -489,7 +506,8 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
 
 /// A new weak set for the runtime's own use, never seen by scripts (a
 /// resizable buffer's views: see `typed`).
-pub(crate) fn new_weak_set(vm: &mut Vm) -> Result<Obj> {
+#[inline(always)]
+pub(crate) fn new_weak_set(vm: &mut Vm) -> Result<Fresh<'_, Obj>> {
     new_collection(vm, Class::WeakSet, Proto::WeakSet)
 }
 
@@ -561,7 +579,8 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     let f = vm.callee_obj();
     let default = object_value((vm.collection_prototypes[proto as usize]).ptr());
     let p = vm.take_new_target(f, default)?;
-    let c = new_collection(vm, class, proto)?;
+    // take: nothing collects before its last use.
+    let c = new_collection(vm, class, proto)?.take();
     if p != default {
         vm.set_prototype_of(c, p);
     }
@@ -805,7 +824,8 @@ fn set_entries(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 /// deleted, as the iterator's mode has it; exhausted for good at the end.
 pub(crate) fn iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let it = this_of(this, Class::CollectionIterator, "Iterator.prototype.next")?;
-    Ok(match step(vm, it)? {
+    // take: given at once to iter_result, which only allocates.
+    Ok(match step(vm, it)?.take() {
         Some(v) => iter_result(vm, v, false),
         None => iter_result(vm, Value::UNDEFINED, true),
     })
@@ -819,7 +839,12 @@ pub(crate) fn default_iterator(vm: &mut Vm, o: Obj) -> Value {
 
 /// [`iterator_next`]'s value, without its result object: `None` once
 /// exhausted (for good).
-pub(crate) fn step(vm: &mut Vm, it: Obj) -> Result<Option<Value>> {
+#[inline(always)]
+pub(crate) fn step(vm: &mut Vm, it: Obj) -> Result<Fresh<'_, Option<Value>>> {
+    step_raw(vm, it).map(Fresh::new)
+}
+
+fn step_raw(vm: &mut Vm, it: Obj) -> Result<Option<Value>> {
     if it.code().is_null() {
         return Ok(None);
     }
@@ -1030,7 +1055,7 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::range_error(format!("Invalid DataView length {}", len.unwrap_or(0))));
     }
     let proto = object_value((vm.collection_prototypes[Proto::DataView as usize]).ptr());
-    crate::typed::make_view(vm, Class::DataView, proto, crate::object::TypedKind::U8, b, offset, len)
+    crate::typed::make_view(vm, Class::DataView, proto, crate::object::TypedKind::U8, b, offset, len).map(Fresh::take)
 }
 
 fn this_view(this: Value) -> Result<Obj> {
@@ -1119,7 +1144,7 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Val
     let i = to_index(vm, arg(&a, 0))?;
     let is_big = T == 8 || T == 9;
     let big = if is_big {
-        crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(&a, 1))?)
+        crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(&a, 1))?.take())
     } else {
         0
     };
@@ -1152,7 +1177,7 @@ fn map_group_by(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // (Its data made directly, as the spec has it: not through `get` and
     // `set`, which code may have replaced. Rooted across the callbacks.)
     let sc = Scope::new(vm);
-    let out = sc.root(object_value((new_collection(vm, Class::Map, Proto::Map)?).ptr()));
+    let out = sc.root(object_value((new_collection(vm, Class::Map, Proto::Map)?).peek().ptr()));
     crate::props::group_by(vm, &a, |vm, key, v| {
         // (-0 as +0, as `set` keeps it.)
         let key = if key.is_number() && key.to_number() == 0.0 { Value::from_i32(0) } else { key };
@@ -1290,7 +1315,7 @@ fn each_value(vm: &mut Vm, o: Obj, mut f: impl FnMut(&mut Vm, Value) -> Result<b
 
 /// A new set of set `o`'s values, rooted in `sc`.
 fn copy_set<'s>(vm: &mut Vm, sc: &'s Scope, o: Obj) -> Result<Handle<'s>> {
-    let out = sc.root(object_value(new_collection(vm, Class::Set, Proto::Set)?.ptr()));
+    let out = sc.root(object_value(new_collection(vm, Class::Set, Proto::Set)?.peek().ptr()));
     each_value(vm, o, |vm, v| append(vm, Obj::of(out.v()), &[v]).map(|()| true))?;
     Ok(out)
 }
@@ -1324,7 +1349,7 @@ fn set_intersection(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.intersection")?;
     let sc = Scope::new(vm);
     let rec = set_record(vm, &sc, arg(&a, 0))?;
-    let out = sc.root(object_value(new_collection(vm, Class::Set, Proto::Set)?.ptr()));
+    let out = sc.root(object_value(new_collection(vm, Class::Set, Proto::Set)?.peek().ptr()));
     if live(o) as f64 <= rec.size {
         each_value(vm, o, |vm, v| {
             if record_has(vm, &rec, v)? {
@@ -1435,10 +1460,11 @@ fn weak_ref_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !can_be_held_weakly(t) {
         return Err(Error::type_error("WeakRef: target must be an object or a non-registered symbol"));
     }
-    let o = new_collection(vm, Class::WeakRef, Proto::WeakRef)?;
-    append(vm, o, &[t])?;
+    let sc_o = Scope::new(vm);
+    let o = new_collection(vm, Class::WeakRef, Proto::WeakRef)?.root(&sc_o);
+    append(vm, o.obj(), &[t])?;
     vm.kept_alive.push(t);
-    Ok(object_value(o.ptr()))
+    Ok(object_value(o.obj().ptr()))
 }
 
 /// `weakRef.deref()`: its target, or `undefined` once collected.
@@ -1469,7 +1495,7 @@ fn finalization_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::type_error("FinalizationRegistry: cleanup must be callable"));
     }
     let o = new_collection(vm, Class::FinalizationRegistry, Proto::FinalizationRegistry)?;
-    Ok(object_value(o.ptr()))
+    Ok(object_value(o.peek().ptr()))
 }
 
 /// `registry.register(target, held, token)`.

@@ -8,6 +8,7 @@
 //! much they read and wrote.
 
 use crate::brand::Args;
+use crate::brand::Fresh;
 use crate::interp::to_boolean;
 use crate::object::{Class, Obj, TypedKind, object_value};
 use crate::props::is_object;
@@ -243,10 +244,15 @@ fn decode_hex(s: &[u16], max: usize) -> Decoded {
 }
 
 /// A new `Uint8Array` of `bytes`.
-fn new_uint8_array(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
+#[inline(always)]
+fn new_uint8_array<'v>(vm: &'v mut Vm, bytes: &[u8]) -> Result<Fresh<'v>> {
+    new_uint8_array_raw(vm, bytes).map(Fresh::new)
+}
+
+fn new_uint8_array_raw(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
     let ta = crate::typed::allocate(vm, TypedKind::U8, bytes.len())?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), Obj::of(ta).elems().cast::<u8>(), bytes.len()) };
-    Ok(ta)
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), Obj::of(ta.peek()).elems().cast::<u8>(), bytes.len()) };
+    Ok(ta.peek())
 }
 
 fn from_base64(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -258,7 +264,7 @@ fn from_base64(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if let Some(e) = d.error {
         return Err(e);
     }
-    new_uint8_array(vm, &d.bytes)
+    new_uint8_array(vm, &d.bytes).map(Fresh::take)
 }
 
 fn from_hex(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -266,12 +272,17 @@ fn from_hex(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if let Some(e) = d.error {
         return Err(e);
     }
-    new_uint8_array(vm, &d.bytes)
+    new_uint8_array(vm, &d.bytes).map(Fresh::take)
 }
 
 /// What the `setFrom` methods do with a decoding into `o`: its bytes
 /// written, then its error thrown, or `{ read, written }`.
-fn written(vm: &mut Vm, o: Obj, d: Decoded) -> Result<Value> {
+#[inline(always)]
+fn written(vm: &mut Vm, o: Obj, d: Decoded) -> Result<Fresh<'_>> {
+    written_raw(vm, o, d).map(Fresh::new)
+}
+
+fn written_raw(vm: &mut Vm, o: Obj, d: Decoded) -> Result<Value> {
     // (A decoding runs no code: `o` is as it was checked.)
     assert!(d.bytes.len() <= length_of(vm, o)?);
     unsafe { crate::racy::copy(d.bytes.as_ptr(), o.elems().cast::<u8>(), d.bytes.len()) };
@@ -297,7 +308,7 @@ fn set_from_base64(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let last = last_chunk(vm, opts)?;
     let max = length_of(vm, o)?;
     let d = decode_base64(s, url, last, max);
-    written(vm, o, d)
+    written(vm, o, d).map(Fresh::take)
 }
 
 fn set_from_hex(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -306,7 +317,7 @@ fn set_from_hex(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let s = string_arg(arg(&a, 0))?;
     let max = length_of(vm, o)?;
     let d = decode_hex(s, max);
-    written(vm, o, d)
+    written(vm, o, d).map(Fresh::take)
 }
 
 fn to_base64(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {

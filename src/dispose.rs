@@ -170,7 +170,8 @@ const DISPOSED: usize = 1;
 const RESOURCES: usize = 2;
 
 /// A new capability's state: `[async, disposed, resources]`.
-pub(crate) fn new_state(vm: &mut Vm, async_: bool) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn new_state(vm: &mut Vm, async_: bool) -> Result<Fresh<'_>> {
     // take: only calls that don't collect follow (allocation, stores, filling it).
     let resources = vm.mu().new_array().v();
     crate::array::new_array_of(vm, &[Value::from_bool(async_), Value::FALSE, resources])
@@ -184,7 +185,12 @@ pub(crate) fn is_empty(state: Value) -> bool {
 // ---- Resources ----
 
 /// GetMethod(v, `key`): undefined if absent, a TypeError if not callable.
-fn get_method(vm: &mut Vm, v: Value, key: &str) -> Result<Value> {
+#[inline(always)]
+fn get_method<'v>(vm: &'v mut Vm, v: Value, key: &str) -> Result<Fresh<'v>> {
+    get_method_raw(vm, v, key).map(Fresh::new)
+}
+
+fn get_method_raw(vm: &mut Vm, v: Value, key: &str) -> Result<Value> {
     let a = vm.intern_name(&format!("{}Symbol.{key}", crate::symbol::SYMBOL_MARK));
     let m = vm.get_atom_b(v, a)?;
     if m.peek().is_undefined() || m.peek().is_null() {
@@ -213,21 +219,17 @@ pub(crate) fn add_resource(vm: &mut Vm, state: Value, v: Value, async_: bool) ->
     let held = Scope::new(vm);
     let _rooted = held.roots([v]);
     let (method, kind) = if async_ {
-        match get_method(vm, v, "asyncDispose")? {
-            m if m.is_undefined() => (get_method(vm, v, "dispose")?, ASYNC_FROM_SYNC),
+        match get_method(vm, v, "asyncDispose")?.root(&held) {
+            m if m.v().is_undefined() => (get_method(vm, v, "dispose")?.root(&held), ASYNC_FROM_SYNC),
             m => (m, ASYNC),
         }
     } else {
-        (get_method(vm, v, "dispose")?, SYNC)
+        (get_method(vm, v, "dispose")?.root(&held), SYNC)
     };
-    if method.is_undefined() {
+    if method.v().is_undefined() {
         return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
     }
-    {
-        let held = Scope::new(vm);
-        let _held = held.roots([method]);
-        push(vm, state, v, method, kind)
-    }
+    push(vm, state, v, method.v(), kind)
 }
 
 fn push(vm: &mut Vm, state: Value, v: Value, method: Value, kind: i32) -> Result<()> {
@@ -235,7 +237,12 @@ fn push(vm: &mut Vm, state: Value, v: Value, method: Value, kind: i32) -> Result
 }
 
 /// The thrown value of `e` (a runtime error's object).
-fn thrown(vm: &mut Vm, e: Error) -> Result<Value> {
+#[inline(always)]
+fn thrown(vm: &mut Vm, e: Error) -> Result<Fresh<'_>> {
+    thrown_raw(vm, e).map(Fresh::new)
+}
+
+fn thrown_raw(vm: &mut Vm, e: Error) -> Result<Value> {
     match e.1 {
         Some(v) => Ok(v),
         None if e.0.starts_with("unsupported") => Err(e),
@@ -259,7 +266,12 @@ fn suppressed_error(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
 /// DisposeResources, synchronously, of capability `state`'s resources
 /// after `completion`: each disposed of, last first, what one throws
 /// suppressing what was thrown before (a `SuppressedError`).
-pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Value>) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Value>) -> Result<Fresh<'_>> {
+    dispose_resources_raw(vm, state, completion).map(Fresh::new)
+}
+
+fn dispose_resources_raw(vm: &mut Vm, state: Value, completion: Result<Value>) -> Result<Value> {
     let resources = elem(state, RESOURCES);
     // (The resources, taken off the state, and the completion's value,
     // rooted in slots of their own: the disposers may collect.)
@@ -281,17 +293,14 @@ pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Va
             _ => vm.call_b(method, v, &[]),
         };
         if let Err(e) = r {
-            let e = thrown(vm, e)?;
+            let sc_e = Scope::new(vm);
+            let e = thrown(vm, e)?.root(&sc_e);
             let next = match completion {
                 Err(prev) => {
-                    let prev = {
-                        let held = Scope::new(vm);
-                        let _held = held.roots([e]);
-                        thrown(vm, prev)
-                    }?;
-                    suppressed_error(vm, e, prev)
+                    let prev = thrown(vm, prev)?.root(&sc_e);
+                    suppressed_error(vm, e.v(), prev.v())
                 }
-                Ok(_) => e,
+                Ok(_) => e.v(),
             };
             vm.handles[at] = next;
             completion = Err(Error::thrown(next));
@@ -303,20 +312,26 @@ pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Va
 /// The async disposal helper: `(resources, hasError, error)` to a promise
 /// settled once each resource is disposed of (DisposeResources with its
 /// awaits), made on first use.
-fn async_helper(vm: &mut Vm) -> Result<Value> {
+#[inline(always)]
+fn async_helper(vm: &mut Vm) -> Result<Fresh<'_>> {
+    async_helper_raw(vm).map(Fresh::new)
+}
+
+fn async_helper_raw(vm: &mut Vm) -> Result<Value> {
     let h = root(vm, Root::AsyncHelper);
     if !h.is_undefined() {
         return Ok(h);
     }
-    let make = crate::builtins::run_source(vm, ASYNC_DISPOSE)?;
+    let sc_make = Scope::new(vm);
+    let make = crate::builtins::run_source(vm, ASYNC_DISPOSE)?.root(&sc_make);
     let h = vm.handle_scope(|vm| {
-        vm.handles.push(make);
+        vm.handles.push(make.peek());
         let call = object_value(vm.native_function("call", helper_call, 2, crate::jit::Ty::Any, false).ptr());
         vm.handles.push(call);
         let suppress =
             object_value(vm.native_function("suppress", helper_suppress, 2, crate::jit::Ty::Any, false).ptr());
         vm.handles.push(suppress);
-        vm.call_b(make, Value::UNDEFINED, &[call, suppress]).map(Fresh::take)
+        vm.call_b(make.peek(), Value::UNDEFINED, &[call, suppress]).map(Fresh::take)
     })?;
     vm.dispose_roots[Root::AsyncHelper as usize] = h;
     Ok(h)
@@ -365,12 +380,18 @@ fn helper_suppress(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 
 /// DisposeResources with hint async of capability `state`'s resources
 /// after a throw of `error` (if `has_error`): a promise.
-pub(crate) fn dispose_resources_async(vm: &mut Vm, state: Value, has_error: bool, error: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn dispose_resources_async(vm: &mut Vm, state: Value, has_error: bool, error: Value) -> Result<Fresh<'_>> {
+    dispose_resources_async_raw(vm, state, has_error, error).map(Fresh::new)
+}
+
+fn dispose_resources_async_raw(vm: &mut Vm, state: Value, has_error: bool, error: Value) -> Result<Value> {
     let resources = elem(state, RESOURCES);
     let empty = vm.mu().new_array();
     put(state, RESOURCES, empty.v());
-    let h = async_helper(vm)?;
-    vm.call_b(h, Value::UNDEFINED, &[resources, Value::from_bool(has_error), error]).map(Fresh::take)
+    let sc_h = Scope::new(vm);
+    let h = async_helper(vm)?.root(&sc_h);
+    vm.call_b(h.peek(), Value::UNDEFINED, &[resources, Value::from_bool(has_error), error]).map(Fresh::take)
 }
 
 // ---- SuppressedError ----
@@ -408,11 +429,17 @@ fn name(async_: bool) -> &'static str {
     if async_ { "AsyncDisposableStack" } else { "DisposableStack" }
 }
 
-fn new_stack(vm: &mut Vm, async_: bool) -> Result<Value> {
-    let state = new_state(vm, async_)?;
+#[inline(always)]
+fn new_stack(vm: &mut Vm, async_: bool) -> Result<Fresh<'_>> {
+    new_stack_raw(vm, async_).map(Fresh::new)
+}
+
+fn new_stack_raw(vm: &mut Vm, async_: bool) -> Result<Value> {
+    let sc_state = Scope::new(vm);
+    let state = new_state(vm, async_)?.root(&sc_state);
     let proto = root(vm, if async_ { Root::AsyncStackPrototype } else { Root::StackPrototype });
     let o = vm.mu().new_object_with(Class::DisposableStack, proto, 0);
-    unsafe { (*o.obj().ptr()).code = state.to_bits() as *const crate::vm::Code };
+    unsafe { (*o.obj().ptr()).code = state.peek().to_bits() as *const crate::vm::Code };
     Ok(object_value(o.obj().ptr()))
 }
 
@@ -420,7 +447,7 @@ fn stack_ctor<const ASYNC: bool>(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<V
     if !vm.is_construct() {
         return Err(Error::type_error(format!("Constructor {} requires 'new'", name(ASYNC))));
     }
-    new_stack(vm, ASYNC)
+    new_stack(vm, ASYNC).map(Fresh::take)
 }
 
 /// `this`'s state, a stack of the kind (`async_`), else a TypeError.
@@ -474,7 +501,8 @@ fn stack_defer<const ASYNC: bool>(vm: &mut Vm, this: Value, a: Args<'_>) -> Resu
 /// resources, this one disposed.
 fn stack_move<const ASYNC: bool>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = live_state(this, ASYNC, "move")?;
-    let out = new_stack(vm, ASYNC)?;
+    // take: nothing collects before its last use.
+    let out = new_stack(vm, ASYNC)?.take();
     let to = Value::from_bits(Obj::of(out).code() as u64);
     put(to, RESOURCES, elem(state, RESOURCES));
     let empty = vm.mu().new_array();
@@ -501,7 +529,7 @@ fn stack_dispose(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 fn stack_dispose_async(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = match state_of(this, true, "disposeAsync") {
         Ok(s) => s,
-        Err(e) => return rejected(vm, e),
+        Err(e) => return rejected(vm, e).map(Fresh::take),
     };
     if elem(state, DISPOSED) == Value::TRUE {
         let (p, resolve, _) = crate::promise::new_with_resolvers(vm);
@@ -509,14 +537,20 @@ fn stack_dispose_async(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
         return Ok(p);
     }
     put(state, DISPOSED, Value::TRUE);
-    dispose_resources_async(vm, state, false, Value::UNDEFINED)
+    dispose_resources_async(vm, state, false, Value::UNDEFINED).map(Fresh::take)
 }
 
 /// A promise rejected with what `e` throws.
-fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
-    let v = thrown(vm, e)?;
+#[inline(always)]
+fn rejected(vm: &mut Vm, e: Error) -> Result<Fresh<'_>> {
+    rejected_raw(vm, e).map(Fresh::new)
+}
+
+fn rejected_raw(vm: &mut Vm, e: Error) -> Result<Value> {
+    let sc_v = Scope::new(vm);
+    let v = thrown(vm, e)?.root(&sc_v);
     let (p, _, reject) = crate::promise::new_with_resolvers(vm);
-    vm.call_b(reject, Value::UNDEFINED, &[v])?.take();
+    vm.call_b(reject, Value::UNDEFINED, &[v.peek()])?.take();
     Ok(p)
 }
 
@@ -547,12 +581,13 @@ fn async_iterator_dispose(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value
         vm.call_b(m.peek(), this, &[]).map(Fresh::take)
     })();
     match r {
-        Err(e) => rejected(vm, e),
+        Err(e) => rejected(vm, e).map(Fresh::take),
         // (PromiseResolve of the result, then to undefined.)
         Ok(v) => {
             // (`return()`'s result held across the helper's first making:
             // rooted.)
-            let h = vm.rooted(&[v], async_helper_await)?;
+            // take: a function the VM keeps (`vm.dispose_roots`).
+            let h = vm.rooted(&[v], |vm| async_helper_await(vm).map(Fresh::take))?;
             vm.call_b(h, Value::UNDEFINED, &[v]).map(Fresh::take)
         }
     }
@@ -560,9 +595,15 @@ fn async_iterator_dispose(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value
 
 /// `async (v) => { await v; }`, for `[Symbol.asyncDispose]`, made on
 /// first use (with the disposal helper's roots).
-fn async_helper_await(vm: &mut Vm) -> Result<Value> {
+#[inline(always)]
+fn async_helper_await(vm: &mut Vm) -> Result<Fresh<'_>> {
+    async_helper_await_raw(vm).map(Fresh::new)
+}
+
+fn async_helper_await_raw(vm: &mut Vm) -> Result<Value> {
     if vm.dispose_roots.len() <= 4 {
-        let f = crate::builtins::run_source(vm, "(async function (v) { await v; })")?;
+        // take: kept in `vm.dispose_roots` on the next line.
+        let f = crate::builtins::run_source(vm, "(async function (v) { await v; })")?.take();
         vm.dispose_roots.push(f);
     }
     Ok(vm.dispose_roots[4])

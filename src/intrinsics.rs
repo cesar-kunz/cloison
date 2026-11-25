@@ -94,12 +94,12 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("annex_b_start", annex_b_start),
     ("annex_b_skipped", annex_b_skipped),
     ("bigint", crate::bigint::literal),
-    ("dispose_new", |vm, _| crate::dispose::new_state(vm, false)),
+    ("dispose_new", |vm, _| crate::dispose::new_state(vm, false).map(Fresh::take)),
     ("dispose_add", dispose_add),
     ("dispose_run", dispose_run),
     ("dispose_run_async", dispose_run_async),
-    ("dynamic_import", |vm, a| crate::module::dynamic_import(vm, a[0], a[1], a[2], a[3])),
-    ("import_meta", |vm, a| crate::module::import_meta(vm, a[0])),
+    ("dynamic_import", |vm, a| crate::module::dynamic_import(vm, a[0], a[1], a[2], a[3]).map(Fresh::take)),
+    ("import_meta", |vm, a| crate::module::import_meta(vm, a[0]).map(Fresh::take)),
 ];
 
 /// `using x = v` (`[state, v, async]`): `v` added to the statement list's
@@ -114,7 +114,7 @@ fn dispose_add(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// else) thrown.
 fn dispose_run(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let completion = if a[1] == Value::TRUE { Err(Error::thrown(a[2])) } else { Ok(Value::UNDEFINED) };
-    crate::dispose::dispose_resources(vm, a[0], completion)
+    crate::dispose::dispose_resources(vm, a[0], completion).map(Fresh::take)
 }
 
 /// As [`dispose_run`] with `await using` declarations: a promise of their
@@ -124,7 +124,7 @@ fn dispose_run_async(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if crate::dispose::is_empty(a[0]) {
         return if a[1] == Value::TRUE { Err(Error::thrown(a[2])) } else { Ok(Value::UNDEFINED) };
     }
-    crate::dispose::dispose_resources_async(vm, a[0], a[1] == Value::TRUE, a[2])
+    crate::dispose::dispose_resources_async(vm, a[0], a[1] == Value::TRUE, a[2]).map(Fresh::take)
 }
 
 /// The id of the intrinsic `name`.
@@ -199,20 +199,27 @@ fn spread(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// The elements of array `arr` (made by the front end: dense, its own).
-fn elements(vm: &mut Vm, arr: Value) -> Result<Vec<Value>> {
+#[inline(always)]
+fn elements(vm: &mut Vm, arr: Value) -> Result<Fresh<'_, Vec<Value>>> {
+    elements_raw(vm, arr).map(Fresh::new)
+}
+
+fn elements_raw(vm: &mut Vm, arr: Value) -> Result<Vec<Value>> {
     let n = Obj::of(arr).elems_len();
     (0..n).map(|i| vm.get_keyed_b(arr, Value::from_i32(i as i32)).map(Fresh::take)).collect()
 }
 
 /// `f(…args)` with `this`: `[f, this, args]`.
 fn call_spread(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let args = elements(vm, a[2])?;
+    // take: given at once to the call, which roots its arguments.
+    let args = elements(vm, a[2])?.take();
     vm.call_b(a[0], a[1], &args).map(Fresh::take)
 }
 
 /// `new f(…args)`: `[f, args]`.
 fn construct_spread(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let args = elements(vm, a[1])?;
+    // take: given at once to the construction, which roots its arguments.
+    let args = elements(vm, a[1])?.take();
     construct(vm, a[0], &args)
 }
 
@@ -261,8 +268,9 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         } else if nt == f {
             vm.construct_this(o)
         } else {
-            let proto = prototype_of_target(vm, nt)?;
-            vm.mu().new_plain(proto).v()
+            let sc_proto = Scope::new(vm);
+            let proto = prototype_of_target(vm, nt)?.root(&sc_proto);
+            vm.mu().new_plain(proto.peek()).v()
         };
         if code.uses_new_target {
             vm.new_target = nt;
@@ -304,10 +312,11 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         } else if !vm.realms.is_empty() {
             // (The builtin's prototype of `nt`'s realm.)
             let own = unsafe { (*Obj::of(r).shape()).proto };
+            // take: set as the prototype at once.
             let p = {
                 let held = Scope::new(vm);
                 let _held = held.roots([r]);
-                crate::realm::default_proto(vm, nt, own)
+                crate::realm::default_proto(vm, nt, own).map(Fresh::take)
             }?;
             if p != own {
                 vm.set_prototype_of(Obj::of(r), p);
@@ -340,14 +349,19 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
 }
 
 /// `nt.prototype` if an object, else `Object.prototype`.
-fn prototype_of_target(vm: &mut Vm, nt: Value) -> Result<Value> {
+#[inline(always)]
+fn prototype_of_target(vm: &mut Vm, nt: Value) -> Result<Fresh<'_>> {
+    prototype_of_target_raw(vm, nt).map(Fresh::new)
+}
+
+fn prototype_of_target_raw(vm: &mut Vm, nt: Value) -> Result<Value> {
     let a = vm.a_prototype;
     let p = vm.get_atom_b(nt, a)?;
     if crate::props::is_object(p.peek()) {
         return Ok(p.peek());
     }
     let op = object_value(vm.object_prototype);
-    crate::realm::default_proto(vm, nt, op)
+    crate::realm::default_proto(vm, nt, op).map(Fresh::take)
 }
 
 /// A template literal: `[s0, e1, s1, e2, …]`, each substitution's
@@ -379,7 +393,7 @@ fn template(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             units.extend_from_slice(&digits[at..]);
         } else {
             let s = template_string(vm, v)?;
-            crate::vm::push_string(&mut units, s)?;
+            crate::vm::push_string(&mut units, s.peek())?;
         }
     }
     Ok(vm.mu().new_string(&units).v())
@@ -388,10 +402,15 @@ fn template(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// A template literal's substitution `[e]` as its ToString, before the
 /// next one is evaluated (as the literal's evaluation orders them).
 fn template_part(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    template_string(vm, a[0])
+    template_string(vm, a[0]).map(Fresh::take)
 }
 
-fn template_string(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+fn template_string(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    template_string_raw(vm, v).map(Fresh::new)
+}
+
+fn template_string_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     if !v.is_cell() || crate::vm::string_len(v).is_some() {
         if v.is_cell() || v.is_number() || v.is_bool() || v.is_undefined() || v.is_null() {
         } else {
@@ -738,7 +757,8 @@ fn super_call(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             crate::vm::shown(parent)
         )));
     }
-    let args = elements(vm, a[2])?;
+    // take: given at once to the construction, which roots its arguments.
+    let args = elements(vm, a[2])?.take();
     let r = construct_with(vm, parent, &args, nt)?;
     if this != Value::HOLE {
         return Err(Error::reference_error("Super constructor may only be called once"));
@@ -776,7 +796,7 @@ fn class_call_check(_: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `for … of`'s iterator: `[iterable]`.
 fn get_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let it = crate::symbol::get_iterator(vm, a[0])?;
-    crate::symbol::record(vm, it)
+    crate::symbol::record(vm, it).map(Fresh::take)
 }
 
 /// `[record]` (`get_iterator`'s): its next value, or `HOLE` when done.
@@ -870,13 +890,19 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // rooted.)
     let sc = Scope::new(vm);
     let src = Obj::of(vm.to_obj_b(a[0])?.root(&sc).v());
-    object_rest_of(vm, src, a[1])
+    object_rest_of(vm, src, a[1]).map(Fresh::take)
 }
 
 /// [`object_rest`] of `src`, but the keys in array `keys`.
-fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
+#[inline(always)]
+fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Fresh<'_>> {
+    object_rest_of_raw(vm, src, keys).map(Fresh::new)
+}
+
+fn object_rest_of_raw(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
     let excluded: Vec<Key> = {
-        let ks = elements(vm, keys)?;
+        // take: the keys stay in `keys`, its caller's frame's.
+        let ks = elements(vm, keys)?.take();
         let mut out = Vec::new();
         for k in ks {
             out.push(to_property_key(vm, k)?);
@@ -1270,7 +1296,8 @@ fn eval_withs(flags: u8) -> usize {
 fn eval_source(vm: &mut Vm, a: &[Value], flags: u8) -> Result<ControlFlow<Value, Value>> {
     let (f, src) = (a[0], a[1]);
     let builtin = f.is_cell() && as_object(f) == vm.eval_function;
-    let args = if flags & EVAL_ARGS != 0 { elements(vm, src)? } else { vec![src] };
+    // take: the elements stay in `src`, the frame's.
+    let args = if flags & EVAL_ARGS != 0 { elements(vm, src)?.take() } else { vec![src] };
     if !builtin {
         let this = if flags & EVAL_THIS != 0 { a[7] } else { Value::UNDEFINED };
         return vm.call_b(f, this, &args).map(|v| ControlFlow::Break(v.take()));
@@ -1290,7 +1317,7 @@ fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
-    crate::builtins::global_eval(vm, u, true)
+    crate::builtins::global_eval(vm, u, true).map(Fresh::take)
 }
 
 /// An `eval`'s compile error, thrown.
@@ -1428,7 +1455,7 @@ fn generator_mode(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// whose mode is read only here (no call per step to fetch it).
 fn delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let mode = generator_mode(vm, &a[2..])?;
-    delegate_call(vm, a[0], a[1], mode.as_number().unwrap_or(0.0) as i32, false)
+    delegate_call(vm, a[0], a[1], mode.as_number().unwrap_or(0.0) as i32, false).map(Fresh::take)
 }
 
 /// An async generator's `yield*` step: `[iterator, received, mode,
@@ -1437,9 +1464,9 @@ fn delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn async_delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let mode = a[2].as_number().unwrap_or(0.0) as i32;
     if a[3] == Value::TRUE {
-        return async_from_sync_call(vm, a[0], Some(a[1]), mode);
+        return async_from_sync_call(vm, a[0], Some(a[1]), mode).map(Fresh::take);
     }
-    delegate_call(vm, a[0], a[1], mode, true)
+    delegate_call(vm, a[0], a[1], mode, true).map(Fresh::take)
 }
 
 /// `[record]`, an async iterator's, after a `yield*`'s `throw` step: the
@@ -1459,7 +1486,17 @@ fn async_delegate_closed(_: &mut Vm, a: &[Value]) -> Result<Value> {
 /// record (see [`async_from_sync_done`]); a rejection for what throws
 /// (IfAbruptRejectPromise). (Not of an iterator result, though resolved
 /// as by one: see `promise::resolve_iter_result`.)
-pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<Value>, mode: i32) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn async_from_sync_call(
+    vm: &mut Vm,
+    record: Value,
+    received: Option<Value>,
+    mode: i32,
+) -> Result<Fresh<'_>> {
+    async_from_sync_call_raw(vm, record, received, mode).map(Fresh::new)
+}
+
+fn async_from_sync_call_raw(vm: &mut Vm, record: Value, received: Option<Value>, mode: i32) -> Result<Value> {
     let step = |vm: &mut Vm| -> Result<Value> {
         let (it, next) = crate::symbol::record_parts(record);
         let args = received.as_slice();
@@ -1471,7 +1508,8 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
                 if m.peek().is_undefined() || m.peek().is_null() {
                     if mode == crate::generator::RETURN {
                         crate::symbol::set_sync_done(record, true);
-                        return crate::promise::iter_result_promise(vm, received.unwrap_or(Value::UNDEFINED), record);
+                        return crate::promise::iter_result_promise(vm, received.unwrap_or(Value::UNDEFINED), record)
+                            .map(Fresh::take);
                     }
                     crate::symbol::close(vm, it)?;
                     return Err(Error::type_error("The iterator does not provide a 'throw' method"));
@@ -1493,11 +1531,11 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
         let v = vm.get_atom_b(r, a_value)?.root(&sc_v);
         crate::symbol::set_sync_done(record, done);
         let close = if done || mode == crate::generator::RETURN { Value::UNDEFINED } else { it };
-        crate::promise::async_from_sync(vm, v.peek(), record, close)
+        crate::promise::async_from_sync(vm, v.peek(), record, close).map(Fresh::take)
     };
     match step(vm) {
         Ok(p) => Ok(p),
-        Err(e) => crate::promise::rejected(vm, e),
+        Err(e) => crate::promise::rejected(vm, e).map(Fresh::take),
     }
 }
 
@@ -1519,7 +1557,12 @@ fn async_from_sync_done(_: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `asynchronous` `return` with no method's `received`, the record marked
 /// done.
 /// (`record`'s `next`, read once; `throw` and `return` as they are then.)
-fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchronous: bool) -> Result<Value> {
+#[inline(always)]
+fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchronous: bool) -> Result<Fresh<'_>> {
+    delegate_call_raw(vm, record, received, mode, asynchronous).map(Fresh::new)
+}
+
+fn delegate_call_raw(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchronous: bool) -> Result<Value> {
     let (it, next) = crate::symbol::record_parts(record);
     let m = match mode {
         crate::generator::THROW | crate::generator::RETURN => {
@@ -1536,7 +1579,7 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchr
                 crate::symbol::set_sync_done(record, true);
                 return Ok(received);
             }
-            crate::generator::RETURN => return crate::symbol::iter_result(vm, received, true),
+            crate::generator::RETURN => return crate::symbol::iter_result(vm, received, true).map(Fresh::take),
             crate::generator::THROW if asynchronous => {
                 let a_return = vm.intern_name("return");
                 let sc_close = Scope::new(vm);
@@ -1815,7 +1858,12 @@ fn async_gen_yield(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// `[v]`'s `Symbol.asyncIterator` method, if it has one.
-fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
+#[inline(always)]
+fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Fresh<'_, Option<Value>>> {
+    async_iterator_method_raw(vm, v).map(Fresh::new)
+}
+
+fn async_iterator_method_raw(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
     let a = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     // (A wrapper `o`, the receiver of its prototypes' traps: rooted.)
     let sc = Scope::new(vm);
@@ -1827,16 +1875,16 @@ fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
 /// A `for await`'s iterable `[v]`: whether it has no async iterator, its
 /// sync one used instead.
 fn async_iterator_kind(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(async_iterator_method(vm, a[0])?.is_none()))
+    Ok(Value::from_bool(async_iterator_method(vm, a[0])?.peek().is_none()))
 }
 
 /// `[v, sync]`: `v`'s async iterator (with `sync`, its iterator).
 fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[1] == Value::TRUE {
         let it = crate::symbol::get_iterator(vm, a[0])?;
-        return crate::symbol::sync_record(vm, it);
+        return crate::symbol::sync_record(vm, it).map(Fresh::take);
     }
-    let m = async_iterator_method(vm, a[0])?.unwrap_or(Value::UNDEFINED);
+    let m = async_iterator_method(vm, a[0])?.peek().unwrap_or(Value::UNDEFINED);
     if !crate::props::is_callable(m) {
         return Err(Error::type_error("Symbol.asyncIterator is not a function"));
     }
@@ -1845,14 +1893,14 @@ fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !crate::props::is_object(it.peek()) {
         return Err(Error::type_error("Result of the Symbol.asyncIterator method is not an object"));
     }
-    crate::symbol::async_record(vm, it.peek())
+    crate::symbol::async_record(vm, it.peek()).map(Fresh::take)
 }
 
 /// `[record, sync]`: `iterator.next()`, by the `next` the record read (a
 /// sync iterator's AsyncFromSyncIterator's, a promise).
 fn async_iterator_next(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[1] == Value::TRUE {
-        return async_from_sync_call(vm, a[0], None, crate::generator::NEXT);
+        return async_from_sync_call(vm, a[0], None, crate::generator::NEXT).map(Fresh::take);
     }
     let (it, next) = crate::symbol::record_parts(a[0]);
     if !crate::props::is_callable(next) {
@@ -1885,7 +1933,7 @@ fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// to await). (A sync iterator's AsyncFromSyncIterator's, a promise.)
 fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[1] == Value::TRUE {
-        return async_from_sync_call(vm, a[0], None, crate::generator::RETURN);
+        return async_from_sync_call(vm, a[0], None, crate::generator::RETURN).map(Fresh::take);
     }
     let it = iterator_of(a[0]);
     let a_return = vm.intern_name("return");
@@ -2019,7 +2067,12 @@ fn import_of(vm: &mut Vm) -> Result<Option<(Value, Value, Option<Key>)>> {
 
 /// An imported binding's value, live (a ReferenceError before its module
 /// sets it).
-fn import_value(vm: &mut Vm, name: Value, holder: Value, key: Option<Key>) -> Result<Value> {
+#[inline(always)]
+fn import_value(vm: &mut Vm, name: Value, holder: Value, key: Option<Key>) -> Result<Fresh<'_>> {
+    import_value_raw(vm, name, holder, key).map(Fresh::new)
+}
+
+fn import_value_raw(vm: &mut Vm, name: Value, holder: Value, key: Option<Key>) -> Result<Value> {
     let Some(key) = key else { return Ok(holder) };
     let v = vm.get_key_b(holder, key)?;
     if v.peek() == Value::HOLE {
@@ -2039,7 +2092,7 @@ fn uninitialized(name: Value) -> Error {
 /// ReferenceError before it is initialized).
 pub(crate) fn binding_get(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     if let Some((name, holder, key)) = import_of(vm)? {
-        return import_value(vm, name, holder, key);
+        return import_value(vm, name, holder, key).map(Fresh::take);
     }
     let (u, _, name, boxed) = binding_of(vm)?;
     let v = match boxed {

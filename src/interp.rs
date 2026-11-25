@@ -87,6 +87,7 @@
 // scans; it allocates directly.)
 #![allow(clippy::disallowed_methods)]
 use crate::bigint::BinOp as BigOp;
+use crate::brand::Fresh;
 use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Obj, Object, Shape, as_object, object_value};
@@ -1230,7 +1231,7 @@ handlers! {
             let mut spread = Vec::new();
             let (args, argc) = frame_args(vm, regs, &mut spread);
             let values: &[Value] = if argc > k { std::slice::from_raw_parts(args.add(k), argc - k) } else { &[] };
-            crate::array::new_array_of(vm, values)
+            crate::array::new_array_of(vm, values).map(Fresh::take)
         });
         next_or_throw!(Op::CreateRest.size(), r)
     }
@@ -1265,7 +1266,7 @@ handlers! {
 
     fn op_initial_yield(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
-        match with_top_acc(regs, acc, |vm| crate::generator::create(vm, Obj::from_ptr(f))) {
+        match with_top_acc(regs, acc, |vm| crate::generator::create(vm, Obj::from_ptr(f)).map(Fresh::take)) {
             Ok(g) => {
                 *reg(pc, 1, regs) = g;
                 let code = frame_code(regs);
@@ -1283,12 +1284,13 @@ handlers! {
     fn op_async_start(pc, acc, regs, tag) {
         let f: *mut Object = header(regs, FUNC);
         let r = with_top_acc(regs, acc, |vm| {
-            let g = crate::generator::create(vm, Obj::from_ptr(f))?;
+            // take: stored in the frame's register at once.
+            let g = crate::generator::create(vm, Obj::from_ptr(f)).map(Fresh::take)?;
             *reg(pc, 1, regs) = g;
             let code = frame_code(regs);
             let at = pc.add(Op::AsyncStart.size()).offset_from(code.live().bytecode.as_ptr()) as usize;
             crate::generator::suspend(vm, g, regs, code, at, false);
-            crate::generator::async_start(vm, g)
+            crate::generator::async_start(vm, g).map(Fresh::take)
         });
         match r {
             Ok(p) => tail!(op_return, p),
@@ -1339,7 +1341,8 @@ handlers! {
     fn op_create_regexp(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
         let k = |at: usize| (&(*frame_code(regs)).constants)[index_at(pc, at) as usize];
-        let r = crate::builtins::regexp_literal(vm, k(1), k(5));
+        // take: the accumulator's at once.
+        let r = crate::builtins::regexp_literal(vm, k(1), k(5)).map(Fresh::take);
         next_or_throw!(Op::CreateRegExp.size(), r)
     }
 

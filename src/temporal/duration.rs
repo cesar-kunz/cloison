@@ -7,6 +7,7 @@ use super::fields;
 use super::iso::{self, DateTime, IsoDate, RoundingMode, TIME_DURATION_MAX, Time, Unit};
 use super::*;
 use crate::brand::Args;
+use crate::brand::Fresh;
 use crate::object::Obj;
 
 /// A duration's fields: years, months, weeks, days, hours, minutes,
@@ -219,9 +220,10 @@ fn partial_duration(vm: &mut Vm, item: Value) -> Result<[Option<f64>; 10]> {
     let mut out = [None; 10];
     let mut any = false;
     for k in order {
-        let v = get(vm, item, Unit::PLURAL[k])?;
-        if !v.is_undefined() {
-            out[k] = Some(to_integer_if_integral(vm, v)?);
+        let sc_v = Scope::new(vm);
+        let v = get(vm, item, Unit::PLURAL[k])?.root(&sc_v);
+        if !v.peek().is_undefined() {
+            out[k] = Some(to_integer_if_integral(vm, v.peek())?);
             any = true;
         }
     }
@@ -295,28 +297,29 @@ pub(crate) enum Relative {
 /// GetTemporalRelativeToOption.
 pub(crate) fn relative_to(vm: &mut Vm, options: Value) -> Result<Relative> {
     use fields::Field;
-    let v = get(vm, options, "relativeTo")?;
-    if v.is_undefined() {
+    let sc_v = Scope::new(vm);
+    let v = get(vm, options, "relativeTo")?.root(&sc_v);
+    if v.peek().is_undefined() {
         return Ok(Relative::None);
     }
     // (`v`, maybe a getter's only, rooted while it is read.)
-    let _rooted = vm.root_scope(&[v]);
+    let _rooted = vm.root_scope(&[v.peek()]);
     let (date, time, z, behaviour, offset_ns, match_minutes);
-    if is_object(v) {
-        match slots(v) {
+    if is_object(v.peek()) {
+        match slots(v.peek()) {
             Some(Slots::Zoned(ns, zz)) => return Ok(Relative::Zoned(ns, zz)),
             Some(Slots::Date(d)) => return Ok(Relative::Plain(d)),
             Some(Slots::DateTime(dt)) => return Ok(Relative::Plain(dt.date)),
             _ => {}
         }
-        calendar_with_iso_default(vm, v)?;
+        calendar_with_iso_default(vm, v.peek())?;
         let which: Vec<Field> = fields::DATE_FIELDS
             .iter()
             .chain(fields::TIME_FIELDS)
             .copied()
             .chain([Field::Offset, Field::TimeZone])
             .collect();
-        let f = fields::prepare(vm, v, &which, fields::Required::Some(&[]))?;
+        let f = fields::prepare(vm, v.peek(), &which, fields::Required::Some(&[]))?;
         date = fields::date_from_fields(&f, Overflow::Constrain)?;
         time = Some(fields::time_from_fields(&f, Overflow::Constrain)?);
         z = f.time_zone;
@@ -324,7 +327,7 @@ pub(crate) fn relative_to(vm: &mut Vm, options: Value) -> Result<Relative> {
         offset_ns = f.offset.as_deref().map_or(0, |s| parse::parse_offset(s).unwrap().ns);
         match_minutes = false;
     } else {
-        let s = require_string(v)?;
+        let s = require_string(v.peek())?;
         let r = parse::parse_date_time(&s).map_err(parse_err)?;
         let mut b = OffsetBehaviour::Option;
         let mut mm = false;
@@ -989,7 +992,12 @@ fn duration_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 }
 
 /// An options argument that may be a string (the value of option `name`).
-fn options_or_string(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
+#[inline(always)]
+fn options_or_string<'v>(vm: &'v mut Vm, v: Value, name: &str) -> Result<Fresh<'v>> {
+    options_or_string_raw(vm, v, name).map(Fresh::new)
+}
+
+fn options_or_string_raw(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     if v.is_undefined() {
         return Err(type_err("options parameter is required"));
     }
@@ -1000,20 +1008,21 @@ fn options_or_string(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
         vm.add_property(Obj::of(o), a, v);
         return Ok(o);
     }
-    options_object(vm, v)
+    options_object(vm, v).map(Fresh::take)
 }
 
 fn duration_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
     let existing = default_largest_unit(&d);
-    let o = options_or_string(vm, arg(&a, 0), "smallestUnit")?;
+    let sc_o = Scope::new(vm);
+    let o = options_or_string(vm, arg(&a, 0), "smallestUnit")?.root(&sc_o);
     // (`o`, maybe made here, rooted while its options are read.)
-    let _rooted = vm.root_scope(&[o]);
-    let largest_opt = unit_option(vm, o, "largestUnit", false)?;
-    let relative = relative_to(vm, o)?;
-    let increment = rounding_increment(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-    let smallest_opt = unit_option(vm, o, "smallestUnit", false)?;
+    let _rooted = vm.root_scope(&[o.peek()]);
+    let largest_opt = unit_option(vm, o.peek(), "largestUnit", false)?;
+    let relative = relative_to(vm, o.peek())?;
+    let increment = rounding_increment(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::HalfExpand)?;
+    let smallest_opt = unit_option(vm, o.peek(), "smallestUnit", false)?;
     validate_unit(smallest_opt, Group::DateTime, false)?;
     let smallest = match smallest_opt {
         UnitOption::Unit(u) => u,
@@ -1086,11 +1095,12 @@ fn duration_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn duration_total(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
-    let o = options_or_string(vm, arg(&a, 0), "unit")?;
+    let sc_o = Scope::new(vm);
+    let o = options_or_string(vm, arg(&a, 0), "unit")?.root(&sc_o);
     // (`o`, maybe made here, rooted while its options are read.)
-    let _rooted = vm.root_scope(&[o]);
-    let relative = relative_to(vm, o)?;
-    let unit = match unit_option(vm, o, "unit", true)? {
+    let _rooted = vm.root_scope(&[o.peek()]);
+    let relative = relative_to(vm, o.peek())?;
+    let unit = match unit_option(vm, o.peek(), "unit", true)? {
         UnitOption::Unit(u) => u,
         _ => return Err(range("unit must be a unit")),
     };
@@ -1119,10 +1129,11 @@ fn duration_total(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn duration_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let digits = fractional_digits(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::Trunc)?;
-    let smallest = unit_option(vm, o, "smallestUnit", false)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let digits = fractional_digits(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::Trunc)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", false)?;
     validate_unit(smallest, Group::Time, false)?;
     if matches!(smallest, UnitOption::Unit(Unit::Hour | Unit::Minute)) {
         return Err(range("smallestUnit must be a time unit other than hours or minutes"));
@@ -1151,8 +1162,9 @@ fn duration_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 fn duration_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let one = to_duration(vm, arg(&a, 0))?;
     let two = to_duration(vm, arg(&a, 1))?;
-    let o = options_object(vm, arg(&a, 2))?;
-    let relative = relative_to(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 2))?.root(&sc_o);
+    let relative = relative_to(vm, o.peek())?;
     if one == two {
         return Ok(Value::from_i32(0));
     }

@@ -601,12 +601,17 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         vm.create_data_property(root.v(), Key::Name(empty), v)?;
         let key = vm.mu().new_string(&[]).root(&sc);
         let a_source = vm.intern_name("source");
-        internalize(vm, reviver, root.v(), key.v(), Some(&record), &u, a_source)
+        internalize(vm, reviver, root.v(), key.v(), Some(&record), &u, a_source).map(Fresh::take)
     })
 }
 
 /// `u` parsed as a whole JSON text (a JSON module's).
-pub(crate) fn parse_json(vm: &mut Vm, u: &[u16]) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn parse_json<'v>(vm: &'v mut Vm, u: &[u16]) -> Result<Fresh<'v>> {
+    parse_json_raw(vm, u).map(Fresh::new)
+}
+
+fn parse_json_raw(vm: &mut Vm, u: &[u16]) -> Result<Value> {
     parse_text(vm, u, false).map(|(v, _)| v)
 }
 
@@ -619,8 +624,8 @@ fn parse_text(vm: &mut Vm, u: &[u16], track: bool) -> Result<(Value, Record)> {
     if p.i != u.len() {
         return Err(p.error());
     }
-    let r = p.records.pop().unwrap_or(Record { value: v, kind: RecordKind::None });
-    Ok((v, r))
+    let r = p.records.pop().unwrap_or(Record { value: v.peek(), kind: RecordKind::None });
+    Ok((v.peek(), r))
 }
 
 /// A JSON Parse Record: the value a piece of the text made, and where the
@@ -644,8 +649,21 @@ enum RecordKind {
 /// `record` what the parse made there, if anything: while `holder[name]`
 /// is still that, the reviver gets a primitive's source text in its
 /// third argument, `{ source }`.
+#[inline(always)]
+fn internalize<'v>(
+    vm: &'v mut Vm,
+    reviver: Value,
+    holder: Value,
+    name: Value,
+    record: Option<&Record>,
+    text: &[u16],
+    a_source: crate::object::Atom,
+) -> Result<Fresh<'v>> {
+    internalize_raw(vm, reviver, holder, name, record, text, a_source).map(Fresh::new)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn internalize(
+fn internalize_raw(
     vm: &mut Vm,
     reviver: Value,
     holder: Value,
@@ -660,12 +678,27 @@ fn internalize(
     let v = vm.get_keyed_b(holder, name)?.root(&sc).v();
     let op = object_value(vm.object_prototype);
     let context = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
-    internalize_value(vm, reviver, holder, name, v, context.v(), record, text, a_source)
+    internalize_value(vm, reviver, holder, name, v, context.v(), record, text, a_source).map(Fresh::take)
 }
 
 /// [`internalize`] of `v`, `holder[name]` as read, with its `context`.
+#[inline(always)]
+fn internalize_value<'v>(
+    vm: &'v mut Vm,
+    reviver: Value,
+    holder: Value,
+    name: Value,
+    v: Value,
+    context: Value,
+    record: Option<&Record>,
+    text: &[u16],
+    a_source: crate::object::Atom,
+) -> Result<Fresh<'v>> {
+    internalize_value_raw(vm, reviver, holder, name, v, context, record, text, a_source).map(Fresh::new)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn internalize_value(
+fn internalize_value_raw(
     vm: &mut Vm,
     reviver: Value,
     holder: Value,
@@ -706,7 +739,7 @@ fn internalize_value(
             // maybe, held in `d` across a proxy's trap lookup.)
             let step = Scope::new(vm);
             let ks = step.root(ks);
-            let nv = vm.fresh(|vm| internalize(vm, reviver, v, ks.v(), child, text, a_source))?.root(&step).v();
+            let nv = internalize(vm, reviver, v, ks.v(), child, text, a_source)?.root(&step).v();
             // (A proxy's traps, and what they throw; a property that can't
             // be deleted or defined stays.)
             if nv.is_undefined() {
@@ -815,7 +848,12 @@ impl<'a> Parser<'a> {
     }
 
     /// A value; if tracking, its record pushed (its value rooted).
-    fn value(&mut self, vm: &mut Vm) -> Result<Value> {
+    #[inline(always)]
+    fn value<'v>(&mut self, vm: &'v mut Vm) -> Result<Fresh<'v>> {
+        self.value_raw(vm).map(Fresh::new)
+    }
+
+    fn value_raw(&mut self, vm: &mut Vm) -> Result<Value> {
         check_native_stack(vm)?;
         self.space();
         let start = self.i;
@@ -836,20 +874,21 @@ impl<'a> Parser<'a> {
                         if !self.eat(b':') {
                             return Err(self.error());
                         }
-                        let v = self.value(vm)?;
+                        let sc_v = Scope::new(vm);
+                        let v = self.value(vm)?.root(&sc_v);
                         // (A name the object has, stored in its slot, a
                         // new one added: no string of it, no descriptor.)
                         match property_key(vm, &k) {
                             Key::Name(a) => {
                                 let ob = Obj::of(o);
                                 match ob.shape().live().lookup(a) {
-                                    Some(slot) => vm.store_field(ob, slot, v),
+                                    Some(slot) => vm.store_field(ob, slot, v.peek()),
                                     None => {
-                                        vm.add_property_keyed(ob, a, v);
+                                        vm.add_property_keyed(ob, a, v.peek());
                                     }
                                 }
                             }
-                            key => vm.create_data_property(o, key, v)?,
+                            key => vm.create_data_property(o, key, v.peek())?,
                         }
                         if self.track {
                             keys.push(k.into_owned());
@@ -872,7 +911,8 @@ impl<'a> Parser<'a> {
                 let mut n = 0;
                 if !self.eat(b']') {
                     loop {
-                        let v = self.value(vm)?;
+                        // take: nothing collects before its last use.
+                        let v = self.value(vm)?.take();
                         // (Pushed: traced from here on.)
                         vm.reserve_elems(ao, n + 1);
                         vm.store_element(ao, n, v);

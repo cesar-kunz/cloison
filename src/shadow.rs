@@ -102,7 +102,7 @@ fn evaluate(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         crate::interp::run_script_at(vm, code)
     });
     match out {
-        Ok(v) => wrap(vm, v),
+        Ok(v) => wrap(vm, v).map(Fresh::take),
         Err(e) if e.0.starts_with("unsupported") => Err(e),
         Err(e) => Err(Error::type_error(format!("ShadowRealm evaluation threw: {}", thrown_message(vm, &e)))),
     }
@@ -138,7 +138,12 @@ fn thrown_message(vm: &mut Vm, e: &Error) -> String {
 
 /// GetWrappedValue(current realm, `v`): a primitive as it is, a callable
 /// wrapped; anything else a `TypeError`.
-fn wrap(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+fn wrap(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    wrap_raw(vm, v).map(Fresh::new)
+}
+
+fn wrap_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     if !is_object(v) {
         return Ok(v);
     }
@@ -157,11 +162,16 @@ fn wrap(vm: &mut Vm, v: Value) -> Result<Value> {
 }
 
 /// [`wrap`] in realm `r`.
-fn wrap_in(vm: &mut Vm, r: u32, v: Value) -> Result<Value> {
+#[inline(always)]
+fn wrap_in(vm: &mut Vm, r: u32, v: Value) -> Result<Fresh<'_>> {
+    wrap_in_raw(vm, r, v).map(Fresh::new)
+}
+
+fn wrap_in_raw(vm: &mut Vm, r: u32, v: Value) -> Result<Value> {
     if !is_object(v) {
         return Ok(v);
     }
-    crate::realm::run_in(vm, r, |vm| wrap(vm, v))
+    crate::realm::run_in(vm, r, |vm| wrap(vm, v).map(Fresh::take))
 }
 
 /// CopyNameAndLength(f, target): `f`'s own `length` and `name` from the
@@ -201,14 +211,15 @@ fn wrapped_call(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         vm.handle_scope(|vm| {
             let mut args = Vec::with_capacity(a.len());
             for &v in a {
-                let w = wrap_in(vm, target_realm, v)?;
+                // take: pushed to vm.handles on the next line.
+                let w = wrap_in(vm, target_realm, v)?.take();
                 vm.handles.push(w);
                 args.push(w);
             }
-            let this = wrap_in(vm, target_realm, this)?;
             let sc_v = Scope::new(vm);
-            let v = vm.call_b(target, this, &args)?.root(&sc_v);
-            wrap(vm, v.peek())
+            let this = wrap_in(vm, target_realm, this)?.root(&sc_v);
+            let v = vm.call_b(target, this.v(), &args)?.root(&sc_v);
+            wrap(vm, v.v()).map(Fresh::take)
         })
     })();
     match r {
@@ -259,14 +270,16 @@ fn imported(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (m, name, resolve, reject) = (slot(me, 0), slot(me, 1), slot(me, 2), slot(me, 3));
     let r = (|| {
-        let ns = crate::module::namespace(vm, m.as_number().unwrap_or(0.0) as usize)?;
+        let sc = Scope::new(vm);
+        let ns = crate::module::namespace(vm, m.as_number().unwrap_or(0.0) as usize)?.root(&sc);
         let k = vm.property_key(name);
-        if !crate::proxy::generic_has(vm, ns, k)? {
+        if !crate::proxy::generic_has(vm, ns.v(), k)? {
             let n = String::from_utf16_lossy(string_units(name).unwrap_or(&[]));
             return Err(Error::type_error(format!("The module has no export '{n}'")));
         }
-        let v = crate::proxy::generic_get(vm, ns, k, ns)?;
-        wrap(vm, v)
+        let v = crate::proxy::generic_get(vm, ns.v(), k, ns.v())?;
+        // take: given at once to `resolve`.
+        wrap(vm, v).map(Fresh::take)
     })();
     match r {
         Ok(v) => vm.call_b(resolve, Value::UNDEFINED, &[v]).map(Fresh::take),

@@ -14,6 +14,7 @@
 //! which compares realms, and the JIT is off.
 
 use crate::brand::Args;
+use crate::brand::Fresh;
 use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, object_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -429,7 +430,12 @@ pub(crate) fn counterpart(vm: &mut Vm, v: Value, r: u32) -> Value {
 
 /// GetPrototypeFromConstructor's fallback: `default` (an intrinsic of the
 /// current realm's) of constructor `c`'s realm.
-pub(crate) fn default_proto(vm: &mut Vm, c: Value, default: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn default_proto(vm: &mut Vm, c: Value, default: Value) -> Result<Fresh<'_>> {
+    default_proto_raw(vm, c, default).map(Fresh::new)
+}
+
+fn default_proto_raw(vm: &mut Vm, c: Value, default: Value) -> Result<Value> {
     if vm.realms.is_empty() {
         return Ok(default);
     }

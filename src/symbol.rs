@@ -170,7 +170,12 @@ pub(crate) fn symbol_string(v: Value) -> Vec<u16> {
 
 /// [`symbol_string`] as a string value: a RangeError past the longest
 /// string, thrown before a long description is read.
-pub(crate) fn symbol_string_value(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn symbol_string_value(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    symbol_string_value_raw(vm, v).map(Fresh::new)
+}
+
+fn symbol_string_value_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     crate::vm::check_string_len(crate::vm::string_len(description(v)).unwrap_or(0) + 8)?;
     let u = symbol_string(v);
     Ok(vm.mu().new_string(&u).v())
@@ -226,7 +231,7 @@ fn symbol_key_for(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 
 pub(crate) fn symbol_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let s = this_symbol(this, "Symbol.prototype.toString")?;
-    symbol_string_value(vm, s)
+    symbol_string_value(vm, s).map(Fresh::take)
 }
 
 pub(crate) fn symbol_value_of(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -490,8 +495,14 @@ pub(crate) fn return_this(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value>
 /// entries; 3 a string's code points): a `CollectionIterator`-like
 /// object of class `ArrayIterator`, its state a hidden array `[target,
 /// index, kind]` in `code`.
-fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Value> {
-    let state = crate::array::new_array_of(vm, &[target, Value::from_i32(0), Value::from_i32(kind)])?;
+#[inline(always)]
+fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Fresh<'_>> {
+    new_iterator_raw(vm, target, kind, proto).map(Fresh::new)
+}
+
+fn new_iterator_raw(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Value> {
+    // take: nothing collects before its last use.
+    let state = crate::array::new_array_of(vm, &[target, Value::from_i32(0), Value::from_i32(kind)])?.take();
     Ok(iterator_with_state(vm, Class::ArrayIterator, proto, state))
 }
 
@@ -504,7 +515,12 @@ pub(crate) fn iterator_with_state(vm: &mut Vm, class: Class, proto: Root, state:
     object_value(it.obj().ptr())
 }
 
-fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {
+#[inline(always)]
+fn this_target(vm: &mut Vm, this: Value) -> Result<Fresh<'_>> {
+    this_target_raw(vm, this).map(Fresh::new)
+}
+
+fn this_target_raw(vm: &mut Vm, this: Value) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("Array.prototype iterator called on null or undefined"));
     }
@@ -512,23 +528,27 @@ fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {
 }
 
 pub(crate) fn array_values(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
-    let t = this_target(vm, this)?;
-    new_iterator(vm, t, 1, Root::ArrayIteratorPrototype)
+    let sc_t = Scope::new(vm);
+    let t = this_target(vm, this)?.root(&sc_t);
+    new_iterator(vm, t.peek(), 1, Root::ArrayIteratorPrototype).map(Fresh::take)
 }
 
 /// An array iterator over `target` of kind `kind` (see `new_iterator`).
-pub(crate) fn array_iterator(vm: &mut Vm, target: Value, kind: i32) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn array_iterator(vm: &mut Vm, target: Value, kind: i32) -> Result<Fresh<'_>> {
     new_iterator(vm, target, kind, Root::ArrayIteratorPrototype)
 }
 
 fn array_keys(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
-    let t = this_target(vm, this)?;
-    new_iterator(vm, t, 0, Root::ArrayIteratorPrototype)
+    let sc_t = Scope::new(vm);
+    let t = this_target(vm, this)?.root(&sc_t);
+    new_iterator(vm, t.peek(), 0, Root::ArrayIteratorPrototype).map(Fresh::take)
 }
 
 fn array_entries(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
-    let t = this_target(vm, this)?;
-    new_iterator(vm, t, 2, Root::ArrayIteratorPrototype)
+    let sc_t = Scope::new(vm);
+    let t = this_target(vm, this)?.root(&sc_t);
+    new_iterator(vm, t.peek(), 2, Root::ArrayIteratorPrototype).map(Fresh::take)
 }
 
 fn string_iterator(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -537,11 +557,16 @@ fn string_iterator(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     }
     let sc_s = Scope::new(vm);
     let s = vm.to_string_b(this)?.root(&sc_s);
-    new_iterator(vm, s.peek(), 3, Root::StringIteratorPrototype)
+    new_iterator(vm, s.peek(), 3, Root::StringIteratorPrototype).map(Fresh::take)
 }
 
 /// An iterator result object `{value, done}`.
-pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Fresh<'_>> {
+    iter_result_raw(vm, value, done).map(Fresh::new)
+}
+
+fn iter_result_raw(vm: &mut Vm, value: Value, done: bool) -> Result<Value> {
     // The shape the realm's first one got: given at once, the two slots
     // stored (V8's iterator result map, JSC's iteratorResultObjectStructure).
     let s = vm.iter_result_shape;
@@ -576,15 +601,21 @@ fn iterator_state(this: Value, what: &str) -> Result<Value> {
 }
 
 fn array_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
-    match array_step(vm, this)? {
-        Some(v) => iter_result(vm, v, false),
-        None => iter_result(vm, Value::UNDEFINED, true),
+    // take: given at once to iter_result, which only allocates.
+    match array_step(vm, this)?.take() {
+        Some(v) => iter_result(vm, v, false).map(Fresh::take),
+        None => iter_result(vm, Value::UNDEFINED, true).map(Fresh::take),
     }
 }
 
 /// `%ArrayIteratorPrototype%.next` on `this`, without its result object:
 /// the value, or `None` when done.
-fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
+#[inline(always)]
+fn array_step(vm: &mut Vm, this: Value) -> Result<Fresh<'_, Option<Value>>> {
+    array_step_raw(vm, this).map(Fresh::new)
+}
+
+fn array_step_raw(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     let state = iterator_state(this, "%ArrayIteratorPrototype%.next")?;
     // Values of a dense array (`[target, index, kind]` itself one, plain):
     // its element read directly, unless a hole (a prototype's then).
@@ -645,7 +676,7 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
         _ => {
             let sc_e = Scope::new(vm);
             let e = vm.get_keyed_b(target.v(), k)?.root(&sc_e);
-            crate::array::new_array_of(vm, &[k, e.peek()])?
+            crate::array::new_array_of(vm, &[k, e.peek()])?.take()
         }
     };
     Ok(Some(v))
@@ -659,11 +690,11 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> 
     let i = vm.get_keyed_b(state, Value::from_i32(1))?.take().as_number().unwrap_or(0.0) as usize;
     let target = vm.get_keyed_b(state, Value::from_i32(0))?;
     let Some(u) = string_units(target.peek()) else {
-        return iter_result(vm, Value::UNDEFINED, true);
+        return iter_result(vm, Value::UNDEFINED, true).map(Fresh::take);
     };
     if i >= u.len() {
         vm.set_keyed(state, Value::from_i32(0), Value::UNDEFINED)?;
-        return iter_result(vm, Value::UNDEFINED, true);
+        return iter_result(vm, Value::UNDEFINED, true).map(Fresh::take);
     }
     let c = u[i];
     let n =
@@ -672,7 +703,7 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> 
     vm.set_keyed(state, Value::from_i32(1), Value::from_i32((i + n) as i32))?;
     // take: only calls that don't collect follow (allocation, stores, filling it).
     let s = vm.mu().new_string(&piece).v();
-    iter_result(vm, s, false)
+    iter_result(vm, s, false).map(Fresh::take)
 }
 
 // ---- The protocol ----
@@ -702,25 +733,33 @@ pub(crate) fn get_iterator(vm: &mut Vm, v: Value) -> Result<Value> {
 /// iterator and its `next`, read once as GetIterator does, in the two
 /// in-object slots of an object no JS code ever sees (no properties, the
 /// collector tracing the slots by its capacity).
-pub(crate) fn record(vm: &mut Vm, it: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn record(vm: &mut Vm, it: Value) -> Result<Fresh<'_>> {
     record_with(vm, it, None)
 }
 
 /// A [`record`] of sync iterator `it` stepped as AsyncFromSyncIterator
 /// (`for await`, `yield*`): a third slot, whether its last step was done
 /// ([`set_sync_done`]).
-pub(crate) fn sync_record(vm: &mut Vm, it: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn sync_record(vm: &mut Vm, it: Value) -> Result<Fresh<'_>> {
     record_with(vm, it, Some(Value::FALSE))
 }
 
 /// A [`record`] of async iterator `it`: a third slot, whether `yield*`'s
 /// last step had no method for its `throw` (the iterator closed instead)
 /// or `return` (kept as a [`sync_record`]'s `done`: [`set_sync_done`]).
-pub(crate) fn async_record(vm: &mut Vm, it: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn async_record(vm: &mut Vm, it: Value) -> Result<Fresh<'_>> {
     record_with(vm, it, Some(Value::FALSE))
 }
 
-fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
+#[inline(always)]
+fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Fresh<'_>> {
+    record_with_raw(vm, it, done).map(Fresh::new)
+}
+
+fn record_with_raw(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     let a_next = vm.a_next;
     let s = Scope::new(vm);
     let it = s.root(it);
@@ -778,14 +817,14 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     // (The builtin array iterator's step, its result object unobservable:
     // fresh, its own data properties read back at once.)
     if is_native(vm, next, array_iterator_next) && it.is_cell() && Obj::of(it).class() == Class::ArrayIterator {
-        return array_step(vm, it);
+        return array_step(vm, it).map(Fresh::take);
     }
     // (`matchAll`'s, the same way.)
     if it.is_cell()
         && Obj::of(it).class() == Class::RegExpStringIterator
         && is_native(vm, next, crate::builtins::regexp_string_iterator_next)
     {
-        return crate::builtins::regexp_string_iterator_step(vm, it);
+        return crate::builtins::regexp_string_iterator_step(vm, it).map(Fresh::take);
     }
     // (The result rooted across `done`'s getter.)
     let s = Scope::new(vm);
@@ -1121,7 +1160,7 @@ pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()>
         let sc_it = Scope::new(vm);
         let it = vm.get_iterator_b(*slots)?.root(&sc_it);
         let r = record(vm, it.peek())?;
-        *slots = r;
+        *slots = r.peek();
         *slots.add(1) = Value::UNDEFINED;
         Ok(())
     }
@@ -1186,7 +1225,12 @@ pub(crate) fn is_open_array(v: Value) -> bool {
 
 /// Element `i` of array `a` as `%ArrayIteratorPrototype%.next` gives it,
 /// `None` past its length.
-pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Option<Value>> {
+#[inline(always)]
+pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Fresh<'_, Option<Value>>> {
+    open_array_element_raw(vm, a, i).map(Fresh::new)
+}
+
+fn open_array_element_raw(vm: &mut Vm, a: Value, i: u32) -> Result<Option<Value>> {
     let o = Obj::of(a);
     if i >= vm.length_field(o) {
         return Ok(None);
@@ -1229,8 +1273,8 @@ pub(crate) unsafe fn iterator_next(vm: &mut Vm, slots: *mut Value) -> Result<Val
             // (A number: a far array's indices go past an int32's.)
             let i = open_index(*slots.add(1));
             *slots.add(1) = Value::number(i as f64 + 1.0);
-            return Ok(match open_array_element(vm, s, i)? {
-                Some(v) => v,
+            return Ok(match open_array_element(vm, s, i)?.transpose() {
+                Some(v) => v.peek(),
                 None => {
                     *slots = Value::UNDEFINED;
                     Value::HOLE
@@ -1266,8 +1310,8 @@ unsafe fn iterator_next_other(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
                 });
             }
             Class::CollectionIterator => {
-                return Ok(match crate::collections::step(vm, Obj::of(s))? {
-                    Some(v) => v,
+                return Ok(match crate::collections::step(vm, Obj::of(s))?.transpose() {
+                    Some(v) => v.peek(),
                     None => {
                         *slots = Value::UNDEFINED;
                         Value::HOLE
@@ -1292,8 +1336,8 @@ pub(crate) fn open_state_close(vm: &mut Vm, a: &[Value]) -> Result<()> {
     }
     let it = match Obj::of(a[0]).class() {
         Class::CollectionIterator => a[0],
-        Class::String => new_iterator(vm, a[0], 3, Root::StringIteratorPrototype)?,
-        _ => new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?,
+        Class::String => new_iterator(vm, a[0], 3, Root::StringIteratorPrototype)?.take(),
+        _ => new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?.take(),
     };
     // (A new iterator, held across its state's write: rooted.)
     let s = Scope::new(vm);

@@ -11,7 +11,7 @@ use super::{
     Kind, Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
-use crate::brand::{Args, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::object::{Obj, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
@@ -86,17 +86,18 @@ fn collator_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 /// handle), its locale and its other resolved options.
 fn initialize(vm: &mut Vm, locales: Value, options: Value) -> Result<(u32, String, Flags)> {
     let requested = canonicalize_locale_list(vm, locales)?;
-    let options = coerce_options(vm, options)?;
-    let search = string_option(vm, options, "usage", &["sort", "search"])?.as_deref() == Some("search");
-    string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
-    let collation = string_option(vm, options, "collation", &[])?;
+    let sc_options = Scope::new(vm);
+    let options = coerce_options(vm, options)?.root(&sc_options);
+    let search = string_option(vm, options.peek(), "usage", &["sort", "search"])?.as_deref() == Some("search");
+    string_option(vm, options.peek(), "localeMatcher", &["lookup", "best fit"])?;
+    let collation = string_option(vm, options.peek(), "collation", &[])?;
     if let Some(c) = &collation
         && !is_type(c)
     {
         return Err(Error::range_error(format!("Invalid collation: {c}")));
     }
-    let numeric = bool_option(vm, options, "numeric")?.map(|b| b.to_string());
-    let case_first = string_option(vm, options, "caseFirst", &CASE_FIRSTS)?;
+    let numeric = bool_option(vm, options.peek(), "numeric")?.map(|b| b.to_string());
+    let case_first = string_option(vm, options.peek(), "caseFirst", &CASE_FIRSTS)?;
     let r = resolve_locale(
         vm,
         &requested,
@@ -106,12 +107,12 @@ fn initialize(vm: &mut Vm, locales: Value, options: Value) -> Result<(u32, Strin
             ("kn", &[Some("false"), Some("true")], numeric),
         ],
     )?;
-    let sensitivity = match string_option(vm, options, "sensitivity", &SENSITIVITIES)? {
+    let sensitivity = match string_option(vm, options.peek(), "sensitivity", &SENSITIVITIES)? {
         Some(s) => [Sensitivity::Base, Sensitivity::Accent, Sensitivity::Case, Sensitivity::Variant]
             [SENSITIVITIES.iter().position(|&x| x == s).unwrap()],
         None => Sensitivity::Variant,
     };
-    let ignore_punctuation = bool_option(vm, options, "ignorePunctuation")?.unwrap_or(false);
+    let ignore_punctuation = bool_option(vm, options.peek(), "ignorePunctuation")?.unwrap_or(false);
     let flags = Flags {
         search,
         sensitivity,
@@ -253,8 +254,9 @@ fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 /// `Intl.Collator.supportedLocalesOf(locales, options)`.
 fn supported_locales_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let requested = canonicalize_locale_list(vm, arg(&a, 0))?;
-    let options = coerce_options(vm, arg(&a, 1))?;
-    string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
+    let sc_options = Scope::new(vm);
+    let options = coerce_options(vm, arg(&a, 1))?.root(&sc_options);
+    string_option(vm, options.peek(), "localeMatcher", &["lookup", "best fit"])?;
     let found = supported_locales(vm, &requested)?;
-    string_array(vm, &found)
+    string_array(vm, &found).map(Fresh::take)
 }

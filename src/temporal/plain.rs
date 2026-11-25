@@ -6,6 +6,7 @@ use super::fields::{self, Field, Required};
 use super::iso::{self, DateTime, IsoDate, RoundingMode, Time, Unit};
 use super::*;
 use crate::brand::Args;
+use crate::brand::Fresh;
 use crate::object::Obj;
 
 // ---- Shared getters ----
@@ -83,7 +84,7 @@ pub(crate) fn reject_temporal_like(vm: &mut Vm, item: Value) -> Result<()> {
         }
     }
     for name in ["calendar", "timeZone"] {
-        if !get(vm, item, name)?.is_undefined() {
+        if !get(vm, item, name)?.peek().is_undefined() {
             return Err(type_err(format!("with() does not support a {name} property")));
         }
     }
@@ -91,7 +92,12 @@ pub(crate) fn reject_temporal_like(vm: &mut Vm, item: Value) -> Result<()> {
 }
 
 /// `round(roundTo)`'s options: a string the smallest unit.
-fn round_options(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+fn round_options(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    round_options_raw(vm, v).map(Fresh::new)
+}
+
+fn round_options_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
         return Err(type_err("options parameter is required"));
     }
@@ -102,7 +108,7 @@ fn round_options(vm: &mut Vm, v: Value) -> Result<Value> {
         vm.add_property(Obj::of(o), a, v);
         return Ok(o);
     }
-    options_object(vm, v)
+    options_object(vm, v).map(Fresh::take)
 }
 
 /// RoundTime: the days carried over, and the time.
@@ -152,7 +158,12 @@ fn this_date(this: Value) -> Result<IsoDate> {
     }
 }
 
-pub(crate) fn create_date(vm: &mut Vm, d: IsoDate) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create_date(vm: &mut Vm, d: IsoDate) -> Result<Fresh<'_>> {
+    create_date_raw(vm, d).map(Fresh::new)
+}
+
+fn create_date_raw(vm: &mut Vm, d: IsoDate) -> Result<Value> {
     Ok(create(vm, Slots::Date(check_date(d)?)))
 }
 
@@ -173,7 +184,7 @@ fn date_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let d = to_integer(vm, arg(&a, 2))?;
     calendar_arg(arg(&a, 3))?;
     let date = reject_iso_date(y, m, d)?;
-    create_date(vm, date)
+    create_date(vm, date).map(Fresh::take)
 }
 
 fn date_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -183,16 +194,17 @@ fn date_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let base = fields::date_fields(d, true, true);
     let partial = fields::prepare(vm, item, fields::DATE_FIELDS, Required::Partial)?;
     let merged = fields::merge(&base, &partial);
-    let o = options_object(vm, arg(&a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let r = fields::date_from_fields(&merged, ov)?;
-    create_date(vm, r)
+    create_date(vm, r).map(Fresh::take)
 }
 
 fn date_with_calendar(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_date(this)?;
     to_calendar(vm, arg(&a, 0))?;
-    create_date(vm, d)
+    create_date(vm, d).map(Fresh::take)
 }
 
 /// AddDurationToDate.
@@ -203,10 +215,11 @@ fn date_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) -> Resul
         dur = duration::negated(&dur);
     }
     let dd = duration::date_without_time(&dur)?;
-    let o = options_object(vm, arg(a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let r = fields::date_add(d, &dd, ov)?;
-    create_date(vm, r)
+    create_date(vm, r).map(Fresh::take)
 }
 
 fn date_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -221,8 +234,9 @@ fn date_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn date_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Result<Value> {
     let d = this_date(this)?;
     let other = fields::to_date(vm, arg(a, 0), Value::UNDEFINED)?;
-    let o = options_object(vm, arg(a, 1))?;
-    let s = duration::difference_settings(vm, since, o, Group::Date, &[], Unit::Day, Unit::Day)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let s = duration::difference_settings(vm, since, o.peek(), Group::Date, &[], Unit::Day, Unit::Day)?;
     if d == other {
         return Ok(duration::create_duration(vm, [0.0; 10]));
     }
@@ -253,8 +267,9 @@ fn date_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn date_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_date(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let show = show_calendar(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let show = show_calendar(vm, o.peek())?;
     Ok(string(vm, &format!("{}{}", iso::date_string(d), calendar_annotation(show))))
 }
 
@@ -266,19 +281,22 @@ fn date_to_json(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 fn date_to_plain_date_time(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_date(this)?;
     let t = fields::to_time_or_midnight(vm, arg(&a, 0))?;
-    create_date_time(vm, DateTime { date: d, time: t })
+    create_date_time(vm, DateTime { date: d, time: t }).map(Fresh::take)
 }
 
 fn date_to_zoned(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_date(this)?;
     let item = arg(&a, 0);
     let (z, time) = if is_object(item) {
-        let tz = get(vm, item, "timeZone")?;
-        if tz.is_undefined() {
+        let sc_tz = Scope::new(vm);
+        let tz = get(vm, item, "timeZone")?.root(&sc_tz);
+        if tz.peek().is_undefined() {
             (to_time_zone(vm, item)?, Value::UNDEFINED)
         } else {
-            let z = to_time_zone(vm, tz)?;
-            (z, get(vm, item, "plainTime")?)
+            let z = to_time_zone(vm, tz.peek())?;
+            // take: rooted below, before its fields' getters; the start of
+            // the day between doesn't run.
+            (z, get(vm, item, "plainTime")?.take())
         }
     } else {
         (to_time_zone(vm, item)?, Value::UNDEFINED)
@@ -291,26 +309,26 @@ fn date_to_zoned(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         let t = vm.rooted(&[time], |vm| fields::to_time(vm, time, Value::UNDEFINED))?;
         epoch_ns_for(vm, z, DateTime { date: d, time: t }, Disambiguation::Compatible)?
     };
-    super::zoned::create_zoned(vm, ns, z)
+    super::zoned::create_zoned(vm, ns, z).map(Fresh::take)
 }
 
 fn date_to_plain_year_month(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let d = this_date(this)?;
     let f = fields::date_fields(d, true, true);
     let r = fields::year_month_from_fields(&f, Overflow::Constrain)?;
-    create_year_month(vm, r)
+    create_year_month(vm, r).map(Fresh::take)
 }
 
 fn date_to_plain_month_day(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let d = this_date(this)?;
     let f = fields::date_fields(d, true, true);
     let r = fields::month_day_from_fields(&f, Overflow::Constrain)?;
-    create_month_day(vm, r)
+    create_month_day(vm, r).map(Fresh::take)
 }
 
 fn date_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let d = fields::to_date(vm, arg(&a, 0), arg(&a, 1))?;
-    create_date(vm, d)
+    create_date(vm, d).map(Fresh::take)
 }
 
 fn date_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -398,8 +416,9 @@ fn time_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let partial = fields::time_record(vm, item, true)?;
     let base = t.fields();
     let merged: [f64; 6] = std::array::from_fn(|k| partial[k].unwrap_or(base[k] as f64));
-    let o = options_object(vm, arg(&a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let r = regulate_time(merged, ov)?;
     Ok(create_time(vm, r))
 }
@@ -428,8 +447,9 @@ fn time_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn time_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Result<Value> {
     let t = this_time(this)?;
     let other = fields::to_time(vm, arg(a, 0), Value::UNDEFINED)?;
-    let o = options_object(vm, arg(a, 1))?;
-    let s = duration::difference_settings(vm, since, o, Group::Time, &[], Unit::Nanosecond, Unit::Hour)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let s = duration::difference_settings(vm, since, o.peek(), Group::Time, &[], Unit::Nanosecond, Unit::Hour)?;
     let diff = duration::difference_time(t, other);
     let diff = duration::round_time_duration(diff, s.increment, s.smallest, s.mode)?;
     let r = duration::from_internal(&duration::Internal { date: ZERO_DATE, time: diff }, s.largest)?;
@@ -446,12 +466,13 @@ fn time_since(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn time_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let t = this_time(this)?;
-    let o = round_options(vm, arg(&a, 0))?;
+    let sc_o = Scope::new(vm);
+    let o = round_options(vm, arg(&a, 0))?.root(&sc_o);
     // (`o`, maybe made here, rooted while its options are read.)
-    let _rooted = vm.root_scope(&[o]);
-    let increment = rounding_increment(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-    let smallest = unit_option(vm, o, "smallestUnit", true)?;
+    let _rooted = vm.root_scope(&[o.peek()]);
+    let increment = rounding_increment(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::HalfExpand)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", true)?;
     validate_unit(smallest, Group::Time, false)?;
     let UnitOption::Unit(unit) = smallest else { return Err(range("smallestUnit is required")) };
     validate_increment(increment, duration::max_increment(unit).unwrap(), false)?;
@@ -467,10 +488,11 @@ fn time_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn time_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let t = this_time(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let digits = fractional_digits(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::Trunc)?;
-    let smallest = unit_option(vm, o, "smallestUnit", false)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let digits = fractional_digits(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::Trunc)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", false)?;
     validate_unit(smallest, Group::Time, false)?;
     if smallest == UnitOption::Unit(Unit::Hour) {
         return Err(range("smallestUnit must be a time unit other than hour"));
@@ -537,7 +559,12 @@ fn this_date_time(this: Value) -> Result<DateTime> {
     }
 }
 
-pub(crate) fn create_date_time(vm: &mut Vm, dt: DateTime) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create_date_time(vm: &mut Vm, dt: DateTime) -> Result<Fresh<'_>> {
+    create_date_time_raw(vm, dt).map(Fresh::new)
+}
+
+fn create_date_time_raw(vm: &mut Vm, dt: DateTime) -> Result<Value> {
     Ok(create(vm, Slots::DateTime(check_date_time(dt)?)))
 }
 
@@ -556,7 +583,7 @@ fn date_time_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     calendar_arg(arg(&a, 9))?;
     let date = reject_iso_date(y, m, d)?;
     let time = reject_time(f)?;
-    create_date_time(vm, DateTime { date, time })
+    create_date_time(vm, DateTime { date, time }).map(Fresh::take)
 }
 
 fn date_time_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -568,23 +595,24 @@ fn date_time_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let which: Vec<Field> = fields::DATE_FIELDS.iter().chain(fields::TIME_FIELDS).copied().collect();
     let partial = fields::prepare(vm, item, &which, Required::Partial)?;
     let merged = fields::merge(&base, &partial);
-    let o = options_object(vm, arg(&a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let date = fields::date_from_fields(&merged, ov)?;
     let time = fields::time_from_fields(&merged, ov)?;
-    create_date_time(vm, DateTime { date, time })
+    create_date_time(vm, DateTime { date, time }).map(Fresh::take)
 }
 
 fn date_time_with_plain_time(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let dt = this_date_time(this)?;
     let t = fields::to_time_or_midnight(vm, arg(&a, 0))?;
-    create_date_time(vm, DateTime { date: dt.date, time: t })
+    create_date_time(vm, DateTime { date: dt.date, time: t }).map(Fresh::take)
 }
 
 fn date_time_with_calendar(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let dt = this_date_time(this)?;
     to_calendar(vm, arg(&a, 0))?;
-    create_date_time(vm, dt)
+    create_date_time(vm, dt).map(Fresh::take)
 }
 
 /// AddDurationToDateTime.
@@ -594,13 +622,14 @@ fn date_time_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) -> 
     if subtract {
         d = duration::negated(&d);
     }
-    let o = options_object(vm, arg(a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let i = duration::to_internal_24h(&d);
     let (days, time) = iso::balance_time(dt.time.nanos() as i128 + i.time);
     let dd = duration::adjust(&i.date, days as f64, None, None)?;
     let date = fields::date_add(dt.date, &dd, ov)?;
-    create_date_time(vm, DateTime { date, time })
+    create_date_time(vm, DateTime { date, time }).map(Fresh::take)
 }
 
 fn date_time_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -615,8 +644,9 @@ fn date_time_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn date_time_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Result<Value> {
     let dt = this_date_time(this)?;
     let other = fields::to_date_time(vm, arg(a, 0), Value::UNDEFINED)?;
-    let o = options_object(vm, arg(a, 1))?;
-    let s = duration::difference_settings(vm, since, o, Group::DateTime, &[], Unit::Nanosecond, Unit::Day)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let s = duration::difference_settings(vm, since, o.peek(), Group::DateTime, &[], Unit::Nanosecond, Unit::Day)?;
     if dt == other {
         return Ok(duration::create_duration(vm, [0.0; 10]));
     }
@@ -635,12 +665,13 @@ fn date_time_since(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn date_time_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let dt = this_date_time(this)?;
-    let o = round_options(vm, arg(&a, 0))?;
+    let sc_o = Scope::new(vm);
+    let o = round_options(vm, arg(&a, 0))?.root(&sc_o);
     // (`o`, maybe made here, rooted while its options are read.)
-    let _rooted = vm.root_scope(&[o]);
-    let increment = rounding_increment(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::HalfExpand)?;
-    let smallest = unit_option(vm, o, "smallestUnit", true)?;
+    let _rooted = vm.root_scope(&[o.peek()]);
+    let increment = rounding_increment(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::HalfExpand)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", true)?;
     if smallest != UnitOption::Unit(Unit::Day) {
         validate_unit(smallest, Group::Time, false)?;
     }
@@ -648,10 +679,10 @@ fn date_time_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let max = duration::max_increment(unit).unwrap_or(1);
     validate_increment(increment, max, max == 1)?;
     if increment == 1 && unit == Unit::Nanosecond {
-        return create_date_time(vm, dt);
+        return create_date_time(vm, dt).map(Fresh::take);
     }
     let r = round_date_time(dt, increment, unit, mode);
-    create_date_time(vm, r)
+    create_date_time(vm, r).map(Fresh::take)
 }
 
 fn date_time_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -662,11 +693,12 @@ fn date_time_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 fn date_time_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let dt = this_date_time(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let show = show_calendar(vm, o)?;
-    let digits = fractional_digits(vm, o)?;
-    let mode = rounding_mode(vm, o, RoundingMode::Trunc)?;
-    let smallest = unit_option(vm, o, "smallestUnit", false)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let show = show_calendar(vm, o.peek())?;
+    let digits = fractional_digits(vm, o.peek())?;
+    let mode = rounding_mode(vm, o.peek(), RoundingMode::Trunc)?;
+    let smallest = unit_option(vm, o.peek(), "smallestUnit", false)?;
     validate_unit(smallest, Group::Time, false)?;
     if smallest == UnitOption::Unit(Unit::Hour) {
         return Err(range("smallestUnit must be a time unit other than hour"));
@@ -684,15 +716,16 @@ fn date_time_to_json(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 fn date_time_to_zoned(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let dt = this_date_time(this)?;
     let z = to_time_zone(vm, arg(&a, 0))?;
-    let o = options_object(vm, arg(&a, 1))?;
-    let d = disambiguation(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 1))?.root(&sc_o);
+    let d = disambiguation(vm, o.peek())?;
     let ns = epoch_ns_for(vm, z, dt, d)?;
-    super::zoned::create_zoned(vm, ns, z)
+    super::zoned::create_zoned(vm, ns, z).map(Fresh::take)
 }
 
 fn date_time_to_plain_date(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let dt = this_date_time(this)?;
-    create_date(vm, dt.date)
+    create_date(vm, dt.date).map(Fresh::take)
 }
 
 fn date_time_to_plain_time(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -702,7 +735,7 @@ fn date_time_to_plain_time(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Valu
 
 fn date_time_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let dt = fields::to_date_time(vm, arg(&a, 0), arg(&a, 1))?;
-    create_date_time(vm, dt)
+    create_date_time(vm, dt).map(Fresh::take)
 }
 
 fn date_time_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -773,7 +806,12 @@ fn this_year_month(this: Value) -> Result<IsoDate> {
     }
 }
 
-pub(crate) fn create_year_month(vm: &mut Vm, d: IsoDate) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create_year_month(vm: &mut Vm, d: IsoDate) -> Result<Fresh<'_>> {
+    create_year_month_raw(vm, d).map(Fresh::new)
+}
+
+fn create_year_month_raw(vm: &mut Vm, d: IsoDate) -> Result<Value> {
     Ok(create(vm, Slots::YearMonth(check_year_month(d)?)))
 }
 
@@ -786,7 +824,7 @@ fn year_month_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     calendar_arg(arg(&a, 2))?;
     let day = if arg(&a, 3).is_undefined() { 1.0 } else { to_integer(vm, arg(&a, 3))? };
     let d = reject_iso_date(y, m, day)?;
-    create_year_month(vm, d)
+    create_year_month(vm, d).map(Fresh::take)
 }
 
 fn year_month_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -796,10 +834,11 @@ fn year_month_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let base = fields::date_fields(d, true, false);
     let partial = fields::prepare(vm, item, &[Field::Year, Field::Month, Field::MonthCode], Required::Partial)?;
     let merged = fields::merge(&base, &partial);
-    let o = options_object(vm, arg(&a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let r = fields::year_month_from_fields(&merged, ov)?;
-    create_year_month(vm, r)
+    create_year_month(vm, r).map(Fresh::take)
 }
 
 /// AddDurationToYearMonth.
@@ -810,8 +849,9 @@ fn year_month_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) ->
         dur = duration::negated(&dur);
     }
     let i = duration::to_internal(&dur);
-    let o = options_object(vm, arg(a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     if i.date[2] != 0.0 || i.date[3] != 0.0 || i.time != 0 {
         return Err(range("only years and months can be added to Temporal.PlainYearMonth"));
     }
@@ -822,7 +862,7 @@ fn year_month_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) ->
     let added = fields::date_add(start, &i.date, ov)?;
     let f = fields::date_fields(added, true, false);
     let r = fields::year_month_from_fields(&f, ov)?;
-    create_year_month(vm, r)
+    create_year_month(vm, r).map(Fresh::take)
 }
 
 fn year_month_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -837,9 +877,17 @@ fn year_month_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 fn year_month_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Result<Value> {
     let d = this_year_month(this)?;
     let other = fields::to_year_month(vm, arg(a, 0), Value::UNDEFINED)?;
-    let o = options_object(vm, arg(a, 1))?;
-    let s =
-        duration::difference_settings(vm, since, o, Group::Date, &[Unit::Week, Unit::Day], Unit::Month, Unit::Year)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(a, 1))?.root(&sc_o);
+    let s = duration::difference_settings(
+        vm,
+        since,
+        o.peek(),
+        Group::Date,
+        &[Unit::Week, Unit::Day],
+        Unit::Month,
+        Unit::Year,
+    )?;
     if d == other {
         return Ok(duration::create_duration(vm, [0.0; 10]));
     }
@@ -883,8 +931,9 @@ fn year_month_string(d: IsoDate, show: usize) -> String {
 
 fn year_month_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_year_month(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let show = show_calendar(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let show = show_calendar(vm, o.peek())?;
     Ok(string(vm, &year_month_string(d, show)))
 }
 
@@ -903,12 +952,12 @@ fn year_month_to_plain_date(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Val
     let input = fields::prepare(vm, item, &[Field::Day], Required::Some(&[]))?;
     let merged = fields::merge(&base, &input);
     let r = fields::date_from_fields(&merged, Overflow::Constrain)?;
-    create_date(vm, r)
+    create_date(vm, r).map(Fresh::take)
 }
 
 fn year_month_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let d = fields::to_year_month(vm, arg(&a, 0), arg(&a, 1))?;
-    create_year_month(vm, d)
+    create_year_month(vm, d).map(Fresh::take)
 }
 
 fn year_month_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -962,7 +1011,12 @@ fn this_month_day(this: Value) -> Result<IsoDate> {
     }
 }
 
-pub(crate) fn create_month_day(vm: &mut Vm, d: IsoDate) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create_month_day(vm: &mut Vm, d: IsoDate) -> Result<Fresh<'_>> {
+    create_month_day_raw(vm, d).map(Fresh::new)
+}
+
+fn create_month_day_raw(vm: &mut Vm, d: IsoDate) -> Result<Value> {
     Ok(create(vm, Slots::MonthDay(check_date(d)?)))
 }
 
@@ -975,7 +1029,7 @@ fn month_day_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     calendar_arg(arg(&a, 2))?;
     let y = if arg(&a, 3).is_undefined() { 1972.0 } else { to_integer(vm, arg(&a, 3))? };
     let date = reject_iso_date(y, m, d)?;
-    create_month_day(vm, date)
+    create_month_day(vm, date).map(Fresh::take)
 }
 
 fn month_day_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -985,10 +1039,11 @@ fn month_day_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let base = fields::date_fields(d, false, true);
     let partial = fields::prepare(vm, item, fields::DATE_FIELDS, Required::Partial)?;
     let merged = fields::merge(&base, &partial);
-    let o = options_object(vm, arg(&a, 1))?;
-    let ov = overflow(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 1))?.root(&sc_o);
+    let ov = overflow(vm, o.peek())?;
     let r = fields::month_day_from_fields(&merged, ov)?;
-    create_month_day(vm, r)
+    create_month_day(vm, r).map(Fresh::take)
 }
 
 fn month_day_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
@@ -1007,8 +1062,9 @@ fn month_day_string(d: IsoDate, show: usize) -> String {
 
 fn month_day_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_month_day(this)?;
-    let o = options_object(vm, arg(&a, 0))?;
-    let show = show_calendar(vm, o)?;
+    let sc_o = Scope::new(vm);
+    let o = options_object(vm, arg(&a, 0))?.root(&sc_o);
+    let show = show_calendar(vm, o.peek())?;
     Ok(string(vm, &month_day_string(d, show)))
 }
 
@@ -1027,12 +1083,12 @@ fn month_day_to_plain_date(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Valu
     let input = fields::prepare(vm, item, &[Field::Year], Required::Some(&[]))?;
     let merged = fields::merge(&base, &input);
     let r = fields::date_from_fields(&merged, Overflow::Constrain)?;
-    create_date(vm, r)
+    create_date(vm, r).map(Fresh::take)
 }
 
 fn month_day_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let d = fields::to_month_day(vm, arg(&a, 0), arg(&a, 1))?;
-    create_month_day(vm, d)
+    create_month_day(vm, d).map(Fresh::take)
 }
 
 const MD: usize = Kind::MonthDay as usize;

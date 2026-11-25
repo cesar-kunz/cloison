@@ -13,6 +13,7 @@ mod collator;
 mod icu;
 mod segmenter;
 
+use crate::brand::Fresh;
 use crate::brand::Scope;
 use crate::raw::Live;
 use std::collections::HashMap;
@@ -310,7 +311,12 @@ fn resolve_locale(
 // ---- Options ----
 
 /// CoerceOptionsToObject.
-fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+fn coerce_options(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    coerce_options_raw(vm, v).map(Fresh::new)
+}
+
+fn coerce_options_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
         return Ok(vm.mu().new_plain(Value::NULL).v());
     }
@@ -318,7 +324,12 @@ fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
 }
 
 /// GetOptionsObject.
-fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
+#[inline(always)]
+fn options_object(vm: &mut Vm, v: Value) -> Result<Fresh<'_>> {
+    options_object_raw(vm, v).map(Fresh::new)
+}
+
+fn options_object_raw(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() {
         return Ok(vm.mu().new_plain(Value::NULL).v());
     }
@@ -351,7 +362,12 @@ fn bool_option(vm: &mut Vm, options: Value, name: &str) -> Result<Option<bool>> 
 }
 
 /// An array of `strings`.
-fn string_array(vm: &mut Vm, strings: &[String]) -> Result<Value> {
+#[inline(always)]
+fn string_array<'v>(vm: &'v mut Vm, strings: &[String]) -> Result<Fresh<'v>> {
+    string_array_raw(vm, strings).map(Fresh::new)
+}
+
+fn string_array_raw(vm: &mut Vm, strings: &[String]) -> Result<Value> {
     // take: only calls that don't collect follow (allocation, stores, filling it).
     let arr = vm.mu().new_array().v();
     for s in strings {

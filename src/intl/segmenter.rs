@@ -11,6 +11,7 @@ use super::{
     Kind, Root, canonicalize_locale_list, coerce_options, create, data_error, options_object, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
+use crate::brand::Fresh;
 use crate::brand::{Args, Scope};
 use crate::object::{DONT_ENUM, Obj, object_value};
 use crate::temporal::arg;
@@ -77,10 +78,11 @@ fn segmenter_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let proto = vm.take_new_target(f, default)?;
     // ResolveOptions (no relevant extension keys).
     let requested = canonicalize_locale_list(vm, arg(&a, 0))?;
-    let options = options_object(vm, arg(&a, 1))?;
-    string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
+    let sc_options = Scope::new(vm);
+    let options = options_object(vm, arg(&a, 1))?.root(&sc_options);
+    string_option(vm, options.peek(), "localeMatcher", &["lookup", "best fit"])?;
     let r = resolve_locale(vm, &requested, &[])?;
-    let granularity = string_option(vm, options, "granularity", &GRANULARITIES)?;
+    let granularity = string_option(vm, options.peek(), "granularity", &GRANULARITIES)?;
     let g = granularity.map_or(0, |g| GRANULARITIES.iter().position(|&n| n == g).unwrap());
     if vm.intl.breakers[g].is_none() {
         let granularity = [Granularity::Grapheme, Granularity::Word, Granularity::Sentence][g];
@@ -93,10 +95,11 @@ fn segmenter_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 /// `Intl.Segmenter.supportedLocalesOf(locales, options)`.
 fn supported_locales_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let requested = canonicalize_locale_list(vm, arg(&a, 0))?;
-    let options = coerce_options(vm, arg(&a, 1))?;
-    string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
+    let sc_options = Scope::new(vm);
+    let options = coerce_options(vm, arg(&a, 1))?.root(&sc_options);
+    string_option(vm, options.peek(), "localeMatcher", &["lookup", "best fit"])?;
     let found = supported_locales(vm, &requested)?;
-    string_array(vm, &found)
+    string_array(vm, &found).map(Fresh::take)
 }
 
 /// `Intl.Segmenter.prototype.resolvedOptions()`.
@@ -145,7 +148,7 @@ fn containing(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // end at each index).
     let (last, last_end) = (slot(o, AT).to_number() as usize, slot(o, END).to_number() as usize);
     if last <= n && n < last_end {
-        return segment_data(vm, o, last, last_end, slot(o, WORD_LIKE) == Value::TRUE);
+        return segment_data(vm, o, last, last_end, slot(o, WORD_LIKE) == Value::TRUE).map(Fresh::take);
     }
     // Else the segments from a boundary known at or before `n`, up to
     // its own: the last segment's end if `n` is shortly after it (asking
@@ -199,7 +202,7 @@ fn containing(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     crate::promise::set_slot(o, AT, Value::number(start as f64));
     crate::promise::set_slot(o, END, Value::number(end as f64));
     crate::promise::set_slot(o, WORD_LIKE, Value::from_bool(word_like));
-    segment_data(vm, o, start, end, word_like)
+    segment_data(vm, o, start, end, word_like).map(Fresh::take)
 }
 
 /// `%IntlSegmentsPrototype%[Symbol.iterator]()`: a Segment Iterator
@@ -216,15 +219,16 @@ fn iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let units = string_units(slot(o, STRING)).unwrap_or(&[]);
     let start = slot(o, AT).to_number() as usize;
     if start >= units.len() {
-        return crate::symbol::iter_result(vm, Value::UNDEFINED, true);
+        return crate::symbol::iter_result(vm, Value::UNDEFINED, true).map(Fresh::take);
     }
     // (A boundary found from the last one is the one found from the
     // string's start: no rule of UAX #29 looks back past a boundary.)
     let (length, word_like) = breaker(vm, o).first(&units[start..]);
     let end = start + length;
     crate::promise::set_slot(o, AT, Value::number(end as f64));
-    let data = segment_data(vm, o, start, end, word_like)?;
-    crate::symbol::iter_result(vm, data, false)
+    // take: nothing collects before its last use.
+    let data = segment_data(vm, o, start, end, word_like)?.take();
+    crate::symbol::iter_result(vm, data, false).map(Fresh::take)
 }
 
 fn granularity(o: Obj) -> usize {
@@ -240,7 +244,12 @@ fn breaker(vm: &Vm, o: Obj) -> &Breaker {
 /// CreateSegmentDataObject: `{segment, index, input}` of the segment
 /// from `start` to `end` of the string of `o` (a Segments object or a
 /// Segment Iterator), with `isWordLike` if the segments are words.
-fn segment_data(vm: &mut Vm, o: Obj, start: usize, end: usize, word_like: bool) -> Result<Value> {
+#[inline(always)]
+fn segment_data(vm: &mut Vm, o: Obj, start: usize, end: usize, word_like: bool) -> Result<Fresh<'_>> {
+    segment_data_raw(vm, o, start, end, word_like).map(Fresh::new)
+}
+
+fn segment_data_raw(vm: &mut Vm, o: Obj, start: usize, end: usize, word_like: bool) -> Result<Value> {
     let string = slot(o, STRING);
     let segment = crate::builtins::part(vm, string, string_units(string).unwrap_or(&[]), start, end);
     let op = object_value(vm.object_prototype);

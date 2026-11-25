@@ -104,7 +104,12 @@ fn trap_key(vm: &mut Vm, key: Key) -> Value {
 /// thread's stack's end a RangeError. (Not `Vm::native_limit`, the run's
 /// budget for compiled calls: a module namespace, a proxy, is read deep
 /// in a deep graph's evaluation.)
-fn trap(vm: &mut Vm, h: Value, name: &str) -> Result<Option<Value>> {
+#[inline(always)]
+fn trap<'v>(vm: &'v mut Vm, h: Value, name: &str) -> Result<Fresh<'v, Option<Value>>> {
+    trap_raw(vm, h, name).map(Fresh::new)
+}
+
+fn trap_raw(vm: &mut Vm, h: Value, name: &str) -> Result<Option<Value>> {
     if crate::stack::low() {
         return Err(Error::range_error("Maximum call stack size exceeded"));
     }
@@ -152,7 +157,12 @@ fn compatible(extensible: bool, d: &Desc, cur: Option<&Desc>) -> bool {
 }
 
 /// A new proxy of `target` and `handler`.
-pub(crate) fn create(vm: &mut Vm, target: Value, handler: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create(vm: &mut Vm, target: Value, handler: Value) -> Result<Fresh<'_>> {
+    create_raw(vm, target, handler).map(Fresh::new)
+}
+
+fn create_raw(vm: &mut Vm, target: Value, handler: Value) -> Result<Value> {
     if !is_object(target) || !is_object(handler) {
         return Err(Error::type_error("Cannot create proxy with a non-object as target or handler"));
     }
@@ -202,12 +212,13 @@ fn proxy_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor Proxy requires 'new'"));
     }
-    create(vm, arg(&a, 0), arg(&a, 1))
+    create(vm, arg(&a, 0), arg(&a, 1)).map(Fresh::take)
 }
 
 /// `Proxy.revocable(target, handler)`: `{ proxy, revoke }`.
 fn proxy_revocable(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
-    let p = create(vm, arg(&a, 0), arg(&a, 1))?;
+    let sc_p = Scope::new(vm);
+    let p = create(vm, arg(&a, 0), arg(&a, 1))?.root(&sc_p);
     let full = vm.root_shape(Class::Native, object_value(vm.function_prototype), 1);
     let bare = vm.root_shape(Class::Native, object_value(vm.function_prototype), 0);
     let r = vm.heap.alloc_object(full.live());
@@ -215,13 +226,13 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         crate::object::set_shape(r, bare);
         (*r).code = vm.proxy_codes[2];
     }
-    set_slot(unsafe { Obj::from_ptr(r) }, 0, p);
+    set_slot(unsafe { Obj::from_ptr(r) }, 0, p.peek());
     let out = {
         let arg = object_value(vm.object_prototype);
         vm.mu().new_plain(arg).v()
     };
     let (a_proxy, a_revoke) = (vm.intern_name("proxy"), vm.intern_name("revoke"));
-    vm.create_data_property(out, Key::Name(a_proxy), p)?;
+    vm.create_data_property(out, Key::Name(a_proxy), p.peek())?;
     vm.create_data_property(out, Key::Name(a_revoke), object_value(r))?;
     Ok(out)
 }
@@ -248,11 +259,12 @@ fn trampoline(vm: &mut Vm, this: Value, args: Args<'_>) -> Result<Value> {
     // `new.target`, taken from the VM, and the arguments' list rooted.)
     let held = Scope::new(vm);
     let _rooted = held.roots([t, h, nt]);
-    let list = crate::array::new_array_of(vm, &args)?;
+    let sc_list = Scope::new(vm);
+    let list = crate::array::new_array_of(vm, &args)?.root(&sc_list);
     {
         let held = Scope::new(vm);
-        let _held = held.roots([list]);
-        trampoline_with(vm, constructing, p, t, h, nt, this, &args, list)
+        let _held = held.roots([list.peek()]);
+        trampoline_with(vm, constructing, p, t, h, nt, this, &args, list.peek())
     }
 }
 
@@ -271,7 +283,8 @@ fn trampoline_with(
 ) -> Result<Value> {
     if constructing {
         let nt = if nt == Value::EMPTY { object_value(p.ptr()) } else { nt };
-        let Some(f) = trap(vm, h, "construct")? else {
+        // take: given at once to the call.
+        let Some(f) = trap(vm, h, "construct")?.take() else {
             return crate::intrinsics::construct_with(vm, t, args, nt);
         };
         let r = vm.call_b(f, h, &[t, list, nt])?;
@@ -280,7 +293,8 @@ fn trampoline_with(
         }
         return Ok(r.peek());
     }
-    match trap(vm, h, "apply")? {
+    // take: given at once to the call.
+    match trap(vm, h, "apply")?.take() {
         Some(f) => vm.call_b(f, h, &[t, this, list]).map(Fresh::take),
         None => vm.call_b(t, this, args).map(Fresh::take),
     }
@@ -290,17 +304,27 @@ fn trampoline_with(
 
 /// A proxy's `[[Get]]` by its handler `h`'s `get` trap `f`, its target
 /// `t` (one without the trap forwards in `generic_get`'s loop).
-fn get(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, receiver: Value) -> Result<Value> {
+#[inline(always)]
+fn get(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, receiver: Value) -> Result<Fresh<'_>> {
+    get_raw(vm, t, h, f, key, receiver).map(Fresh::new)
+}
+
+fn get_raw(vm: &mut Vm, t: Value, h: Value, f: Value, key: Key, receiver: Value) -> Result<Value> {
     let sc = Scope::new(vm);
     let _rooted = sc.roots([t, h, f]);
     let k = trap_key(vm, key);
     // (Read after the target's traps.)
     let v = vm.call_b(f, h, &[t, k, receiver])?.root(&sc).v();
-    get_checked(vm, t, key, v)
+    get_checked(vm, t, key, v).map(Fresh::take)
 }
 
 /// [`get`]'s check of the trap's result `v` against the target's property.
-fn get_checked(vm: &mut Vm, t: Value, key: Key, v: Value) -> Result<Value> {
+#[inline(always)]
+fn get_checked(vm: &mut Vm, t: Value, key: Key, v: Value) -> Result<Fresh<'_>> {
+    get_checked_raw(vm, t, key, v).map(Fresh::new)
+}
+
+fn get_checked_raw(vm: &mut Vm, t: Value, key: Key, v: Value) -> Result<Value> {
     if let Some(d) = get_own_property(vm, Obj::of(t), key)?
         && d.configurable == Some(false)
     {
@@ -389,11 +413,16 @@ fn forward(vm: &mut Vm, p: Obj, name: &str, hops: &mut u32) -> Result<(Value, Va
     }
     let (t, h) = parts(p)?;
     // (A getter of the trap may revoke the proxy: its parts rooted.)
-    Ok((t, h, {
-        let held = Scope::new(vm);
-        let _held = held.roots([t, h]);
-        trap(vm, h, name)
-    }?))
+    Ok((
+        t,
+        h,
+        {
+            let held = Scope::new(vm);
+            let _held = held.roots([t, h]);
+            trap(vm, h, name)
+        }?
+        .take(),
+    ))
 }
 
 /// Proxy `o`'s target, handler and trap `name` (if it has one), the
@@ -404,11 +433,16 @@ fn forward(vm: &mut Vm, p: Obj, name: &str, hops: &mut u32) -> Result<(Value, Va
 #[inline(always)]
 fn trap_of(vm: &mut Vm, o: Obj, name: &str) -> Result<(Value, Value, Option<Value>)> {
     let (t, h) = parts(o)?;
-    Ok((t, h, {
-        let held = Scope::new(vm);
-        let _held = held.roots([t, h]);
-        trap(vm, h, name)
-    }?))
+    Ok((
+        t,
+        h,
+        {
+            let held = Scope::new(vm);
+            let _held = held.roots([t, h]);
+            trap(vm, h, name)
+        }?
+        .take(),
+    ))
 }
 
 /// Run a proxy's trap `f` (`run`, given its target `t` and handler `h`),
@@ -441,7 +475,7 @@ pub(crate) fn generic_get(vm: &mut Vm, o: Value, key: Key, receiver: Value) -> R
     loop {
         if is_proxy(vm, cur) {
             match forward(vm, cur, "get", &mut hops)? {
-                (t, h, Some(f)) => return get(vm, t, h, f, key, receiver),
+                (t, h, Some(f)) => return get(vm, t, h, f, key, receiver).map(Fresh::take),
                 (t, _, None) => {
                     cur = Obj::of(t);
                     continue;
@@ -595,14 +629,19 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: Obj, key: Key) -> Result<Option<D
         {
             let held = Scope::new(vm);
             let _held = held.roots([r, a, b, c]);
-            own_property_checked(vm, t, r, target)
+            own_property_checked(vm, t, r, target).map(Fresh::take)
         }
     })
 }
 
 /// [`get_own_property`]'s check of its trap's result `r` against the
 /// target's property `target`: the descriptor it stands for.
-fn own_property_checked(vm: &mut Vm, t: Value, r: Value, target: Option<Desc>) -> Result<Option<Desc>> {
+#[inline(always)]
+fn own_property_checked(vm: &mut Vm, t: Value, r: Value, target: Option<Desc>) -> Result<Fresh<'_, Option<Desc>>> {
+    own_property_checked_raw(vm, t, r, target).map(Fresh::new)
+}
+
+fn own_property_checked_raw(vm: &mut Vm, t: Value, r: Value, target: Option<Desc>) -> Result<Option<Desc>> {
     if r.is_undefined() {
         if let Some(td) = target {
             if td.configurable == Some(false) {
@@ -891,7 +930,12 @@ pub(crate) fn get_prototype_of(vm: &mut Vm, o: Obj) -> Result<Value> {
 /// `hops`. Past [`MAX_FORWARDS`] proxies a RangeError, as a lookup's: a
 /// cycle through a proxy (10.1.2.1 step 7.b.i) has no end, and nothing
 /// else bounds the walk (#336).
-pub(crate) fn walk_prototype(vm: &mut Vm, o: Obj, hops: &mut u32) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn walk_prototype<'v>(vm: &'v mut Vm, o: Obj, hops: &mut u32) -> Result<Fresh<'v>> {
+    walk_prototype_raw(vm, o, hops).map(Fresh::new)
+}
+
+fn walk_prototype_raw(vm: &mut Vm, o: Obj, hops: &mut u32) -> Result<Value> {
     if !is_proxy(vm, o) {
         return Ok(o.shape().live().proto);
     }
@@ -1002,11 +1046,11 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: Obj) -> Result<Vec<Vec<u16>>> {
             }
         }
         let p = walk_prototype(vm, cur, &mut hops)?;
-        if !p.is_cell() {
+        if !p.peek().is_cell() {
             return Ok(out);
         }
-        cur = Obj::of(p);
-        vm.handles[slot] = p;
+        cur = Obj::of(p.peek());
+        vm.handles[slot] = p.peek();
     }
 }
 

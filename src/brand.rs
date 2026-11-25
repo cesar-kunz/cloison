@@ -145,14 +145,32 @@ impl<'a, T: Rootable> Fresh<'a, T> {
     }
 }
 
-impl<'a> Fresh<'a> {
+impl<'a, T: Rootable + Copy> Fresh<'a, T> {
     /// The value, the fresh one still unrooted: it keeps borrowing the VM
     /// while it is used, so no call that may collect comes between.
     #[inline(always)]
-    pub fn peek(&self) -> Value {
+    pub fn peek(&self) -> T {
         self.v
     }
+}
 
+impl<'a, T: Rootable> Fresh<'a, Option<T>> {
+    /// The fresh value, if any, itself fresh.
+    #[inline(always)]
+    pub fn transpose(self) -> Option<Fresh<'a, T>> {
+        self.v.map(Fresh::new)
+    }
+}
+
+impl<'a> Fresh<'a, (Value, Value)> {
+    /// The two fresh values, each fresh.
+    #[inline(always)]
+    pub fn split(self) -> (Fresh<'a>, Fresh<'a>) {
+        (Fresh::new(self.v.0), Fresh::new(self.v.1))
+    }
+}
+
+impl<'a> Fresh<'a> {
     /// The value as a `Gc`, while nothing collects.
     pub fn gc(self) -> Gc<'a> {
         Gc { v: self.v, _vm: PhantomData }
@@ -217,6 +235,14 @@ impl Rootable for (bool, Value) {
     type Rooted<'s> = (bool, Handle<'s>);
     fn root_in(self, s: &Scope) -> (bool, Handle<'_>) {
         (self.0, s.root(self.1))
+    }
+}
+
+/// Two values (a pair's).
+impl Rootable for (Value, Value) {
+    type Rooted<'s> = (Handle<'s>, Handle<'s>);
+    fn root_in(self, s: &Scope) -> (Handle<'_>, Handle<'_>) {
+        (s.root(self.0), s.root(self.1))
     }
 }
 

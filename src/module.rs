@@ -360,13 +360,15 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
         let v = match kind {
             Kind::Json => {
                 let u: Vec<u16> = source.encode_utf16().collect();
-                crate::json::parse_json(vm, &u)?
+                // take: stored in the environment at once.
+                crate::json::parse_json(vm, &u)?.take()
             }
             Kind::Text => {
                 let u: Vec<u16> = source.encode_utf16().collect();
                 vm.mu().new_string(&u).v()
             }
-            _ => crate::typed::immutable_bytes(vm, &bytes)?,
+            // take: stored in the environment at once.
+            _ => crate::typed::immutable_bytes(vm, &bytes)?.take(),
         };
         let a = vm.intern_name("default");
         vm.set(env.v(), a, v)?;
@@ -513,21 +515,32 @@ fn exported_names(vm: &Vm, m: usize, set: &mut Vec<usize>) -> Vec<String> {
 
 /// GetModuleNamespace (§16.2.1.10): module `m`'s namespace object, made
 /// once (see the module docs).
-pub(crate) fn namespace(vm: &mut Vm, m: usize) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn namespace(vm: &mut Vm, m: usize) -> Result<Fresh<'_>> {
+    namespace_raw(vm, m).map(Fresh::new)
+}
+
+fn namespace_raw(vm: &mut Vm, m: usize) -> Result<Value> {
     if !rec(vm, m).namespace.is_undefined() {
         return Ok(rec(vm, m).namespace);
     }
-    namespace_of(vm, m, false)
+    namespace_of(vm, m, false).map(Fresh::take)
 }
 
 /// Module `m`'s deferred namespace (`import defer`'s), made once.
-fn deferred_namespace(vm: &mut Vm, m: usize) -> Result<Value> {
+#[inline(always)]
+fn deferred_namespace(vm: &mut Vm, m: usize) -> Result<Fresh<'_>> {
     namespace_of(vm, m, true)
 }
 
 /// Module `m`'s namespace, or its deferred one: a proxy whose traps have
 /// the module and whether it's deferred in their slots.
-fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
+#[inline(always)]
+fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Fresh<'_>> {
+    namespace_of_raw(vm, m, deferred).map(Fresh::new)
+}
+
+fn namespace_of_raw(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     let made = if deferred { rec(vm, m).deferred } else { rec(vm, m).namespace };
     if !made.is_undefined() {
         return Ok(made);
@@ -580,14 +593,16 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
         let a = vm.intern_name(n);
         vm.set(object_value(handler.obj().ptr()), a, f)?;
     }
-    let ns = crate::proxy::create(vm, object_value(target.obj().ptr()), object_value(handler.obj().ptr()))?;
+    let sc_ns = Scope::new(vm);
+    let ns =
+        crate::proxy::create(vm, object_value(target.obj().ptr()), object_value(handler.obj().ptr()))?.root(&sc_ns);
     let r = rec_mut(vm, m);
     if deferred {
-        r.deferred = ns;
+        r.deferred = ns.peek();
     } else {
-        r.namespace = ns;
+        r.namespace = ns.peek();
     }
-    Ok(ns)
+    Ok(ns.peek())
 }
 
 /// The namespace's module (its traps' slot), its exports made available:
@@ -623,10 +638,15 @@ fn ns_binding(vm: &Vm, m: usize, key: &[u16]) -> Option<Resolution> {
 
 /// A binding's value: module `k`'s variable, live (a ReferenceError while
 /// uninitialized), or a namespace, or a source object.
-fn binding_value(vm: &mut Vm, res: &Resolution, name: &[u16]) -> Result<Value> {
+#[inline(always)]
+fn binding_value<'v>(vm: &'v mut Vm, res: &Resolution, name: &[u16]) -> Result<Fresh<'v>> {
+    binding_value_raw(vm, res, name).map(Fresh::new)
+}
+
+fn binding_value_raw(vm: &mut Vm, res: &Resolution, name: &[u16]) -> Result<Value> {
     let (k, local) = match res {
         Resolution::Binding(k, local) => (*k, local),
-        Resolution::Namespace(k, deferred) => return namespace_of(vm, *k, *deferred),
+        Resolution::Namespace(k, deferred) => return namespace_of(vm, *k, *deferred).map(Fresh::take),
         Resolution::Source(k) => return module_source(vm, *k),
         Resolution::Ambiguous => return Ok(Value::UNDEFINED),
     };
@@ -661,7 +681,7 @@ fn ns_get(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     };
     let m = ns_module(vm)?;
     match ns_binding(vm, m, &key) {
-        Some(res) => binding_value(vm, &res, &key),
+        Some(res) => binding_value(vm, &res, &key).map(Fresh::take),
         None => Ok(Value::UNDEFINED),
     }
 }
@@ -708,13 +728,14 @@ fn ns_define(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let Some(res) = ns_binding(vm, m, &key) else {
         return Ok(Value::FALSE);
     };
-    let current = binding_value(vm, &res, &key)?;
+    let sc_current = Scope::new(vm);
+    let current = binding_value(vm, &res, &key)?.root(&sc_current);
     let d = vm.own_descriptor(arg(&a, 2));
     let ok = d.configurable != Some(true)
         && d.enumerable != Some(false)
         && !d.is_accessor()
         && d.writable != Some(false)
-        && d.value.is_none_or(|v| same_value(v, current));
+        && d.value.is_none_or(|v| same_value(v, current.peek()));
     Ok(Value::from_bool(ok))
 }
 
@@ -732,8 +753,9 @@ fn ns_get_own(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let m = ns_module(vm)?;
     match ns_binding(vm, m, &key) {
         Some(res) => {
-            let v = binding_value(vm, &res, &key)?;
-            Ok(vm.descriptor_record(&Desc::data(v, true, true, false)))
+            let sc_v = Scope::new(vm);
+            let v = binding_value(vm, &res, &key)?.root(&sc_v);
+            Ok(vm.descriptor_record(&Desc::data(v.peek(), true, true, false)))
         }
         None => Ok(Value::UNDEFINED),
     }
@@ -848,7 +870,7 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
             }
             Resolution::Namespace(k, deferred) => {
                 let ns = namespace_of(vm, k, deferred)?;
-                holders.push(ns);
+                holders.push(ns.peek());
                 links.push(None);
             }
             Resolution::Source(k) => {
@@ -872,7 +894,8 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
         // (Past `IMPORT_PARAMS`, the holders in one array: see
         // `ast::Import`.)
         if imports.len() > IMPORT_PARAMS {
-            let rest = crate::array::new_array_of(vm, &holders[1 + IMPORT_PARAMS..])?;
+            // take: pushed to vm.handles on the next line.
+            let rest = crate::array::new_array_of(vm, &holders[1 + IMPORT_PARAMS..])?.take();
             vm.handles.push(rest);
             holders.truncate(1 + IMPORT_PARAMS);
             holders.push(rest);
@@ -889,7 +912,12 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
 
 /// Evaluate (§16.2.1.5.3): a promise of module `m`'s evaluation (and its
 /// graph's), settled now if none of it is async.
-fn evaluate(vm: &mut Vm, m: usize) -> Result<Value> {
+#[inline(always)]
+fn evaluate(vm: &mut Vm, m: usize) -> Result<Fresh<'_>> {
+    evaluate_raw(vm, m).map(Fresh::new)
+}
+
+fn evaluate_raw(vm: &mut Vm, m: usize) -> Result<Value> {
     let mut m = m;
     if matches!(rec(vm, m).status, Status::EvaluatingAsync | Status::Evaluated) {
         m = rec(vm, m).cycle_root;
@@ -902,13 +930,14 @@ fn evaluate(vm: &mut Vm, m: usize) -> Result<Value> {
     let mut stack = Vec::new();
     match inner_evaluate(vm, m, &mut stack, 0) {
         Err(e) => {
-            let v = thrown(vm, e)?;
+            let sc_v = Scope::new(vm);
+            let v = thrown(vm, e)?.root(&sc_v);
             for k in stack {
                 let r = rec_mut(vm, k);
                 r.status = Status::Evaluated;
-                r.error = Some(v);
+                r.error = Some(v.peek());
             }
-            vm.call_b(cap.2, Value::UNDEFINED, &[v])?.take();
+            vm.call_b(cap.2, Value::UNDEFINED, &[v.peek()])?.take();
         }
         Ok(_) => {
             if rec(vm, m).async_order.is_none() {
@@ -921,7 +950,12 @@ fn evaluate(vm: &mut Vm, m: usize) -> Result<Value> {
 
 /// The value thrown for `e` (an error object for the runtime's own); an
 /// `unsupported` error stays one.
-fn thrown(vm: &mut Vm, e: Error) -> Result<Value> {
+#[inline(always)]
+fn thrown(vm: &mut Vm, e: Error) -> Result<Fresh<'_>> {
+    thrown_raw(vm, e).map(Fresh::new)
+}
+
+fn thrown_raw(vm: &mut Vm, e: Error) -> Result<Value> {
     match e.1 {
         Some(v) => Ok(v),
         None if e.0.starts_with("unsupported") => Err(e),
@@ -1088,7 +1122,7 @@ fn evaluate_sync(vm: &mut Vm, m: usize) -> Result<()> {
         return Err(Error::type_error("A deferred module can't be evaluated now: it is evaluating, or async"));
     }
     let p = evaluate(vm, m)?;
-    match crate::promise::state(p) {
+    match crate::promise::state(p.peek()) {
         (2, v) => Err(Error::thrown(v)),
         _ => Ok(()),
     }
@@ -1121,7 +1155,8 @@ fn with_budget<T>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> Result<T>) -> Result<T
 /// waiting for it.
 fn execute_async(vm: &mut Vm, m: usize) -> Result<()> {
     let g = rec(vm, m).generator;
-    let p = with_budget(vm, |vm| crate::generator::async_start(vm, g))?;
+    // take: rooted on the lines after.
+    let p = with_budget(vm, |vm| crate::generator::async_start(vm, g).map(Fresh::take))?;
     // (The promise, then the first closure, rooted while the next is made.)
     let held = Scope::new(vm);
     let _rooted = held.roots([p]);
@@ -1184,8 +1219,9 @@ fn module_fulfilled(vm: &mut Vm, m: usize) -> Result<()> {
         }
         match execute(vm, k) {
             Err(e) => {
-                let v = thrown(vm, e)?;
-                module_rejected(vm, k, v)?;
+                let sc_v = Scope::new(vm);
+                let v = thrown(vm, e)?.root(&sc_v);
+                module_rejected(vm, k, v.peek())?;
             }
             Ok(()) => {
                 let r = rec_mut(vm, k);
@@ -1237,7 +1273,7 @@ pub(crate) fn run_main(vm: &mut Vm, path: &str) -> std::result::Result<Value, st
     let path = resolve_path(".", path);
     let m = load(vm, &path, Kind::Js).map_err(early)?;
     link(vm, m).map_err(early)?;
-    evaluate(vm, m).map_err(Err)
+    evaluate(vm, m).map(Fresh::take).map_err(Err)
 }
 
 /// An error of loading or linking: its message, unless it isn't early
@@ -1264,23 +1300,29 @@ pub(crate) fn import_now(vm: &mut Vm, specifier: Value) -> Result<(usize, Value)
     let m = load(vm, &path, request_type(None)?)?;
     link(vm, m)?;
     let p = evaluate(vm, m)?;
-    Ok((m, p))
+    Ok((m, p.peek()))
 }
 
+#[inline(always)]
 pub(crate) fn dynamic_import(
     vm: &mut Vm,
     specifier: Value,
     options: Value,
     referrer: Value,
     phase: Value,
-) -> Result<Value> {
+) -> Result<Fresh<'_>> {
+    dynamic_import_raw(vm, specifier, options, referrer, phase).map(Fresh::new)
+}
+
+fn dynamic_import_raw(vm: &mut Vm, specifier: Value, options: Value, referrer: Value, phase: Value) -> Result<Value> {
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
     // (The promise and its functions rooted across the specifier's and the
     // options' conversions and getters, then the specifier and the type
     // while the job is made.)
     let held = Scope::new(vm);
     let _rooted = held.roots([p, resolve, reject]);
-    match import_request(vm, specifier, options) {
+    // (Its values rooted at once.)
+    match import_request(vm, specifier, options).map(Fresh::take) {
         Ok((spec, ty)) => {
             let job = vm.rooted(&[spec, ty], |vm| {
                 closure(vm, Template::ImportJob, &[spec, ty, referrer, resolve, reject, phase])
@@ -1288,8 +1330,9 @@ pub(crate) fn dynamic_import(
             crate::promise::await_then(vm, Value::UNDEFINED, job, Value::UNDEFINED)?;
         }
         Err(e) => {
-            let v = thrown(vm, e)?;
-            vm.call_b(reject, Value::UNDEFINED, &[v])?.take();
+            let sc_v = Scope::new(vm);
+            let v = thrown(vm, e)?.root(&sc_v);
+            vm.call_b(reject, Value::UNDEFINED, &[v.peek()])?.take();
         }
     }
     Ok(p)
@@ -1298,7 +1341,12 @@ pub(crate) fn dynamic_import(
 /// `import()`'s specifier, a string, and its `type` attribute (or
 /// undefined), from its options (`{ with: { type: "json" } }`: each
 /// attribute a string).
-fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Value, Value)> {
+#[inline(always)]
+fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<Fresh<'_, (Value, Value)>> {
+    import_request_raw(vm, specifier, options).map(Fresh::new)
+}
+
+fn import_request_raw(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Value, Value)> {
     // (`spec`, a new string maybe, `attrs`, maybe a getter's only, and the
     // type found rooted across the getters and traps.)
     let sc = Scope::new(vm);
@@ -1393,24 +1441,27 @@ fn import_job(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
             })?;
             return vm.rooted(&[done], |vm| {
                 for k in deps {
-                    let p = evaluate(vm, k)?;
-                    crate::promise::await_then(vm, p, done, reject)?;
+                    let sc_p = Scope::new(vm);
+                    let p = evaluate(vm, k)?.root(&sc_p);
+                    crate::promise::await_then(vm, p.peek(), done, reject)?;
                 }
                 vm.call_b(done, Value::UNDEFINED, &[]).map(drop)
             });
         }
-        let p = evaluate(vm, m)?;
+        let sc_p = Scope::new(vm);
+        let p = evaluate(vm, m)?.root(&sc_p);
         // (Rooted while the closure is made.)
         let done = {
             let held = Scope::new(vm);
-            let _held = held.roots([p]);
+            let _held = held.roots([p.peek()]);
             closure(vm, Template::ImportDone, &[Value::from_i32(m as i32), resolve])
         };
-        crate::promise::await_then(vm, p, done, reject)
+        crate::promise::await_then(vm, p.peek(), done, reject)
     })();
     if let Err(e) = r {
-        let v = thrown(vm, e)?;
-        vm.call_b(reject, Value::UNDEFINED, &[v])?.take();
+        let sc_v = Scope::new(vm);
+        let v = thrown(vm, e)?.root(&sc_v);
+        vm.call_b(reject, Value::UNDEFINED, &[v.peek()])?.take();
     }
     Ok(Value::UNDEFINED)
 }
@@ -1420,7 +1471,8 @@ fn import_job(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
 fn import_done(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (m, resolve) = (slot(me, 0).as_i32_unchecked() as usize, slot(me, 1));
-    match namespace(vm, m) {
+    // take: given at once to `resolve`.
+    match namespace(vm, m).map(Fresh::take) {
         Ok(ns) => vm.call_b(resolve, Value::UNDEFINED, &[ns]).map(Fresh::take),
         Err(e) => Err(e),
     }
@@ -1437,8 +1489,9 @@ fn defer_done(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     if left > 0 {
         return Ok(Value::UNDEFINED);
     }
-    let ns = deferred_namespace(vm, m)?;
-    vm.call_b(resolve, Value::UNDEFINED, &[ns]).map(Fresh::take)
+    let sc_ns = Scope::new(vm);
+    let ns = deferred_namespace(vm, m)?.root(&sc_ns);
+    vm.call_b(resolve, Value::UNDEFINED, &[ns.peek()]).map(Fresh::take)
 }
 
 /// `%AbstractModuleSource%`: a constructor that always throws, whose
@@ -1483,7 +1536,12 @@ fn abstract_source_tag(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 
 /// `import.meta` of module `m`: an object of its own, with a null
 /// prototype, made once.
-pub(crate) fn import_meta(vm: &mut Vm, m: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn import_meta(vm: &mut Vm, m: Value) -> Result<Fresh<'_>> {
+    import_meta_raw(vm, m).map(Fresh::new)
+}
+
+fn import_meta_raw(vm: &mut Vm, m: Value) -> Result<Value> {
     let m = m.as_i32_unchecked() as usize;
     if rec(vm, m).meta.is_undefined() {
         let o = vm.mu().new_plain(Value::NULL);

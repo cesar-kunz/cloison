@@ -18,6 +18,7 @@
 //! ([`Vm::run_event_loop`]), between promise jobs ([`poll`]) and once
 //! they have run out.
 
+use crate::brand::Fresh;
 use crate::brand::{Args, Scope};
 use crate::raw::ObjectPtr;
 use std::alloc::Layout;
@@ -231,16 +232,18 @@ fn prune(vm: &mut Vm) -> Result<()> {
     // buffers rooted meanwhile: the old set holds them weakly.)
     vm.handle_scope(|vm| {
         vm.handles.extend_from_slice(&values);
-        let set = crate::collections::new_weak_set(vm)?;
-        vm.shared.live = set.ptr();
+        let sc_set = Scope::new(vm);
+        let set = crate::collections::new_weak_set(vm)?.root(&sc_set);
+        vm.shared.live = set.obj().ptr();
         for &v in &values {
-            crate::collections::weak_set_insert(vm, set, v)?;
+            crate::collections::weak_set_insert(vm, set.obj(), v)?;
         }
         if !vm.shared.growing.is_null() {
-            let set = crate::collections::new_weak_set(vm)?;
-            vm.shared.growing = set.ptr();
+            let sc_set = Scope::new(vm);
+            let set = crate::collections::new_weak_set(vm)?.root(&sc_set);
+            vm.shared.growing = set.obj().ptr();
             for v in values.into_iter().filter(|&v| is_resizable(Obj::of(v))) {
-                crate::collections::weak_set_insert(vm, set, v)?;
+                crate::collections::weak_set_insert(vm, set.obj(), v)?;
             }
         }
         Ok(())
@@ -249,16 +252,21 @@ fn prune(vm: &mut Vm) -> Result<()> {
 
 /// A shared buffer on block `b` (growable if `growable`), whose reference
 /// to it the VM takes over, even if this fails (#225).
-pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<Fresh<'_>> {
+    new_shared_raw(vm, b, growable).map(Fresh::new)
+}
+
+fn new_shared_raw(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<Value> {
     // (Before `b` is among the blocks: no buffer on it is in the set yet.
     // The sets made first too: once `b` is among the blocks, a failure
     // leaves it to the next pruning, which needs `live`.)
     let made = prune(vm).and_then(|()| {
         if vm.shared.live.is_null() {
-            vm.shared.live = (crate::collections::new_weak_set(vm)?).ptr();
+            vm.shared.live = (crate::collections::new_weak_set(vm)?).peek().ptr();
         }
         if growable && vm.shared.growing.is_null() {
-            vm.shared.growing = (crate::collections::new_weak_set(vm)?).ptr();
+            vm.shared.growing = (crate::collections::new_weak_set(vm)?).peek().ptr();
         }
         Ok(())
     });
@@ -285,7 +293,7 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
             o.obj().set_flags(o.obj().flags() | RESIZABLE);
             *Object::aux(o.obj().ptr()) = (*b).room as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o.obj().ptr()).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
+            (*o.obj().ptr()).code = object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code;
         }
     }
     let live = vm.shared.live;
@@ -489,7 +497,8 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::range_error("Array buffer allocation failed"));
     }
     let b = new_block(n, room).ok_or_else(|| Error::range_error("Array buffer allocation failed"))?;
-    let o = new_shared(vm, b, max.is_some())?;
+    // take: nothing collects before its last use.
+    let o = new_shared(vm, b, max.is_some())?.take();
     vm.set_prototype_of(Obj::of(o), proto);
     Ok(o)
 }
@@ -643,7 +652,7 @@ fn revalidate(o: Obj, i: usize) -> Result<()> {
 fn operand(vm: &mut Vm, k: TypedKind, v: Value) -> Result<(u64, Value)> {
     if k.is_big() {
         let v = crate::typed::to_element(vm, k, v)?;
-        return Ok((crate::bigint::to_bits(v), v));
+        return Ok((crate::bigint::to_bits(v.peek()), v.peek()));
     }
     let d = integer(vm, v)?;
     Ok((crate::interp::to_int32(d) as u32 as u64, Value::number(d)))
@@ -833,12 +842,12 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
     let (o, k, i) = access_shared(vm, arg(a, 0), arg(a, 1))?;
     let v = if k == TypedKind::I64 {
         let v = crate::typed::to_element(vm, k, arg(a, 2))?;
-        crate::bigint::to_bits(v)
+        crate::bigint::to_bits(v.peek())
     } else {
-        let d = crate::typed::to_element(vm, k, arg(a, 2))?.to_number();
+        let d = crate::typed::to_element(vm, k, arg(a, 2))?.peek().to_number();
         crate::interp::to_int32(d) as u32 as u64
     };
-    let q = crate::typed::to_element(vm, TypedKind::F64, arg(a, 3))?.to_number();
+    let q = crate::typed::to_element(vm, TypedKind::F64, arg(a, 3))?.peek().to_number();
     let t = if q.is_nan() { f64::INFINITY } else { q.max(0.0) };
     if !async_ && !can_block(vm) {
         return Err(Error::type_error("Atomics.wait: this agent can't block"));
@@ -856,21 +865,21 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
         drop(list);
         catch_up(vm);
         let s = str_value(vm, "not-equal");
-        return if async_ { wait_result(vm, false, s) } else { Ok(s) };
+        return if async_ { wait_result(vm, false, s).map(Fresh::take) } else { Ok(s) };
     }
     if async_ {
         if t == 0.0 {
             drop(list);
             catch_up(vm);
             let s = str_value(vm, "timed-out");
-            return wait_result(vm, false, s);
+            return wait_result(vm, false, s).map(Fresh::take);
         }
         let waiter = Waiter::new(block, index, deadline, vm.shared.signal.clone());
         list.push(waiter.clone());
         drop(list);
         let (p, resolve, _) = crate::promise::new_with_resolvers(vm);
         vm.shared.waits.push((waiter, p, resolve));
-        return wait_result(vm, true, p);
+        return wait_result(vm, true, p).map(Fresh::take);
     }
     let waiter = Waiter::new(block, index, deadline, Arc::new(Condvar::new()));
     list.push(waiter.clone());
@@ -910,7 +919,12 @@ fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(Obj, TypedKind
 }
 
 /// `{async, value}`: what `Atomics.waitAsync` returns.
-fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
+#[inline(always)]
+fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Fresh<'_>> {
+    wait_result_raw(vm, async_, value).map(Fresh::new)
+}
+
+fn wait_result_raw(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     let op = object_value(vm.object_prototype);
     // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let r = vm.mu().new_plain(op).obj();

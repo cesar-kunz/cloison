@@ -113,7 +113,12 @@ fn clear_regs(st: *mut Value, code: *const Code) {
 
 /// A new generator object for function `f`: its prototype `f.prototype`
 /// (or `%GeneratorPrototype%`).
-pub(crate) fn create(vm: &mut Vm, f: Obj) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn create(vm: &mut Vm, f: Obj) -> Result<Fresh<'_>> {
+    create_raw(vm, f).map(Fresh::new)
+}
+
+fn create_raw(vm: &mut Vm, f: Obj) -> Result<Value> {
     let a_prototype = vm.a_prototype;
     let p = vm.get_atom_b(object_value(f.ptr()), a_prototype)?;
     // (An async generator function's: kind 6, see `vm::Code::kind`.)
@@ -169,13 +174,14 @@ pub(crate) unsafe fn suspend(vm: &mut Vm, g: Value, regs: *mut Value, code: *con
 
 /// Resume generator `g` (`mode` [`NEXT`]…, with `v`): the iterator
 /// result.
-fn resume(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<Value> {
-    let (out, done) = resume_raw(vm, g, v, mode, what)?;
+#[inline(always)]
+fn resume<'v>(vm: &'v mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<Fresh<'v>> {
+    let (out, done) = resume_done(vm, g, v, mode, what)?;
     crate::symbol::iter_result(vm, out, done)
 }
 
 /// [`resume`]'s value and whether the generator is done.
-fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<(Value, bool)> {
+fn resume_done(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<(Value, bool)> {
     let Some(st) = state_of(g) else {
         return Err(Error::type_error(format!("{what} called on an incompatible receiver")));
     };
@@ -224,7 +230,7 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
 
 /// Run module generator `g` (see `module`) to its end.
 pub(crate) fn run_module(vm: &mut Vm, g: Value) -> Result<()> {
-    resume_raw(vm, g, Value::UNDEFINED, NEXT, "a module").map(drop)
+    resume_done(vm, g, Value::UNDEFINED, NEXT, "a module").map(drop)
 }
 
 /// Run function `f`'s code from offset `pc` in a frame of registers
@@ -262,7 +268,12 @@ unsafe fn run(vm: &mut Vm, f: Obj, saved: *mut Value, pc: usize, v: Value) -> Re
 
 /// An async function's coroutine `g` started: its promise, the
 /// coroutine run until it awaits or ends (see [`async_step`]).
-pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Fresh<'_>> {
+    async_start_raw(vm, g).map(Fresh::new)
+}
+
+fn async_start_raw(vm: &mut Vm, g: Value) -> Result<Value> {
     // (No resolving functions: only its end settles it, `async_step`.)
     let p = crate::promise::new_promise(vm);
     let st = state_of(g).unwrap();
@@ -288,7 +299,7 @@ pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     let held = Scope::new(vm);
     let _rooted = held.roots([g]);
     loop {
-        match resume_raw(vm, g, v, mode, "an async function") {
+        match resume_done(vm, g, v, mode, "an async function") {
             Ok((out, true)) => {
                 let p = get(vm, st, 5);
                 return crate::promise::resolve_own(vm, p, out);
@@ -326,7 +337,12 @@ pub(crate) fn async_gen_yield(vm: &mut Vm, g: Value) {
 /// `next(v)`, `throw(v)` or `return(v)` (`mode`) of async generator `g`: a
 /// promise for the iterator result, the request queued (and run unless
 /// one is).
-fn async_gen_enqueue(vm: &mut Vm, g: Value, v: Value, mode: i32) -> Result<Value> {
+#[inline(always)]
+fn async_gen_enqueue(vm: &mut Vm, g: Value, v: Value, mode: i32) -> Result<Fresh<'_>> {
+    async_gen_enqueue_raw(vm, g, v, mode).map(Fresh::new)
+}
+
+fn async_gen_enqueue_raw(vm: &mut Vm, g: Value, v: Value, mode: i32) -> Result<Value> {
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
     let st = match state_of(g) {
         Some(st) if is_async_generator(st) => st,
@@ -401,7 +417,7 @@ fn async_gen_step_rooted(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     } else {
         let (mut mode, mut v) = (mode, v);
         loop {
-            match resume_raw(vm, g, v, mode, "an async generator") {
+            match resume_done(vm, g, v, mode, "an async generator") {
                 Ok((out, false)) if get(vm, st, AG_YIELD) == Value::TRUE => {
                     set(vm, st, AG_YIELD, Value::FALSE);
                     break Ok((out, false));
@@ -420,12 +436,14 @@ fn async_gen_step_rooted(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     let (resolve, reject) = (qget(vm, q, 2), qget(vm, q, 3));
     let len = vm.length_of(q)? as i32;
     let rest: Vec<Value> = (REQUEST as i32..len).map(|i| qget(vm, q, i)).collect();
-    let rest = crate::array::new_array_of(vm, &rest)?;
-    set(vm, st, AG_QUEUE, rest);
+    let sc_rest = Scope::new(vm);
+    let rest = crate::array::new_array_of(vm, &rest)?.root(&sc_rest);
+    set(vm, st, AG_QUEUE, rest.peek());
     match settled {
         Ok((v, done)) => {
-            let r = crate::symbol::iter_result(vm, v, done)?;
-            vm.call_b(resolve, Value::UNDEFINED, &[r])?.take();
+            let sc_r = Scope::new(vm);
+            let r = crate::symbol::iter_result(vm, v, done)?.root(&sc_r);
+            vm.call_b(resolve, Value::UNDEFINED, &[r.peek()])?.take();
         }
         Err(reason) => {
             vm.call_b(reject, Value::UNDEFINED, &[reason])?.take();
@@ -435,15 +453,15 @@ fn async_gen_step_rooted(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
 }
 
 fn async_generator_next(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
-    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), NEXT)
+    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), NEXT).map(Fresh::take)
 }
 
 fn async_generator_return(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
-    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), RETURN)
+    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), RETURN).map(Fresh::take)
 }
 
 fn async_generator_throw(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
-    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), THROW)
+    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), THROW).map(Fresh::take)
 }
 
 fn return_this(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
@@ -460,15 +478,17 @@ pub(crate) fn mode(vm: &mut Vm, g: Value) -> Value {
 }
 
 fn generator_next(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
-    resume(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), NEXT, "Generator.prototype.next")
+    resume(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), NEXT, "Generator.prototype.next").map(Fresh::take)
 }
 
 fn generator_return(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     resume(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), RETURN, "Generator.prototype.return")
+        .map(Fresh::take)
 }
 
 fn generator_throw(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     resume(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), THROW, "Generator.prototype.throw")
+        .map(Fresh::take)
 }
 
 /// `%GeneratorPrototype%`: next, return, throw; its iterator itself.

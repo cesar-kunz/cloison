@@ -240,7 +240,12 @@ fn callback(a: &[Value], what: &str) -> Result<Value> {
 }
 
 /// A new array of length `n` (ArraySpeciesCreate without species).
-fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
+#[inline(always)]
+fn new_array_len(vm: &mut Vm, n: f64) -> Result<Fresh<'_>> {
+    new_array_len_raw(vm, n).map(Fresh::new)
+}
+
+fn new_array_len_raw(vm: &mut Vm, n: f64) -> Result<Value> {
     if n > u32::MAX as f64 {
         return Err(Error::range_error("Invalid array length"));
     }
@@ -261,10 +266,10 @@ fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Fresh<'_>> {
 
 fn species_create_raw(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
     if species_pristine(vm, original) {
-        return new_array_len(vm, n);
+        return new_array_len(vm, n).map(Fresh::take);
     }
     if !crate::proxy::is_array(vm, original)? {
-        return new_array_len(vm, n);
+        return new_array_len(vm, n).map(Fresh::take);
     }
     let a_constructor = vm.a_constructor;
     // (The constructor, maybe a getter's only, held across its realm's and
@@ -285,7 +290,7 @@ fn species_create_raw(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
     }
     let c = c.v();
     if c.is_undefined() || (c.is_cell() && as_object(c) == vm.array_fn) {
-        return new_array_len(vm, n);
+        return new_array_len(vm, n).map(Fresh::take);
     }
     if !crate::intrinsics::is_constructor(c) {
         return Err(Error::type_error("object.constructor[Symbol.species] is not a constructor"));
@@ -410,7 +415,12 @@ fn array_flat_map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 }
 
 /// A new array of `values`.
-pub(crate) fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn new_array_of<'v>(vm: &'v mut Vm, values: &[Value]) -> Result<Fresh<'v>> {
+    new_array_of_raw(vm, values).map(Fresh::new)
+}
+
+fn new_array_of_raw(vm: &mut Vm, values: &[Value]) -> Result<Value> {
     // take: only calls that don't collect follow (allocation, stores, filling it).
     let a = vm.mu().new_array().v();
     array_push(vm, a, values)?;
@@ -1488,7 +1498,7 @@ fn array_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let out = if crate::intrinsics::is_constructor(this) && !(this.is_cell() && as_object(this) == vm.array_fn) {
         vm.fresh(|vm| crate::intrinsics::construct(vm, this, &[Value::number(n)]))?.root(&sc).v()
     } else {
-        vm.fresh(|vm| new_array_len(vm, n))?.root(&sc).v()
+        new_array_len(vm, n)?.root(&sc).v()
     };
     for (i, &v) in a.iter().enumerate() {
         create(vm, out, i as f64, v)?;
@@ -1509,7 +1519,7 @@ fn array_from_async(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if vm.from_async_helper.is_undefined() {
         // (The maker and its natives, held across the call: rooted.)
         let sc = Scope::new(vm);
-        let make = vm.fresh(|vm| crate::builtins::run_source(vm, FROM_ASYNC))?.root(&sc);
+        let make = crate::builtins::run_source(vm, FROM_ASYNC)?.root(&sc);
         let mut natives = Vec::new();
         {
             for (name, f, n) in [
@@ -1662,13 +1672,13 @@ fn from_async_type_error(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 }
 
 fn from_async_sync_record(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
-    crate::symbol::sync_record(vm, arg(&a, 0))
+    crate::symbol::sync_record(vm, arg(&a, 0)).map(Fresh::take)
 }
 
 /// `syncStep(record, close)`: `next()`, or `return()` if `close`.
 fn from_async_sync_step(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let mode = if arg(&a, 1) == Value::TRUE { crate::generator::RETURN } else { crate::generator::NEXT };
-    crate::intrinsics::async_from_sync_call(vm, arg(&a, 0), None, mode)
+    crate::intrinsics::async_from_sync_call(vm, arg(&a, 0), None, mode).map(Fresh::take)
 }
 
 /// `syncDone(record)`: whether its step was done, undefined if its
@@ -1731,11 +1741,16 @@ fn array_from(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     }
     let sc = Scope::new(vm);
     let out = vm.mu().new_array().root(&sc);
-    array_from_list(vm, items, out.v(), mapfn, that)
+    array_from_list(vm, items, out.v(), mapfn, that).map(Fresh::take)
 }
 
 /// [`array_from`] of an array-like or string `items`, into `out`.
-fn array_from_list(vm: &mut Vm, items: Value, out: Value, mapfn: Value, that: Value) -> Result<Value> {
+#[inline(always)]
+fn array_from_list(vm: &mut Vm, items: Value, out: Value, mapfn: Value, that: Value) -> Result<Fresh<'_>> {
+    array_from_list_raw(vm, items, out, mapfn, that).map(Fresh::new)
+}
+
+fn array_from_list_raw(vm: &mut Vm, items: Value, out: Value, mapfn: Value, that: Value) -> Result<Value> {
     if let Some(u) = string_units(items) {
         let mut n = 0.0;
         let mut i = 0;

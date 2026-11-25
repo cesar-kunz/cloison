@@ -176,7 +176,12 @@ pub(crate) fn shares(o: Obj) -> bool {
 }
 
 /// A new buffer of `n` zero bytes (resizable up to `max` bytes, if given).
-pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Result<Obj> {
+#[inline(always)]
+pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Result<Fresh<'_, Obj>> {
+    new_buffer_max_raw(vm, n, max).map(Fresh::new)
+}
+
+fn new_buffer_max_raw(vm: &mut Vm, n: usize, max: Option<usize>) -> Result<Obj> {
     let room = max.unwrap_or(n);
     if n > MAX_BYTES || room > if max.is_some() { MAX_RESIZABLE } else { MAX_BYTES } {
         return Err(Error::range_error("Array buffer allocation failed"));
@@ -191,7 +196,7 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
             o.set_flags(o.flags() | RESIZABLE);
             *Object::aux(o.ptr()) = max as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o.ptr()).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
+            (*o.ptr()).code = object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code;
         }
     }
     Ok(o)
@@ -199,16 +204,22 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
 
 /// A `Uint8Array` of `bytes`, on an immutable buffer (a bytes module's
 /// value).
-pub(crate) fn immutable_bytes(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
-    let b = new_buffer_max(vm, bytes.len(), None)?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.elems().cast::<u8>(), bytes.len()) };
-    make_immutable(vm, b);
-    new_view(vm, TypedKind::U8, b, 0, Some(bytes.len()))
+#[inline(always)]
+pub(crate) fn immutable_bytes<'v>(vm: &'v mut Vm, bytes: &[u8]) -> Result<Fresh<'v>> {
+    immutable_bytes_raw(vm, bytes).map(Fresh::new)
+}
+
+fn immutable_bytes_raw(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
+    let sc_b = Scope::new(vm);
+    let b = new_buffer_max(vm, bytes.len(), None)?.root(&sc_b);
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.obj().elems().cast::<u8>(), bytes.len()) };
+    make_immutable(vm, b.obj());
+    new_view(vm, TypedKind::U8, b.obj(), 0, Some(bytes.len())).map(Fresh::take)
 }
 
 /// A new fixed-length buffer of `n` zero bytes.
 pub(crate) fn new_buffer(vm: &mut Vm, n: usize) -> Obj {
-    new_buffer_max(vm, n, None).expect("buffer too large")
+    new_buffer_max(vm, n, None).expect("buffer too large").take()
 }
 
 /// Record view `v` of resizable buffer `b` (see the module's docs).
@@ -296,7 +307,20 @@ pub(crate) fn view_byte_length(o: Obj) -> Option<usize> {
 
 /// A view (`class` `TypedArray` of kind `k`, or `DataView`) of `len`
 /// elements of `b` from byte `offset` (`None`: tracking its length).
+#[inline(always)]
 pub(crate) fn make_view(
+    vm: &mut Vm,
+    class: Class,
+    proto: Value,
+    k: TypedKind,
+    b: Obj,
+    offset: usize,
+    len: Option<usize>,
+) -> Result<Fresh<'_>> {
+    make_view_raw(vm, class, proto, k, b, offset, len).map(Fresh::new)
+}
+
+fn make_view_raw(
     vm: &mut Vm,
     class: Class,
     proto: Value,
@@ -413,7 +437,8 @@ pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
     }
 }
 
-fn new_view(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, len: Option<usize>) -> Result<Value> {
+#[inline(always)]
+fn new_view(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, len: Option<usize>) -> Result<Fresh<'_>> {
     let proto = object_value((vm.typed_prototypes[k as usize]).ptr());
     make_view(vm, Class::TypedArray, proto, k, b, offset, len)
 }
@@ -447,7 +472,8 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     }
     let c = vm.typed_constructors[TypedKind::ALL.len()];
     let proto = vm.take_new_target(c, object_value(vm.array_buffer_prototype))?;
-    let o = new_buffer_max(vm, n, max)?;
+    // take: nothing collects before its last use.
+    let o = new_buffer_max(vm, n, max)?.take();
     vm.set_prototype_of(o, proto);
     Ok(object_value(o.ptr()))
 }
@@ -564,11 +590,12 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
     if max.is_some_and(|m| n > m) {
         return Err(Error::range_error("ArrayBuffer.prototype.transfer: beyond maxByteLength"));
     }
-    let out = new_buffer_max(vm, n, max)?;
+    let sc_out = Scope::new(vm);
+    let out = new_buffer_max(vm, n, max)?.root(&sc_out);
     let count = n.min(b.elems_len() as usize);
-    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.elems().cast::<u8>(), count) };
+    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.obj().elems().cast::<u8>(), count) };
     detach(vm, b)?;
-    Ok(object_value(out.ptr()))
+    Ok(object_value(out.obj().ptr()))
 }
 
 /// `transferToImmutable(newLength)`: a new immutable buffer with the bytes
@@ -584,12 +611,13 @@ fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Va
             "ArrayBuffer.prototype.transferToImmutable: the buffer is detached or immutable",
         ));
     }
-    let out = new_buffer_max(vm, n, None)?;
+    let sc_out = Scope::new(vm);
+    let out = new_buffer_max(vm, n, None)?.root(&sc_out);
     let count = n.min(b.elems_len() as usize);
-    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.elems().cast::<u8>(), count) };
+    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.obj().elems().cast::<u8>(), count) };
     detach(vm, b)?;
-    make_immutable(vm, out);
-    Ok(object_value(out.ptr()))
+    make_immutable(vm, out.obj());
+    Ok(object_value(out.obj().ptr()))
 }
 
 /// `sliceToImmutable(start, end)`: a new immutable buffer with those
@@ -611,7 +639,8 @@ fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value
     if first + n > b.elems_len() as usize {
         return Err(Error::range_error("ArrayBuffer.prototype.sliceToImmutable: the buffer shrank"));
     }
-    let out = new_buffer_max(vm, n, None)?;
+    // take: nothing collects before its last use.
+    let out = new_buffer_max(vm, n, None)?.take();
     unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>().add(first), out.elems().cast::<u8>(), n) };
     make_immutable(vm, out);
     Ok(object_value(out.ptr()))
@@ -668,7 +697,12 @@ fn validate(vm: &mut Vm, v: Value) -> Result<(Obj, usize)> {
 
 /// `v` converted for an element of kind `k`: ToBigInt for a BigInt kind
 /// (a BigInt), else ToNumber (a number).
-pub(crate) fn to_element(vm: &mut Vm, k: TypedKind, v: Value) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn to_element(vm: &mut Vm, k: TypedKind, v: Value) -> Result<Fresh<'_>> {
+    to_element_raw(vm, k, v).map(Fresh::new)
+}
+
+fn to_element_raw(vm: &mut Vm, k: TypedKind, v: Value) -> Result<Value> {
     if k.is_big() {
         if crate::bigint::is_bigint(v) {
             return Ok(v);
@@ -701,7 +735,7 @@ fn put(o: Obj, i: usize, v: Value) {
 /// is within its length.
 fn set(vm: &mut Vm, o: Obj, i: usize, v: Value) -> Result<()> {
     let v = to_element(vm, kind_of(o), v)?;
-    put(o, i, v);
+    put(o, i, v.peek());
     Ok(())
 }
 
@@ -891,12 +925,17 @@ fn create_same(vm: &mut Vm, exemplar: Obj, n: usize) -> Result<Fresh<'_, Obj>> {
 }
 
 /// A new typed array of kind `k`, `n` zero elements.
-pub(crate) fn allocate(vm: &mut Vm, k: TypedKind, n: usize) -> Result<Value> {
+#[inline(always)]
+pub(crate) fn allocate(vm: &mut Vm, k: TypedKind, n: usize) -> Result<Fresh<'_>> {
+    allocate_raw(vm, k, n).map(Fresh::new)
+}
+
+fn allocate_raw(vm: &mut Vm, k: TypedKind, n: usize) -> Result<Value> {
     if n.checked_mul(k.size()).is_none_or(|b| b > MAX_BYTES) {
         return Err(Error::range_error(format!("Invalid typed array length: {n}")));
     }
     let b = new_buffer(vm, n * k.size());
-    new_view(vm, k, b, 0, Some(n))
+    new_view(vm, k, b, 0, Some(n)).map(Fresh::take)
 }
 
 /// `new X(length)`, `new X(typedArray)`, `new X(buffer, byteOffset,
@@ -909,7 +948,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Valu
     let first = arg(&a, 0);
     if !is_object(first) {
         let n = to_index(vm, first)?;
-        return allocate(vm, k, n);
+        return allocate(vm, k, n).map(Fresh::take);
     }
     let fo = Obj::of(first);
     match fo.class() {
@@ -926,19 +965,19 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Valu
                 )));
             }
             let out = allocate(vm, k, n)?;
-            let o = Obj::of(out);
+            let o = Obj::of(out.peek());
             if sk == k {
                 // (Its bytes, as they are.)
                 let (from, to) = (fo.elems().cast::<u8>(), o.elems().cast::<u8>());
                 unsafe { crate::racy::copy_if(shares(fo), from, to, n * k.size()) };
-                return Ok(out);
+                return Ok(out.peek());
             }
             // (Converted and stored where nothing collects.)
             for i in 0..n {
                 let v = unsafe { sk.load(fo.elems().cast(), i) };
                 unsafe { k.store_value(o.elems().cast(), i, v) };
             }
-            Ok(out)
+            Ok(out.peek())
         }
         Class::ArrayBuffer | Class::SharedArrayBuffer => {
             let offset = to_index(vm, arg(&a, 1))?;
@@ -951,7 +990,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Valu
             }
             let length = arg(&a, 2);
             let n = if length.is_undefined() { None } else { Some(to_index(vm, length)?) };
-            on_buffer(vm, k, fo, offset, n)
+            on_buffer(vm, k, fo, offset, n).map(Fresh::take)
         }
         _ => {
             let a_iter = vm.a_sym_iterator;
@@ -967,14 +1006,14 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Valu
                     // take: its values in vm.handles (iterate_with's).
                     let values = iterate_with(vm, first, m.peek())?.take();
                     let sc = Scope::new(vm);
-                    let out = vm.fresh(|vm| allocate(vm, k, values.len()))?.root(&sc).v();
+                    let out = allocate(vm, k, values.len())?.root(&sc).v();
                     set_all(vm, Obj::of(out), 0, &values)?;
                     Ok(out)
                 });
             }
             let n = vm.length_of_b(first)? as usize;
             let sc = Scope::new(vm);
-            let out = vm.fresh(|vm| allocate(vm, k, n))?.root(&sc).v();
+            let out = allocate(vm, k, n)?.root(&sc).v();
             set_from(vm, Obj::of(out), 0, first, n)?;
             Ok(out)
         }
@@ -985,7 +1024,12 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Valu
 /// of the element size), `n` elements (`None`: the rest, or tracking a
 /// resizable buffer's length): InitializeTypedArrayFromArrayBuffer's
 /// checks once its arguments are converted.
-fn on_buffer(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, n: Option<usize>) -> Result<Value> {
+#[inline(always)]
+fn on_buffer(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, n: Option<usize>) -> Result<Fresh<'_>> {
+    on_buffer_raw(vm, k, b, offset, n).map(Fresh::new)
+}
+
+fn on_buffer_raw(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, n: Option<usize>) -> Result<Value> {
     let size = k.size();
     if is_detached(b) {
         return Err(Error::type_error("Cannot construct a typed array on a detached ArrayBuffer"));
@@ -1015,7 +1059,7 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: Obj, offset: usize, n: Option<usize>)
             Some(n)
         }
     };
-    new_view(vm, k, b, offset, len)
+    new_view(vm, k, b, offset, len).map(Fresh::take)
 }
 
 /// The values of iterating `v` with its `@@iterator` method `m` (rooted
@@ -1033,18 +1077,19 @@ fn iterate_with_raw(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
     }
     // (Pushed into `vm.handles`, the caller's handle scope's: the values
     // outlive this function, read from the `Vec` while no cell moves.)
-    let sc_it = Scope::new(vm);
-    let it = vm.call_b(m, v, &[])?.root(&sc_it);
-    if !is_object(it.peek()) {
+    // (No Scope here: its end would drop them.)
+    // take: pushed to vm.handles after the check.
+    let it = vm.call_b(m, v, &[])?.take();
+    if !is_object(it) {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
     }
-    vm.handles.push(it.peek());
+    vm.handles.push(it);
     let a_next = vm.intern_name("next");
-    let sc_next = Scope::new(vm);
-    let next = vm.get_atom_b(it.peek(), a_next)?.root(&sc_next);
-    vm.handles.push(next.peek());
+    // take: pushed to vm.handles on the next line.
+    let next = vm.get_atom_b(it, a_next)?.take();
+    vm.handles.push(next);
     let mut out = Vec::new();
-    while let Some(x) = vm.step_b(it.peek(), next.peek())?.take() {
+    while let Some(x) = vm.step_b(it, next)?.take() {
         vm.handles.push(x);
         out.push(x);
     }
@@ -1262,7 +1307,7 @@ fn typed_fill(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     writable_view(o)?;
     // (A BigInt held across the conversions: rooted.)
     let sc = Scope::new(vm);
-    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(&a, 0)))?.root(&sc);
+    let v = to_element(vm, kind_of(o), arg(&a, 0))?.root(&sc);
     let s = relative(integer(vm, arg(&a, 1))?, len);
     let end = arg(&a, 2);
     let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
@@ -1666,7 +1711,7 @@ fn typed_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let i = if r >= 0.0 { r } else { len as f64 + r };
     // (The value, maybe a new BigInt, held across the new array's making.)
     let sc = Scope::new(vm);
-    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(&a, 1)))?.root(&sc);
+    let v = to_element(vm, kind_of(o), arg(&a, 1))?.root(&sc);
     if !(i >= 0.0 && ta_length(o).is_some_and(|n| i < n as f64)) {
         return Err(Error::range_error("Invalid typed array index"));
     }
@@ -1697,7 +1742,7 @@ fn typed_subarray(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc_c = Scope::new(vm);
     let c = species_constructor(vm, this, default)?.root(&sc_c);
     if c.peek() == default {
-        return on_buffer(vm, k, b, begin, n);
+        return on_buffer(vm, k, b, begin, n).map(Fresh::take);
     }
     let mut args = vec![object_value(b.ptr()), Value::number(begin as f64)];
     args.extend(n.map(|n| Value::number(n as f64)));
@@ -1737,7 +1782,7 @@ fn typed_to_locale_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value
 /// over a typed array in bounds.
 fn typed_iterator<const K: i32>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     validate(vm, this)?;
-    crate::symbol::array_iterator(vm, this, K)
+    crate::symbol::array_iterator(vm, this, K).map(Fresh::take)
 }
 
 /// `%TypedArray%.prototype.values`, `[@@iterator]` too (one function,

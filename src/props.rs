@@ -925,7 +925,7 @@ impl Vm {
                             }
                             let kind = crate::object::TypedKind::from_u8(o.kind());
                             let v = crate::typed::to_element(self, kind, full.value.unwrap())?;
-                            kind.store_value(o.elems().cast(), i as usize, v);
+                            kind.store_value(o.elems().cast(), i as usize, v.peek());
                             return Ok(true);
                         }
                         _ => {}
@@ -1751,7 +1751,12 @@ fn object_get_own_property_descriptor(vm: &mut Vm, _: Value, a: Args<'_>) -> Res
 }
 
 /// An array of `o`'s own keys (`all`: including the non-enumerable).
-fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
+#[inline(always)]
+fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Fresh<'_>> {
+    keys_array_raw(vm, o, all).map(Fresh::new)
+}
+
+fn keys_array_raw(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
     // (A proxy's through its traps.)
     if vm.proxies_exist && crate::proxy::is_proxy(vm, o) {
         let keys = if all {
@@ -1761,7 +1766,7 @@ fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
             crate::proxy::enumerable_own_keys(vm, o)?
         };
         let values: Vec<Value> = keys.into_iter().map(|k| vm.key_string(k)).collect();
-        return crate::array::new_array_of(vm, &values);
+        return crate::array::new_array_of(vm, &values).map(Fresh::take);
     }
     if vm.plain_named(o) {
         let slots = vm.listed_slots(o, all, false).unwrap_or_default();
@@ -1795,14 +1800,14 @@ fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
 fn object_get_own_property_names(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // take: given at once to the next call.
     let o = vm.to_obj_b(arg(&a, 0))?.take();
-    keys_array(vm, o, true)
+    keys_array(vm, o, true).map(Fresh::take)
 }
 
 /// `Object.keys(o)`: its own enumerable keys.
 fn object_keys(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // take: given at once to the next call.
     let o = vm.to_obj_b(arg(&a, 0))?.take();
-    keys_array(vm, o, false)
+    keys_array(vm, o, false).map(Fresh::take)
 }
 
 /// `Object.getPrototypeOf(o)`.
@@ -2201,12 +2206,13 @@ fn object_is_prototype_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value
     let o = Obj::of(vm.to_object_b(this)?.root(&sc).v());
     // (Each step V.[[GetPrototypeOf]](), 20.1.3.3: a proxy's trap runs.)
     let mut hops = 0;
-    let mut p = crate::proxy::walk_prototype(vm, Obj::of(v), &mut hops)?;
-    while p.is_cell() {
-        if as_object(p) == o.ptr() {
+    let sc_p = Scope::new(vm);
+    let p = crate::proxy::walk_prototype(vm, Obj::of(v), &mut hops)?.root(&sc_p);
+    while p.peek().is_cell() {
+        if as_object(p.peek()) == o.ptr() {
             return Ok(Value::TRUE);
         }
-        p = crate::proxy::walk_prototype(vm, Obj::of(p), &mut hops)?;
+        p.set(crate::proxy::walk_prototype(vm, Obj::of(p.peek()), &mut hops)?.take());
     }
     Ok(Value::FALSE)
 }

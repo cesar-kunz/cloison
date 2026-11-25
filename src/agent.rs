@@ -229,7 +229,9 @@ fn run_agent_vm(mut vm: Vm, src: &[u16], mailbox: &Mailbox, reports: Reports) {
             // (The new buffer's length is read seq-cst, after the message:
             // a catch-up for both, after the read, as by `read_length`; for
             // the message alone if no buffer was made.)
-            let sab = crate::shared::new_shared(vm, m.block as *mut crate::shared::Block, m.growable);
+            // take: pushed to vm.handles below; the catch-up between doesn't
+            // collect.
+            let sab = crate::shared::new_shared(vm, m.block as *mut crate::shared::Block, m.growable).map(Fresh::take);
             crate::shared::catch_up(vm);
             let sab = sab?;
             vm.handles.push(sab);

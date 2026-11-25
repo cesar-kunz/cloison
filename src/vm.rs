@@ -4,7 +4,7 @@
 //! The interpreter reaches it through each frame's header (see
 //! `src/interp.rs`), which holds the frame's [`Code`] and the `Vm`.
 
-use crate::brand::Args;
+use crate::brand::{Args, Fresh};
 use crate::object::Obj;
 use crate::raw::{Live, ObjectPtr};
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -4363,7 +4363,7 @@ impl Vm {
         // value converted, then nothing.)
         if self.typed_numeric(o, name) {
             let kind = crate::object::TypedKind::from_u8(o.kind());
-            crate::typed::to_element(self, kind, value)?;
+            crate::typed::to_element(self, kind, value)?.take();
             return Ok(());
         }
         if self.read_only(o, name) {
@@ -5099,7 +5099,8 @@ impl Vm {
         let mut o = Obj::of(v);
         let mut hops = 0;
         loop {
-            let proto = crate::proxy::walk_prototype(self, o, &mut hops)?;
+            // take: kept in `self.handles[slot]` before the next walk.
+            let proto = crate::proxy::walk_prototype(self, o, &mut hops)?.take();
             if !proto.is_cell() {
                 return Ok(false);
             }
@@ -5832,7 +5833,7 @@ impl Vm {
                     let kind = crate::object::TypedKind::from_u8(o.kind());
                     let v = crate::typed::to_element(self, kind, value)?;
                     if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
-                        kind.store_value(o.elems().cast(), i as usize, v);
+                        kind.store_value(o.elems().cast(), i as usize, v.peek());
                     }
                     return Ok(());
                 }
@@ -7200,7 +7201,7 @@ impl Vm {
         if crate::props::is_object(p) {
             return Ok(p);
         }
-        crate::realm::default_proto(self, nt, default)
+        crate::realm::default_proto(self, nt, default).map(Fresh::take)
     }
 
     /// Whether the native now called was called by `new`, taken: a

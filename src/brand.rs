@@ -80,6 +80,19 @@
 //! # Ok(n) }
 //! ```
 //!
+//! A native called with arguments no frame roots (they go through
+//! `Vm::with_args`, which puts them in the VM stack):
+//!
+//! ```compile_fail,E0308
+//! # use cloison::{brand::Args, vm::Vm, value::Value};
+//! fn native(_: &mut Vm, _: Value, a: Args<'_>) -> cloison::vm::Result<Value> {
+//!     Ok(a.first().copied().unwrap_or(Value::UNDEFINED))
+//! }
+//! # fn f(vm: &mut Vm, x: Value) -> cloison::vm::Result<Value> {
+//! native(vm, Value::UNDEFINED, &[x])
+//! # }
+//! ```
+//!
 //! A handle outliving its scope:
 //!
 //! ```compile_fail,E0597
@@ -401,7 +414,79 @@ impl Handle<'_> {
 }
 
 /// The calls that may collect, their results branded ([`Fresh`]).
+/// A native's arguments: rooted while it runs, in the VM stack (where
+/// the dispatch put them) or in `vm.handles` with no cell moving. So they
+/// are safe across any call the native makes, and passed on as they are.
+/// Only the dispatch and [`Vm::with_args`] make them: a Rust caller's
+/// `&[x, y]` given to a native directly doesn't compile, where it was
+/// once a slice no collection saw.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Args<'s>(&'s [Value]);
+
+impl<'s> Args<'s> {
+    /// No arguments.
+    pub const NONE: Args<'static> = Args(&[]);
+
+    /// `a` as a native's arguments.
+    ///
+    /// # Safety
+    ///
+    /// Every value of `a` stays rooted for `'s`: `a` lies in the VM stack
+    /// (a frame's arguments), or its values are in `vm.handles` with no
+    /// cell moving meanwhile, or none is a cell.
+    #[inline(always)]
+    pub unsafe fn rooted(a: &'s [Value]) -> Args<'s> {
+        Args(a)
+    }
+
+    /// The arguments as a slice, for as long as they are rooted.
+    #[inline(always)]
+    pub fn slice(self) -> &'s [Value] {
+        self.0
+    }
+
+    /// Arguments `from..` (`apply`'s rest, a bound function's): rooted as
+    /// these are.
+    #[inline(always)]
+    pub fn from(self, from: usize) -> Args<'s> {
+        Args(self.0.get(from..).unwrap_or(&[]))
+    }
+}
+
+impl<'s> IntoIterator for Args<'s> {
+    type Item = &'s Value;
+    type IntoIter = std::slice::Iter<'s, Value>;
+    #[inline(always)]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl std::ops::Deref for Args<'_> {
+    type Target = [Value];
+    #[inline(always)]
+    fn deref(&self) -> &[Value] {
+        self.0
+    }
+}
+
 impl Vm {
+    /// Run `f` with `args` rooted as a native's arguments ([`Args`]):
+    /// copied to the VM stack's free top, unless they are there already
+    /// (see [`crate::interp::with_args_on_stack`]). What a Rust caller
+    /// gives a native it calls directly.
+    #[inline(always)]
+    pub(crate) fn with_args(
+        &mut self,
+        args: &[Value],
+        f: impl FnOnce(&mut Vm, Args<'_>) -> Result<Value>,
+    ) -> Result<Value> {
+        // SAFETY: `with_args_on_stack` gives `f` its arguments in the VM
+        // stack, or in `vm.handles` with no cell moving.
+        crate::interp::with_args_on_stack(self, args, |vm, a| f(vm, unsafe { Args::rooted(a) }))
+    }
+
     /// What `f`, a call that may collect, returns, branded: a module's own
     /// calls, which have no `*_b` form here.
     #[inline(always)]

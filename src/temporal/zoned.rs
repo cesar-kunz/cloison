@@ -6,6 +6,7 @@ use super::fields::{self, Field, Required};
 use super::iso::{self, DateTime, RoundingMode, Unit};
 use super::plain::{self, date_getter, time_getter};
 use super::*;
+use crate::brand::Args;
 use crate::object::Obj;
 
 /// ToBigInt of `v`, as an exact time in range (a RangeError if not).
@@ -42,19 +43,19 @@ pub(crate) fn create_instant(vm: &mut Vm, ns: i128) -> Result<Value> {
     Ok(create(vm, Slots::Instant(check_epoch_ns(ns)?)))
 }
 
-fn instant_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn instant_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(type_err("Constructor Temporal.Instant requires 'new'"));
     }
-    let ns = to_epoch_ns(vm, arg(a, 0))?;
+    let ns = to_epoch_ns(vm, arg(&a, 0))?;
     create_instant(vm, ns)
 }
 
-fn instant_epoch_ms(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn instant_epoch_ms(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(epoch_ms(this_instant(this)?))
 }
 
-fn instant_epoch_ns(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn instant_epoch_ns(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
     Ok(bigint_of(vm, ns))
 }
@@ -74,12 +75,12 @@ fn instant_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) -> Re
     create_instant(vm, r)
 }
 
-fn instant_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    instant_add_impl(vm, this, a, false)
+fn instant_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    instant_add_impl(vm, this, &a, false)
 }
 
-fn instant_subtract(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    instant_add_impl(vm, this, a, true)
+fn instant_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    instant_add_impl(vm, this, &a, true)
 }
 
 /// DifferenceTemporalInstant.
@@ -96,12 +97,12 @@ fn instant_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Res
     Ok(duration::create_duration(vm, r))
 }
 
-fn instant_until(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    instant_difference(vm, this, a, false)
+fn instant_until(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    instant_difference(vm, this, &a, false)
 }
 
-fn instant_since(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    instant_difference(vm, this, a, true)
+fn instant_since(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    instant_difference(vm, this, &a, true)
 }
 
 /// `round(roundTo)`'s options: a string the smallest unit.
@@ -118,9 +119,9 @@ fn round_options(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     options_object(vm, v)
 }
 
-fn instant_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn instant_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
-    let o = round_options(vm, arg(a, 0), "smallestUnit")?;
+    let o = round_options(vm, arg(&a, 0), "smallestUnit")?;
     // (`o`, maybe made here, rooted while its options are read.)
     let _rooted = vm.root_scope(&[o]);
     let increment = rounding_increment(vm, o)?;
@@ -134,9 +135,9 @@ fn instant_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     create_instant(vm, r)
 }
 
-fn instant_equals(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn instant_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
-    let other = fields::to_instant(vm, arg(a, 0))?;
+    let other = fields::to_instant(vm, arg(&a, 0))?;
     Ok(Value::from_bool(ns == other))
 }
 
@@ -152,9 +153,9 @@ fn instant_string(vm: &Vm, ns: i128, z: Option<u32>, precision: iso::Precision) 
     }
 }
 
-fn instant_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn instant_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
-    let o = options_object(vm, arg(a, 0))?;
+    let o = options_object(vm, arg(&a, 0))?;
     let digits = fractional_digits(vm, o)?;
     let mode = rounding_mode(vm, o, RoundingMode::Trunc)?;
     let smallest = unit_option(vm, o, "smallestUnit", false)?;
@@ -170,20 +171,20 @@ fn instant_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(string(vm, &s))
 }
 
-fn instant_to_json(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn instant_to_json(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
     let s = instant_string(vm, ns, None, iso::Precision::Auto);
     Ok(string(vm, &s))
 }
 
-fn instant_to_zoned(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn instant_to_zoned(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let ns = this_instant(this)?;
-    let z = to_time_zone(vm, arg(a, 0))?;
+    let z = to_time_zone(vm, arg(&a, 0))?;
     create_zoned(vm, ns, z)
 }
 
-fn instant_from_epoch_ms(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let ms = number(vm, arg(a, 0))?;
+fn instant_from_epoch_ms(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let ms = number(vm, arg(&a, 0))?;
     if !ms.is_finite() || ms.trunc() != ms {
         return Err(range("epoch milliseconds must be an integer"));
     }
@@ -193,19 +194,19 @@ fn instant_from_epoch_ms(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     create_instant(vm, ms as i128 * 1_000_000)
 }
 
-fn instant_from_epoch_ns(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let ns = to_epoch_ns(vm, arg(a, 0))?;
+fn instant_from_epoch_ns(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let ns = to_epoch_ns(vm, arg(&a, 0))?;
     create_instant(vm, ns)
 }
 
-fn instant_from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let ns = fields::to_instant(vm, arg(a, 0))?;
+fn instant_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let ns = fields::to_instant(vm, arg(&a, 0))?;
     create_instant(vm, ns)
 }
 
-fn instant_compare(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let one = fields::to_instant(vm, arg(a, 0))?;
-    let two = fields::to_instant(vm, arg(a, 1))?;
+fn instant_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let one = fields::to_instant(vm, arg(&a, 0))?;
+    let two = fields::to_instant(vm, arg(&a, 1))?;
     Ok(Value::from_i32(one.cmp(&two) as i32))
 }
 
@@ -250,14 +251,14 @@ pub(crate) fn create_zoned(vm: &mut Vm, ns: i128, z: u32) -> Result<Value> {
     Ok(create(vm, Slots::Zoned(check_epoch_ns(ns)?, z)))
 }
 
-fn zoned_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn zoned_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(type_err("Constructor Temporal.ZonedDateTime requires 'new'"));
     }
-    let b = crate::bigint::to_bigint(vm, arg(a, 0))?;
-    let id = require_string(arg(a, 1))?;
+    let b = crate::bigint::to_bigint(vm, arg(&a, 0))?;
+    let id = require_string(arg(&a, 1))?;
     let z = time_zone_from_identifier(vm, &id)?;
-    let c = arg(a, 2);
+    let c = arg(&a, 2);
     if !c.is_undefined() {
         canonicalize_calendar(&require_string(c)?)?;
     }
@@ -268,22 +269,22 @@ fn zoned_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
 }
 
-fn zoned_time_zone_id(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_time_zone_id(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (_, z) = this_zoned(this)?;
     let id = zone(vm, z).id.clone();
     Ok(string(vm, &id))
 }
 
-fn zoned_epoch_ms(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_epoch_ms(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(epoch_ms(this_zoned(this)?.0))
 }
 
-fn zoned_epoch_ns(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_epoch_ns(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, _) = this_zoned(this)?;
     Ok(bigint_of(vm, ns))
 }
 
-fn zoned_hours_in_day(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_hours_in_day(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let today = zone(vm, z).date_time_at(ns).date;
     let tomorrow = iso::add_days(today, 1);
@@ -292,20 +293,20 @@ fn zoned_hours_in_day(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(Value::number(iso::fdiv(b - a, Unit::Hour.nanos())))
 }
 
-fn zoned_offset_ns(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_offset_ns(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     Ok(Value::number(zone(vm, z).offset_ns(ns) as f64))
 }
 
-fn zoned_offset(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_offset(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let s = iso::offset_string(zone(vm, z).offset_ns(ns));
     Ok(string(vm, &s))
 }
 
-fn zoned_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let item = arg(a, 0);
+    let item = arg(&a, 0);
     plain::reject_temporal_like(vm, item)?;
     let off = zone(vm, z).offset_ns(ns);
     let dt = zone(vm, z).date_time_at(ns);
@@ -316,7 +317,7 @@ fn zoned_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         fields::DATE_FIELDS.iter().chain(fields::TIME_FIELDS).copied().chain([Field::Offset]).collect();
     let partial = fields::prepare(vm, item, &which, Required::Partial)?;
     let merged = fields::merge(&base, &partial);
-    let o = options_object(vm, arg(a, 1))?;
+    let o = options_object(vm, arg(&a, 1))?;
     let d = disambiguation(vm, o)?;
     let offset_opt = offset_option(vm, o, OffsetOption::Prefer)?;
     let ov = overflow(vm, o)?;
@@ -327,10 +328,10 @@ fn zoned_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     create_zoned(vm, r, z)
 }
 
-fn zoned_with_plain_time(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_with_plain_time(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let date = zone(vm, z).date_time_at(ns).date;
-    let t = arg(a, 0);
+    let t = arg(&a, 0);
     let r = if t.is_undefined() {
         start_of_day(vm, z, date)?
     } else {
@@ -340,15 +341,15 @@ fn zoned_with_plain_time(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
     create_zoned(vm, r, z)
 }
 
-fn zoned_with_time_zone(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_with_time_zone(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, _) = this_zoned(this)?;
-    let z = to_time_zone(vm, arg(a, 0))?;
+    let z = to_time_zone(vm, arg(&a, 0))?;
     create_zoned(vm, ns, z)
 }
 
-fn zoned_with_calendar(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_with_calendar(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    to_calendar(vm, arg(a, 0))?;
+    to_calendar(vm, arg(&a, 0))?;
     create_zoned(vm, ns, z)
 }
 
@@ -365,12 +366,12 @@ fn zoned_add_impl(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) -> Resu
     create_zoned(vm, r, z)
 }
 
-fn zoned_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    zoned_add_impl(vm, this, a, false)
+fn zoned_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    zoned_add_impl(vm, this, &a, false)
 }
 
-fn zoned_subtract(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    zoned_add_impl(vm, this, a, true)
+fn zoned_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    zoned_add_impl(vm, this, &a, true)
 }
 
 /// DifferenceTemporalZonedDateTime.
@@ -400,17 +401,17 @@ fn zoned_difference(vm: &mut Vm, this: Value, a: &[Value], since: bool) -> Resul
     Ok(duration::create_duration(vm, r))
 }
 
-fn zoned_until(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    zoned_difference(vm, this, a, false)
+fn zoned_until(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    zoned_difference(vm, this, &a, false)
 }
 
-fn zoned_since(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    zoned_difference(vm, this, a, true)
+fn zoned_since(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    zoned_difference(vm, this, &a, true)
 }
 
-fn zoned_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let o = round_options(vm, arg(a, 0), "smallestUnit")?;
+    let o = round_options(vm, arg(&a, 0), "smallestUnit")?;
     // (`o`, maybe made here, rooted while its options are read.)
     let _rooted = vm.root_scope(&[o]);
     let increment = rounding_increment(vm, o)?;
@@ -451,9 +452,9 @@ fn zoned_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     create_zoned(vm, r, z)
 }
 
-fn zoned_equals(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_equals(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let (other, oz) = fields::to_zoned(vm, arg(a, 0), Value::UNDEFINED)?;
+    let (other, oz) = fields::to_zoned(vm, arg(&a, 0), Value::UNDEFINED)?;
     Ok(Value::from_bool(ns == other && zone(vm, z).equals(zone(vm, oz))))
 }
 
@@ -487,9 +488,9 @@ fn zoned_string(
     s + calendar_annotation(show_calendar)
 }
 
-fn zoned_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let o = options_object(vm, arg(a, 0))?;
+    let o = options_object(vm, arg(&a, 0))?;
     let show_calendar = show_calendar(vm, o)?;
     let digits = fractional_digits(vm, o)?;
     let show_offset = option(vm, o, "offset", &["auto", "never"], Some(0))? == 0;
@@ -505,22 +506,22 @@ fn zoned_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(string(vm, &s))
 }
 
-fn zoned_to_json(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_to_json(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let s = zoned_string(vm, ns, z, iso::Precision::Auto, 0, 0, true, None);
     Ok(string(vm, &s))
 }
 
-fn zoned_start_of_day(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_start_of_day(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let date = zone(vm, z).date_time_at(ns).date;
     let r = start_of_day(vm, z, date)?;
     create_zoned(vm, r, z)
 }
 
-fn zoned_transition(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn zoned_transition(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
-    let o = round_options(vm, arg(a, 0), "direction")?;
+    let o = round_options(vm, arg(&a, 0), "direction")?;
     // (`o`, maybe made here, rooted while its options are read.)
     let _rooted = vm.root_scope(&[o]);
     let next = option(vm, o, "direction", &["next", "previous"], None)? == 0;
@@ -532,37 +533,37 @@ fn zoned_transition(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
 }
 
-fn zoned_to_instant(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_to_instant(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, _) = this_zoned(this)?;
     create_instant(vm, ns)
 }
 
-fn zoned_to_plain_date(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_to_plain_date(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let d = zone(vm, z).date_time_at(ns).date;
     plain::create_date(vm, d)
 }
 
-fn zoned_to_plain_time(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_to_plain_time(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let t = zone(vm, z).date_time_at(ns).time;
     Ok(plain::create_time(vm, t))
 }
 
-fn zoned_to_plain_date_time(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn zoned_to_plain_date_time(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (ns, z) = this_zoned(this)?;
     let dt = zone(vm, z).date_time_at(ns);
     plain::create_date_time(vm, dt)
 }
 
-fn zoned_from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (ns, z) = fields::to_zoned(vm, arg(a, 0), arg(a, 1))?;
+fn zoned_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let (ns, z) = fields::to_zoned(vm, arg(&a, 0), arg(&a, 1))?;
     create_zoned(vm, ns, z)
 }
 
-fn zoned_compare(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (one, _) = fields::to_zoned(vm, arg(a, 0), Value::UNDEFINED)?;
-    let (two, _) = fields::to_zoned(vm, arg(a, 1), Value::UNDEFINED)?;
+fn zoned_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let (one, _) = fields::to_zoned(vm, arg(&a, 0), Value::UNDEFINED)?;
+    let (two, _) = fields::to_zoned(vm, arg(&a, 1), Value::UNDEFINED)?;
     Ok(Value::from_i32(one.cmp(&two) as i32))
 }
 
@@ -636,41 +637,41 @@ fn now_zone(vm: &mut Vm, v: Value) -> Result<u32> {
     if v.is_undefined() { Ok(system_time_zone(vm)) } else { to_time_zone(vm, v) }
 }
 
-fn now_instant(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn now_instant(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     create_instant(vm, system_ns())
 }
 
-fn now_time_zone_id(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn now_time_zone_id(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let z = system_time_zone(vm);
     let id = zone(vm, z).id.clone();
     Ok(string(vm, &id))
 }
 
-fn now_zoned(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let z = now_zone(vm, arg(a, 0))?;
+fn now_zoned(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let z = now_zone(vm, arg(&a, 0))?;
     create_zoned(vm, system_ns(), z)
 }
 
-fn now_date_time(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let z = now_zone(vm, arg(a, 0))?;
+fn now_date_time(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let z = now_zone(vm, arg(&a, 0))?;
     let dt = zone(vm, z).date_time_at(system_ns());
     plain::create_date_time(vm, dt)
 }
 
-fn now_date(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let z = now_zone(vm, arg(a, 0))?;
+fn now_date(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let z = now_zone(vm, arg(&a, 0))?;
     let dt = zone(vm, z).date_time_at(system_ns());
     plain::create_date(vm, dt.date)
 }
 
-fn now_time(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let z = now_zone(vm, arg(a, 0))?;
+fn now_time(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let z = now_zone(vm, arg(&a, 0))?;
     let dt = zone(vm, z).date_time_at(system_ns());
     Ok(plain::create_time(vm, dt.time))
 }
 
 /// `Date.prototype.toTemporalInstant()`.
-fn to_temporal_instant(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_temporal_instant(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let Some(t) = crate::date::date_value(this) else {
         return Err(type_err("Date.prototype.toTemporalInstant called on an incompatible receiver"));
     };

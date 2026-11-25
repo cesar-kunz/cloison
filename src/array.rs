@@ -3,7 +3,7 @@
 //! `props`), with fast paths over a plain array's elements. Installed by
 //! [`install`] (`push` is `vm::array_push`, which compiled code calls).
 
-use crate::brand::{Fresh, Handle, Scope};
+use crate::brand::{Args, Fresh, Handle, Scope};
 use crate::interp::{strict_equals, to_boolean, to_number, to_string_units};
 use crate::layout::swap_words;
 use crate::object::{Class, EXTERNAL, Obj, PROTOTYPE, as_object, object_value};
@@ -390,21 +390,21 @@ fn flatten(
     Ok(at)
 }
 
-fn array_flat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_flat(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let depth = if arg(a, 0).is_undefined() { 1.0 } else { to_integer(arg(a, 0)).max(0.0) };
+    let depth = if arg(&a, 0).is_undefined() { 1.0 } else { to_integer(arg(&a, 0)).max(0.0) };
     let out = species_create(vm, o, 0.0)?.root(&sc).v();
     flatten(vm, out, o, len, 0.0, depth, None)?;
     Ok(out)
 }
 
-fn array_flat_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_flat_map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let f = callback(a, "flatMap")?;
+    let f = callback(&a, "flatMap")?;
     let out = species_create(vm, o, 0.0)?.root(&sc).v();
-    flatten(vm, out, o, len, 0.0, 1.0, Some((f, arg(a, 1))))?;
+    flatten(vm, out, o, len, 0.0, 1.0, Some((f, arg(&a, 1))))?;
     Ok(out)
 }
 
@@ -438,8 +438,8 @@ fn create(vm: &mut Vm, o: Value, i: f64, v: Value) -> Result<()> {
     vm.create_data_property(o, key(i), v)
 }
 
-fn array_is_array(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
+fn array_is_array(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let v = arg(&a, 0);
     if vm.proxies_exist {
         return crate::proxy::is_array(vm, v).map(Value::from_bool);
     }
@@ -458,7 +458,7 @@ fn joining(vm: &Vm, o: Value) -> bool {
     h.len() > from + 1 && h[from..].windows(2).any(|w| w[0] == Value::HOLE && w[1] == o)
 }
 
-pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_join(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     // (A wrapper `o` held across the separator's conversion: rooted; from
     // the loop on, in the joins' marked handles.)
@@ -535,7 +535,7 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 
 /// `Array.prototype.toString()`: `join()`, or `Object.prototype.toString`
 /// where there is no callable `join`.
-pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let a_join = vm.intern_name("join");
     // (A wrapper `o` held across the getter: rooted.)
     let sc = Scope::new(vm);
@@ -546,12 +546,12 @@ pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
         return vm.call_b(f.peek(), o, &[]).map(Fresh::take);
     }
     // (The intrinsic, not whatever `Object.prototype.toString` is now.)
-    crate::builtins::object_to_string(vm, o, &[])
+    crate::builtins::object_to_string(vm, o, Args::NONE)
 }
 
 /// `Array.prototype.toLocaleString()`: each element's `toLocaleString()`,
 /// comma-separated.
-pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
     if joining(vm, o) {
@@ -592,12 +592,12 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> R
 }
 
 /// `Array.prototype.concat(…items)`: arrays spread, other values appended.
-fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_concat(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // (A wrapper `o`, and `out`, held across getters: rooted.)
     let sc = Scope::new(vm);
     let o = vm.to_object_b(this)?.root(&sc).v();
     let out = species_create(vm, o, 0.0)?.root(&sc).v();
-    concat_into(vm, o, out, a)?;
+    concat_into(vm, o, out, &a)?;
     Ok(out)
 }
 
@@ -668,7 +668,7 @@ fn concat_into(vm: &mut Vm, o: Value, out: Value, a: &[Value]) -> Result<()> {
 }
 
 /// `Array.prototype.pop()`.
-pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if this.is_cell() && dense(vm, Obj::of(this)) {
         let o = Obj::of(this);
         let len = o.elems_len() as usize;
@@ -695,7 +695,7 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
 }
 
 /// `Array.prototype.reverse()`, in place.
-pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
     if dense(vm, Obj::of(o)) {
@@ -749,7 +749,7 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
 }
 
 /// `Array.prototype.shift()`: the first element, the rest moved down.
-fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn array_shift(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
     if len == 0.0 {
@@ -790,7 +790,7 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `Array.prototype.unshift(…items)`: the items prepended; the length.
-fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_unshift(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
     let n = a.len() as f64;
@@ -801,18 +801,20 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if dense(vm, Obj::of(o)) {
             let obj = Obj::of(o);
             unsafe {
-                let m = obj.elems_len() as usize;
-                vm.reserve_elems(obj, m + a.len());
-                vm.heap.move_values(obj.elems(), obj.elems().add(a.len()), m);
+                let (m, k) = (obj.elems_len() as usize, a.len());
+                vm.reserve_elems(obj, m + k);
+                vm.heap.move_values(obj.elems(), obj.elems().add(k), m);
                 for (i, &v) in a.iter().enumerate() {
                     obj.clear_elem(i);
                     vm.store_element(obj, i, v);
                 }
-                obj.set_elems_len((m + a.len()) as u32);
-                // (Moved elements keep the shape's elements type.)
-                for i in a.len()..m + a.len() {
-                    let v = obj.elem(i);
-                    crate::heap::barrier(obj.elems().cast::<u8>().sub(8), obj.elems().add(i), v);
+                obj.set_elems_len((m + k) as u32);
+                // (Moved elements keep the shape's elements type. The
+                // elements stay where they are meanwhile, no allocation, and
+                // `i` is below `m + k`, the length just set.)
+                let e = obj.elems();
+                for i in k..m + k {
+                    crate::heap::barrier(e.cast::<u8>().sub(8), e.add(i), *e.add(i));
                 }
             }
             return Ok(Value::number(len + n));
@@ -837,11 +839,11 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Array.prototype.slice(start, end)`.
-fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let k = relative(arg(a, 0), len, 0.0);
-    let end = relative(arg(a, 1), len, len);
+    let k = relative(arg(&a, 0), len, 0.0);
+    let end = relative(arg(&a, 1), len, len);
     let count = (end - k).max(0.0);
     // (A plain array's result isn't given its length, of holes, to have
     // every one written over: the copy below sets it, or the loop's end.)
@@ -904,10 +906,10 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `Array.prototype.splice(start, deleteCount, …items)`: the removed
 /// elements, as an array.
-fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_splice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let start = relative(arg(a, 0), len, 0.0);
+    let start = relative(arg(&a, 0), len, 0.0);
     let (del, items): (f64, &[Value]) = match a.len() {
         0 => (0.0, &[]),
         1 => (len - start, &[]),
@@ -1010,8 +1012,8 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `Array.prototype.sort(compare)`: stable; `undefined`s last, holes
 /// after them.
-fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let cmp = arg(a, 0);
+fn array_sort(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let cmp = arg(&a, 0);
     if !cmp.is_undefined() && !is_callable(cmp) {
         return Err(Error::type_error("The comparison function must be either a function or undefined"));
     }
@@ -1124,10 +1126,10 @@ fn merge_sort(vm: &mut Vm, v: &mut [Value], after: &mut dyn FnMut(&mut Vm, Value
 }
 
 /// `Array.prototype.indexOf(x, from)`.
-pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let x = arg(a, 0);
+    let x = arg(&a, 0);
     if len == 0.0 {
         return Ok(Value::from_i32(-1));
     }
@@ -1165,10 +1167,10 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
 }
 
 /// `Array.prototype.lastIndexOf(x, from)`.
-pub(crate) fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_last_index_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let x = arg(a, 0);
+    let x = arg(&a, 0);
     if len == 0.0 {
         return Ok(Value::from_i32(-1));
     }
@@ -1192,10 +1194,10 @@ pub(crate) fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Resu
 
 /// `Array.prototype.includes(x, from)`: SameValueZero, holes as
 /// `undefined`.
-pub(crate) fn array_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_includes(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let x = arg(a, 0);
+    let x = arg(&a, 0);
     if len == 0.0 {
         return Ok(Value::FALSE);
     }
@@ -1273,48 +1275,48 @@ fn each_rooted(
     Ok(())
 }
 
-pub(crate) fn array_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_every(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let mut all = true;
-    each(vm, this, a, "every", |_, _, _, r| {
+    each(vm, this, &a, "every", |_, _, _, r| {
         all = to_boolean(r);
         Ok(all)
     })?;
     Ok(Value::from_bool(all))
 }
 
-pub(crate) fn array_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_some(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let mut any = false;
-    each(vm, this, a, "some", |_, _, _, r| {
+    each(vm, this, &a, "some", |_, _, _, r| {
         any = to_boolean(r);
         Ok(!any)
     })?;
     Ok(Value::from_bool(any))
 }
 
-pub(crate) fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    each(vm, this, a, "forEach", |_, _, _, _| Ok(true))?;
+pub(crate) fn array_for_each(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    each(vm, this, &a, "forEach", |_, _, _, _| Ok(true))?;
     Ok(Value::UNDEFINED)
 }
 
-fn array_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    callback(a, "map")?;
+    callback(&a, "map")?;
     let out = species_create(vm, o, len)?.root(&sc).v();
-    each(vm, o, a, "map", |vm, i, _, r| {
+    each(vm, o, &a, "map", |vm, i, _, r| {
         create(vm, out, i, r)?;
         Ok(true)
     })?;
     Ok(out)
 }
 
-fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_filter(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, _) = this_rooted(vm, &sc, this)?;
-    callback(a, "filter")?;
+    callback(&a, "filter")?;
     let out = species_create(vm, o, 0.0)?.root(&sc).v();
     let mut n = 0.0;
-    each(vm, this, a, "filter", |vm, _, v, r| {
+    each(vm, this, &a, "filter", |vm, _, v, r| {
         if to_boolean(r) {
             create(vm, out, n, v)?;
             n += 1.0;
@@ -1324,11 +1326,11 @@ fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(out)
 }
 
-pub(crate) fn array_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_find(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let f = callback(a, "find")?;
-    let that = arg(a, 1);
+    let f = callback(&a, "find")?;
+    let that = arg(&a, 1);
     let mut i = 0.0;
     while i < len {
         // take: the call's argument, alive in its frame; nothing collects after.
@@ -1342,11 +1344,11 @@ pub(crate) fn array_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
     Ok(Value::UNDEFINED)
 }
 
-pub(crate) fn array_find_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_find_index(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let f = callback(a, "findIndex")?;
-    let that = arg(a, 1);
+    let f = callback(&a, "findIndex")?;
+    let that = arg(&a, 1);
     let mut i = 0.0;
     while i < len {
         // take: the call's argument, alive in its frame; nothing collects after.
@@ -1406,21 +1408,21 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], right: bool) -> Result<Value> {
     Ok(acc.v())
 }
 
-pub(crate) fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    reduce(vm, this, a, false)
+pub(crate) fn array_reduce(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    reduce(vm, this, &a, false)
 }
 
-pub(crate) fn array_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    reduce(vm, this, a, true)
+pub(crate) fn array_reduce_right(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    reduce(vm, this, &a, true)
 }
 
 /// `Array.prototype.fill(v, start, end)`.
-fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_fill(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let mut k = relative(arg(a, 1), len, 0.0);
-    let end = relative(arg(a, 2), len, len);
-    let v = arg(a, 0);
+    let mut k = relative(arg(&a, 1), len, 0.0);
+    let end = relative(arg(&a, 2), len, len);
+    let v = arg(&a, 0);
     // A plain array's elements, holes too (nothing indexed above it to
     // see a store), written in place: the first takes the elements to a
     // type the value fits, the rest are it again.
@@ -1447,12 +1449,12 @@ fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Array.prototype.copyWithin(target, start, end)`.
-pub(crate) fn array_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_copy_within(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let mut to = relative(arg(a, 0), len, 0.0);
-    let mut from = relative(arg(a, 1), len, 0.0);
-    let end = relative(arg(a, 2), len, len);
+    let mut to = relative(arg(&a, 0), len, 0.0);
+    let mut from = relative(arg(&a, 1), len, 0.0);
+    let end = relative(arg(&a, 2), len, len);
     let mut count = (end - from).min(len - to);
     let dir = if from < to && to < from + count {
         from += count - 1.0;
@@ -1477,7 +1479,7 @@ pub(crate) fn array_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result
 }
 
 /// `Array.of(…items)`.
-fn array_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let n = a.len() as f64;
     // (A constructor's object may be a proxy, its traps run: rooted.)
     let sc = Scope::new(vm);
@@ -1501,7 +1503,7 @@ fn array_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// async JS helper, made on first use, runs the algorithm; what it calls
 /// it gets from here, not from globals or prototypes code may have
 /// replaced.
-fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_from_async(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if vm.from_async_helper.is_undefined() {
         // (The maker and its natives, held across the call: rooted.)
         let sc = Scope::new(vm);
@@ -1529,7 +1531,7 @@ fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         vm.from_async_helper = vm.call_b(make.v(), Value::UNDEFINED, &args)?.take();
     }
     let helper = vm.from_async_helper;
-    vm.call_b(helper, Value::UNDEFINED, &[this, arg(a, 0), arg(a, 1), arg(a, 2)]).map(Fresh::take)
+    vm.call_b(helper, Value::UNDEFINED, &[this, arg(&a, 0), arg(&a, 1), arg(&a, 2)]).map(Fresh::take)
 }
 
 /// `Array.fromAsync`'s algorithm (ECMA-262 §23.1.2.2), its steps as the
@@ -1636,53 +1638,53 @@ const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, s
   };
 })"#;
 
-fn from_async_is_constructor(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(crate::intrinsics::is_constructor(arg(a, 0))))
+fn from_async_is_constructor(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(crate::intrinsics::is_constructor(arg(&a, 0))))
 }
 
 /// `call(f, that, ...args)`: `f` called with `this` `that`.
-fn from_async_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    vm.call_b(arg(a, 0), arg(a, 1), a.get(2..).unwrap_or(&[])).map(Fresh::take)
+fn from_async_call(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    vm.call_b(arg(&a, 0), arg(&a, 1), a.get(2..).unwrap_or(&[])).map(Fresh::take)
 }
 
 /// `define(o, k, v)`: CreateDataPropertyOrThrow.
-fn from_async_define(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let key = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
-    vm.create_data_property(arg(a, 0), key, arg(a, 2))?;
+fn from_async_define(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let key = crate::intrinsics::to_property_key(vm, arg(&a, 1))?;
+    vm.create_data_property(arg(&a, 0), key, arg(&a, 2))?;
     Ok(Value::UNDEFINED)
 }
 
-fn from_async_type_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let m = to_string_units(arg(a, 0));
+fn from_async_type_error(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let m = to_string_units(arg(&a, 0));
     Err(Error::type_error(String::from_utf16_lossy(&m)))
 }
 
-fn from_async_sync_record(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    crate::symbol::sync_record(vm, arg(a, 0))
+fn from_async_sync_record(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    crate::symbol::sync_record(vm, arg(&a, 0))
 }
 
 /// `syncStep(record, close)`: `next()`, or `return()` if `close`.
-fn from_async_sync_step(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let mode = if arg(a, 1) == Value::TRUE { crate::generator::RETURN } else { crate::generator::NEXT };
-    crate::intrinsics::async_from_sync_call(vm, arg(a, 0), None, mode)
+fn from_async_sync_step(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let mode = if arg(&a, 1) == Value::TRUE { crate::generator::RETURN } else { crate::generator::NEXT };
+    crate::intrinsics::async_from_sync_call(vm, arg(&a, 0), None, mode)
 }
 
 /// `syncDone(record)`: whether its step was done, undefined if its
 /// promise gave an iterator result to read instead.
-fn from_async_sync_done(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    if crate::symbol::sync_result(arg(a, 0)) {
+fn from_async_sync_done(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    if crate::symbol::sync_result(arg(&a, 0)) {
         return Ok(Value::UNDEFINED);
     }
-    Ok(Value::from_bool(crate::symbol::sync_done(arg(a, 0))))
+    Ok(Value::from_bool(crate::symbol::sync_done(arg(&a, 0))))
 }
 
-fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let items = arg(a, 0);
-    let mapfn = arg(a, 1);
+fn array_from(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let items = arg(&a, 0);
+    let mapfn = arg(&a, 1);
     if !mapfn.is_undefined() && !is_callable(mapfn) {
         return Err(Error::type_error("Array.from: mapfn is not callable"));
     }
-    let that = arg(a, 2);
+    let that = arg(&a, 2);
     let custom = crate::intrinsics::is_constructor(this) && !(this.is_cell() && as_object(this) == vm.array_fn);
     // An iterable: its values (into `this`'s new object, if a constructor).
     if !items.is_undefined() && !items.is_null() {
@@ -1790,10 +1792,10 @@ pub(crate) fn apply_list(vm: &mut Vm, list: Value) -> Result<Vec<Value>> {
 }
 
 /// `at(i)`: element `i`, counted from the end if negative.
-pub(crate) fn array_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_at(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let n = to_integer(arg(a, 0));
+    let n = to_integer(arg(&a, 0));
     let k = if n < 0.0 { len + n } else { n };
     if k < 0.0 || k >= len {
         return Ok(Value::UNDEFINED);
@@ -1821,12 +1823,12 @@ fn find_last(vm: &mut Vm, this: Value, a: &[Value], index: bool) -> Result<Value
     Ok(if index { Value::from_i32(-1) } else { Value::UNDEFINED })
 }
 
-pub(crate) fn array_find_last(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    find_last(vm, this, a, false)
+pub(crate) fn array_find_last(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    find_last(vm, this, &a, false)
 }
 
-pub(crate) fn array_find_last_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    find_last(vm, this, a, true)
+pub(crate) fn array_find_last_index(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    find_last(vm, this, &a, true)
 }
 
 /// A new array of `len` elements, element `i` from `f(i)`.
@@ -1847,15 +1849,15 @@ fn array_from_fn(vm: &mut Vm, len: f64, mut f: impl FnMut(&mut Vm, f64) -> Resul
 }
 
 /// `toReversed()`: a reversed copy.
-fn array_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn array_to_reversed(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
     array_from_fn(vm, len, |vm, i| get(vm, o, len - 1.0 - i).map(Fresh::take))
 }
 
 /// `toSorted(compare)`: a sorted copy.
-fn array_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let cmp = arg(a, 0);
+fn array_to_sorted(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let cmp = arg(&a, 0);
     if !cmp.is_undefined() && !is_callable(cmp) {
         return Err(Error::type_error("The comparison function must be either a function or undefined"));
     }
@@ -1863,15 +1865,15 @@ fn array_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_rooted(vm, &sc, this)?;
     // (`this` to `array_sort`, held by Rust alone: rooted.)
     let out = vm.fresh(|vm| array_from_fn(vm, len, |vm, i| get(vm, o, i).map(Fresh::take)))?.root(&sc).v();
-    array_sort(vm, out, &[cmp])
+    vm.with_args(&[cmp], |vm, a| array_sort(vm, out, a))
 }
 
 /// `toSpliced(start, skipCount, ...items)`: a copy with the elements
 /// `splice` would remove replaced by the items.
-fn array_to_spliced(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_to_spliced(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let start = relative(arg(a, 0), len, 0.0);
+    let start = relative(arg(&a, 0), len, 0.0);
     let skip = match a.len() {
         0 => 0.0,
         1 => len - start,
@@ -1895,14 +1897,14 @@ fn array_to_spliced(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `with(i, v)`: a copy with element `i` (counted from the end if
 /// negative) `v`.
-fn array_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn array_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
     let (o, len) = this_rooted(vm, &sc, this)?;
-    let n = to_integer(arg(a, 0));
+    let n = to_integer(arg(&a, 0));
     let k = if n < 0.0 { len + n } else { n };
     if k < 0.0 || k >= len {
         return Err(Error::range_error("Invalid index"));
     }
-    let v = arg(a, 1);
+    let v = arg(&a, 1);
     array_from_fn(vm, len, |vm, i| if i == k { Ok(v) } else { get(vm, o, i).map(Fresh::take) })
 }

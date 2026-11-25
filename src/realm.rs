@@ -13,6 +13,7 @@
 //! through `interp::enter_compiled` (all codes' `calls_left` kept at 0),
 //! which compares realms, and the JIT is off.
 
+use crate::brand::Args;
 use crate::object::{Atom, Class, FieldType, Obj, Object, Shape, object_value};
 use crate::raw::{Live, ObjectPtr};
 use crate::value::Value;
@@ -437,7 +438,7 @@ pub(crate) fn default_proto(vm: &mut Vm, c: Value, default: Value) -> Result<Val
 }
 
 /// `$262.createRealm()`: a new realm's `$262`.
-pub(crate) fn host_create_realm(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn host_create_realm(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let r = create(vm);
     let a = vm.intern_name("$262");
     let g = intrinsic(vm, r, |vm| vm.global);

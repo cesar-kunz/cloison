@@ -4,7 +4,7 @@
 //! crosses as a wrapped function, which wraps what it is passed and what
 //! it returns the same way (and turns what is thrown into a `TypeError`).
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::object::{Class, Obj, Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, is_callable, is_object};
@@ -52,7 +52,7 @@ pub(crate) fn install(vm: &mut Vm) {
 }
 
 /// `new ShadowRealm()`: a new realm, its global object the host's.
-fn shadow_realm_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn shadow_realm_ctor(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor ShadowRealm requires 'new'"));
     }
@@ -82,9 +82,9 @@ fn realm_of(vm: &mut Vm, v: Value, what: &str) -> Result<u32> {
 
 /// `ShadowRealm.prototype.evaluate(sourceText)`: the script run in the
 /// realm, its result wrapped.
-fn evaluate(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn evaluate(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let r = realm_of(vm, this, "evaluate")?;
-    let Some(units) = string_units(arg(a, 0)) else {
+    let Some(units) = string_units(arg(&a, 0)) else {
         return Err(Error::type_error("ShadowRealm.prototype.evaluate requires a string"));
     };
     let src = crate::js::lex::Source::from_units(units);
@@ -191,7 +191,7 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
 /// A wrapped function's call (in its own realm): the target called in
 /// its realm with the arguments and `this` wrapped for it, the result
 /// wrapped back. Whatever is thrown is a `TypeError`.
-fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn wrapped_call(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let target = slot(vm.callee_obj(), 0);
     let r = (|| {
         let target_realm = crate::realm::function_realm(vm, target)?;
@@ -220,11 +220,11 @@ fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `ShadowRealm.prototype.importValue(specifier, exportName)`: a promise
 /// of the module's export, imported in the realm, wrapped.
-fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn import_value(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let r = realm_of(vm, this, "importValue")?;
     let sc = Scope::new(vm);
-    let spec = vm.to_string_b(arg(a, 0))?.root(&sc);
-    let name = arg(a, 1);
+    let spec = vm.to_string_b(arg(&a, 0))?.root(&sc);
+    let name = arg(&a, 1);
     if !is_string(name) {
         return Err(Error::type_error("ShadowRealm.prototype.importValue requires a string export name"));
     }
@@ -252,7 +252,7 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `importValue`'s module evaluated: its export, wrapped (none: a
 /// `TypeError`).
-fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn imported(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (m, name, resolve, reject) = (slot(me, 0), slot(me, 1), slot(me, 2), slot(me, 3));
     let r = (|| {
@@ -277,9 +277,9 @@ fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `importValue`'s module failed: a `TypeError`.
-fn import_failed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn import_failed(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let reject = slot(vm.callee_obj(), 0);
-    let e = Error::thrown(arg(a, 0));
+    let e = Error::thrown(arg(&a, 0));
     let m = thrown_message(vm, &e);
     let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));
     vm.call_b(reject, Value::UNDEFINED, &[v]).map(Fresh::take)

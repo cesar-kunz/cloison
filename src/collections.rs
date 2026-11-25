@@ -14,7 +14,7 @@
 //! collector doesn't trace (`heap::WEAK_VALUES`): it keeps the value of
 //! each entry whose key is live and clears the others (`Vm::ephemerons`).
 
-use crate::brand::{Handle, Scope};
+use crate::brand::{Args, Handle, Scope};
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{to_boolean, to_int32, to_number};
 use crate::jit::Ty;
@@ -626,40 +626,51 @@ fn new_iterator(vm: &mut Vm, o: Obj, mode: IterMode) -> Value {
 
 // ---- Map ----
 
-fn map_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    collection_ctor(vm, a, Class::Map, Proto::Map, "Map")
+fn map_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    collection_ctor(vm, &a, Class::Map, Proto::Map, "Map")
 }
 
-fn map_get(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn map_get(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.get")?;
-    Ok(find(o, arg(a, 0)).map_or(Value::UNDEFINED, |i| slot(entries(o), i + 1)))
+    Ok(map_get_of(o, arg(&a, 0)))
+}
+
+/// Map `o`'s value for `key`, or undefined.
+fn map_get_of(o: Obj, key: Value) -> Value {
+    find(o, key).map_or(Value::UNDEFINED, |i| slot(entries(o), i + 1))
 }
 
 /// `map.set(key, value)`: the map.
-fn map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn map_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.set")?;
-    let (k, v) = (normalize(arg(a, 0)), arg(a, 1));
-    match find(o, k) {
-        Some(i) => vm.set_keyed(object_value(entries(o).ptr()), Value::from_i32(i as i32 + 1), v)?,
-        None => append(vm, o, &[k, v])?,
-    }
+    map_set_of(vm, o, arg(&a, 0), arg(&a, 1))?;
     Ok(this)
 }
 
-fn map_has(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let o = this_of(this, Class::Map, "Map.prototype.has")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).is_some()))
+/// Map `o`'s value for `k` set to `v` (stores and an append: no JS runs).
+fn map_set_of(vm: &mut Vm, o: Obj, k: Value, v: Value) -> Result<()> {
+    let k = normalize(k);
+    match find(o, k) {
+        Some(i) => vm.set_keyed(object_value(entries(o).ptr()), Value::from_i32(i as i32 + 1), v)?,
+        None => append(vm, o, &[k, v])?,
+    };
+    Ok(())
 }
 
-fn map_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn map_has(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let o = this_of(this, Class::Map, "Map.prototype.has")?;
+    Ok(Value::from_bool(find(o, arg(&a, 0)).is_some()))
+}
+
+fn map_delete(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.delete")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).inspect(|&i| remove(o, i)).is_some()))
+    Ok(Value::from_bool(find(o, arg(&a, 0)).inspect(|&i| remove(o, i)).is_some()))
 }
 
 /// `map.clear()`: every entry's slots become holes, and the map moves to
 /// a new entries array (iterators in progress go on there, from its start,
 /// as the spec has it).
-fn map_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn map_clear(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.clear")?;
     clear(vm, o)?;
     Ok(Value::UNDEFINED)
@@ -675,9 +686,9 @@ fn clear(vm: &mut Vm, o: Obj) -> Result<()> {
 
 /// `map.forEach(f, thisArg)`: `f(value, key, map)` for each entry, in
 /// insertion order, entries added meanwhile included.
-fn map_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn map_for_each(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.forEach")?;
-    for_each(vm, o, a, this)
+    for_each(vm, o, &a, this)
 }
 
 fn for_each(vm: &mut Vm, o: Obj, a: &[Value], this: Value) -> Result<Value> {
@@ -710,75 +721,75 @@ fn for_each(vm: &mut Vm, o: Obj, a: &[Value], this: Value) -> Result<Value> {
     Ok(Value::UNDEFINED)
 }
 
-fn map_size(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn map_size(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "get Map.prototype.size")?;
     Ok(Value::from_i32(live(o) as i32))
 }
 
-fn map_keys(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn map_keys(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.keys")?;
     Ok(new_iterator(vm, o, IterMode::Keys))
 }
 
-fn map_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn map_values(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.values")?;
     Ok(new_iterator(vm, o, IterMode::Values))
 }
 
-pub(crate) fn map_entries(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn map_entries(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.entries")?;
     Ok(new_iterator(vm, o, IterMode::Entries))
 }
 
 // ---- Set ----
 
-fn set_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    collection_ctor(vm, a, Class::Set, Proto::Set, "Set")
+fn set_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    collection_ctor(vm, &a, Class::Set, Proto::Set, "Set")
 }
 
 /// `set.add(value)`: the set.
-fn set_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.add")?;
-    let k = normalize(arg(a, 0));
+    let k = normalize(arg(&a, 0));
     if find(o, k).is_none() {
         append(vm, o, &[k])?;
     }
     Ok(this)
 }
 
-fn set_has(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_has(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.has")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).is_some()))
+    Ok(Value::from_bool(find(o, arg(&a, 0)).is_some()))
 }
 
-fn set_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_delete(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.delete")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).inspect(|&i| remove(o, i)).is_some()))
+    Ok(Value::from_bool(find(o, arg(&a, 0)).inspect(|&i| remove(o, i)).is_some()))
 }
 
-fn set_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn set_clear(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.clear")?;
     clear(vm, o)?;
     Ok(Value::UNDEFINED)
 }
 
 /// `set.forEach(f, thisArg)`: `f(value, value, set)` for each value.
-fn set_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_for_each(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.forEach")?;
-    for_each(vm, o, a, this)
+    for_each(vm, o, &a, this)
 }
 
-fn set_size(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn set_size(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "get Set.prototype.size")?;
     Ok(Value::from_i32(live(o) as i32))
 }
 
-pub(crate) fn set_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn set_values(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.values")?;
     Ok(new_iterator(vm, o, IterMode::Values))
 }
 
-fn set_entries(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn set_entries(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.entries")?;
     Ok(new_iterator(vm, o, IterMode::Entries))
 }
@@ -787,7 +798,7 @@ fn set_entries(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `%MapIteratorPrototype%.next()` and the set one's: the next entry not
 /// deleted, as the iterator's mode has it; exhausted for good at the end.
-pub(crate) fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let it = this_of(this, Class::CollectionIterator, "Iterator.prototype.next")?;
     Ok(match step(vm, it)? {
         Some(v) => iter_result(vm, v, false),
@@ -837,20 +848,20 @@ pub(crate) fn step(vm: &mut Vm, it: Obj) -> Result<Option<Value>> {
 
 // ---- WeakMap and WeakSet ----
 
-fn weak_map_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    collection_ctor(vm, a, Class::WeakMap, Proto::WeakMap, "WeakMap")
+fn weak_map_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    collection_ctor(vm, &a, Class::WeakMap, Proto::WeakMap, "WeakMap")
 }
 
-fn weak_map_get(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn weak_map_get(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakMap, "WeakMap.prototype.get")?;
-    Ok(find(o, arg(a, 0)).map_or(Value::UNDEFINED, |i| slot(entries(o), i + 1)))
+    Ok(find(o, arg(&a, 0)).map_or(Value::UNDEFINED, |i| slot(entries(o), i + 1)))
 }
 
 /// `weakMap.set(key, value)`: the key must be an object or a symbol not
 /// in the registry.
-fn weak_map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn weak_map_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakMap, "WeakMap.prototype.set")?;
-    let (k, v) = (arg(a, 0), arg(a, 1));
+    let (k, v) = (arg(&a, 0), arg(&a, 1));
     if !can_be_held_weakly(k) {
         return Err(Error::type_error("Invalid value used as weak map key"));
     }
@@ -861,33 +872,33 @@ fn weak_map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(this)
 }
 
-fn weak_map_has(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn weak_map_has(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakMap, "WeakMap.prototype.has")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).is_some()))
+    Ok(Value::from_bool(find(o, arg(&a, 0)).is_some()))
 }
 
 /// `map.getOrInsert(key, value)` (`WEAK`: a `WeakMap`'s): `key`'s value,
 /// `value` added for it first if it has none.
-fn get_or_insert<const WEAK: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn get_or_insert<const WEAK: bool>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of_map::<WEAK>(this, "getOrInsert")?;
-    let k = key_of::<WEAK>(arg(a, 0))?;
+    let k = key_of::<WEAK>(arg(&a, 0))?;
     if let Some(i) = find(o, k) {
         return Ok(slot(entries(o), i + 1));
     }
-    let v = arg(a, 1);
+    let v = arg(&a, 1);
     append(vm, o, &[k, v])?;
     Ok(v)
 }
 
 /// `map.getOrInsertComputed(key, f)`: `key`'s value, `f(key)` added for
 /// it first if it has none (set over what `f` itself added for it).
-fn get_or_insert_computed<const WEAK: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn get_or_insert_computed<const WEAK: bool>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of_map::<WEAK>(this, "getOrInsertComputed")?;
-    let f = arg(a, 1);
+    let f = arg(&a, 1);
     if !is_callable(f) {
         return Err(Error::type_error("getOrInsertComputed: the callback is not a function"));
     }
-    let k = key_of::<WEAK>(arg(a, 0))?;
+    let k = key_of::<WEAK>(arg(&a, 0))?;
     if let Some(i) = find(o, k) {
         return Ok(slot(entries(o), i + 1));
     }
@@ -921,20 +932,20 @@ fn key_of<const WEAK: bool>(k: Value) -> Result<Value> {
     }
 }
 
-fn weak_map_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn weak_map_delete(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakMap, "WeakMap.prototype.delete")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).inspect(|&i| remove(o, i)).is_some()))
+    Ok(Value::from_bool(find(o, arg(&a, 0)).inspect(|&i| remove(o, i)).is_some()))
 }
 
-fn weak_set_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    collection_ctor(vm, a, Class::WeakSet, Proto::WeakSet, "WeakSet")
+fn weak_set_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    collection_ctor(vm, &a, Class::WeakSet, Proto::WeakSet, "WeakSet")
 }
 
 /// `weakSet.add(value)`: the value must be an object or a symbol not in
 /// the registry.
-fn weak_set_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn weak_set_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakSet, "WeakSet.prototype.add")?;
-    let k = arg(a, 0);
+    let k = arg(&a, 0);
     if !can_be_held_weakly(k) {
         return Err(Error::type_error("Invalid value used in weak set"));
     }
@@ -944,14 +955,14 @@ fn weak_set_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(this)
 }
 
-fn weak_set_has(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn weak_set_has(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakSet, "WeakSet.prototype.has")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).is_some()))
+    Ok(Value::from_bool(find(o, arg(&a, 0)).is_some()))
 }
 
-fn weak_set_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn weak_set_delete(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakSet, "WeakSet.prototype.delete")?;
-    Ok(Value::from_bool(find(o, arg(a, 0)).inspect(|&i| remove(o, i)).is_some()))
+    Ok(Value::from_bool(find(o, arg(&a, 0)).inspect(|&i| remove(o, i)).is_some()))
 }
 
 // ---- DataView ----
@@ -974,16 +985,16 @@ const VIEW_TYPES: [(&str, usize); 11] = [
 
 /// `new DataView(buffer, byteOffset, byteLength)`: a view of the buffer's
 /// bytes from `byteOffset` (0), `byteLength` of them (the rest).
-fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn data_view_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor DataView requires 'new'"));
     }
-    let buffer = arg(a, 0);
+    let buffer = arg(&a, 0);
     if !is_class(buffer, Class::ArrayBuffer) && !is_class(buffer, Class::SharedArrayBuffer) {
         return Err(Error::type_error("First argument to DataView constructor must be an ArrayBuffer"));
     }
     let b = Obj::of(buffer);
-    let offset = to_index(vm, arg(a, 1))?;
+    let offset = to_index(vm, arg(&a, 1))?;
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }
@@ -1036,7 +1047,7 @@ fn this_live_view(this: Value) -> Result<(Obj, usize)> {
     live_view(o, crate::typed::view_byte_length(o))
 }
 
-fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn view_buffer(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(object_value(this_view(this)?.code() as *mut Object))
 }
 
@@ -1047,11 +1058,11 @@ fn this_live_view_seq_cst(vm: &mut Vm, this: Value) -> Result<(Obj, usize)> {
     live_view(o, crate::typed::view_byte_length_seq_cst(vm, o))
 }
 
-fn view_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn view_byte_length(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::number(this_live_view_seq_cst(vm, this)?.1 as f64))
 }
 
-fn view_byte_offset(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn view_byte_offset(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (o, _) = this_live_view_seq_cst(vm, this)?;
     Ok(Value::number(crate::typed::offset_of(o) as f64))
 }
@@ -1068,10 +1079,10 @@ fn view_bytes(o: Obj, i: usize, size: usize) -> Result<*mut u8> {
 /// `view.getInt8(byteOffset)`, …, `view.getFloat64(byteOffset,
 /// littleEndian)`: the value of type `VIEW_TYPES[T]` there (big-endian
 /// unless `littleEndian`).
-fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_view(this)?;
-    let i = to_index(vm, arg(a, 0))?;
-    let little = to_boolean(arg(a, 1));
+    let i = to_index(vm, arg(&a, 0))?;
+    let little = to_boolean(arg(&a, 1));
     let size = VIEW_TYPES[T].1;
     let p = view_bytes(o, i, size)?;
     let mut b = [0u8; 8];
@@ -1096,21 +1107,21 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 /// `view.setInt8(byteOffset, value)`, …, `view.setFloat64(byteOffset,
 /// value, littleEndian)`: the offset is converted, then the value, then
 /// the offset checked (as the spec orders it).
-fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_view(this)?;
     crate::typed::writable_view(o)?;
-    let i = to_index(vm, arg(a, 0))?;
+    let i = to_index(vm, arg(&a, 0))?;
     let is_big = T == 8 || T == 9;
     let big = if is_big {
-        crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?)
+        crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(&a, 1))?)
     } else {
         0
     };
-    let d = if is_big { 0.0 } else { to_number(arg(a, 1)) };
+    let d = if is_big { 0.0 } else { to_number(arg(&a, 1)) };
     if vm.conv_thrown {
         return Err(vm.take_conv_error());
     }
-    let little = to_boolean(arg(a, 2));
+    let little = to_boolean(arg(&a, 2));
     let size = VIEW_TYPES[T].1;
     let p = view_bytes(o, i, size)?;
     let mut b = [0u8; 8];
@@ -1131,15 +1142,15 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 }
 
 /// `Map.groupBy(items, callback)`: a Map of arrays.
-fn map_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn map_group_by(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // (Its data made directly, as the spec has it: not through `get` and
     // `set`, which code may have replaced. Rooted across the callbacks.)
     let sc = Scope::new(vm);
     let out = sc.root(object_value((new_collection(vm, Class::Map, Proto::Map)?).ptr()));
-    crate::props::group_by(vm, a, |vm, key, v| {
+    crate::props::group_by(vm, &a, |vm, key, v| {
         // (-0 as +0, as `set` keeps it.)
         let key = if key.is_number() && key.to_number() == 0.0 { Value::from_i32(0) } else { key };
-        let group = map_get(vm, out.v(), &[key])?;
+        let group = map_get_of(Obj::of(out.v()), key);
         if !group.is_undefined() {
             // (Given at once.)
             array_push(vm, group, &[v])?;
@@ -1148,7 +1159,7 @@ fn map_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         // (A new group, held across its entry's making.)
         let step = Scope::new(vm);
         let group = vm.mu().new_array().root(&step);
-        map_set(vm, out.v(), &[key, group.v()])?;
+        map_set_of(vm, Obj::of(out.v()), key, group.v())?;
         array_push(vm, group.v(), &[v])?;
         Ok(())
     })?;
@@ -1291,10 +1302,10 @@ fn set_remove_value(o: Obj, v: Value) {
     }
 }
 
-fn set_union(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_union(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.union")?;
     let sc = Scope::new(vm);
-    let rec = set_record(vm, &sc, arg(a, 0))?;
+    let rec = set_record(vm, &sc, arg(&a, 0))?;
     // (The iterator got before the copy: `keys` and `next`'s getter may
     // change this set.)
     let iterator = record_iterator(vm, &sc, &rec)?;
@@ -1303,10 +1314,10 @@ fn set_union(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(out.v())
 }
 
-fn set_intersection(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_intersection(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.intersection")?;
     let sc = Scope::new(vm);
-    let rec = set_record(vm, &sc, arg(a, 0))?;
+    let rec = set_record(vm, &sc, arg(&a, 0))?;
     let out = sc.root(object_value(new_collection(vm, Class::Set, Proto::Set)?.ptr()));
     if live(o) as f64 <= rec.size {
         each_value(vm, o, |vm, v| {
@@ -1326,10 +1337,10 @@ fn set_intersection(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(out.v())
 }
 
-fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_difference(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.difference")?;
     let sc = Scope::new(vm);
-    let rec = set_record(vm, &sc, arg(a, 0))?;
+    let rec = set_record(vm, &sc, arg(&a, 0))?;
     let out = copy_set(vm, &sc, o)?;
     if live(o) as f64 <= rec.size {
         // (The copy's values, which `has` can't change: not this set's.)
@@ -1348,10 +1359,10 @@ fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(out.v())
 }
 
-fn set_symmetric_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_symmetric_difference(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.symmetricDifference")?;
     let sc = Scope::new(vm);
-    let rec = set_record(vm, &sc, arg(a, 0))?;
+    let rec = set_record(vm, &sc, arg(&a, 0))?;
     let iterator = record_iterator(vm, &sc, &rec)?;
     let out = copy_set(vm, &sc, o)?;
     each_key(vm, iterator, |vm, v| {
@@ -1366,30 +1377,30 @@ fn set_symmetric_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
     Ok(out.v())
 }
 
-fn set_is_subset_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_is_subset_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.isSubsetOf")?;
     let sc = Scope::new(vm);
-    let rec = set_record(vm, &sc, arg(a, 0))?;
+    let rec = set_record(vm, &sc, arg(&a, 0))?;
     if live(o) as f64 > rec.size {
         return Ok(Value::FALSE);
     }
     Ok(Value::from_bool(each_value(vm, o, |vm, v| record_has(vm, &rec, v))?))
 }
 
-fn set_is_superset_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_is_superset_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.isSupersetOf")?;
     let sc = Scope::new(vm);
-    let rec = set_record(vm, &sc, arg(a, 0))?;
+    let rec = set_record(vm, &sc, arg(&a, 0))?;
     if (live(o) as f64) < rec.size {
         return Ok(Value::FALSE);
     }
     Ok(Value::from_bool(record_keys(vm, &rec, |_, v| Ok(find(o, v).is_some()))?))
 }
 
-fn set_is_disjoint_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_is_disjoint_from(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.isDisjointFrom")?;
     let sc = Scope::new(vm);
-    let rec = set_record(vm, &sc, arg(a, 0))?;
+    let rec = set_record(vm, &sc, arg(&a, 0))?;
     let r = if live(o) as f64 <= rec.size {
         each_value(vm, o, |vm, v| Ok(!record_has(vm, &rec, v)?))?
     } else {
@@ -1410,11 +1421,11 @@ fn can_be_held_weakly(v: Value) -> bool {
 }
 
 /// `new WeakRef(target)`.
-fn weak_ref_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn weak_ref_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor WeakRef requires 'new'"));
     }
-    let t = arg(a, 0);
+    let t = arg(&a, 0);
     if !can_be_held_weakly(t) {
         return Err(Error::type_error("WeakRef: target must be an object or a non-registered symbol"));
     }
@@ -1425,7 +1436,7 @@ fn weak_ref_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `weakRef.deref()`: its target, or `undefined` once collected.
-fn weak_ref_deref(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn weak_ref_deref(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::WeakRef, "WeakRef.prototype.deref")?;
     let e = entries(o);
     if len(e) <= BASE {
@@ -1444,11 +1455,11 @@ fn weak_ref_deref(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `new FinalizationRegistry(cleanup)`. (Its callback is never called:
 /// the spec lets an implementation not; registering a target keeps
 /// nothing alive.)
-fn finalization_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn finalization_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor FinalizationRegistry requires 'new'"));
     }
-    if !is_callable(arg(a, 0)) {
+    if !is_callable(arg(&a, 0)) {
         return Err(Error::type_error("FinalizationRegistry: cleanup must be callable"));
     }
     let o = new_collection(vm, Class::FinalizationRegistry, Proto::FinalizationRegistry)?;
@@ -1456,9 +1467,9 @@ fn finalization_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `registry.register(target, held, token)`.
-fn finalization_register(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn finalization_register(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::FinalizationRegistry, "FinalizationRegistry.prototype.register")?;
-    let (target, held, token) = (arg(a, 0), arg(a, 1), arg(a, 2));
+    let (target, held, token) = (arg(&a, 0), arg(&a, 1), arg(&a, 2));
     if !can_be_held_weakly(target) {
         return Err(Error::type_error("FinalizationRegistry.prototype.register: invalid target"));
     }
@@ -1478,9 +1489,9 @@ fn finalization_register(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 }
 
 /// `registry.unregister(token)`: whether anything was registered with it.
-fn finalization_unregister(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn finalization_unregister(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_of(this, Class::FinalizationRegistry, "FinalizationRegistry.prototype.unregister")?;
-    let token = arg(a, 0);
+    let token = arg(&a, 0);
     if !can_be_held_weakly(token) {
         return Err(Error::type_error("FinalizationRegistry.prototype.unregister: invalid unregister token"));
     }

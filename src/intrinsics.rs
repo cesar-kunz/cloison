@@ -3,7 +3,7 @@
 //! desugars newer syntax into (spread, templates, computed keys, …), slow
 //! paths all: the JIT leaves them to the interpreter.
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::interp::to_string_units;
 use crate::js::ast::{
     EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_LIVE_THIS,
@@ -231,7 +231,7 @@ pub(crate) fn is_constructor(f: Value) -> bool {
 
 /// `new f(…args)`, from the runtime.
 pub(crate) fn construct(vm: &mut Vm, f: Value, args: &[Value]) -> Result<Value> {
-    construct_with(vm, f, args, f)
+    construct_with(vm, f, &args, f)
 }
 
 /// `new f(…args)` with `new.target` `nt`: a bytecode function's `this`
@@ -2029,7 +2029,7 @@ fn uninitialized(name: Value) -> Error {
 
 /// A direct `eval`'s binding's getter: its variable's value (a
 /// ReferenceError before it is initialized).
-pub(crate) fn binding_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn binding_get(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     if let Some((name, holder, key)) = import_of(vm)? {
         return import_value(vm, name, holder, key);
     }
@@ -2048,7 +2048,7 @@ pub(crate) fn binding_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// `const`'s; an imported one's always, its target initialized or not:
 /// an immutable binding CreateImportBinding records as initialized, the
 /// code strict, see ECMA-262 9.1.1.1.5 SetMutableBinding, step 5).
-pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if import_of(vm)?.is_some() {
         return Err(Error::type_error("Assignment to constant variable."));
     }
@@ -2063,7 +2063,7 @@ pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if kind & EVAL_CONST as i32 != 0 {
         return Err(Error::type_error("Assignment to constant variable."));
     }
-    let v = arg(a, 0);
+    let v = arg(&a, 0);
     if let Some((b, key)) = boxed {
         vm.put_key(b, key, v)?;
         return Ok(Value::UNDEFINED);

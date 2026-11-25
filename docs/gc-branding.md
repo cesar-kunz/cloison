@@ -1,10 +1,10 @@
 # Branded cells: letting the compiler check GC safety
 
 Status: 2026-11-25, on the `gc-handles` branch. Every module's calls that
-may collect are branded (step 2 below), and every raw value taken out of
-a branded result either is checked by the compiler or states why it is
-safe (step 3). Typed arguments for natives and allocation through
-`vm.mu()` are next (step 4).
+may collect are branded, and every raw value taken out of a branded
+result either is checked by the compiler or states why it is safe.
+Natives take their arguments as `Args<'s>`, which only rooted values can
+become. Allocation through `vm.mu()` is next.
 
 This page explains the idea for someone who knows Rust but not the
 collector: what can go wrong, how a few types make the compiler catch
@@ -78,6 +78,7 @@ All of them live in `src/brand.rs`.
 | `Scope` | a guard; values rooted in it stay alive until it's dropped | the Rust block it's in |
 | `Handle<'s>` | a value rooted in a `Scope` (a slot the collector updates) | as long as its `Scope` |
 | `Mu<'a>` / `Gc<'a>` | `vm.mu()`: a context in which nothing can collect, and the values made in it | while the `Mu` lives |
+| `Args<'s>` | a native's arguments, rooted by the caller's frame | while the native runs |
 
 There are three ways to use a `Fresh`:
 
@@ -199,7 +200,6 @@ Across the whole branch:
 
 - **The `take()`s**: 93 of them, each reviewed and given a reason.
 - **Raw values that never came from a `Fresh`**:
-  - a native's arguments copied into locals;
   - an allocation's result made outside `vm.mu()`;
   - a value read from an object's slot.
 
@@ -209,22 +209,43 @@ Across the whole branch:
 
 CI's stress run stays as the safety net for all of these.
 
-## Next: typed arguments and allocation through `Mu`
+## A native's arguments: `Args<'s>`
 
-Step 4 closes the second gap:
+A native is a Rust function the VM calls with `(vm, this, args)`. Its
+arguments are safe to hold across any call it makes, but only because
+the caller put them somewhere the collector sees: the interpreter passes
+a slice of its own frame, and `call_function` copies a Rust caller's
+values to the VM stack first.
 
-- **`Args<'s>`.** Natives get their arguments as typed handles instead
-  of `&[Value]`. An argument is rooted by the caller's frame, so it is
-  safe across calls, but only while the native runs. Branding the
-  arguments with the native's lifetime lets them be passed on without
-  `take()`, and stops them from leaking into a `Vec` or a struct that
-  outlives the call.
-- **Allocation through `vm.mu()`.** A new object or string comes back as
-  a `Gc<'a>`, which can't be held across a call that may collect: it has
-  to be rooted or used. Today `vm.new_array()` returns a plain `Value`.
+Nothing in a `&[Value]` says that. Rust code could call a native
+directly with a slice of its own locals, `map_set(vm, m, &[key, v])`,
+and if the native then ran JavaScript, `key` was unrooted. So natives
+now take `Args<'s>`, a wrapper over the slice with the same layout and
+no run-time cost, which reads like a slice (`a.len()`, `a[0]`, `for v in
+a`). There are only two ways to make one:
 
-Together they remove most raw `Value` locals from natives. What remains
-raw is inside `Mu` code, where nothing collects, and in the interpreter
-and the JIT.
+- **the dispatch**, from a frame's registers or `call_function`'s copy,
+  through an `unsafe` constructor whose safety rule is exactly that the
+  values are rooted;
+- **`vm.with_args(&[key, v], |vm, a| native(vm, this, a))`**, which
+  copies them to the VM stack.
+
+A Rust caller's own slice no longer compiles (`expected Args, found
+&[Value; 2]`). Converting the 670 natives turned up 11 helpers that only
+looked like natives, which went back to `&[Value]`, and a dozen direct
+calls. Most of those now call a plain helper instead; `Map.groupBy`, for
+one, reads and writes its map through `map_get_of` and `map_set_of`, not
+through the `get` and `set` natives. The rest use `with_args`.
+
+The interpreter's and the JIT's calls build `Args` from their frames
+directly, so the check costs nothing at run time: Octane is unchanged.
+
+## Next: allocation through `Mu`
+
+A new object or string should come back as a `Gc<'a>`, which can't be
+held across a call that may collect: it has to be rooted or used. Today
+`vm.new_array()` returns a plain `Value`. With that, most raw `Value`
+locals leave natives. What stays raw is inside `Mu` code, where nothing
+collects, and in the interpreter and the JIT.
 
 [gc-arena]: https://github.com/kyren/gc-arena

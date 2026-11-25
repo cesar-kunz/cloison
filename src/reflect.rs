@@ -6,7 +6,7 @@
 //! are roots already (the VM stack), and its keys' atoms are held while
 //! it runs (`Vm::hold_atom`).
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::intrinsics::{is_constructor, ordinary_set, to_property_key};
 use crate::object::{DONT_ENUM, Obj, object_value};
 use crate::props::is_object;
@@ -61,18 +61,18 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(g, a, object_value(r.ptr()), DONT_ENUM);
 }
 
-fn reflect_apply(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let f = arg(a, 0);
+fn reflect_apply(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let f = arg(&a, 0);
     if !crate::props::is_callable(f) {
         return Err(Error::type_error("Reflect.apply target is not a function"));
     }
     // take: given at once to the call, which copies it to the VM stack.
-    let args = list(vm, arg(a, 2))?.take();
-    vm.call_b(f, arg(a, 1), &args).map(Fresh::take)
+    let args = list(vm, arg(&a, 2))?.take();
+    vm.call_b(f, arg(&a, 1), &args).map(Fresh::take)
 }
 
-fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let f = arg(a, 0);
+fn reflect_construct(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let f = arg(&a, 0);
     if !is_constructor(f) {
         return Err(Error::type_error("Reflect.construct target is not a constructor"));
     }
@@ -81,35 +81,35 @@ fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Reflect.construct newTarget is not a constructor"));
     }
     // take: given at once to the call, which copies it to the VM stack.
-    let args = list(vm, arg(a, 1))?.take();
+    let args = list(vm, arg(&a, 1))?.take();
     vm.construct_b(f, &args, nt).map(Fresh::take)
 }
 
-pub(crate) fn reflect_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "defineProperty")?;
-    let key = to_property_key(vm, arg(a, 1))?;
+pub(crate) fn reflect_define_property(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "defineProperty")?;
+    let key = to_property_key(vm, arg(&a, 1))?;
     let s = Scope::new(vm);
     // (Its values, maybe getters' only.)
-    let d = vm.to_descriptor_b(arg(a, 2))?.root(&s);
+    let d = vm.to_descriptor_b(arg(&a, 2))?.root(&s);
     crate::proxy::define_property(vm, o, key, &d.desc()).map(Value::from_bool)
 }
 
-pub(crate) fn reflect_delete_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "deleteProperty")?;
-    let key = to_property_key(vm, arg(a, 1))?;
+pub(crate) fn reflect_delete_property(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "deleteProperty")?;
+    let key = to_property_key(vm, arg(&a, 1))?;
     crate::proxy::delete(vm, o, key).map(Value::from_bool)
 }
 
-pub(crate) fn reflect_get(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "get")?;
-    let key = to_property_key(vm, arg(a, 1))?;
+pub(crate) fn reflect_get(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "get")?;
+    let key = to_property_key(vm, arg(&a, 1))?;
     let receiver = if a.len() > 2 { a[2] } else { object_value(o.ptr()) };
     vm.get_from_b(o, key, receiver).map(Fresh::take)
 }
 
-pub(crate) fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "getOwnPropertyDescriptor")?;
-    let key = to_property_key(vm, arg(a, 1))?;
+pub(crate) fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "getOwnPropertyDescriptor")?;
+    let key = to_property_key(vm, arg(&a, 1))?;
     // (Its values maybe a trap's only; its object made where nothing
     // collects.)
     Ok(match vm.own_property_b(o, key)?.take() {
@@ -118,25 +118,25 @@ pub(crate) fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Va
     })
 }
 
-fn reflect_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "getPrototypeOf")?;
+fn reflect_get_prototype_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "getPrototypeOf")?;
     vm.prototype_of_b(o).map(Fresh::take)
 }
 
-pub(crate) fn reflect_has(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "has")?;
-    let key = to_property_key(vm, arg(a, 1))?;
+pub(crate) fn reflect_has(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "has")?;
+    let key = to_property_key(vm, arg(&a, 1))?;
     vm.has_key(object_value(o.ptr()), key).map(Value::from_bool)
 }
 
-fn reflect_is_extensible(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "isExtensible")?;
+fn reflect_is_extensible(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "isExtensible")?;
     crate::proxy::is_extensible(vm, o).map(Value::from_bool)
 }
 
 /// `Reflect.ownKeys(o)`: its string keys, then its symbols.
-pub(crate) fn reflect_own_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "ownKeys")?;
+pub(crate) fn reflect_own_keys(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "ownKeys")?;
     let keys = crate::proxy::own_keys(vm, o)?;
     let s = Scope::new(vm);
     let out = vm.mu().new_array().root(&s);
@@ -147,25 +147,25 @@ pub(crate) fn reflect_own_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Val
     Ok(out.v())
 }
 
-fn reflect_prevent_extensions(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "preventExtensions")?;
+fn reflect_prevent_extensions(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "preventExtensions")?;
     crate::proxy::prevent_extensions(vm, o).map(Value::from_bool)
 }
 
-fn reflect_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "set")?;
-    let key = to_property_key(vm, arg(a, 1))?;
+fn reflect_set(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "set")?;
+    let key = to_property_key(vm, arg(&a, 1))?;
     let receiver = if a.len() > 3 { a[3] } else { object_value(o.ptr()) };
-    let v = arg(a, 2);
+    let v = arg(&a, 2);
     if crate::proxy::chain_has_proxy(vm, o) {
         return crate::proxy::generic_set(vm, object_value(o.ptr()), key, v, receiver).map(Value::from_bool);
     }
     ordinary_set(vm, object_value(o.ptr()), key, v, receiver).map(Value::from_bool)
 }
 
-fn reflect_set_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let o = target(a, "setPrototypeOf")?;
-    let proto = arg(a, 1);
+fn reflect_set_prototype_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let o = target(&a, "setPrototypeOf")?;
+    let proto = arg(&a, 1);
     if !(proto.is_null() || is_object(proto)) {
         return Err(Error::type_error("Object prototype may only be an Object or null"));
     }

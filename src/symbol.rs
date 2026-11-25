@@ -9,7 +9,7 @@
 //! once it is a key: see [`symbol_atom`]) and its description in `code`'s
 //! bits (traced: see `gc`).
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::interp::to_boolean;
 use crate::object::{Atom, Class, DONT_ENUM, Obj, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
@@ -188,18 +188,18 @@ fn this_symbol(this: Value, what: &str) -> Result<Value> {
     Err(Error::type_error(format!("{what} requires that 'this' be a Symbol")))
 }
 
-fn symbol_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn symbol_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if vm.is_construct() {
         return Err(Error::type_error("Symbol is not a constructor"));
     }
-    let d = arg(a, 0);
+    let d = arg(&a, 0);
     let desc = if d.is_undefined() { d } else { vm.to_string_b(d)?.take() };
     Ok(make_symbol(vm, desc, None))
 }
 
-fn symbol_for(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn symbol_for(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let sc_key = Scope::new(vm);
-    let key = vm.to_string_b(arg(a, 0))?.root(&sc_key);
+    let key = vm.to_string_b(arg(&a, 0))?.root(&sc_key);
     let units = string_units(key.peek()).unwrap_or(&[]).to_vec();
     if let Some(&s) = vm.symbol_registry.get(&units) {
         return Ok(object_value(s));
@@ -215,32 +215,32 @@ fn symbol_for(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(s)
 }
 
-fn symbol_key_for(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let s = arg(a, 0);
+fn symbol_key_for(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let s = arg(&a, 0);
     if !is_symbol(s) {
         return Err(Error::type_error(format!("{} is not a symbol", crate::vm::shown(s))));
     }
     Ok(if is_registered(s) { description(s) } else { Value::UNDEFINED })
 }
 
-pub(crate) fn symbol_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn symbol_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let s = this_symbol(this, "Symbol.prototype.toString")?;
     symbol_string_value(vm, s)
 }
 
-pub(crate) fn symbol_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn symbol_value_of(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     this_symbol(this, "Symbol.prototype.valueOf")
 }
 
-fn symbol_description(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn symbol_description(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(description(this_symbol(this, "Symbol.prototype.description")?))
 }
 
 /// `Object.getOwnPropertySymbols(o)`.
-fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn get_own_property_symbols(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // (A primitive's new wrapper, held across a proxy's traps: rooted.)
     let s = Scope::new(vm);
-    let o = Obj::of(vm.to_object_b(arg(a, 0))?.root(&s).v());
+    let o = Obj::of(vm.to_object_b(arg(&a, 0))?.root(&s).v());
     let keys: Vec<Value> = if vm.proxies_exist && crate::proxy::is_proxy(vm, o) {
         let ks = crate::proxy::own_keys(vm, o)?;
         ks.into_iter()
@@ -276,7 +276,7 @@ fn define_symbol_native(vm: &mut Vm, o: Obj, a: Atom, name: &str, f: NativeFn, n
 }
 
 /// `Function.prototype[Symbol.hasInstance](v)`: OrdinaryHasInstance.
-fn function_has_instance(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn function_has_instance(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let v = a.first().copied().unwrap_or(Value::UNDEFINED);
     vm.ordinary_has_instance(v, this).map(Value::from_bool)
 }
@@ -472,7 +472,7 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 }
 
-pub(crate) fn return_this(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn return_this(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(this)
 }
 
@@ -503,7 +503,7 @@ fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {
     Ok(vm.to_object_b(this)?.take())
 }
 
-pub(crate) fn array_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_values(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let t = this_target(vm, this)?;
     new_iterator(vm, t, 1, Root::ArrayIteratorPrototype)
 }
@@ -513,17 +513,17 @@ pub(crate) fn array_iterator(vm: &mut Vm, target: Value, kind: i32) -> Result<Va
     new_iterator(vm, target, kind, Root::ArrayIteratorPrototype)
 }
 
-fn array_keys(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn array_keys(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let t = this_target(vm, this)?;
     new_iterator(vm, t, 0, Root::ArrayIteratorPrototype)
 }
 
-fn array_entries(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn array_entries(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let t = this_target(vm, this)?;
     new_iterator(vm, t, 2, Root::ArrayIteratorPrototype)
 }
 
-fn string_iterator(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_iterator(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype[Symbol.iterator] called on null or undefined"));
     }
@@ -564,7 +564,7 @@ fn iterator_state(this: Value, what: &str) -> Result<Value> {
     Err(Error::type_error(format!("{what} called on an incompatible receiver")))
 }
 
-fn array_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn array_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     match array_step(vm, this)? {
         Some(v) => iter_result(vm, v, false),
         None => iter_result(vm, Value::UNDEFINED, true),
@@ -640,7 +640,7 @@ fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     Ok(Some(v))
 }
 
-fn string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = iterator_state(this, "%StringIteratorPrototype%.next")?;
     // (The state is an array JS doesn't see, its elements its own: reading
     // and writing them run no JS. `target`'s units are read before the

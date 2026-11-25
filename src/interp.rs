@@ -2486,7 +2486,8 @@ handlers! {
         if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
             enter!(fo, that, w.add(1), argc, 0, Op::Call.size())
         }
-        let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
+        // SAFETY: the caller's frame's arguments, in the VM stack.
+        let args = crate::brand::Args::rooted(std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize));
         let r = with_top_acc(regs, acc, |vm| { let r = vm.call_own(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Call.size(), r)
     }
@@ -2498,7 +2499,8 @@ handlers! {
         if let Some((fo, that)) = crate::builtins::unwrap_bound(frame_vm(regs), *reg(pc, 1, regs)) {
             enter!(fo, that, reg(pc, 2, regs), *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
-        let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
+        // SAFETY: the caller's frame's arguments, in the VM stack.
+        let args = crate::brand::Args::rooted(std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize));
         let r = with_top_acc(regs, acc, |vm| { let r = vm.call_own(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::CallUndefined.size(), r)
     }
@@ -2507,8 +2509,9 @@ handlers! {
     #[inline(never)]
     fn slow_construct(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
-        let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = with_top_acc(regs, acc, |vm| { let r = vm.construct_other(*reg(pc, 1, regs), args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
+        // SAFETY: the caller's frame's arguments, in the VM stack.
+        let args = crate::brand::Args::rooted(std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize));
+        let r = with_top_acc(regs, acc, |vm| { let r = vm.construct_own(*reg(pc, 1, regs), args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Construct.size(), r)
     }
 }
@@ -4268,7 +4271,7 @@ unsafe fn to_primitive_object(vm: &mut Vm, v: Value, hint: u8) -> Value {
                 Class::Native => vm.rooted(&[m], |vm| {
                     vm.callee = as_object(m);
                     let native = (*Obj::of(m).code()).native.unwrap();
-                    vm.run_native(|vm| native(vm, v, &[]))
+                    vm.run_native(|vm| native(vm, v, crate::brand::Args::NONE))
                 }),
                 Class::Function => call_function(vm, m, v, &[]),
                 _ => continue,
@@ -4933,7 +4936,12 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
             }
             // (`f` and `this`, maybe a Rust caller's only, rooted while it
             // runs: no frame holds them.)
-            let r = vm.rooted(&[f, this], |vm| vm.call_other(f, this, args));
+            // SAFETY: given by `with_args_on_stack`: in the VM stack, or in
+            // `vm.handles` with no cell moving.
+            let a = crate::brand::Args::rooted(args);
+            let r = vm.rooted(&[f, this], |vm| {
+                if vm.running() { vm.call_own(f, this, a) } else { vm.call_other(f, this, args) }
+            });
             // (Its conversion's exception thrown to its caller, a native
             // maybe: not left for it to go on. The interpreter's calls
             // check after `call_other` themselves.)
@@ -5297,7 +5305,8 @@ unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value,
         }
         vm.constructing = false;
         vm.callee = o;
-        code.live().native.unwrap()(vm, this, args).ok()
+        // SAFETY: none of `args` is a cell (checked above).
+        code.live().native.unwrap()(vm, this, crate::brand::Args::rooted(args)).ok()
     }
 }
 
@@ -5913,10 +5922,13 @@ pub(crate) unsafe fn call_from_jit(
                         // (Past every register the compiled code uses.)
                         let saved = vm.native_top;
                         vm.native_top = regs.add(frame - HEADER);
+                        // SAFETY: the compiled frame's registers, in the VM
+                        // stack (the VM is running: compiled code is).
+                        let rooted = crate::brand::Args::rooted(std::slice::from_raw_parts(args, argc));
                         let r = if op == Op::Construct {
-                            vm.construct_other(fv, std::slice::from_raw_parts(args, argc))
+                            vm.construct_own(fv, rooted)
                         } else {
-                            vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
+                            vm.call_own(fv, this, rooted)
                         };
                         vm.native_top = saved;
                         if vm.conv_thrown {

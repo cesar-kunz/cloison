@@ -21,7 +21,7 @@ mod plain;
 pub(crate) mod tz;
 mod zoned;
 
-use crate::brand::Fresh;
+use crate::brand::{Args, Fresh};
 use crate::raw::ObjectPtr;
 use std::collections::HashMap;
 
@@ -781,7 +781,7 @@ pub(crate) fn parse_err(e: String) -> Error {
 }
 
 /// `valueOf`: Temporal objects can't be compared or added as primitives.
-fn value_of(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn value_of(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Err(type_err("use Temporal compare() or equals(), not arithmetic or comparison operators"))
 }
 

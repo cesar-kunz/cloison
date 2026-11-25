@@ -7,6 +7,7 @@
 //! an error is still written by the `setFrom` methods, which report how
 //! much they read and wrote.
 
+use crate::brand::Args;
 use crate::interp::to_boolean;
 use crate::object::{Class, Obj, TypedKind, object_value};
 use crate::props::is_object;
@@ -248,9 +249,9 @@ fn new_uint8_array(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
     Ok(ta)
 }
 
-fn from_base64(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let s = string_arg(arg(a, 0))?;
-    let opts = options(arg(a, 1))?;
+fn from_base64(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let s = string_arg(arg(&a, 0))?;
+    let opts = options(arg(&a, 1))?;
     let url = url_alphabet(vm, opts)?;
     let last = last_chunk(vm, opts)?;
     let d = decode_base64(s, url, last, usize::MAX);
@@ -260,8 +261,8 @@ fn from_base64(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     new_uint8_array(vm, &d.bytes)
 }
 
-fn from_hex(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let d = decode_hex(string_arg(arg(a, 0))?, usize::MAX);
+fn from_hex(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let d = decode_hex(string_arg(arg(&a, 0))?, usize::MAX);
     if let Some(e) = d.error {
         return Err(e);
     }
@@ -284,11 +285,11 @@ fn written(vm: &mut Vm, o: Obj, d: Decoded) -> Result<Value> {
     Ok(r)
 }
 
-fn set_from_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_from_base64(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = uint8_array(this)?;
     crate::typed::writable_view(o)?;
-    let s = string_arg(arg(a, 0))?;
-    let opts = options(arg(a, 1))?;
+    let s = string_arg(arg(&a, 0))?;
+    let opts = options(arg(&a, 1))?;
     let url = url_alphabet(vm, opts)?;
     let last = last_chunk(vm, opts)?;
     let max = length_of(vm, o)?;
@@ -296,18 +297,18 @@ fn set_from_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     written(vm, o, d)
 }
 
-fn set_from_hex(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_from_hex(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = uint8_array(this)?;
     crate::typed::writable_view(o)?;
-    let s = string_arg(arg(a, 0))?;
+    let s = string_arg(arg(&a, 0))?;
     let max = length_of(vm, o)?;
     let d = decode_hex(s, max);
     written(vm, o, d)
 }
 
-fn to_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn to_base64(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = uint8_array(this)?;
-    let opts = options(arg(a, 0))?;
+    let opts = options(arg(&a, 0))?;
     let alphabet = if url_alphabet(vm, opts)? { URL } else { STANDARD };
     let omit_padding = match opts {
         Some(o) => {
@@ -333,7 +334,7 @@ fn to_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(vm.new_string(&out))
 }
 
-fn to_hex(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_hex(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let bytes = bytes_of(vm, uint8_array(this)?)?;
     crate::vm::check_string_len(2 * bytes.len())?;
     let digits = b"0123456789abcdef";

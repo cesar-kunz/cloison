@@ -3,7 +3,7 @@
 //! `JSON.rawJSON` and `isRawJSON`, as the spec has them. Installed by
 //! [`install`].
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::interp::{check_native_stack, to_number, to_string_units};
 use crate::object::{ACCESSOR, Atom, Class, DONT_ENUM, Obj, RAW_JSON, object_value};
 use crate::props::{is_callable, is_object};
@@ -45,11 +45,11 @@ struct Stringify {
 }
 
 /// `JSON.stringify(value, replacer, space)`.
-fn json_stringify(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn json_stringify(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // (No cell moves meanwhile: what it serializes or revives is held in
     // Rust structures, objects by address, see `Vm::unmovable`.)
     vm.unmovable += 1;
-    let r = json_stringify_(vm, this, a);
+    let r = json_stringify_(vm, this, &a);
     vm.unmovable -= 1;
     r
 }
@@ -62,7 +62,7 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // replacer's keys are copied into a `Vec` as its getters run, which
     // may collect.)
     let depth = vm.handles.len();
-    let r = vm.handle_scope(|vm| stringify_rooted(vm, a));
+    let r = vm.handle_scope(|vm| stringify_rooted(vm, &a));
     vm.handles.truncate(depth);
     r
 }
@@ -571,21 +571,21 @@ fn quoted_len(u: &[u16]) -> usize {
 }
 
 /// `JSON.parse(text, reviver)`.
-fn json_parse(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn json_parse(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // (No cell moves meanwhile: what it serializes or revives is held in
     // Rust structures, objects by address, see `Vm::unmovable`.)
     vm.unmovable += 1;
-    let r = json_parse_(vm, this, a);
+    let r = json_parse_(vm, this, &a);
     vm.unmovable -= 1;
     r
 }
 
 fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let u = to_string_units(arg(a, 0));
+    let u = to_string_units(arg(&a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
-    let reviver = arg(a, 1);
+    let reviver = arg(&a, 1);
     if !is_callable(reviver) {
         return parse_text(vm, &u, false).map(|(v, _)| v);
     }
@@ -729,8 +729,8 @@ fn is_raw_json(v: Value) -> bool {
 /// `JSON.rawJSON(text)`: a frozen null-prototype object whose `rawJSON`
 /// is `text`, which `stringify` writes as it is: a primitive's JSON text,
 /// without whitespace around it.
-fn json_raw_json(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let u = to_string_units(arg(a, 0));
+fn json_raw_json(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let u = to_string_units(arg(&a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
@@ -748,8 +748,8 @@ fn json_raw_json(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(object_value(o.ptr()))
 }
 
-fn json_is_raw_json(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(is_raw_json(arg(a, 0))))
+fn json_is_raw_json(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(is_raw_json(arg(&a, 0))))
 }
 
 struct Parser<'a> {
@@ -1020,7 +1020,7 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
 
-    fn handles(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn handles(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         Ok(Value::from_i32(vm.handles.len() as i32))
     }
 

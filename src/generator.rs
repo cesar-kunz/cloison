@@ -12,7 +12,7 @@
 //! The object (class `Generator`) keeps a hidden array in `code`:
 //! `[state, registers, pc, function, mode]`.
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::interp::{native_stack_low, write_frame_header};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, object_value};
 use crate::raw::{Live, ObjectPtr};
@@ -432,19 +432,19 @@ fn async_gen_step_rooted(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     async_gen_run(vm, g)
 }
 
-fn async_generator_next(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn async_generator_next(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), NEXT)
 }
 
-fn async_generator_return(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn async_generator_return(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), RETURN)
 }
 
-fn async_generator_throw(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn async_generator_throw(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), THROW)
 }
 
-fn return_this(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn return_this(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(this)
 }
 
@@ -457,15 +457,15 @@ pub(crate) fn mode(vm: &mut Vm, g: Value) -> Value {
     }
 }
 
-fn generator_next(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn generator_next(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     resume(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), NEXT, "Generator.prototype.next")
 }
 
-fn generator_return(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn generator_return(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     resume(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), RETURN, "Generator.prototype.return")
 }
 
-fn generator_throw(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn generator_throw(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     resume(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), THROW, "Generator.prototype.throw")
 }
 

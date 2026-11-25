@@ -11,7 +11,7 @@ use super::{
     Kind, Root, canonicalize_locale_list, coerce_options, create, data_error, options_object, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
-use crate::brand::Scope;
+use crate::brand::{Args, Scope};
 use crate::object::{DONT_ENUM, Obj, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
@@ -65,7 +65,7 @@ pub(super) fn install(vm: &mut Vm, intl: Obj) {
 }
 
 /// `new Intl.Segmenter(locales, options)`.
-fn segmenter_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn segmenter_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor Intl.Segmenter requires 'new'"));
     }
@@ -73,8 +73,8 @@ fn segmenter_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let default = object_value(root(vm, Root::SegmenterPrototype).ptr());
     let proto = vm.take_new_target(f, default)?;
     // ResolveOptions (no relevant extension keys).
-    let requested = canonicalize_locale_list(vm, arg(a, 0))?;
-    let options = options_object(vm, arg(a, 1))?;
+    let requested = canonicalize_locale_list(vm, arg(&a, 0))?;
+    let options = options_object(vm, arg(&a, 1))?;
     string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
     let r = resolve_locale(vm, &requested, &[])?;
     let granularity = string_option(vm, options, "granularity", &GRANULARITIES)?;
@@ -88,16 +88,16 @@ fn segmenter_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Intl.Segmenter.supportedLocalesOf(locales, options)`.
-fn supported_locales_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let requested = canonicalize_locale_list(vm, arg(a, 0))?;
-    let options = coerce_options(vm, arg(a, 1))?;
+fn supported_locales_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let requested = canonicalize_locale_list(vm, arg(&a, 0))?;
+    let options = coerce_options(vm, arg(&a, 1))?;
     string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
     let found = supported_locales(vm, &requested)?;
     string_array(vm, &found)
 }
 
 /// `Intl.Segmenter.prototype.resolvedOptions()`.
-fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = require(this, Kind::Segmenter, "Intl.Segmenter.prototype.resolvedOptions")?;
     let op = object_value(vm.object_prototype);
     let r = vm.new_plain(op);
@@ -111,12 +111,12 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `Intl.Segmenter.prototype.segment(string)`: a Segments object
 /// (CreateSegmentsObject).
-fn segment(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn segment(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = require(this, Kind::Segmenter, "Intl.Segmenter.prototype.segment")?;
     // (`string`, a new string maybe, held across the prototype's making
     // and the object's: rooted.)
     let sc = Scope::new(vm);
-    let string = vm.to_string_b(arg(a, 0))?.root(&sc).v();
+    let string = vm.to_string_b(arg(&a, 0))?.root(&sc).v();
     let proto = object_value(root(vm, Root::SegmentsPrototype).ptr());
     let zero = Value::number(0.0);
     Ok(create(vm, proto, Kind::Segments, &[string, slot(o, GRANULARITY), zero, zero, Value::FALSE, Value::UNDEFINED]))
@@ -124,9 +124,9 @@ fn segment(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `%IntlSegmentsPrototype%.containing(index)`: the segment the code
 /// unit at `index` is in.
-fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn containing(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = require(this, Kind::Segments, "%IntlSegmentsPrototype%.containing")?;
-    let n = crate::interp::to_number(arg(a, 0));
+    let n = crate::interp::to_number(arg(&a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
@@ -200,14 +200,14 @@ fn containing(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `%IntlSegmentsPrototype%[Symbol.iterator]()`: a Segment Iterator
 /// (CreateSegmentIterator).
-fn segments_iterator(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn segments_iterator(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = require(this, Kind::Segments, "%IntlSegmentsPrototype%[Symbol.iterator]")?;
     let proto = object_value(root(vm, Root::SegmentIteratorPrototype).ptr());
     Ok(create(vm, proto, Kind::SegmentIterator, &[slot(o, STRING), slot(o, GRANULARITY), Value::number(0.0)]))
 }
 
 /// `%IntlSegmentIteratorPrototype%.next()`.
-fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = require(this, Kind::SegmentIterator, "%IntlSegmentIteratorPrototype%.next")?;
     let units = string_units(slot(o, STRING)).unwrap_or(&[]);
     let start = slot(o, AT).to_number() as usize;

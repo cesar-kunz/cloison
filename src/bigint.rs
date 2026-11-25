@@ -9,6 +9,7 @@
 //! multiplication, Knuth's long division, two's complement for the
 //! bitwise operators.
 
+use crate::brand::Args;
 use crate::raw::ObjectPtr;
 use std::cmp::Ordering;
 
@@ -831,11 +832,11 @@ pub(crate) fn to_bigint(vm: &mut Vm, v: Value) -> Result<Big> {
 
 /// `BigInt(v)`: a number (an integer) or what ToBigInt takes; not a
 /// constructor.
-fn bigint_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn bigint_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if vm.is_construct() {
         return Err(Error::type_error("BigInt is not a constructor"));
     }
-    let p = crate::interp::to_primitive(arg(a, 0));
+    let p = crate::interp::to_primitive(arg(&a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
@@ -865,18 +866,18 @@ fn bits_arg(vm: &mut Vm, v: Value) -> Result<u64> {
     Ok(d as u64)
 }
 
-fn bigint_as_int_n(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let bits = bits_arg(vm, arg(a, 0))?;
-    let b = to_bigint(vm, arg(a, 1))?;
+fn bigint_as_int_n(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let bits = bits_arg(vm, arg(&a, 0))?;
+    let b = to_bigint(vm, arg(&a, 1))?;
     if bits > 1 << 30 {
         return Ok(new_bigint(vm, b));
     }
     Ok(new_bigint(vm, b.as_int_n(bits)))
 }
 
-fn bigint_as_uint_n(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let bits = bits_arg(vm, arg(a, 0))?;
-    let b = to_bigint(vm, arg(a, 1))?;
+fn bigint_as_uint_n(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let bits = bits_arg(vm, arg(&a, 0))?;
+    let b = to_bigint(vm, arg(&a, 1))?;
     if bits > 1 << 30 {
         if b.neg {
             return Err(Error::range_error("Maximum BigInt size exceeded"));
@@ -895,9 +896,9 @@ fn this_bigint(this: Value, what: &str) -> Result<Big> {
     Err(Error::type_error(format!("BigInt.prototype.{what} requires that 'this' be a BigInt")))
 }
 
-pub(crate) fn bigint_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn bigint_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let b = this_bigint(this, "toString")?;
-    let r = arg(a, 0);
+    let r = arg(&a, 0);
     let radix = if r.is_undefined() {
         10.0
     } else {
@@ -914,13 +915,13 @@ pub(crate) fn bigint_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<
     Ok(crate::builtins::str_value(vm, &s))
 }
 
-fn bigint_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn bigint_to_locale_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let b = this_bigint(this, "toLocaleString")?;
     let s = b.to_string_radix(10);
     Ok(crate::builtins::str_value(vm, &s))
 }
 
-pub(crate) fn bigint_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn bigint_value_of(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     this_bigint(this, "valueOf")?;
     Ok(crate::vm::wrapped(this).unwrap_or(this))
 }

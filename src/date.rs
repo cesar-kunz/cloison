@@ -4,7 +4,7 @@
 //! library's `localtime_r` (its `tm_gmtoff`), so it follows the machine's
 //! time zone, and the spec's own calendar arithmetic does the rest.
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::raw::ObjectPtr;
 use std::ffi::CStr;
 
@@ -334,7 +334,7 @@ pub(crate) fn date_value(v: Value) -> Option<f64> {
 
 /// `Date.prototype[Symbol.toPrimitive](hint)`: OrdinaryToPrimitive,
 /// `toString` first for "string" and "default", `valueOf` for "number".
-pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !crate::props::is_object(this) {
         return Err(Error::type_error("Date.prototype[Symbol.toPrimitive] called on a non-object"));
     }
@@ -400,12 +400,12 @@ fn new_date(vm: &mut Vm, t: f64) -> Value {
 /// `new Date()` (now), `new Date(value)` (a `Date`'s time, a string parsed,
 /// else a number), `new Date(year, month[, date, hours, minutes, seconds,
 /// ms])` (local time). Called as a function: the string of now.
-fn date_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+fn date_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         let s = date_string(now_ms());
         return Ok(str_value(vm, &s));
     }
-    let t = match args {
+    let t = match &*args {
         [] => now_ms(),
         [v] => match date_value(*v) {
             Some(t) => t,
@@ -420,7 +420,7 @@ fn date_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
                 }
             }
         },
-        _ => utc(fields_date(vm, args)?),
+        _ => utc(fields_date(vm, &args)?),
     };
     Ok(new_date(vm, time_clip(t)))
 }
@@ -438,27 +438,27 @@ fn fields_date(vm: &mut Vm, args: &[Value]) -> Result<f64> {
 }
 
 /// `Date.now()`.
-fn date_now(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn date_now(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Ok(num(now_ms()))
 }
 
 /// `Date.parse(s)`: the time value of the string `s` (see [`parse`]).
-fn date_parse(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let u = to_string_units(arg(a, 0));
+fn date_parse(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let u = to_string_units(arg(&a, 0));
     Ok(num(parse(&u)))
 }
 
 /// `Date.UTC(year[, month, date, hours, minutes, seconds, ms])`: the time
 /// value of the fields as UTC.
-fn date_utc(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let t = fields_date(vm, a)?;
+fn date_utc(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let t = fields_date(vm, &a)?;
     Ok(num(time_clip(t)))
 }
 
 // ---- Getters ----
 
 /// `Date.prototype.getTime()` and `valueOf()`.
-pub(crate) fn date_get_time(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn date_get_time(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(num(this_time(this)?))
 }
 
@@ -474,7 +474,7 @@ fn get_field(this: Value, local: bool, field: fn(f64) -> f64) -> Result<Value> {
 
 macro_rules! getters {
     ($($name:ident($local:expr, $field:expr);)*) => {$(
-        fn $name(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+        fn $name(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
             get_field(this, $local, $field)
         }
     )*};
@@ -502,7 +502,7 @@ getters! {
 
 /// `Date.prototype.getTimezoneOffset()`: minutes UTC is ahead of local
 /// time at this date.
-fn get_timezone_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn get_timezone_offset(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let t = this_time(this)?;
     if t.is_nan() {
         return Ok(num(f64::NAN));
@@ -513,9 +513,9 @@ fn get_timezone_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 // ---- Setters ----
 
 /// `Date.prototype.setTime(t)`.
-fn set_time(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_time(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     this_time(this)?;
-    let t = time_clip(to_num(vm, arg(a, 0))?);
+    let t = time_clip(to_num(vm, arg(&a, 0))?);
     set_date_value(this, t);
     Ok(num(t))
 }
@@ -554,8 +554,8 @@ fn set_fields(vm: &mut Vm, this: Value, a: &[Value], first: usize, n: usize, loc
 
 macro_rules! setters {
     ($($name:ident($first:expr, $n:expr, $local:expr);)*) => {$(
-        fn $name(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-            set_fields(vm, this, a, $first, $n, $local)
+        fn $name(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+            set_fields(vm, this, &a, $first, $n, $local)
         }
     )*};
 }
@@ -579,9 +579,9 @@ setters! {
 
 /// `Date.prototype.setYear(y)` (Annex B): the full year, years 0 to 99
 /// being 1900 to 1999.
-fn set_year(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_year(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let t = this_time(this)?;
-    let y = to_num(vm, arg(a, 0))?;
+    let y = to_num(vm, arg(&a, 0))?;
     let t = if t.is_nan() { 0.0 } else { local_time(t) };
     let yyyy = make_full_year(y);
     if yyyy.is_nan() {
@@ -633,20 +633,20 @@ fn date_string(tv: f64) -> String {
 }
 
 /// `Date.prototype.toString()` (and `toLocaleString`).
-pub(crate) fn to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let s = date_string(this_time(this)?);
     Ok(str_value(vm, &s))
 }
 
 /// `Date.prototype.toDateString()` (and `toLocaleDateString`).
-fn to_date_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_date_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let tv = this_time(this)?;
     let s = if tv.is_nan() { "Invalid Date".to_string() } else { date_part(local_time(tv)) };
     Ok(str_value(vm, &s))
 }
 
 /// `Date.prototype.toTimeString()` (and `toLocaleTimeString`).
-fn to_time_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_time_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let tv = this_time(this)?;
     let s = if tv.is_nan() {
         "Invalid Date".to_string()
@@ -658,7 +658,7 @@ fn to_time_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `Date.prototype.toUTCString()` (and `toGMTString`): `Tue, 15 Oct 2026
 /// 10:34:56 GMT`.
-fn to_utc_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_utc_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let tv = this_time(this)?;
     let s = if tv.is_nan() {
         "Invalid Date".to_string()
@@ -678,7 +678,7 @@ fn to_utc_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `Date.prototype.toISOString()`: `2026-10-15T10:34:56.789Z`, the year as
 /// `±YYYYYY` outside 0..=9999; a RangeError for an invalid date.
-fn to_iso_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_iso_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let tv = this_time(this)?;
     if tv.is_nan() {
         return Err(Error::range_error("Invalid time value"));
@@ -705,7 +705,7 @@ fn to_iso_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `Date.prototype.toJSON(key)`: `this.toISOString()`, or null when
 /// `this`'s primitive is a non-finite number. Generic: any object with a
 /// `toISOString`.
-fn to_json(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_json(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("Date.prototype.toJSON called on null or undefined"));
     }

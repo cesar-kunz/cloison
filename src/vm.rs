@@ -4,6 +4,7 @@
 //! The interpreter reaches it through each frame's header (see
 //! `src/interp.rs`), which holds the frame's [`Code`] and the `Vm`.
 
+use crate::brand::Args;
 use crate::object::Obj;
 use crate::raw::{Live, ObjectPtr};
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -120,7 +121,7 @@ fn lookup_index(shape: *const crate::object::Shape, name: Atom) -> usize {
 }
 
 /// A function implemented in Rust: `(vm, this, args)`.
-pub type NativeFn = fn(&mut Vm, Value, &[Value]) -> Result<Value>;
+pub type NativeFn = fn(&mut Vm, Value, crate::brand::Args<'_>) -> Result<Value>;
 
 /// One way of an inline-cache slot. A load hits when the receiver's shape is `shape`:
 /// the value is at `loc` in the receiver, or, if `holder` is set, in that
@@ -3616,7 +3617,7 @@ impl Vm {
     /// `interp::current_vm` names too: its operations enter it, as
     /// between runs.
     #[inline(always)]
-    fn running(&self) -> bool {
+    pub(crate) fn running(&self) -> bool {
         debug_assert!(!self.entered() || std::ptr::eq(crate::interp::current_vm(), self));
         self.entered()
     }
@@ -7224,13 +7225,13 @@ impl Vm {
         if !self.running() {
             return self.host(&[f, this], args, |vm| vm.call_other(f, this, args));
         }
-        self.call_own(f, this, args)
+        self.with_args(args, |vm, a| vm.call_own(f, this, a))
     }
 
     /// [`call_other`](Self::call_other) from a frame of this VM, which is
     /// running.
     #[inline(always)]
-    pub(crate) fn call_own(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
+    pub(crate) fn call_own(&mut self, f: Value, this: Value, args: crate::brand::Args<'_>) -> Result<Value> {
         self.check_own(f, "Vm::call_other");
         self.check_own(this, "Vm::call_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::call_other"));
@@ -7262,6 +7263,12 @@ impl Vm {
         if !self.running() {
             return self.host(&[f], args, |vm| vm.construct_other(f, args));
         }
+        self.with_args(args, |vm, a| vm.construct_own(f, a))
+    }
+
+    /// [`construct_other`](Self::construct_other) from a frame of this VM,
+    /// which is running, its arguments rooted.
+    pub(crate) fn construct_own(&mut self, f: Value, args: crate::brand::Args<'_>) -> Result<Value> {
         self.check_own(f, "Vm::construct_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::construct_other"));
         if f.is_cell() {
@@ -8613,10 +8620,10 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
 
 /// `Array(…)` and `new Array(…)`: `Array(n)` has length `n` (holes), any
 /// other arguments are the elements.
-fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+fn array_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
     let a = vm.new_array();
     let o = Obj::of(a);
-    let elems: Vec<Value> = match args {
+    let elems: Vec<Value> = match &*args {
         [n] if n.is_number() => {
             let len = n.as_number().unwrap();
             if len < 0.0 || len.fract() != 0.0 || len > u32::MAX as f64 {
@@ -8697,27 +8704,27 @@ fn num_arg(args: &[Value], i: usize) -> f64 {
     args.get(i).map_or(f64::NAN, |&v| crate::interp::to_number(v))
 }
 
-fn math_log(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(crate::math::log(num_arg(a, 0))))
+fn math_log(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(crate::math::log(num_arg(&a, 0))))
 }
-fn math_exp(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(crate::math::exp(num_arg(a, 0))))
+fn math_exp(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(crate::math::exp(num_arg(&a, 0))))
 }
-fn math_sqrt(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).sqrt()))
+fn math_sqrt(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(num_arg(&a, 0).sqrt()))
 }
-fn math_abs(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).abs()))
+fn math_abs(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(num_arg(&a, 0).abs()))
 }
-fn math_floor(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).floor()))
+fn math_floor(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(num_arg(&a, 0).floor()))
 }
-fn math_ceil(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).ceil()))
+fn math_ceil(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(num_arg(&a, 0).ceil()))
 }
 /// `Math.round`: halves round up (`-2.5` is `-2`), unlike Rust's `round`.
-fn math_round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = num_arg(a, 0);
+fn math_round(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = num_arg(&a, 0);
     // (Not `(x + 0.5).floor()`: 0.49999999999999994 + 0.5 rounds to 1.)
     let f = x.floor();
     let r = if x - f >= 0.5 { f + 1.0 } else { f };
@@ -8731,23 +8738,23 @@ fn math_round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         r
     }))
 }
-fn math_sin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(crate::math::sin(num_arg(a, 0))))
+fn math_sin(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(crate::math::sin(num_arg(&a, 0))))
 }
-fn math_cos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(crate::math::cos(num_arg(a, 0))))
+fn math_cos(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(crate::math::cos(num_arg(&a, 0))))
 }
 /// `Math.pow` (fdlibm's, as V8's: `pow(1, NaN)` and `pow(±1, ±∞)` are NaN).
-fn math_pow(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(crate::math::pow(num_arg(a, 0), num_arg(a, 1))))
+fn math_pow(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(crate::math::pow(num_arg(&a, 0), num_arg(&a, 1))))
 }
 /// `Math.min`/`max` of all the arguments (NaN if any is; no arguments:
 /// `Infinity`/`-Infinity`).
-fn math_min(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn math_min(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let mut r = f64::INFINITY;
     let mut nan = false;
     for i in 0..a.len() {
-        let x = num_arg(a, i);
+        let x = num_arg(&a, i);
         // (Not past one that throws.)
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
@@ -8762,11 +8769,11 @@ fn math_min(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     Ok(Value::number(if nan { f64::NAN } else { r }))
 }
-fn math_max(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn math_max(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let mut r = f64::NEG_INFINITY;
     let mut nan = false;
     for i in 0..a.len() {
-        let x = num_arg(a, i);
+        let x = num_arg(&a, i);
         // (Not past one that throws.)
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
@@ -8782,7 +8789,7 @@ fn math_max(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::number(if nan { f64::NAN } else { r }))
 }
 /// `Math.random`: xorshift64*, seeded from the clock.
-fn math_random(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn math_random(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     thread_local! {
         static STATE: Cell<u64> = Cell::new(
             (crate::date::now_ms() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
@@ -8807,7 +8814,7 @@ fn this_number(this: Value) -> Result<f64> {
 
 /// `Number.prototype.toFixed(digits)`: rounded to `digits` (0 to 100)
 /// decimals, halves away from zero; `ToString` past 1e21.
-fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn number_to_fixed(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let x = this_number(this)?;
     let f = to_integer_arg(vm, a.first().copied())?;
     if !(0.0..=100.0).contains(&f) {
@@ -8929,7 +8936,7 @@ pub(crate) fn significant(x: f64, p: usize) -> (String, i32) {
 
 /// `Number.prototype.toPrecision(p)`: `p` (1 to 100) significant digits,
 /// in exponent form when the exponent is below -6 or at least `p`.
-fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn number_to_precision(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let x = this_number(this)?;
     let s = match a.first() {
         None => number_to_string(x),
@@ -8967,7 +8974,7 @@ fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Number.prototype.toString(radix)` (2 to 36, 10 by default).
-pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let radix = match a.first() {
         Some(r) if !r.is_undefined() => crate::interp::to_number(*r).trunc(),
         _ => 10.0,
@@ -8979,7 +8986,7 @@ pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> 
     Ok(vm.new_string(&units))
 }
 
-fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+fn object_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
     vm.is_construct();
     match args.first() {
         Some(&v) if !v.is_undefined() && !v.is_null() => Ok(object_value(vm.to_obj_b(v)?.take().ptr())),
@@ -8991,7 +8998,7 @@ fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
 }
 
 /// `Function.prototype` called: `undefined`.
-fn function_prototype_fn(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn function_prototype_fn(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::UNDEFINED)
 }
 
@@ -9051,9 +9058,9 @@ impl MappedArgs {
 
 /// `Function.prototype.call` on a native: a call through it to a bytecode
 /// function is unwrapped where it is made (`interp::unwrap_call`).
-fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
-    let (that, rest) = match args {
-        [] => (Value::UNDEFINED, args),
+fn function_call(vm: &mut Vm, this: Value, args: Args<'_>) -> Result<Value> {
+    let (that, rest) = match &*args {
+        [] => (Value::UNDEFINED, args.slice()),
         [t, rest @ ..] => (*t, rest),
     };
     if !crate::props::is_callable(this) {
@@ -9067,7 +9074,7 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
 fn array_push_generic(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     // (`args`, maybe a Rust caller's only, and `this`'s object rooted
     // across the getters and setters.)
-    vm.rooted(args, |vm| {
+    vm.rooted(&args, |vm| {
         // take: rooted at once by the closure.
         let this = object_value(vm.to_obj_b(this)?.take().ptr());
         vm.rooted(&[this], |vm| array_push_generic_of(vm, this, args))
@@ -9094,11 +9101,11 @@ fn array_push_generic_of(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
 /// `Array.prototype.push`: [`array_push`], but each element stored with
 /// `Set` once a prototype may have a setter or read-only element there
 /// (see `Vm::protect_indices`).
-fn array_push_method(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
+fn array_push_method(vm: &mut Vm, this: Value, args: Args<'_>) -> Result<Value> {
     if vm.indices_protected {
-        return array_push_generic(vm, this, args);
+        return array_push_generic(vm, this, &args);
     }
-    array_push(vm, this, args)
+    array_push(vm, this, &args)
 }
 
 /// Push onto array `this` (as array literals do: elements defined, not
@@ -9115,7 +9122,7 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
     if len + args.len() > unsafe { Object::elems_cap(o.ptr().cast_const()) } as usize {
         // (`args`, maybe a Rust caller's only (a new string), rooted
         // across the growth.)
-        vm.rooted(args, |vm| vm.reserve_elems(o, len + args.len()));
+        vm.rooted(&args, |vm| vm.reserve_elems(o, len + args.len()));
     }
     for (i, &v) in args.iter().enumerate() {
         vm.store_element(o, len + i, v);
@@ -9137,7 +9144,7 @@ fn array_push_flagged(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value>
         return array_push_generic(vm, this, args);
     }
     // (`args` rooted across the setters.)
-    vm.rooted(args, |vm| {
+    vm.rooted(&args, |vm| {
         for &v in args {
             let n = crate::far::array_length(o);
             vm.put_key(this, Key::Index(n), v)?;
@@ -10136,7 +10143,7 @@ mod tests {
     /// A native making a string past the longest through `new_string_with`
     /// (a builder that didn't check), which leaves the RangeError for its
     /// caller to throw: `fill` isn't called.
-    fn too_long(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn too_long(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         Ok(vm.new_string_with(MAX_STRING_LEN + 1, |_| unreachable!()))
     }
 
@@ -10221,7 +10228,7 @@ out.join();"#;
     }
 
     /// `addr(o)`: where object `o` is.
-    fn addr(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    fn addr(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         Ok(Value::number(as_object(a[0]) as usize as f64))
     }
 
@@ -10361,7 +10368,7 @@ out.join();"#;
     }
 
     /// `mark()`: a native compiled code calls, counted.
-    fn mark(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn mark(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         MARKS.with(|m| m.set(m.get() + 1));
         Ok(Value::UNDEFINED)
     }
@@ -10616,7 +10623,7 @@ out.join();"#;
     }
 
     /// `squeeze()`: no more fresh blocks.
-    fn squeeze(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn squeeze(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         vm.heap.limit_growth(0);
         Ok(Value::UNDEFINED)
     }
@@ -10648,7 +10655,7 @@ out.join();"#;
 
     /// `boom(panics)`: if `panics`, a conversion's state left pending (a
     /// redo asked, replays checked, an error), then a panic.
-    fn boom(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    fn boom(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         if a.first() == Some(&Value::TRUE) {
             (vm.conv_redo, vm.conv_replays, vm.conv_thrown) = (true, true, true);
             vm.conv_error = Some(Error::type_error("stale"));
@@ -10828,7 +10835,7 @@ sum;
 
     /// `known(ta, p)`: what `Vm::typed_lengths` gives for typed array
     /// `ta`: 0 nothing, 1 prototype `p`, 2 another address.
-    fn known(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    fn known(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         let r = match vm.known_typed_length(Obj::of(a[0])) {
             None => 0,
             Some(h) if h == Obj::of(a[1]) => 1,
@@ -10839,7 +10846,7 @@ sum;
 
     /// What a collection moving cells does to the VM's caches of addresses
     /// (`gc::Evacuation`).
-    fn forget(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn forget(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         vm.forget_lookups();
         Ok(Value::UNDEFINED)
     }
@@ -10886,7 +10893,7 @@ before + "," + known(ta, P);
     }
 
     /// `swap()`: the running VM swapped with another.
-    fn swap_vm(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn swap_vm(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         swap_with_other(vm);
         Ok(Value::UNDEFINED)
     }
@@ -10906,21 +10913,21 @@ before + "," + known(ta, P);
     /// `replace(...)`: a new VM put in the running one's place
     /// (`std::mem::replace`'s short form), the one running dropped, then
     /// the arguments read (a slice of its VM stack).
-    fn replace_vm(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    fn replace_vm(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
         drop(std::mem::take(vm));
-        past_the_drop(args)
+        past_the_drop(&args)
     }
 
     /// `swapDrop(...)`: the swap, then the VM that was running, now in
     /// the other's place, dropped, and the arguments read.
-    fn swap_vm_and_drop(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    fn swap_vm_and_drop(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
         swap_with_other(vm);
         drop(OTHER.with(|o| o.borrow_mut().take()));
-        past_the_drop(args)
+        past_the_drop(&args)
     }
 
     /// `swapPanic()`: the swap, then a panic.
-    fn swap_vm_and_panic(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn swap_vm_and_panic(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         swap_with_other(vm);
         panic!("after the swap")
     }
@@ -10929,7 +10936,7 @@ before + "," + known(ta, P);
     /// running one's place, a getter's call: the operation of a VM
     /// between runs, which it is. (An exit if it fails: not the abort
     /// the test expects.)
-    fn swap_vm_and_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn swap_vm_and_get(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         swap_with_other(vm);
         let (g, k) = (vm.global_object().value(), vm.intern("got"));
         let r = vm.get(g, k);
@@ -10942,7 +10949,7 @@ before + "," + known(ta, P);
 
     /// `swapUse()`: the swap, then an operation on the VM that was
     /// running, where it is now.
-    fn swap_vm_and_use(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn swap_vm_and_use(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         swap_with_other(vm);
         OTHER.with(|o| {
             let mut o = o.borrow_mut();
@@ -10954,7 +10961,7 @@ before + "," + known(ta, P);
 
     /// `swapBack()`: the swap, and the swap back: the running VM is where
     /// it was as the native returns.
-    fn swap_vm_and_back(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn swap_vm_and_back(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         swap_with_other(vm);
         swap_with_other(vm);
         Ok(Value::number(1.0))
@@ -10963,7 +10970,7 @@ before + "," + known(ta, P);
     /// `swapGetSwap()`: the swap, then a getter of the VM now in the
     /// running one's place which calls that VM's `swap()`: the first VM
     /// is back in its place, under the getter's frames.
-    fn swap_vm_and_get_swap(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    fn swap_vm_and_get_swap(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
         swap_with_other(vm);
         let (g, k) = (vm.global_object().value(), vm.intern("swapsBack"));
         vm.get(g, k)

@@ -14,7 +14,7 @@
 //! async JS helper made on first use (as `Array.fromAsync`'s), so its
 //! awaits are the language's, calling only what it is given here.
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::builtins::{getter, link_constructor};
 use crate::interp::to_string_units;
 use crate::object::{Class, DONT_ENUM, Obj, object_value};
@@ -346,12 +346,12 @@ const ASYNC_DISPOSE: &str = r#"(function (call, suppress) {
   };
 })"#;
 
-fn helper_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    vm.call_b(arg(a, 0), arg(a, 1), a.get(2..).unwrap_or(&[])).map(Fresh::take)
+fn helper_call(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    vm.call_b(arg(&a, 0), arg(&a, 1), a.get(2..).unwrap_or(&[])).map(Fresh::take)
 }
 
-fn helper_suppress(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(suppressed_error(vm, arg(a, 0), arg(a, 1)))
+fn helper_suppress(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(suppressed_error(vm, arg(&a, 0), arg(&a, 1)))
 }
 
 /// DisposeResources with hint async of capability `state`'s resources
@@ -367,7 +367,7 @@ pub(crate) fn dispose_resources_async(vm: &mut Vm, state: Value, has_error: bool
 // ---- SuppressedError ----
 
 /// `new SuppressedError(error, suppressed, message)` (or a call).
-fn suppressed_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn suppressed_error_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     vm.is_construct();
     let message = match a.get(2) {
         Some(&v) if !v.is_undefined() => {
@@ -387,8 +387,8 @@ fn suppressed_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         vm.add_property_with(o, a_message, m, DONT_ENUM);
     }
     let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
-    vm.add_property_with(o, a_error, arg(a, 0), DONT_ENUM);
-    vm.add_property_with(o, a_suppressed, arg(a, 1), DONT_ENUM);
+    vm.add_property_with(o, a_error, arg(&a, 0), DONT_ENUM);
+    vm.add_property_with(o, a_suppressed, arg(&a, 1), DONT_ENUM);
     Ok(object_value(o.ptr()))
 }
 
@@ -406,7 +406,7 @@ fn new_stack(vm: &mut Vm, async_: bool) -> Result<Value> {
     Ok(object_value(o.ptr()))
 }
 
-fn stack_ctor<const ASYNC: bool>(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn stack_ctor<const ASYNC: bool>(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error(format!("Constructor {} requires 'new'", name(ASYNC))));
     }
@@ -433,16 +433,16 @@ fn live_state(this: Value, async_: bool, what: &str) -> Result<Value> {
     Ok(state)
 }
 
-fn stack_use<const ASYNC: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn stack_use<const ASYNC: bool>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let state = live_state(this, ASYNC, "use")?;
-    let v = arg(a, 0);
+    let v = arg(&a, 0);
     add_resource(vm, state, v, ASYNC)?;
     Ok(v)
 }
 
-fn stack_adopt<const ASYNC: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn stack_adopt<const ASYNC: bool>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let state = live_state(this, ASYNC, "adopt")?;
-    let (v, f) = (arg(a, 0), arg(a, 1));
+    let (v, f) = (arg(&a, 0), arg(&a, 1));
     if !is_callable(f) {
         return Err(Error::type_error("adopt: onDispose is not a function"));
     }
@@ -450,9 +450,9 @@ fn stack_adopt<const ASYNC: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Resu
     Ok(v)
 }
 
-fn stack_defer<const ASYNC: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn stack_defer<const ASYNC: bool>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let state = live_state(this, ASYNC, "defer")?;
-    let f = arg(a, 0);
+    let f = arg(&a, 0);
     if !is_callable(f) {
         return Err(Error::type_error("defer: onDispose is not a function"));
     }
@@ -462,7 +462,7 @@ fn stack_defer<const ASYNC: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Resu
 
 /// `move()`: a new stack (of the intrinsic prototype) with this one's
 /// resources, this one disposed.
-fn stack_move<const ASYNC: bool>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn stack_move<const ASYNC: bool>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = live_state(this, ASYNC, "move")?;
     let out = new_stack(vm, ASYNC)?;
     let to = Value::from_bits(Obj::of(out).code() as u64);
@@ -473,12 +473,12 @@ fn stack_move<const ASYNC: bool>(vm: &mut Vm, this: Value, _: &[Value]) -> Resul
     Ok(out)
 }
 
-fn stack_disposed<const ASYNC: bool>(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn stack_disposed<const ASYNC: bool>(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = state_of(this, ASYNC, "disposed")?;
     Ok(elem(state, DISPOSED))
 }
 
-fn stack_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn stack_dispose(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = state_of(this, false, "dispose")?;
     if elem(state, DISPOSED) == Value::TRUE {
         return Ok(Value::UNDEFINED);
@@ -488,7 +488,7 @@ fn stack_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `disposeAsync()`: a promise, rejected for another receiver.
-fn stack_dispose_async(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn stack_dispose_async(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = match state_of(this, true, "disposeAsync") {
         Ok(s) => s,
         Err(e) => return rejected(vm, e),
@@ -514,7 +514,7 @@ fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
 
 /// `%IteratorPrototype%[Symbol.dispose]()`: `this.return()`, if it has
 /// one.
-fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn iterator_dispose(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let a = vm.intern_name("return");
     let sc_m = Scope::new(vm);
     let m = vm.get_atom_b(this, a)?.root(&sc_m);
@@ -526,7 +526,7 @@ fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `%AsyncIteratorPrototype%[Symbol.asyncDispose]()`: a promise of
 /// `this.return()` settling (to undefined), if it has one.
-fn async_iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn async_iterator_dispose(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let r = (|| -> Result<Value> {
         let a = vm.intern_name("return");
         let sc_m = Scope::new(vm);

@@ -32,7 +32,7 @@
 //! does a typed array longer than `i32::MAX`: its length is no int32,
 //! which compiled code would box it as (#226).
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{to_boolean, to_number};
 use crate::object::Obj;
@@ -425,12 +425,12 @@ fn this_buffer(this: Value, what: &str) -> Result<Obj> {
 }
 
 /// `new ArrayBuffer(length, {maxByteLength})`.
-fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn array_buffer_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor ArrayBuffer requires 'new'"));
     }
-    let n = to_index(vm, arg(a, 0))?;
-    let options = arg(a, 1);
+    let n = to_index(vm, arg(&a, 0))?;
+    let options = arg(&a, 1);
     let mut max = None;
     if is_object(options) {
         let a_max = vm.intern_name("maxByteLength");
@@ -450,12 +450,12 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(object_value(o.ptr()))
 }
 
-fn buffer_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn buffer_byte_length(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     // (A number: 2^31 bytes is no int32.)
     Ok(Value::number(unsafe { (*(this_buffer(this, "byteLength")?).ptr()).elems_len } as f64))
 }
 
-fn buffer_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn buffer_max_byte_length(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let b = this_buffer(this, "maxByteLength")?;
     let n = unsafe {
         if is_detached(b) {
@@ -469,21 +469,21 @@ fn buffer_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value>
     Ok(Value::number(n as f64))
 }
 
-fn buffer_resizable(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn buffer_resizable(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::from_bool(is_resizable(this_buffer(this, "resizable")?)))
 }
 
-fn buffer_detached(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn buffer_detached(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::from_bool(is_detached(this_buffer(this, "detached")?)))
 }
 
 /// `buffer.resize(newLength)`: its bytes from there on zero.
-fn buffer_resize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn buffer_resize(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let b = this_buffer(this, "resize")?;
     if !is_resizable(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.resize: the buffer is not resizable"));
     }
-    let n = to_index(vm, arg(a, 0))?;
+    let n = to_index(vm, arg(&a, 0))?;
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.resize: the buffer is detached"));
     }
@@ -503,14 +503,14 @@ fn buffer_resize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `buffer.slice(begin, end)`: a copy of those bytes, in a buffer of the
 /// species.
-fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn buffer_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let b = this_buffer(this, "slice")?;
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the buffer is detached"));
     }
     let len = b.elems_len() as usize;
-    let first = relative(integer(vm, arg(a, 0))?, len);
-    let end = arg(a, 1);
+    let first = relative(integer(vm, arg(&a, 0))?, len);
+    let end = arg(&a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
     let default = object_value((vm.typed_constructors[TypedKind::ALL.len()]).ptr());
@@ -571,9 +571,9 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
 
 /// `transferToImmutable(newLength)`: a new immutable buffer with the bytes
 /// (zeros past them), this one detached.
-fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let b = this_buffer(this, "transferToImmutable")?;
-    let n = match arg(a, 0) {
+    let n = match arg(&a, 0) {
         v if v.is_undefined() => (b.elems_len()) as usize,
         v => to_index(vm, v)?,
     };
@@ -593,14 +593,14 @@ fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
 /// `sliceToImmutable(start, end)`: a new immutable buffer with those
 /// bytes, the bounds from the length before their conversions (a
 /// RangeError if it shrank below them since).
-fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let b = this_buffer(this, "sliceToImmutable")?;
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.sliceToImmutable: the buffer is detached"));
     }
     let len = b.elems_len() as usize;
-    let first = relative(integer(vm, arg(a, 0))?, len);
-    let end = arg(a, 1);
+    let first = relative(integer(vm, arg(&a, 0))?, len);
+    let end = arg(&a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
     if is_detached(b) {
@@ -615,21 +615,21 @@ fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value
     Ok(object_value(out.ptr()))
 }
 
-fn buffer_immutable(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn buffer_immutable(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::from_bool(is_immutable(this_buffer(this, "immutable")?)))
 }
 
-fn buffer_transfer(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    transfer_with(vm, this, a, false)
+fn buffer_transfer(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    transfer_with(vm, this, &a, false)
 }
 
-fn buffer_transfer_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    transfer_with(vm, this, a, true)
+fn buffer_transfer_fixed(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    transfer_with(vm, this, &a, true)
 }
 
 /// `ArrayBuffer.isView(v)`: a typed array or a `DataView`.
-fn buffer_is_view(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
+fn buffer_is_view(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let v = arg(&a, 0);
     Ok(Value::from_bool(is_class(v, Class::TypedArray) || is_class(v, Class::DataView)))
 }
 
@@ -899,12 +899,12 @@ pub(crate) fn allocate(vm: &mut Vm, k: TypedKind, n: usize) -> Result<Value> {
 
 /// `new X(length)`, `new X(typedArray)`, `new X(buffer, byteOffset,
 /// length)`, or `new X(object)` (iterable, or array-like).
-fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let k = TypedKind::ALL[K];
     if !vm.is_construct() {
         return Err(Error::type_error(format!("Constructor {} requires 'new'", k.name())));
     }
-    let first = arg(a, 0);
+    let first = arg(&a, 0);
     if !is_object(first) {
         let n = to_index(vm, first)?;
         return allocate(vm, k, n);
@@ -939,7 +939,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
             Ok(out)
         }
         Class::ArrayBuffer | Class::SharedArrayBuffer => {
-            let offset = to_index(vm, arg(a, 1))?;
+            let offset = to_index(vm, arg(&a, 1))?;
             if offset % k.size() != 0 {
                 return Err(Error::range_error(format!(
                     "start offset of {} should be a multiple of {}",
@@ -947,7 +947,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
                     k.size()
                 )));
             }
-            let length = arg(a, 2);
+            let length = arg(&a, 2);
             let n = if length.is_undefined() { None } else { Some(to_index(vm, length)?) };
             on_buffer(vm, k, fo, offset, n)
         }
@@ -1050,16 +1050,16 @@ fn iterate_with_raw(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
 }
 
 /// `%TypedArray%` itself: not to be called or constructed.
-fn typed_array_abstract(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn typed_array_abstract(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Err(Error::type_error("Abstract class TypedArray not directly constructable"))
 }
 
 /// `TA.from(source, mapFn, thisArg)`.
-fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_from(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !crate::intrinsics::is_constructor(this) {
         return Err(Error::type_error("TypedArray.from: this is not a constructor"));
     }
-    let (source, f, this_arg) = (arg(a, 0), arg(a, 1), arg(a, 2));
+    let (source, f, this_arg) = (arg(&a, 0), arg(&a, 1), arg(&a, 2));
     if !f.is_undefined() && !is_callable(f) {
         return Err(Error::type_error("TypedArray.from: the mapping function is not callable"));
     }
@@ -1103,7 +1103,7 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `TA.of(...items)`.
-fn typed_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !crate::intrinsics::is_constructor(this) {
         return Err(Error::type_error("TypedArray.of: this is not a constructor"));
     }
@@ -1116,21 +1116,21 @@ fn typed_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(o)
 }
 
-fn typed_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_buffer(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(object_value((buffer_of(this_typed(this)?)).ptr()))
 }
 
-fn typed_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_byte_length(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (o, len) = this_typed_seq_cst(vm, this)?;
     Ok(Value::number((len.unwrap_or(0) * kind_of(o).size()) as f64))
 }
 
-fn typed_byte_offset(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_byte_offset(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (o, len) = this_typed_seq_cst(vm, this)?;
     Ok(Value::number(if len.is_some() { offset_of(o) as f64 } else { 0.0 }))
 }
 
-fn typed_length_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_length_getter(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::number(this_typed_seq_cst(vm, this)?.1.unwrap_or(0) as f64))
 }
 
@@ -1146,7 +1146,7 @@ pub(crate) fn is_length_getter(v: Value) -> bool {
 }
 
 /// `get %TypedArray%.prototype[Symbol.toStringTag]`: the kind's name.
-pub(crate) fn typed_to_string_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn typed_to_string_tag(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if !is_class(this, Class::TypedArray) {
         return Ok(Value::UNDEFINED);
     }
@@ -1165,9 +1165,9 @@ fn callback(a: &[Value], what: &str) -> Result<Value> {
     Ok(f)
 }
 
-fn typed_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_at(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let r = integer(vm, arg(a, 0))?;
+    let r = integer(vm, arg(&a, 0))?;
     let k = if r >= 0.0 { r } else { len as f64 + r };
     if k < 0.0 || k >= len as f64 {
         return Ok(Value::UNDEFINED);
@@ -1175,12 +1175,12 @@ fn typed_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(get(o, k as usize))
 }
 
-fn typed_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_copy_within(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     writable_view(o)?;
-    let to = relative(integer(vm, arg(a, 0))?, len);
-    let from = relative(integer(vm, arg(a, 1))?, len);
-    let end = arg(a, 2);
+    let to = relative(integer(vm, arg(&a, 0))?, len);
+    let from = relative(integer(vm, arg(&a, 1))?, len);
+    let end = arg(&a, 2);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let count = (last as isize - from as isize).min(len as isize - to as isize);
     if count > 0 {
@@ -1220,34 +1220,34 @@ fn search(vm: &mut Vm, this: Value, a: &[Value], what: &str, back: bool, stop: b
     Ok(None)
 }
 
-fn typed_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(search(vm, this, a, "every", false, false)?.is_none()))
+fn typed_every(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(search(vm, this, &a, "every", false, false)?.is_none()))
 }
 
-fn typed_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(search(vm, this, a, "some", false, true)?.is_some()))
+fn typed_some(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(search(vm, this, &a, "some", false, true)?.is_some()))
 }
 
-fn typed_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(search(vm, this, a, "find", false, true)?.map_or(Value::UNDEFINED, |(_, v)| v))
+fn typed_find(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(search(vm, this, &a, "find", false, true)?.map_or(Value::UNDEFINED, |(_, v)| v))
 }
 
-fn typed_find_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(search(vm, this, a, "findIndex", false, true)?.map_or(-1.0, |(i, _)| i as f64)))
+fn typed_find_index(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(search(vm, this, &a, "findIndex", false, true)?.map_or(-1.0, |(i, _)| i as f64)))
 }
 
-fn typed_find_last(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(search(vm, this, a, "findLast", true, true)?.map_or(Value::UNDEFINED, |(_, v)| v))
+fn typed_find_last(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(search(vm, this, &a, "findLast", true, true)?.map_or(Value::UNDEFINED, |(_, v)| v))
 }
 
-fn typed_find_last_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(search(vm, this, a, "findLastIndex", true, true)?.map_or(-1.0, |(i, _)| i as f64)))
+fn typed_find_last_index(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::number(search(vm, this, &a, "findLastIndex", true, true)?.map_or(-1.0, |(i, _)| i as f64)))
 }
 
-fn typed_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_for_each(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let f = callback(a, "forEach")?;
-    let this_arg = arg(a, 1);
+    let f = callback(&a, "forEach")?;
+    let this_arg = arg(&a, 1);
     for i in 0..len {
         let v = get(o, i);
         vm.call_b(f, this_arg, &[v, Value::number(i as f64), this])?.take();
@@ -1255,14 +1255,14 @@ fn typed_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::UNDEFINED)
 }
 
-fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_fill(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     // (A BigInt held across the conversions: rooted.)
     let sc = Scope::new(vm);
-    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(a, 0)))?.root(&sc);
-    let s = relative(integer(vm, arg(a, 1))?, len);
-    let end = arg(a, 2);
+    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(&a, 0)))?.root(&sc);
+    let s = relative(integer(vm, arg(&a, 1))?, len);
+    let end = arg(&a, 2);
     let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let v = v.v();
     let Some(len) = ta_length(o) else {
@@ -1275,10 +1275,10 @@ fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(this)
 }
 
-fn typed_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_filter(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let f = callback(a, "filter")?;
-    let this_arg = arg(a, 1);
+    let f = callback(&a, "filter")?;
+    let this_arg = arg(&a, 1);
     vm.handle_scope(|vm| {
         let mut kept = Vec::new();
         for i in 0..len {
@@ -1308,32 +1308,32 @@ fn from_index(vm: &mut Vm, v: Value, len: usize) -> Result<Option<usize>> {
     Ok((k < len as f64).then_some(k as usize))
 }
 
-fn typed_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_includes(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     if len == 0 {
         return Ok(Value::FALSE);
     }
-    let Some(start) = from_index(vm, arg(a, 1), len)? else { return Ok(Value::FALSE) };
-    let x = arg(a, 0);
+    let Some(start) = from_index(vm, arg(&a, 1), len)? else { return Ok(Value::FALSE) };
+    let x = arg(&a, 0);
     // (An element past its length now, the conversion having run code,
     // is undefined.)
     let now = ta_length(o).unwrap_or(0).min(len);
     Ok(Value::from_bool(find(o, start.min(now), now, x, false, true).is_some() || x.is_undefined() && now < len))
 }
 
-fn typed_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_index_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     if len == 0 {
         return Ok(Value::from_i32(-1));
     }
-    let Some(start) = from_index(vm, arg(a, 1), len)? else { return Ok(Value::from_i32(-1)) };
-    let x = arg(a, 0);
+    let Some(start) = from_index(vm, arg(&a, 1), len)? else { return Ok(Value::from_i32(-1)) };
+    let x = arg(&a, 0);
     let n = ta_length(o).unwrap_or(0).min(len);
     let found = find(o, start.min(n), n, x, false, false);
     Ok(Value::number(found.map_or(-1.0, |i| i as f64)))
 }
 
-fn typed_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_last_index_of(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     if len == 0 {
         return Ok(Value::from_i32(-1));
@@ -1346,15 +1346,15 @@ fn typed_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if k < 0.0 {
         return Ok(Value::from_i32(-1));
     }
-    let x = arg(a, 0);
+    let x = arg(&a, 0);
     let now = ta_length(o).unwrap_or(0);
     let found = find(o, 0, (k as usize + 1).min(now), x, true, false);
     Ok(Value::number(found.map_or(-1.0, |i| i as f64)))
 }
 
-pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let sep: Vec<u16> = match arg(a, 0) {
+    let sep: Vec<u16> = match arg(&a, 0) {
         s if s.is_undefined() => vec![b',' as u16],
         s => {
             let s = vm.to_string_b(s)?;
@@ -1381,10 +1381,10 @@ pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
     vm.try_new_string(&out)
 }
 
-fn typed_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let f = callback(a, "map")?;
-    let this_arg = arg(a, 1);
+    let f = callback(&a, "map")?;
+    let this_arg = arg(&a, 1);
     let sc = Scope::new(vm);
     let out = species_create(vm, o, &[Value::number(len as f64)], Some(len))?.root(&sc).v();
     for i in 0..len {
@@ -1416,15 +1416,15 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], back: bool) -> Result<Value> {
     Ok(acc)
 }
 
-fn typed_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    reduce(vm, this, a, false)
+fn typed_reduce(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    reduce(vm, this, &a, false)
 }
 
-fn typed_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    reduce(vm, this, a, true)
+fn typed_reduce_right(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    reduce(vm, this, &a, true)
 }
 
-fn typed_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_reverse(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     if shares(o) {
@@ -1451,17 +1451,17 @@ fn typed_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `t.set(source, offset)`: `source`'s elements (a typed array's, or an
 /// array-like's) stored from `offset` on.
-fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_typed(this)?;
     writable_view(o)?;
-    let offset = integer(vm, arg(a, 1))?;
+    let offset = integer(vm, arg(&a, 1))?;
     if offset < 0.0 {
         return Err(Error::range_error("offset is out of bounds"));
     }
     let Some(len) = ta_length_seq_cst(vm, o) else {
         return Err(Error::type_error("Cannot perform set on a detached or out of bounds typed array"));
     };
-    let src = arg(a, 0);
+    let src = arg(&a, 0);
     let k = kind_of(o);
     if is_class(src, Class::TypedArray) {
         let s = Obj::of(src);
@@ -1512,10 +1512,10 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::UNDEFINED)
 }
 
-fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let s = relative(integer(vm, arg(a, 0))?, len);
-    let end = arg(a, 1);
+    let s = relative(integer(vm, arg(&a, 0))?, len);
+    let end = arg(&a, 1);
     let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let count = e.saturating_sub(s);
     let sc = Scope::new(vm);
@@ -1617,8 +1617,8 @@ fn values(vm: &mut Vm, o: Obj, len: usize) -> Vec<Value> {
     values
 }
 
-fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let cmp = comparator(a)?;
+fn typed_sort(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let cmp = comparator(&a)?;
     let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     vm.handle_scope(|vm| {
@@ -1631,8 +1631,8 @@ fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let cmp = comparator(a)?;
+fn typed_to_sorted(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let cmp = comparator(&a)?;
     let (o, len) = validate(vm, this)?;
     let sc = Scope::new(vm);
     let out = Obj::of(create_same(vm, o, len)?.root(&sc).v());
@@ -1647,7 +1647,7 @@ fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_to_reversed(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     // (Its values stored where nothing collects.)
     // take: filled where nothing collects, then returned.
@@ -1658,13 +1658,13 @@ fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(object_value(out.ptr()))
 }
 
-fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
-    let r = integer(vm, arg(a, 0))?;
+    let r = integer(vm, arg(&a, 0))?;
     let i = if r >= 0.0 { r } else { len as f64 + r };
     // (The value, maybe a new BigInt, held across the new array's making.)
     let sc = Scope::new(vm);
-    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(a, 1)))?.root(&sc);
+    let v = vm.fresh(|vm| to_element(vm, kind_of(o), arg(&a, 1)))?.root(&sc);
     if !(i >= 0.0 && ta_length(o).is_some_and(|n| i < n as f64)) {
         return Err(Error::range_error("Invalid typed array index"));
     }
@@ -1676,14 +1676,14 @@ fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(object_value(out.ptr()))
 }
 
-fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_subarray(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_typed(this)?;
     let b = buffer_of(o);
     let len = ta_length_seq_cst(vm, o).unwrap_or(0);
-    let s = relative(integer(vm, arg(a, 0))?, len);
+    let s = relative(integer(vm, arg(&a, 0))?, len);
     let k = kind_of(o);
     let begin = offset_of(o) + s * k.size();
-    let end = arg(a, 1);
+    let end = arg(&a, 1);
     let n = if unsafe { *Object::aux(o.ptr()) } == TRACKING && end.is_undefined() {
         None
     } else {
@@ -1707,7 +1707,7 @@ fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(object_value(out.ptr()))
 }
 
-fn typed_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_to_locale_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let (o, len) = validate(vm, this)?;
     let mut out = Vec::new();
     let a_tls = vm.intern_name("toLocaleString");
@@ -1733,14 +1733,14 @@ fn typed_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
 
 /// `keys()`, `values()` and `entries()` (`K`: 0, 1, 2): an array iterator
 /// over a typed array in bounds.
-fn typed_iterator<const K: i32>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_iterator<const K: i32>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     validate(vm, this)?;
     crate::symbol::array_iterator(vm, this, K)
 }
 
 /// `%TypedArray%.prototype.values`, `[@@iterator]` too (one function,
 /// for `symbol::protector` to tell).
-pub(crate) fn typed_values(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn typed_values(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     typed_iterator::<1>(vm, this, a)
 }
 

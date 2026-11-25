@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::brand::Fresh;
+use crate::brand::{Args, Fresh};
 use crate::builtins::is_class;
 use crate::object::{Class, Obj, object_value};
 use crate::value::Value;
@@ -142,8 +142,8 @@ fn source_of(v: Value) -> Result<Vec<u16>> {
 }
 
 /// `$262.agent.start(source)`.
-fn agent_start(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let src = source_of(arg(a, 0))?;
+fn agent_start(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let src = source_of(arg(&a, 0))?;
     // (Those that ended are joined.)
     let (ended, running): (Vec<_>, Vec<_>) =
         std::mem::take(&mut vm.agent.started).into_iter().partition(|a| a.thread.is_finished());
@@ -247,15 +247,15 @@ fn run_agent_vm(mut vm: Vm, src: &[u16], mailbox: &Mailbox, reports: Reports) {
 
 /// `$262.agent.broadcast(sab, id)`: to every agent, once each has taken
 /// it.
-fn agent_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let b = arg(a, 0);
+fn agent_broadcast(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let b = arg(&a, 0);
     if !is_class(b, Class::SharedArrayBuffer) {
         return Err(Error::type_error("$262.agent.broadcast: not a SharedArrayBuffer"));
     }
     let o = Obj::of(b);
     let block = crate::shared::block_of(o);
     let growable = crate::typed::is_resizable(o);
-    let id = arg(a, 1);
+    let id = arg(&a, 1);
     let id = if id.is_number() { Value::number(id.to_number()) } else { Value::UNDEFINED };
     let agents: Vec<Arc<Mailbox>> = vm.agent.started.iter().map(|a| a.mailbox.clone()).collect();
     // (An agent that ends meanwhile is closed: skipped, not waited for.)
@@ -285,7 +285,7 @@ fn agent_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `$262.agent.getReport()`: the oldest report not taken, or `null`.
-fn agent_get_report(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn agent_get_report(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let r = lock(&vm.agent.reports).pop_front();
     Ok(match r {
         Some(s) => {
@@ -298,28 +298,28 @@ fn agent_get_report(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `$262.agent.receiveBroadcast(callback)`.
-fn agent_receive_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    vm.agent.callback = Some(arg(a, 0));
+fn agent_receive_broadcast(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    vm.agent.callback = Some(arg(&a, 0));
     Ok(Value::UNDEFINED)
 }
 
 /// `$262.agent.report(value)`: its string queued, for the agent's
 /// starter (a VM no agent's: its own).
-fn agent_report(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let s = vm.to_string_b(arg(a, 0))?;
+fn agent_report(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let s = vm.to_string_b(arg(&a, 0))?;
     let s = String::from_utf16_lossy(string_units(s.peek()).unwrap_or(&[]));
     lock(vm.agent.report_to.as_ref().unwrap_or(&vm.agent.reports)).push_back(s);
     Ok(Value::UNDEFINED)
 }
 
-fn agent_leaving(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn agent_leaving(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     vm.agent.leaving = true;
     Ok(Value::UNDEFINED)
 }
 
 /// `$262.agent.sleep(ms)`.
-fn agent_sleep(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let ms = crate::typed::integer(vm, arg(a, 0))?;
+fn agent_sleep(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let ms = crate::typed::integer(vm, arg(&a, 0))?;
     if ms > 0.0 {
         std::thread::sleep(Duration::from_secs_f64(ms.min(1e9) / 1000.0));
     }
@@ -327,7 +327,7 @@ fn agent_sleep(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `$262.agent.monotonicNow()`: milliseconds since the process started.
-fn agent_monotonic_now(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn agent_monotonic_now(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let t = EPOCH.get_or_init(Instant::now).elapsed();
     Ok(Value::number(t.as_millis() as f64))
 }

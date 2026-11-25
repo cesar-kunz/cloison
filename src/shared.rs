@@ -18,7 +18,7 @@
 //! ([`Vm::run_event_loop`]), between promise jobs ([`poll`]) and once
 //! they have run out.
 
-use crate::brand::Scope;
+use crate::brand::{Args, Scope};
 use crate::raw::ObjectPtr;
 use std::alloc::Layout;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicUsize, Ordering::SeqCst};
@@ -463,12 +463,12 @@ fn this_shared(this: Value, what: &str) -> Result<Obj> {
 }
 
 /// `new SharedArrayBuffer(length, {maxByteLength})`.
-fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn shared_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor SharedArrayBuffer requires 'new'"));
     }
-    let n = to_index(vm, arg(a, 0))?;
-    let options = arg(a, 1);
+    let n = to_index(vm, arg(&a, 0))?;
+    let options = arg(&a, 1);
     let mut max = None;
     if is_object(options) {
         let a_max = vm.intern_name("maxByteLength");
@@ -497,28 +497,28 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// synchronizes with the grow that wrote it, another agent's maybe: what
 /// that agent did before (other buffers' grows too) happens before what
 /// follows here (#155).
-fn shared_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn shared_byte_length(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let n = read_length(vm, this_shared(this, "byteLength")?);
     Ok(Value::number(n as f64))
 }
 
-fn shared_growable(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn shared_growable(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::from_bool(is_resizable(this_shared(this, "growable")?)))
 }
 
-fn shared_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn shared_max_byte_length(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_shared(this, "maxByteLength")?;
     let n = if is_resizable(o) { unsafe { (*block_of(o)).room } } else { sync_length(o) };
     Ok(Value::number(n as f64))
 }
 
 /// `buffer.grow(newLength)`: never shorter.
-fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn shared_grow(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_shared(this, "grow")?;
     if !is_resizable(o) {
         return Err(Error::type_error("SharedArrayBuffer.prototype.grow: the buffer is not growable"));
     }
-    let n = to_index(vm, arg(a, 0))?;
+    let n = to_index(vm, arg(&a, 0))?;
     let b = block_of(o);
     let room = unsafe { (*b).room };
     // The length's seq-cst read and compare-exchanges (25.2.5.3), whatever
@@ -566,12 +566,12 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `buffer.slice(begin, end)`: a copy of those bytes, in a shared buffer
 /// of the species.
-fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn shared_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let o = this_shared(this, "slice")?;
     // (Its length read seq-cst, 25.2.5.6: as by `byteLength`.)
     let len = read_length(vm, o);
-    let first = relative(integer(vm, arg(a, 0))?, len);
-    let end = arg(a, 1);
+    let first = relative(integer(vm, arg(&a, 0))?, len);
+    let end = arg(&a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
     let n = last.saturating_sub(first);
     let default = object_value(vm.shared.constructor);
@@ -712,42 +712,42 @@ fn read_modify_write(vm: &mut Vm, a: &[Value], op: Op) -> Result<Value> {
     Ok(r)
 }
 
-fn atomics_add(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    read_modify_write(vm, a, Op::Add)
+fn atomics_add(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    read_modify_write(vm, &a, Op::Add)
 }
 
-fn atomics_sub(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    read_modify_write(vm, a, Op::Sub)
+fn atomics_sub(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    read_modify_write(vm, &a, Op::Sub)
 }
 
-fn atomics_and(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    read_modify_write(vm, a, Op::And)
+fn atomics_and(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    read_modify_write(vm, &a, Op::And)
 }
 
-fn atomics_or(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    read_modify_write(vm, a, Op::Or)
+fn atomics_or(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    read_modify_write(vm, &a, Op::Or)
 }
 
-fn atomics_xor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    read_modify_write(vm, a, Op::Xor)
+fn atomics_xor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    read_modify_write(vm, &a, Op::Xor)
 }
 
-fn atomics_exchange(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    read_modify_write(vm, a, Op::Exchange)
+fn atomics_exchange(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    read_modify_write(vm, &a, Op::Exchange)
 }
 
-fn atomics_compare_exchange(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), false, true)?;
-    let (expected, _) = operand(vm, k, arg(a, 2))?;
-    let (replacement, _) = operand(vm, k, arg(a, 3))?;
+fn atomics_compare_exchange(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let (o, k, i) = access(vm, arg(&a, 0), arg(&a, 1), false, true)?;
+    let (expected, _) = operand(vm, k, arg(&a, 2))?;
+    let (replacement, _) = operand(vm, k, arg(&a, 3))?;
     revalidate(o, i)?;
     let r = element(k, apply(o, k, i, Op::CompareExchange(expected), replacement));
     catch_up(vm);
     Ok(r)
 }
 
-fn atomics_load(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), false, false)?;
+fn atomics_load(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let (o, k, i) = access(vm, arg(&a, 0), arg(&a, 1), false, false)?;
     revalidate(o, i)?;
     let r = element(k, apply(o, k, i, Op::Load, 0));
     catch_up(vm);
@@ -756,24 +756,24 @@ fn atomics_load(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `Atomics.store(ta, index, value)`: the value converted (not wrapped
 /// to the element's type).
-fn atomics_store(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), false, true)?;
-    let (v, out) = operand(vm, k, arg(a, 2))?;
+fn atomics_store(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let (o, k, i) = access(vm, arg(&a, 0), arg(&a, 1), false, true)?;
+    let (v, out) = operand(vm, k, arg(&a, 2))?;
     revalidate(o, i)?;
     apply(o, k, i, Op::Store, v);
     catch_up(vm);
     Ok(out)
 }
 
-fn atomics_is_lock_free(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let n = integer(vm, arg(a, 0))?;
+fn atomics_is_lock_free(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let n = integer(vm, arg(&a, 0))?;
     Ok(Value::from_bool(matches!(n as i64, 1 | 2 | 4 | 8) && n.fract() == 0.0))
 }
 
 /// `Atomics.pause(n)`: a spin-wait hint (`n` an integral number, if
 /// given).
-fn atomics_pause(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let n = arg(a, 0);
+fn atomics_pause(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let n = arg(&a, 0);
     if !n.is_undefined() {
         if !n.is_number() {
             return Err(Error::type_error("Atomics.pause: the argument is not a number"));
@@ -919,19 +919,19 @@ fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     Ok(object_value(r.ptr()))
 }
 
-fn atomics_wait(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    do_wait(vm, a, false)
+fn atomics_wait(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    do_wait(vm, &a, false)
 }
 
-fn atomics_wait_async(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    do_wait(vm, a, true)
+fn atomics_wait_async(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    do_wait(vm, &a, true)
 }
 
 /// `Atomics.notify(ta, index, count)`: up to `count` (all) waiters on
 /// the element woken, in the order they came; how many.
-fn atomics_notify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), true, false)?;
-    let count = arg(a, 2);
+fn atomics_notify(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let (o, k, i) = access(vm, arg(&a, 0), arg(&a, 1), true, false)?;
+    let count = arg(&a, 2);
     let c = if count.is_undefined() { f64::INFINITY } else { integer(vm, count)?.max(0.0) };
     let b = crate::typed::buffer_of(o);
     if !is_shared(b) {

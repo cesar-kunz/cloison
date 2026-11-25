@@ -16,7 +16,7 @@
 //! §10.5.*: a non-configurable property can't be reported otherwise than
 //! the target has it, nor a non-extensible target otherwise than it is).
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::interp::to_boolean;
 use crate::jit::HashSet;
 use crate::object::{Class, Obj, Object, object_value};
@@ -198,16 +198,16 @@ fn arg(a: &[Value], i: usize) -> Value {
 }
 
 /// `new Proxy(target, handler)`.
-fn proxy_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn proxy_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(Error::type_error("Constructor Proxy requires 'new'"));
     }
-    create(vm, arg(a, 0), arg(a, 1))
+    create(vm, arg(&a, 0), arg(&a, 1))
 }
 
 /// `Proxy.revocable(target, handler)`: `{ proxy, revoke }`.
-fn proxy_revocable(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let p = create(vm, arg(a, 0), arg(a, 1))?;
+fn proxy_revocable(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let p = create(vm, arg(&a, 0), arg(&a, 1))?;
     let full = vm.root_shape(Class::Native, object_value(vm.function_prototype), 1);
     let bare = vm.root_shape(Class::Native, object_value(vm.function_prototype), 0);
     let r = vm.heap.alloc_object(full.live());
@@ -224,7 +224,7 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// A revocable proxy's `revoke()`: its proxy's target and handler gone.
-fn revoke(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn revoke(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let r = vm.callee_obj();
     let p = slot(r, 0);
     if p.is_cell() {
@@ -236,7 +236,7 @@ fn revoke(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// A callable proxy called (`apply`) or constructed (`construct`).
-fn trampoline(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
+fn trampoline(vm: &mut Vm, this: Value, args: Args<'_>) -> Result<Value> {
     let constructing = vm.is_construct();
     let p = vm.callee_obj();
     let nt = std::mem::replace(&mut vm.new_target, Value::EMPTY);
@@ -245,11 +245,11 @@ fn trampoline(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     // `new.target`, taken from the VM, and the arguments' list rooted.)
     let held = Scope::new(vm);
     let _rooted = held.roots([t, h, nt]);
-    let list = crate::array::new_array_of(vm, args)?;
+    let list = crate::array::new_array_of(vm, &args)?;
     {
         let held = Scope::new(vm);
         let _held = held.roots([list]);
-        trampoline_with(vm, constructing, p, t, h, nt, this, args, list)
+        trampoline_with(vm, constructing, p, t, h, nt, this, &args, list)
     }
 }
 

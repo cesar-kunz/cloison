@@ -6,6 +6,7 @@
 use super::fields;
 use super::iso::{self, DateTime, IsoDate, RoundingMode, TIME_DURATION_MAX, Time, Unit};
 use super::*;
+use crate::brand::Args;
 use crate::object::Obj;
 
 /// A duration's fields: years, months, weeks, days, hours, minutes,
@@ -919,13 +920,13 @@ fn this_duration(this: Value) -> Result<Dur> {
     }
 }
 
-fn duration_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn duration_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     if !vm.is_construct() {
         return Err(type_err("Constructor Temporal.Duration requires 'new'"));
     }
     let mut d = [0f64; 10];
     for (k, v) in d.iter_mut().enumerate() {
-        let x = arg(a, k);
+        let x = arg(&a, k);
         if !x.is_undefined() {
             *v = to_integer_if_integral(vm, x)?;
         }
@@ -934,31 +935,31 @@ fn duration_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(create_duration(vm, d))
 }
 
-fn field<const K: usize>(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn field<const K: usize>(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::number(this_duration(this)?[K]))
 }
 
-fn duration_sign_getter(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn duration_sign_getter(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::from_i32(duration_sign(&this_duration(this)?) as i32))
 }
 
-fn duration_blank(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn duration_blank(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::from_bool(duration_sign(&this_duration(this)?) == 0))
 }
 
-fn duration_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn duration_with(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
-    let p = partial_duration(vm, arg(a, 0))?;
+    let p = partial_duration(vm, arg(&a, 0))?;
     let r = reject_duration(&std::array::from_fn(|k| p[k].unwrap_or(d[k])))?;
     Ok(create_duration(vm, r))
 }
 
-fn duration_negated(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn duration_negated(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
     Ok(create_duration(vm, negated(&d)))
 }
 
-fn duration_abs(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn duration_abs(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
     Ok(create_duration(vm, d.map(f64::abs)))
 }
@@ -979,12 +980,12 @@ fn add_durations(vm: &mut Vm, this: Value, a: &[Value], subtract: bool) -> Resul
     Ok(create_duration(vm, r))
 }
 
-fn duration_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    add_durations(vm, this, a, false)
+fn duration_add(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    add_durations(vm, this, &a, false)
 }
 
-fn duration_subtract(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    add_durations(vm, this, a, true)
+fn duration_subtract(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    add_durations(vm, this, &a, true)
 }
 
 /// An options argument that may be a string (the value of option `name`).
@@ -1001,10 +1002,10 @@ fn options_or_string(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     options_object(vm, v)
 }
 
-fn duration_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn duration_round(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
     let existing = default_largest_unit(&d);
-    let o = options_or_string(vm, arg(a, 0), "smallestUnit")?;
+    let o = options_or_string(vm, arg(&a, 0), "smallestUnit")?;
     // (`o`, maybe made here, rooted while its options are read.)
     let _rooted = vm.root_scope(&[o]);
     let largest_opt = unit_option(vm, o, "largestUnit", false)?;
@@ -1082,9 +1083,9 @@ fn duration_round(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(create_duration(vm, r))
 }
 
-fn duration_total(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn duration_total(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
-    let o = options_or_string(vm, arg(a, 0), "unit")?;
+    let o = options_or_string(vm, arg(&a, 0), "unit")?;
     // (`o`, maybe made here, rooted while its options are read.)
     let _rooted = vm.root_scope(&[o]);
     let relative = relative_to(vm, o)?;
@@ -1115,9 +1116,9 @@ fn duration_total(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::number(total))
 }
 
-fn duration_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn duration_to_string(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
-    let o = options_object(vm, arg(a, 0))?;
+    let o = options_object(vm, arg(&a, 0))?;
     let digits = fractional_digits(vm, o)?;
     let mode = rounding_mode(vm, o, RoundingMode::Trunc)?;
     let smallest = unit_option(vm, o, "smallestUnit", false)?;
@@ -1136,20 +1137,20 @@ fn duration_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(string(vm, &duration_string(&r, precision)))
 }
 
-fn duration_to_json(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn duration_to_json(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let d = this_duration(this)?;
     Ok(string(vm, &duration_string(&d, iso::Precision::Auto)))
 }
 
-fn duration_from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let d = to_duration(vm, arg(a, 0))?;
+fn duration_from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let d = to_duration(vm, arg(&a, 0))?;
     Ok(create_duration(vm, d))
 }
 
-fn duration_compare(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let one = to_duration(vm, arg(a, 0))?;
-    let two = to_duration(vm, arg(a, 1))?;
-    let o = options_object(vm, arg(a, 2))?;
+fn duration_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let one = to_duration(vm, arg(&a, 0))?;
+    let two = to_duration(vm, arg(&a, 1))?;
+    let o = options_object(vm, arg(&a, 2))?;
     let relative = relative_to(vm, o)?;
     if one == two {
         return Ok(Value::from_i32(0));

@@ -13,7 +13,7 @@
 //! machine per kind, and its `return` does what that generator would on a
 //! return completion at its `yield`.
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::interp::{to_boolean, to_number};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, READ_ONLY, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object};
@@ -126,7 +126,7 @@ fn arg(a: &[Value], i: usize) -> Value {
 
 /// `Iterator()`: abstract, only a subclass's constructor's `super()`
 /// constructs one (see `intrinsics::construct_with`).
-fn iterator_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn iterator_ctor(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let derived = std::mem::replace(&mut vm.derived_construct, Value::UNDEFINED);
     if !vm.is_construct() || derived != object_value((vm.iterator_roots[CONSTRUCTOR]).ptr()) {
         return Err(Error::type_error("Abstract class Iterator not directly constructable"));
@@ -135,22 +135,22 @@ fn iterator_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     Ok(object_value((vm.new_plain(object_value(ip.ptr()))).ptr()))
 }
 
-fn get_constructor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn get_constructor(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Ok(object_value((vm.iterator_roots[CONSTRUCTOR]).ptr()))
 }
 
-fn get_tag(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn get_tag(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Ok(vm.new_string(&"Iterator".encode_utf16().collect::<Vec<_>>()))
 }
 
-fn set_constructor(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_constructor(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let key = Key::Name(vm.intern_name("constructor"));
-    ignoring_prototype(vm, this, key, arg(a, 0))
+    ignoring_prototype(vm, this, key, arg(&a, 0))
 }
 
-fn set_tag(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn set_tag(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let key = Key::Name(vm.a_sym_to_string_tag);
-    ignoring_prototype(vm, this, key, arg(a, 0))
+    ignoring_prototype(vm, this, key, arg(&a, 0))
 }
 
 /// SetterThatIgnoresPrototypeProperties(this, `Iterator.prototype`, key, v).
@@ -300,7 +300,7 @@ fn int(v: Value) -> i32 {
 }
 
 /// `%IteratorHelperPrototype%.next()`: the next step of its closure.
-fn helper_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn helper_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = state_of(this, false, "Iterator Helper next")?;
     match int(get(vm, state, STATE)?) {
         RUNNING => return Err(Error::type_error("Generator is already running")),
@@ -489,7 +489,7 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
 /// `%IteratorHelperPrototype%.return()`: its underlying iterator closed
 /// (before it starts), or its closure resumed with a return completion
 /// (the iterators open at its `yield` closed, innermost first).
-fn helper_return(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn helper_return(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = state_of(this, false, "Iterator Helper return")?;
     let kind = int(get(vm, state, KIND)?);
     match int(get(vm, state, STATE)?) {
@@ -528,7 +528,7 @@ fn helper_return(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `%WrapForValidIteratorPrototype%.next()`: the wrapped iterator's.
-fn wrap_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn wrap_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = state_of(this, true, "%WrapForValidIteratorPrototype%.next")?;
     let (it, next) = (get(vm, state, ITER)?, get(vm, state, NEXT)?);
     vm.call_b(next, it, &[]).map(Fresh::take)
@@ -536,7 +536,7 @@ fn wrap_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `%WrapForValidIteratorPrototype%.return()`: the wrapped iterator's
 /// `return()`, if it has one.
-fn wrap_return(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn wrap_return(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let state = state_of(this, true, "%WrapForValidIteratorPrototype%.return")?;
     let it = get(vm, state, ITER)?;
     let a_return = vm.intern_name("return");
@@ -552,8 +552,8 @@ fn wrap_return(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `Iterator.from(o)`: `o`'s iterator, wrapped unless it inherits from
 /// `Iterator.prototype`.
-fn from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (it, next) = flattenable(vm, arg(a, 0), true)?;
+fn from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let (it, next) = flattenable(vm, arg(&a, 0), true)?;
     let c = object_value((vm.iterator_roots[CONSTRUCTOR]).ptr());
     // (A proxy's `getPrototypeOf` may collect: both rooted.)
     if {
@@ -568,12 +568,12 @@ fn from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `Iterator.concat(...items)`: their values in turn (each item an
 /// iterable object).
-fn concat(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn concat(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let list = vm.new_array();
     {
         let held = Scope::new(vm);
         let _held = held.roots([list]);
-        concat_list(vm, list, a)
+        concat_list(vm, list, &a)
     }?;
     new_helper(vm, CONCAT, Value::UNDEFINED, Value::UNDEFINED, list, Value::from_i32(0))
 }
@@ -620,16 +620,16 @@ fn lazy(vm: &mut Vm, this: Value, a: &[Value], kind: i32, what: &str) -> Result<
     new_helper(vm, kind, it, next, f, Value::from_i32(0))
 }
 
-fn map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    lazy(vm, this, a, MAP, "map")
+fn map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    lazy(vm, this, &a, MAP, "map")
 }
 
-fn filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    lazy(vm, this, a, FILTER, "filter")
+fn filter(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    lazy(vm, this, &a, FILTER, "filter")
 }
 
-fn flat_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    lazy(vm, this, a, FLAT_MAP, "flatMap")
+fn flat_map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    lazy(vm, this, &a, FLAT_MAP, "flatMap")
 }
 
 /// `take(limit)`'s and `drop(limit)`'s.
@@ -652,12 +652,12 @@ fn limited(vm: &mut Vm, this: Value, a: &[Value], kind: i32, what: &str) -> Resu
     new_helper(vm, kind, it, next, Value::UNDEFINED, Value::number(limit))
 }
 
-fn take(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    limited(vm, this, a, TAKE, "take")
+fn take(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    limited(vm, this, &a, TAKE, "take")
 }
 
-fn drop(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    limited(vm, this, a, DROP, "drop")
+fn drop(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    limited(vm, this, &a, DROP, "drop")
 }
 
 /// The eager methods' loop: `f(vm, value, counter)` for each value, until
@@ -697,9 +697,9 @@ fn each(
     Ok(None)
 }
 
-fn reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn reduce(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let it = this_object(this, "reduce")?;
-    let f = callable_arg(vm, it, arg(a, 0))?;
+    let f = callable_arg(vm, it, arg(&a, 0))?;
     let next = next_method(vm, it)?;
     // (`next`, and the accumulator in a slot of its own, held across the
     // calls: rooted.)
@@ -727,7 +727,7 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(vm.handles[slot])
 }
 
-fn to_array(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn to_array(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let out = vm.new_array();
     vm.rooted(&[out], |vm| {
         each(vm, this, None, "toArray", |vm, v, _| crate::vm::array_push(vm, out, &[v]).map(|_| None))
@@ -735,8 +735,8 @@ fn to_array(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(out)
 }
 
-fn for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let f = arg(a, 0);
+fn for_each(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let f = arg(&a, 0);
     each(vm, this, Some(f), "forEach", |vm, v, k| {
         vm.call_b(f, Value::UNDEFINED, &[v, Value::number(k)]).map(|_| None)
     })?;
@@ -752,16 +752,16 @@ fn search(vm: &mut Vm, this: Value, a: &[Value], want: bool, what: &str) -> Resu
     })
 }
 
-fn some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(search(vm, this, a, true, "some")?.is_some()))
+fn some(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(search(vm, this, &a, true, "some")?.is_some()))
 }
 
-fn every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(search(vm, this, a, false, "every")?.is_none()))
+fn every(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(search(vm, this, &a, false, "every")?.is_none()))
 }
 
-fn find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    Ok(search(vm, this, a, true, "find")?.unwrap_or(Value::UNDEFINED))
+fn find(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    Ok(search(vm, this, &a, true, "find")?.unwrap_or(Value::UNDEFINED))
 }
 
 /// A copy of array `a` from index `from` on (`CreateArrayFromList`).
@@ -785,9 +785,9 @@ fn is_string(v: Value, s: &str) -> bool {
 
 /// `includes(searchElement, skippedElements)`: whether a value past the
 /// first `skippedElements` is `searchElement` (SameValueZero).
-fn includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn includes(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let it = this_object(this, "includes")?;
-    let (search, skip) = (arg(a, 0), arg(a, 1));
+    let (search, skip) = (arg(&a, 0), arg(&a, 1));
     let to_skip = if skip.is_undefined() {
         0.0
     } else {
@@ -812,9 +812,9 @@ fn includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `join(separator)`: the values as strings (`null` and `undefined` as
 /// empty ones), `separator` (`","` if undefined) between them.
-fn join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn join(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let it = this_object(this, "join")?;
-    let sep: Vec<u16> = match arg(a, 0) {
+    let sep: Vec<u16> = match arg(&a, 0) {
         s if s.is_undefined() => vec![b',' as u16],
         s => match vm.to_string_b(s) {
             Ok(s) => crate::vm::string_units(s.take()).unwrap_or(&[]).to_vec(),
@@ -854,9 +854,9 @@ fn size_arg(vm: &mut Vm, it: Value, v: Value) -> Result<f64> {
 }
 
 /// `chunks(size)`: arrays of `size` values in turn (the last maybe fewer).
-fn chunks(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn chunks(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let it = this_object(this, "chunks")?;
-    let size = size_arg(vm, it, arg(a, 0))?;
+    let size = size_arg(vm, it, arg(&a, 0))?;
     let next = next_method(vm, it)?;
     let h = new_helper(vm, CHUNKS, it, next, Value::number(size), Value::from_i32(0))?;
     let state = Value::from_bits(Obj::of(h).code() as u64);
@@ -868,10 +868,10 @@ fn chunks(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `windows(size, undersized)`: arrays of each `size` consecutive values
 /// (with "allow-partial", all of them if fewer).
-fn windows(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn windows(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let it = this_object(this, "windows")?;
-    let size = size_arg(vm, it, arg(a, 0))?;
-    let undersized = arg(a, 1);
+    let size = size_arg(vm, it, arg(&a, 0))?;
+    let undersized = arg(&a, 1);
     let partial = if undersized.is_undefined() || is_string(undersized, "only-full") {
         false
     } else if is_string(undersized, "allow-partial") {
@@ -1013,12 +1013,12 @@ fn zip_padding(vm: &mut Vm, option: Value, keys: Option<&[Key]>, iters: &[(Value
 /// `Iterator.zip(iterables, options)`: arrays of each iterable's next
 /// values, until the shortest ends ("longest": the longest, padded;
 /// "strict": all at once, or a TypeError).
-fn zip(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let iterables = arg(a, 0);
+fn zip(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let iterables = arg(&a, 0);
     if !is_object(iterables) {
         return Err(Error::type_error("Iterator.zip: iterables must be an object"));
     }
-    let (mode, padding) = zip_options(vm, arg(a, 1))?;
+    let (mode, padding) = zip_options(vm, arg(&a, 1))?;
     // (`padding`, the input iterator and its `next`, held across calls:
     // rooted.)
     vm.handle_scope(|vm| {
@@ -1060,12 +1060,12 @@ fn zip_iterables(vm: &mut Vm, input: Value, input_next: Value, mode: i32, paddin
 /// `Iterator.zipKeyed(iterables, options)`: as `Iterator.zip` over the
 /// object `iterables`' enumerable own properties not undefined, its
 /// results objects of their keys.
-fn zip_keyed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let iterables = arg(a, 0);
+fn zip_keyed(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let iterables = arg(&a, 0);
     if !is_object(iterables) {
         return Err(Error::type_error("Iterator.zipKeyed: iterables must be an object"));
     }
-    let (mode, padding) = zip_options(vm, arg(a, 1))?;
+    let (mode, padding) = zip_options(vm, arg(&a, 1))?;
     vm.handle_scope(|vm| {
         // (Held across calls: rooted.)
         vm.handles.push(padding);

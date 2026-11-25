@@ -32,7 +32,7 @@
 //! has none (a SyntaxError); the specifier `<module source>` is a module
 //! of the host's that has one, an `%AbstractModuleSource%` (test262's).
 
-use crate::brand::{Fresh, Handle, Scope};
+use crate::brand::{Args, Fresh, Handle, Scope};
 use crate::js::ast::{IMPORT_PARAMS, ImportName, ModuleInfo, Phase};
 use crate::object::{Obj, Object, object_value};
 use crate::promise::{native_closure, slot};
@@ -648,8 +648,8 @@ fn arg(a: &[Value], i: usize) -> Value {
 }
 
 /// [[Get]]: the binding's value; a symbol's, the target's.
-fn ns_get(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let Some(key) = ns_key(vm, arg(a, 1))? else {
+fn ns_get(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let Some(key) = ns_key(vm, arg(&a, 1))? else {
         return crate::reflect::reflect_get(vm, this, a);
     };
     let m = ns_module(vm)?;
@@ -660,13 +660,13 @@ fn ns_get(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// [[Set]]: never.
-fn ns_set(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn ns_set(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::FALSE)
 }
 
 /// [[HasProperty]]: an export (a symbol: the target's).
-fn ns_has(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let Some(key) = ns_key(vm, arg(a, 1))? else {
+fn ns_has(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let Some(key) = ns_key(vm, arg(&a, 1))? else {
         return crate::reflect::reflect_has(vm, this, a);
     };
     let m = ns_module(vm)?;
@@ -674,8 +674,8 @@ fn ns_has(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// [[Delete]]: anything but an export.
-fn ns_delete(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let Some(key) = ns_key(vm, arg(a, 1))? else {
+fn ns_delete(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    let Some(key) = ns_key(vm, arg(&a, 1))? else {
         return crate::reflect::reflect_delete_property(vm, this, a);
     };
     let m = ns_module(vm)?;
@@ -689,20 +689,20 @@ fn ns_delete(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// own fields only: a namespace's [[DefineOwnProperty]] reads no property,
 /// so no getter of `Object.prototype` runs (nor makes an inherited `get`
 /// a field).
-fn ns_define(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let Some(key) = ns_key(vm, arg(a, 1))? else {
+fn ns_define(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let Some(key) = ns_key(vm, arg(&a, 1))? else {
         // (A symbol, or a deferred namespace's `then`: the target's own,
         // OrdinaryDefineOwnProperty.)
-        let k = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
-        let d = vm.own_descriptor(arg(a, 2));
-        return vm.define_own_property(Obj::of(arg(a, 0)), k, &d).map(Value::from_bool);
+        let k = crate::intrinsics::to_property_key(vm, arg(&a, 1))?;
+        let d = vm.own_descriptor(arg(&a, 2));
+        return vm.define_own_property(Obj::of(arg(&a, 0)), k, &d).map(Value::from_bool);
     };
     let m = ns_module(vm)?;
     let Some(res) = ns_binding(vm, m, &key) else {
         return Ok(Value::FALSE);
     };
     let current = binding_value(vm, &res, &key)?;
-    let d = vm.own_descriptor(arg(a, 2));
+    let d = vm.own_descriptor(arg(&a, 2));
     let ok = d.configurable != Some(true)
         && d.enumerable != Some(false)
         && !d.is_accessor()
@@ -714,10 +714,10 @@ fn ns_define(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// [[GetOwnProperty]]: an export's value, writable, enumerable, not
 /// configurable. As a record (`descriptor_record`): the proxy reads it
 /// back, and must find no `Object.prototype` field.
-fn ns_get_own(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let Some(key) = ns_key(vm, arg(a, 1))? else {
-        let k = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
-        return Ok(match vm.own_property(Obj::of(arg(a, 0)), k) {
+fn ns_get_own(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let Some(key) = ns_key(vm, arg(&a, 1))? else {
+        let k = crate::intrinsics::to_property_key(vm, arg(&a, 1))?;
+        return Ok(match vm.own_property(Obj::of(arg(&a, 0)), k) {
             Some(d) => vm.descriptor_record(&d),
             None => Value::UNDEFINED,
         });
@@ -735,7 +735,7 @@ fn ns_get_own(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// [[OwnPropertyKeys]]: the exports' names, in order, then
 /// `Symbol.toStringTag` (a deferred namespace's `"then"`, an ordinary
 /// key's, has no property: not one).
-fn ns_own_keys(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn ns_own_keys(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let m = ns_module(vm)?;
     let deferred = slot(vm.callee_obj(), 1) == Value::TRUE;
     let then: Vec<u16> = "then".encode_utf16().collect();
@@ -1143,7 +1143,7 @@ fn gather_ancestors(vm: &mut Vm, m: usize, out: &mut Vec<usize>) {
 }
 
 /// AsyncModuleExecutionFulfilled (§16.2.1.5.3.4), module in slot 0.
-fn async_fulfilled(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn async_fulfilled(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let m = slot(vm.callee_obj(), 0).as_i32_unchecked() as usize;
     module_fulfilled(vm, m)?;
     Ok(Value::UNDEFINED)
@@ -1192,9 +1192,9 @@ fn module_fulfilled(vm: &mut Vm, m: usize) -> Result<()> {
 }
 
 /// AsyncModuleExecutionRejected (§16.2.1.5.3.5), module in slot 0.
-fn async_rejected(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn async_rejected(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let m = slot(vm.callee_obj(), 0).as_i32_unchecked() as usize;
-    module_rejected(vm, m, arg(a, 0))?;
+    module_rejected(vm, m, arg(&a, 0))?;
     Ok(Value::UNDEFINED)
 }
 
@@ -1349,7 +1349,7 @@ fn import_attributes(
 /// resolve, reject, the phase): the module loaded and linked, its
 /// evaluation's promise then resolving `import()`'s with its namespace
 /// (see [`dynamic_import`] for the other phases).
-fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn import_job(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (spec, ty, referrer, resolve, reject) = (slot(me, 0), slot(me, 1), slot(me, 2), slot(me, 3), slot(me, 4));
     let phase = slot(me, 5).to_number() as i32;
@@ -1407,7 +1407,7 @@ fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 
 /// `import()`'s module evaluated (slots: the module, resolve): its
 /// namespace resolves the promise.
-fn import_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn import_done(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (m, resolve) = (slot(me, 0).as_i32_unchecked() as usize, slot(me, 1));
     match namespace(vm, m) {
@@ -1419,7 +1419,7 @@ fn import_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// One of `import.defer()`'s module's async dependencies evaluated
 /// (slots: the module, resolve, `[how many to go]`): after the last, its
 /// deferred namespace resolves the promise.
-fn defer_done(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn defer_done(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let me = vm.callee_obj();
     let (m, resolve, count) = (slot(me, 0).as_i32_unchecked() as usize, slot(me, 1), slot(me, 2));
     let left = vm.get_keyed_b(count, Value::from_i32(0))?.take().as_i32_unchecked() - 1;
@@ -1455,14 +1455,14 @@ pub(crate) fn install_symbols(vm: &mut Vm) {
     vm.define_accessor(Obj::of(proto), a_tag, Some(object_value(f.ptr())), None, crate::object::DONT_ENUM);
 }
 
-fn abstract_source_ctor(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn abstract_source_ctor(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     vm.is_construct();
     Err(Error::type_error("AbstractModuleSource is not a constructor of instances"))
 }
 
 /// `get %AbstractModuleSource%.prototype[@@toStringTag]`: a module source's
 /// class name, `undefined` for anything else.
-fn abstract_source_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn abstract_source_tag(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if this.is_cell() && vm.modules.records.iter().any(|r| r.source_object == this) {
         return Ok(string(vm, "ModuleSource"));
     }

@@ -6,7 +6,7 @@
 use crate::raw::{Live, ObjectPtr};
 use std::borrow::Cow;
 
-use crate::brand::{Fresh, Scope};
+use crate::brand::{Args, Fresh, Scope};
 use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Obj, Object, READ_ONLY, as_object, object_value};
@@ -409,7 +409,7 @@ fn num(d: f64) -> Value {
 // ---- String ----
 
 /// `String(v)`: ToString (`""` without an argument).
-fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn string_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let construct = vm.is_construct();
     let s = match a.first() {
         None => vm.new_string(&[]),
@@ -430,8 +430,8 @@ fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `String.fromCharCode(…codes)`: each ToUint16.
-fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    if let [v] = a
+fn string_from_char_code(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    if let [v] = &*a
         && v.is_int32()
     {
         return Ok(vm.single_char(v.as_i32_unchecked() as u16));
@@ -451,9 +451,9 @@ fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(string(vm, &u))
 }
 
-fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_char_code_at(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let i = int_arg(a, 0);
+    let i = int_arg(&a, 0);
     Ok(if i >= 0.0 && (i as usize) < u.len() {
         Value::from_i32(u[i as usize] as i32)
     } else {
@@ -461,9 +461,9 @@ fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-fn string_char_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_char_at(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let i = int_arg(a, 0);
+    let i = int_arg(&a, 0);
     Ok(if i >= 0.0 && (i as usize) < u.len() { vm.single_char(u[i as usize]) } else { vm.new_string(&[]) })
 }
 
@@ -474,16 +474,16 @@ fn find(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
     crate::regexp::find(hay, needle, from)
 }
 
-fn string_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_index_of(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let needle = units(arg(a, 0));
-    let from = int_arg(a, 1).clamp(0.0, u.len() as f64) as usize;
+    let needle = units(arg(&a, 0));
+    let from = int_arg(&a, 1).clamp(0.0, u.len() as f64) as usize;
     Ok(Value::from_i32(find(&u, &needle, from).map_or(-1, |i| i as i32)))
 }
 
-fn string_last_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_last_index_of(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let needle = units(arg(a, 0));
+    let needle = units(arg(&a, 0));
     let pos = match a.get(1).map(|&v| to_number(v)) {
         Some(d) if !d.is_nan() => d.trunc().clamp(0.0, u.len() as f64) as usize,
         _ => u.len(),
@@ -496,39 +496,39 @@ fn string_last_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_i32(r.map_or(-1, |i| i as i32)))
 }
 
-fn string_substring(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_substring(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     let len = u.len() as f64;
-    let s = int_arg(a, 0).clamp(0.0, len) as usize;
+    let s = int_arg(&a, 0).clamp(0.0, len) as usize;
     let e = match a.get(1) {
-        Some(v) if !v.is_undefined() => int_arg(a, 1).clamp(0.0, len) as usize,
+        Some(v) if !v.is_undefined() => int_arg(&a, 1).clamp(0.0, len) as usize,
         _ => u.len(),
     };
     let (s, e) = (s.min(e), s.max(e));
     Ok(part(vm, this, &u, s, e))
 }
 
-fn string_substr(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_substr(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let s = relative(int_arg(a, 0), u.len());
+    let s = relative(int_arg(&a, 0), u.len());
     let n = match a.get(1) {
-        Some(v) if !v.is_undefined() => int_arg(a, 1).clamp(0.0, (u.len() - s) as f64) as usize,
+        Some(v) if !v.is_undefined() => int_arg(&a, 1).clamp(0.0, (u.len() - s) as f64) as usize,
         _ => u.len() - s,
     };
     Ok(part(vm, this, &u, s, s + n))
 }
 
-fn string_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let s = relative(int_arg(a, 0), u.len());
+    let s = relative(int_arg(&a, 0), u.len());
     let e = match a.get(1) {
-        Some(v) if !v.is_undefined() => relative(int_arg(a, 1), u.len()),
+        Some(v) if !v.is_undefined() => relative(int_arg(&a, 1), u.len()),
         _ => u.len(),
     };
     Ok(part(vm, this, &u, s, e.max(s)))
 }
 
-fn string_to_lower_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_to_lower_case(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     if let Some(v) = ascii_case(vm, this, &u, b'A', b'a') {
         return Ok(v);
@@ -537,7 +537,7 @@ fn string_to_lower_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
     vm.try_new_string(&u)
 }
 
-fn string_to_upper_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_to_upper_case(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     if let Some(v) = ascii_case(vm, this, &u, b'a', b'A') {
         return Ok(v);
@@ -602,20 +602,20 @@ pub(crate) fn is_space(c: u16) -> bool {
     )
 }
 
-fn string_trim(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_trim(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     let s = u.iter().position(|&c| !is_space(c)).unwrap_or(u.len());
     let e = u.iter().rposition(|&c| !is_space(c)).map_or(s, |e| e + 1);
     Ok(part(vm, this, &u, s, e))
 }
 
-fn string_trim_start(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_trim_start(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     let s = u.iter().position(|&c| !is_space(c)).unwrap_or(u.len());
     Ok(string(vm, &u[s..]))
 }
 
-fn string_trim_end(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_trim_end(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     let e = u.iter().rposition(|&c| !is_space(c)).map_or(0, |e| e + 1);
     Ok(string(vm, &u[..e]))
@@ -624,16 +624,16 @@ fn string_trim_end(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `localeCompare(that, locales, options)`: with the `intl` feature, as
 /// `Intl.Collator(locales, options)` compares (ECMA-402); without it by
 /// code units (no locales).
-fn string_locale_compare(_vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_locale_compare(_vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let v = units(arg(a, 0));
+    let v = units(arg(&a, 0));
     #[cfg(feature = "intl")]
     let ord = {
         // (`that` is converted before the locales and options are read.)
         if _vm.conv_failed() {
             return Err(_vm.take_conv_error());
         }
-        crate::intl::locale_compare(_vm, &u, &v, arg(a, 1), arg(a, 2))?
+        crate::intl::locale_compare(_vm, &u, &v, arg(&a, 1), arg(&a, 2))?
     };
     #[cfg(not(feature = "intl"))]
     let ord = u.cmp(&v);
@@ -651,33 +651,33 @@ fn search_string<'a>(v: Value, what: &str) -> Result<Cow<'a, [u16]>> {
     Ok(units(v))
 }
 
-fn string_starts_with(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_starts_with(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let s = search_string(arg(a, 0), "startsWith")?;
-    let at = int_arg(a, 1).clamp(0.0, u.len() as f64) as usize;
+    let s = search_string(arg(&a, 0), "startsWith")?;
+    let at = int_arg(&a, 1).clamp(0.0, u.len() as f64) as usize;
     Ok(Value::from_bool(u[at..].starts_with(&s)))
 }
 
-fn string_ends_with(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_ends_with(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let s = search_string(arg(a, 0), "endsWith")?;
+    let s = search_string(arg(&a, 0), "endsWith")?;
     let end = match a.get(1) {
-        Some(v) if !v.is_undefined() => int_arg(a, 1).clamp(0.0, u.len() as f64) as usize,
+        Some(v) if !v.is_undefined() => int_arg(&a, 1).clamp(0.0, u.len() as f64) as usize,
         _ => u.len(),
     };
     Ok(Value::from_bool(u[..end].ends_with(&s)))
 }
 
-fn string_includes(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_includes(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let s = search_string(arg(a, 0), "includes")?;
-    let at = int_arg(a, 1).clamp(0.0, u.len() as f64) as usize;
+    let s = search_string(arg(&a, 0), "includes")?;
+    let at = int_arg(&a, 1).clamp(0.0, u.len() as f64) as usize;
     Ok(Value::from_bool(find(&u, &s, at).is_some()))
 }
 
-fn string_repeat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_repeat(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let n = int_arg(a, 0);
+    let n = int_arg(&a, 0);
     if n < 0.0 || n == f64::INFINITY {
         return Err(Error::range_error("Invalid count value"));
     }
@@ -717,17 +717,17 @@ fn pad(vm: &mut Vm, this: Value, a: &[Value], start: bool) -> Result<Value> {
     Ok(vm.new_string(&out))
 }
 
-fn string_pad_start(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    pad(vm, this, a, true)
+fn string_pad_start(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    pad(vm, this, &a, true)
 }
 
-fn string_pad_end(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    pad(vm, this, a, false)
+fn string_pad_end(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    pad(vm, this, &a, false)
 }
 
-fn string_code_point_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_code_point_at(_: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let i = int_arg(a, 0);
+    let i = int_arg(&a, 0);
     if i < 0.0 || i >= u.len() as f64 {
         return Ok(Value::UNDEFINED);
     }
@@ -740,9 +740,9 @@ fn string_code_point_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_i32(c as i32))
 }
 
-fn string_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_at(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
-    let i = int_arg(a, 0);
+    let i = int_arg(&a, 0);
     let i = if i < 0.0 { u.len() as f64 + i } else { i };
     if i < 0.0 || i >= u.len() as f64 {
         return Ok(Value::UNDEFINED);
@@ -763,14 +763,14 @@ fn well_formed(u: &[u16]) -> bool {
     true
 }
 
-fn string_is_well_formed(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_is_well_formed(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     Ok(Value::from_bool(well_formed(&u)))
 }
 
 /// `toWellFormed()`: the string with each lone surrogate replaced by
 /// U+FFFD.
-fn string_to_well_formed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn string_to_well_formed(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let u = this_units(this)?;
     if well_formed(&u) {
         return Ok(this_string(vm, this, &u));
@@ -792,7 +792,7 @@ fn string_to_well_formed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value>
 
 /// `normalize(form)`: the string in Unicode normalization form `form`
 /// (NFC if undefined; see `normalize`).
-fn string_normalize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_normalize(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     use crate::normalize::Form;
     let u = this_units(this)?;
     let mut form = Form::Nfc;
@@ -812,7 +812,7 @@ fn string_normalize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `String.fromCodePoint(…points)`.
-fn string_from_code_point(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn string_from_code_point(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let mut out = Vec::with_capacity(a.len());
     for &v in a {
         let d = to_number(v);
@@ -832,7 +832,7 @@ fn string_from_code_point(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// Annex B's HTML methods: `"<tag attr=\"value\">this</tag>"`.
-fn string_html<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_html<const K: usize>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     const TAGS: [(&str, &str); 13] = [
         ("a", "name"),
         ("big", ""),
@@ -852,7 +852,7 @@ fn string_html<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<
     let (tag, attr) = TAGS[K];
     let mut s = format!("<{tag}");
     if !attr.is_empty() {
-        let v = String::from_utf16_lossy(&units(arg(a, 0))).replace('"', "&quot;");
+        let v = String::from_utf16_lossy(&units(arg(&a, 0))).replace('"', "&quot;");
         s.push_str(&format!(" {attr}=\"{v}\""));
     }
     s.push('>');
@@ -864,11 +864,11 @@ fn string_html<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<
 /// `split(sep, limit)` with a string separator (or none: the whole
 /// string; `""`: each code unit), or a regular expression (its captures
 /// spliced in).
-fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "split", this, a, string_split)? {
+fn string_split(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    if let Some(r) = delegate(vm, "split", this, &a, string_split)? {
         return Ok(r);
     }
-    split_fast(vm, this, a)
+    split_fast(vm, this, &a)
 }
 
 /// [`string_split`] without a pattern's own `Symbol.split`.
@@ -878,7 +878,7 @@ fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // names, a cell's attributes in a loop, a path split at each use):
     // the pieces made last time, in an array of its own. V8 has such a
     // cache, for its internalized strings.
-    let key = split_key(this, a);
+    let key = split_key(this, &a);
     let mut seen = false;
     if let Some((subject, sep, slot)) = key {
         let (s, p, kept) = vm.split_cache[slot];
@@ -937,7 +937,7 @@ fn array_copy(vm: &mut Vm, from: Value) -> Value {
 
 fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
-    if let Some(re) = regexp_of(arg(a, 0)) {
+    if let Some(re) = regexp_of(arg(&a, 0)) {
         return regexp_split(vm, re, &u, a.get(1).copied());
     }
     let limit = match a.get(1) {
@@ -1013,7 +1013,7 @@ fn this_string(vm: &mut Vm, this: Value, u: &[u16]) -> Value {
     if is_string(this) { this } else { vm.new_string(u) }
 }
 
-fn string_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_concat(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let mut u = this_units(this)?.into_owned();
     for &v in a {
         check_string_len(u.len() + string_len(v).unwrap_or(0))?;
@@ -1023,7 +1023,7 @@ fn string_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(vm.new_string(&u))
 }
 
-pub(crate) fn string_to_string(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn string_to_string(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if is_string(this) {
         return Ok(this);
     }
@@ -1071,41 +1071,41 @@ fn plain_list(list: Value, holes: bool) -> Option<Vec<Value>> {
 /// `Function.prototype.apply(that, list)`. (A call through it to a
 /// bytecode function with a plain array is unwrapped where it is made:
 /// `interp::unwrap_apply`.)
-fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn function_apply(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !crate::props::is_callable(this) {
         return Err(Error::type_error("Function.prototype.apply called on a non-function"));
     }
     // A plain array's elements as they are (`String.fromCharCode.apply`
     // of a chunk's 60,000 codes read each through the generic lookup).
-    if let Some(list) = apply_list_fast(arg(a, 1)).filter(|l| l.len() <= crate::array::APPLY_MAX) {
-        return vm.call_b(this, arg(a, 0), &list).map(Fresh::take);
+    if let Some(list) = apply_list_fast(arg(&a, 1)).filter(|l| l.len() <= crate::array::APPLY_MAX) {
+        return vm.call_b(this, arg(&a, 0), &list).map(Fresh::take);
     }
     // (The list rooted while it is made, a getter maybe running; the call
     // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
     // take: given at once to the call, which copies it to the VM stack.
-    let list = vm.list_b(arg(a, 1))?.take();
-    vm.call_b(this, arg(a, 0), &list).map(Fresh::take)
+    let list = vm.list_b(arg(&a, 1))?.take();
+    vm.call_b(this, arg(&a, 0), &list).map(Fresh::take)
 }
 
 /// `Function(p1, …, body)` / `new Function(…)`: the function
 /// `(function anonymous(p1, …) { body })` evaluates to, in the global scope.
-fn function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    dynamic_function(vm, a, "function")
+fn function_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    dynamic_function(vm, &a, "function")
 }
 
 /// `GeneratorFunction(p1, …, body)`: as `Function`'s, a generator.
-pub(crate) fn generator_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    dynamic_function(vm, a, "function*")
+pub(crate) fn generator_function_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    dynamic_function(vm, &a, "function*")
 }
 
 /// `AsyncGeneratorFunction(p1, …, body)`: an async generator function.
-pub(crate) fn async_generator_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    dynamic_function(vm, a, "async function*")
+pub(crate) fn async_generator_function_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    dynamic_function(vm, &a, "async function*")
 }
 
 /// `AsyncFunction(p1, …, body)`: as `Function`'s, an async function.
-pub(crate) fn async_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    dynamic_function(vm, a, "async function")
+pub(crate) fn async_function_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    dynamic_function(vm, &a, "async function")
 }
 
 /// The function `(<kind> anonymous(p1, …) { body })` evaluates to.
@@ -1143,8 +1143,8 @@ fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
 /// `eval(x)`: `x` itself unless a string, else the value of the script it
 /// is, run in the global scope (also when called directly: its `var`s and
 /// functions become globals, and it can't see the caller's variables).
-fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = arg(a, 0);
+fn eval_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = arg(&a, 0);
     let Some(u) = string_units(x) else {
         return Ok(x);
     };
@@ -1200,8 +1200,8 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
 }
 
 /// `$262.evalScript(src)`: `src` run as a script of its own.
-fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = arg(a, 0);
+fn eval_script(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = arg(&a, 0);
     let src = crate::js::lex::Source::from_units(string_units(x).unwrap_or(&[]));
     let module =
         crate::js::compile_script_lazy_source(&src).map_err(|e| Error(format!("SyntaxError: {e}"), None, 0))?;
@@ -1211,15 +1211,15 @@ fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `$262.gc()`: a full collection now (`Vm::collect_full_now`).
-fn host_gc(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn host_gc(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     vm.collect_full_now();
     Ok(Value::UNDEFINED)
 }
 
 /// `$262.detachArrayBuffer(buffer)`: the buffer loses its bytes (its
 /// views see a detached buffer: `collections::view_bytes`).
-fn host_detach_array_buffer(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let b = arg(a, 0);
+fn host_detach_array_buffer(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let b = arg(&a, 0);
     if !is_class(b, Class::ArrayBuffer) {
         return Err(Error::type_error("not an ArrayBuffer"));
     }
@@ -1230,7 +1230,7 @@ fn host_detach_array_buffer(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
 /// `print(…)`: the arguments' strings, separated by spaces, on a line of
 /// standard output. If that fails (full, closed), the line is dropped, as
 /// V8's and JavaScriptCore's: `println!` panicked, aborting the process.
-fn print_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn print_fn(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     use std::io::Write;
     let parts: Vec<String> = a.iter().map(|&v| String::from_utf16_lossy(&units(v))).collect();
     let _ = writeln!(std::io::stdout(), "{}", parts.join(" "));
@@ -1239,11 +1239,11 @@ fn print_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `String.raw(strings, …subs)`: `strings.raw`'s pieces, the substitutions
 /// between them.
-fn string_raw(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn string_raw(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // (What the calls below return, held across the next: rooted in `s`,
     // or the code doesn't compile; see `brand`.)
     let s = crate::brand::Scope::new(vm);
-    let cooked = vm.to_object_b(arg(a, 0))?.root(&s);
+    let cooked = vm.to_object_b(arg(&a, 0))?.root(&s);
     // take: given at once to the next call.
     let raw = vm.get_b(cooked.v(), "raw")?.take();
     let raw = vm.to_object_b(raw)?.root(&s);
@@ -1263,7 +1263,7 @@ fn string_raw(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `read(file)`: reading files isn't supported.
-fn read_fn(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn read_fn(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Err(Error::unsupported("read()"))
 }
 
@@ -1299,7 +1299,7 @@ const BOUND_INLINE: usize = 1024;
 /// `promise::native_closure`) of [`bound_call`], with `f`, `that` and
 /// `args` in hidden slots after those of its `length` and `name`, which
 /// are properties from the start.
-fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn function_bind(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !this.is_cell() || !matches!(Obj::of(this).class(), Class::Function | Class::Native) {
         return Err(Error::type_error("Bind must be called on a function"));
     }
@@ -1367,7 +1367,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             // (`this` and `a` are where a collection updates them: read
             // after the allocations.)
             crate::promise::set_slot(o, BOUND_OWN, this);
-            crate::promise::set_slot(o, BOUND_OWN + 1, arg(a, 0));
+            crate::promise::set_slot(o, BOUND_OWN + 1, arg(&a, 0));
             if many {
                 crate::promise::set_slot(o, BOUND_OWN + 2, vm.handles[vm.handles.len() - 2]);
                 crate::promise::set_slot(o, BOUND_OWN + 3, Value::EMPTY);
@@ -1416,7 +1416,7 @@ pub(crate) fn bound_target(o: Obj) -> Value {
 /// a bound function exotic object): its target's, with the bound
 /// arguments before `args`, and `new.target` the target where it is the
 /// bound function.
-fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+fn bound_call(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
     let o = vm.callee_obj();
     let constructing = vm.constructing;
     let (target, this) = (crate::promise::slot(o, BOUND_OWN), crate::promise::slot(o, BOUND_OWN + 1));
@@ -1436,14 +1436,14 @@ fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
         }
     };
     if bound == 0 {
-        return run(vm, args);
+        return run(vm, &args);
     }
     // (Copied to the VM stack before any safepoint: see
     // `interp::with_args_on_stack`.)
     if bound == 2 && crate::promise::slot(o, BOUND_OWN + 3) == Value::EMPTY {
         // (Its own array, plain and without holes.)
         let mut all = apply_list_fast(crate::promise::slot(o, BOUND_OWN + 2)).unwrap_or_default();
-        all.extend_from_slice(args);
+        all.extend_from_slice(&args);
         return run(vm, &all);
     }
     let slots = (0..bound).map(|i| crate::promise::slot(o, BOUND_OWN + 2 + i));
@@ -1459,7 +1459,7 @@ fn bound_call(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
 
 /// `Function.prototype.toString`: a function's source text, or (a native,
 /// a bound function) `function name() { [native code] }`.
-pub(crate) fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn function_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if !crate::props::is_callable(this) {
         return Err(Error::type_error("Function.prototype.toString requires that 'this' be a Function"));
     }
@@ -1627,7 +1627,7 @@ fn np_of(vm: &Vm) -> Obj {
 }
 
 /// `Number(v)`: ToNumber (0 without an argument).
-fn number_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn number_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let construct = vm.is_construct();
     let n = match a.first() {
         None => Value::from_i32(0),
@@ -1641,9 +1641,9 @@ fn number_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(if construct { vm.new_wrapper(n) } else { n })
 }
 
-fn boolean_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn boolean_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let construct = vm.is_construct();
-    let b = Value::from_bool(crate::interp::to_boolean(arg(a, 0)));
+    let b = Value::from_bool(crate::interp::to_boolean(arg(&a, 0)));
     Ok(if construct { vm.new_wrapper(b) } else { b })
 }
 
@@ -1656,18 +1656,18 @@ fn this_boolean(this: Value) -> Result<bool> {
     }
 }
 
-pub(crate) fn boolean_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn boolean_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let b = this_boolean(this)?;
     Ok(str_value(vm, if b { "true" } else { "false" }))
 }
 
-pub(crate) fn boolean_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn boolean_value_of(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(Value::from_bool(this_boolean(this)?))
 }
 
 /// `Object.create(proto)`: a plain object with prototype `proto` (an
 /// object or `null`). (No property descriptors yet.)
-fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn number_to_exponential(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
     let Some(x) = n.as_number() else {
         return Err(Error::type_error("Number.prototype.toExponential called on a non-number"));
@@ -1714,7 +1714,7 @@ fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 }
 
 /// `Number.prototype.toLocaleString()`: as `toString()`.
-fn number_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn number_to_locale_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
     let Some(x) = n.as_number() else {
         return Err(Error::type_error("Number.prototype.toLocaleString called on a non-number"));
@@ -1725,7 +1725,7 @@ fn number_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Valu
 // ---- What ToPrimitive calls ----
 
 /// `Object.prototype.toString`: `[object Array]`, `[object Object]`, ….
-pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let primitive_tag = |v: Value| {
         if v.is_bool() {
             "Boolean"
@@ -1791,11 +1791,11 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
     Ok(str_value(vm, &format!("[object {tag}]")))
 }
 
-pub(crate) fn object_value_of(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn object_value_of(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     Ok(object_value(vm.to_obj_b(this)?.take().ptr()))
 }
 
-pub(crate) fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn number_value_of(_: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
     if n.is_number() { Ok(n) } else { Err(Error::type_error("Number.prototype.valueOf called on a non-number")) }
 }
@@ -1805,80 +1805,80 @@ pub(crate) fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Va
 fn math_arg(a: &[Value], i: usize) -> f64 {
     a.get(i).map_or(f64::NAN, |&v| to_number(v))
 }
-pub(crate) fn math_tan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(crate::math::tan(math_arg(a, 0))))
+pub(crate) fn math_tan(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(crate::math::tan(math_arg(&a, 0))))
 }
-pub(crate) fn math_atan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(crate::math::atan(math_arg(a, 0))))
+pub(crate) fn math_atan(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(crate::math::atan(math_arg(&a, 0))))
 }
-pub(crate) fn math_atan2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(crate::math::atan2(math_arg(a, 0), math_arg(a, 1))))
+pub(crate) fn math_atan2(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(crate::math::atan2(math_arg(&a, 0), math_arg(&a, 1))))
 }
-pub(crate) fn math_asin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(crate::math::asin(math_arg(a, 0))))
+pub(crate) fn math_asin(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(crate::math::asin(math_arg(&a, 0))))
 }
-pub(crate) fn math_acos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(crate::math::acos(math_arg(a, 0))))
+pub(crate) fn math_acos(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(crate::math::acos(math_arg(&a, 0))))
 }
-pub(crate) fn math_cbrt(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).cbrt()))
+pub(crate) fn math_cbrt(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).cbrt()))
 }
-pub(crate) fn math_clz32(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_i32((crate::interp::to_int32(math_arg(a, 0)) as u32).leading_zeros() as i32))
+pub(crate) fn math_clz32(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_i32((crate::interp::to_int32(math_arg(&a, 0)) as u32).leading_zeros() as i32))
 }
-pub(crate) fn math_cosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).cosh()))
+pub(crate) fn math_cosh(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).cosh()))
 }
-pub(crate) fn math_sinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).sinh()))
+pub(crate) fn math_sinh(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).sinh()))
 }
-pub(crate) fn math_tanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).tanh()))
+pub(crate) fn math_tanh(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).tanh()))
 }
-pub(crate) fn math_acosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).acosh()))
+pub(crate) fn math_acosh(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).acosh()))
 }
-pub(crate) fn math_asinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = math_arg(a, 0);
+pub(crate) fn math_asinh(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = math_arg(&a, 0);
     Ok(num(if x == 0.0 { x } else { x.asinh() }))
 }
-pub(crate) fn math_atanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = math_arg(a, 0);
+pub(crate) fn math_atanh(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = math_arg(&a, 0);
     Ok(num(if x == 0.0 { x } else { x.atanh() }))
 }
-pub(crate) fn math_expm1(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = math_arg(a, 0);
+pub(crate) fn math_expm1(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = math_arg(&a, 0);
     Ok(num(if x == 0.0 { x } else { x.exp_m1() }))
 }
-pub(crate) fn math_log1p(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = math_arg(a, 0);
+pub(crate) fn math_log1p(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = math_arg(&a, 0);
     Ok(num(if x == 0.0 { x } else { x.ln_1p() }))
 }
-pub(crate) fn math_log2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).log2()))
+pub(crate) fn math_log2(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).log2()))
 }
-pub(crate) fn math_log10(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).log10()))
+pub(crate) fn math_log10(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).log10()))
 }
-pub(crate) fn math_sign(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = math_arg(a, 0);
+pub(crate) fn math_sign(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = math_arg(&a, 0);
     Ok(num(if x.is_nan() || x == 0.0 { x } else { x.signum() }))
 }
-pub(crate) fn math_trunc(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).trunc()))
+pub(crate) fn math_trunc(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0).trunc()))
 }
-pub(crate) fn math_fround(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0) as f32 as f64))
+pub(crate) fn math_fround(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(math_arg(&a, 0) as f32 as f64))
 }
-fn math_f16round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(crate::math::f16_value(crate::math::f16_bits(math_arg(a, 0)))))
+fn math_f16round(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(num(crate::math::f16_value(crate::math::f16_bits(math_arg(&a, 0)))))
 }
 /// `Math.hypot(…values)`: every argument coerced first; infinity wins
 /// over NaN.
-pub(crate) fn math_hypot(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_hypot(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let mut xs: Vec<f64> = Vec::with_capacity(a.len());
     for i in 0..a.len() {
-        xs.push(math_arg(a, i));
+        xs.push(math_arg(&a, i));
         // (No more conversions after one throws.)
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
@@ -1900,10 +1900,10 @@ pub(crate) fn math_hypot(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `Math.sumPrecise(items)`: the exact sum of the numbers `items` yields,
 /// rounded once. Anything else than a number is a TypeError (the iterator
 /// closed); no number at all, or only -0s, is -0.
-fn math_sum_precise(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn math_sum_precise(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let (mut sum, mut any_finite) = (ExactSum::default(), false);
     let (mut nan, mut plus_inf, mut minus_inf) = (false, false, false);
-    crate::symbol::iterate(vm, arg(a, 0), |_, v| {
+    crate::symbol::iterate(vm, arg(&a, 0), |_, v| {
         let Some(x) = v.as_number() else {
             return Err(Error::type_error("Math.sumPrecise: an item is not a number"));
         };
@@ -2020,9 +2020,9 @@ impl ExactSum {
     }
 }
 
-pub(crate) fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let x = crate::interp::to_int32(math_arg(a, 0));
-    let y = crate::interp::to_int32(math_arg(a, 1));
+pub(crate) fn math_imul(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let x = crate::interp::to_int32(math_arg(&a, 0));
+    let y = crate::interp::to_int32(math_arg(&a, 1));
     Ok(Value::from_i32(x.wrapping_mul(y)))
 }
 
@@ -2030,8 +2030,8 @@ pub(crate) fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `parseInt(s, radix)`: the longest prefix of digits in `radix` (2 to 36;
 /// 0 or missing: 10, or 16 after `0x`), after whitespace and a sign.
-fn parse_int(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
+fn parse_int(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let v = arg(&a, 0);
     // ToString of the input, then ToInt32 of the radix (§19.2.5 steps 1
     // and 6), each one's exception thrown before the next runs.
     let radix_of = |vm: &mut Vm| -> Result<i32> {
@@ -2095,8 +2095,8 @@ fn parse_int(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `parseFloat(s)`: the longest prefix that is a decimal literal (or
 /// `Infinity`), after whitespace.
-fn parse_float(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
+fn parse_float(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let v = arg(&a, 0);
     // (Its string: -0's is "0".)
     if v.is_number() {
         return Ok(if v.as_number() == Some(0.0) { Value::from_i32(0) } else { v });
@@ -2148,8 +2148,8 @@ fn parse_float(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-fn escape_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let u = units(arg(a, 0)).into_owned();
+fn escape_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let u = units(arg(&a, 0)).into_owned();
     let mut out = Vec::new();
     for c in u {
         let keep = c < 128 && (c as u8).is_ascii_alphanumeric() || b"@*_+-./".contains(&(c as u8)) && c < 128;
@@ -2174,8 +2174,8 @@ fn hex_digits(u: &[u16]) -> Option<u16> {
     u16::from_str_radix(&s, 16).ok().filter(|_| s.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-fn unescape_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let u = units(arg(a, 0)).into_owned();
+fn unescape_fn(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let u = units(arg(&a, 0)).into_owned();
     let mut out = Vec::new();
     let mut i = 0;
     while i < u.len() {
@@ -2239,12 +2239,12 @@ fn encode(vm: &mut Vm, a: &[Value], keep: &[u8]) -> Result<Value> {
     vm.try_new_string(&out)
 }
 
-fn encode_uri_component(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    encode(vm, a, b"-_.!~*'()")
+fn encode_uri_component(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    encode(vm, &a, b"-_.!~*'()")
 }
 
-fn encode_uri(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    encode(vm, a, b"-_.!~*'();/?:@&=+$,#")
+fn encode_uri(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    encode(vm, &a, b"-_.!~*'();/?:@&=+$,#")
 }
 
 /// `decodeURI…`: `%XX` UTF-8 sequences decoded, but those of `reserved`'s
@@ -2291,47 +2291,47 @@ fn decode(vm: &mut Vm, a: &[Value], reserved: &[u8]) -> Result<Value> {
     Ok(vm.new_string(&out))
 }
 
-fn decode_uri_component(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    decode(vm, a, b"")
+fn decode_uri_component(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    decode(vm, &a, b"")
 }
 
-fn decode_uri(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    decode(vm, a, b";/?:@&=+$,#")
+fn decode_uri(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    decode(vm, &a, b";/?:@&=+$,#")
 }
 
 /// `%ThrowTypeError%`.
-fn throw_type_error(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+fn throw_type_error(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     Err(Error::type_error(
         "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
     ))
 }
 
-fn number_is_integer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
+fn number_is_integer(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let v = arg(&a, 0);
     Ok(Value::from_bool(v.as_number().is_some_and(|d| d.is_finite() && d.trunc() == d)))
 }
 
-fn number_is_safe_integer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
+fn number_is_safe_integer(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let v = arg(&a, 0);
     Ok(Value::from_bool(
         v.as_number().is_some_and(|d| d.is_finite() && d.trunc() == d && d.abs() <= 9007199254740991.0),
     ))
 }
 
-fn number_is_finite(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(arg(a, 0).as_number().is_some_and(f64::is_finite)))
+fn number_is_finite(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(arg(&a, 0).as_number().is_some_and(f64::is_finite)))
 }
 
-fn number_is_nan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(arg(a, 0).as_number().is_some_and(f64::is_nan)))
+fn number_is_nan(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(arg(&a, 0).as_number().is_some_and(f64::is_nan)))
 }
 
-fn is_nan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(math_arg(a, 0).is_nan()))
+fn is_nan(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(math_arg(&a, 0).is_nan()))
 }
 
-fn is_finite(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(math_arg(a, 0).is_finite()))
+fn is_finite(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    Ok(Value::from_bool(math_arg(&a, 0).is_finite()))
 }
 
 // ---- Typed arrays ----
@@ -2355,8 +2355,8 @@ pub(crate) fn is_class(v: Value, c: Class) -> bool {
 
 /// `RegExp.escape(s)`: `s` as a pattern matching it literally, in any
 /// context (after `\`, `\c` or a digit, in a class, with `u` or `v`).
-fn regexp_escape(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let Some(u) = string_units(arg(a, 0)) else {
+fn regexp_escape(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let Some(u) = string_units(arg(&a, 0)) else {
         return Err(Error::type_error("RegExp.escape requires a string"));
     };
     let mut out: Vec<u16> = Vec::with_capacity(u.len() * 2);
@@ -2455,7 +2455,7 @@ fn install_regexps(vm: &mut Vm) {
 /// `RegExp.prototype`'s getters: `source` (0), `flags` (1) and the flags
 /// (2…); `undefined` (`source`: `(?:)`, `flags`: `""`) on the prototype
 /// itself, a `TypeError` on anything but a `RegExp`.
-pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     // (`flags`: generic, any object's.)
     if K == 1 {
         return regexp_flags_getter(vm, this);
@@ -2630,7 +2630,7 @@ fn regexp_of<'a>(v: Value) -> Option<&'a crate::regexp::Regex> {
 
 /// `RegExp.prototype.compile(pattern, flags)` (Annex B): `this` made
 /// anew, of `pattern` (a string, or another `RegExp`'s source and flags).
-fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn regexp_compile(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !is_class(this, Class::RegExp) {
         return Err(Error::type_error("RegExp.prototype.compile called on an incompatible receiver"));
     }
@@ -2640,7 +2640,7 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !vm.realms.is_empty() && realm_of(vm, Obj::of(this)) != vm.realm {
         return Err(Error::type_error("RegExp.prototype.compile called on another realm's RegExp"));
     }
-    let (pattern, flags) = (arg(a, 0), arg(a, 1));
+    let (pattern, flags) = (arg(&a, 0), arg(&a, 1));
     let (p, f) = if let Some(re) = regexp_of(pattern) {
         if !flags.is_undefined() {
             return Err(Error::type_error("Cannot supply flags when constructing one RegExp from another"));
@@ -2692,13 +2692,13 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `RegExp(pattern, flags)`: from a string, or from another `RegExp`
 /// (its source; its flags unless given).
-fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let p = arg(a, 0);
+fn regexp_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let p = arg(&a, 0);
     let construct = vm.is_construct();
     // (IsRegExp: a RegExp, or an object whose `Symbol.match` says so.)
     let is_re = is_regexp(vm, p)?;
     // `RegExp(re)`, called: `re` itself if a regexp of `RegExp`'s.
-    if !construct && arg(a, 1).is_undefined() && is_re {
+    if !construct && arg(&a, 1).is_undefined() && is_re {
         let a_ctor = vm.a_constructor;
         let sc = Scope::new(vm);
         let c = vm.get_atom_b(p, a_ctor)?.root(&sc);
@@ -2722,7 +2722,7 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         // (A RegExp-like object: its `source`, and its `flags` unless
         // given.)
         pattern = units(vm.get_atom_b(p, a_source)?.take()).into_owned();
-        if arg(a, 1).is_undefined() {
+        if arg(&a, 1).is_undefined() {
             let a_flags = vm.intern_name("flags");
             flags = String::from_utf16_lossy(&units(vm.get_atom_b(p, a_flags)?.take()));
         }
@@ -2732,8 +2732,8 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if pattern == EMPTY_SOURCE {
         pattern.clear();
     }
-    if !arg(a, 1).is_undefined() {
-        flags = String::from_utf16_lossy(&units(arg(a, 1)));
+    if !arg(&a, 1).is_undefined() {
+        flags = String::from_utf16_lossy(&units(arg(&a, 1)));
     }
     new_regexp(vm, &pattern, &flags)
 }
@@ -2865,42 +2865,42 @@ fn legacy_part(vm: &mut Vm, range: impl FnOnce(&[Option<(usize, usize)>], usize)
     }
 }
 
-fn legacy_input_get(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn legacy_input_get(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     legacy_this(vm, this)?;
     Ok(if vm.legacy_input.is_cell() { vm.legacy_input } else { vm.new_string(&[]) })
 }
 
 /// SetLegacyRegExpStaticProperty of `input`.
-fn legacy_input_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn legacy_input_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if this != object_value(vm.regexp_constructor) {
         return Err(Error::type_error("RegExp legacy static property set on another receiver"));
     }
-    vm.legacy_input = vm.to_string_b(arg(a, 0))?.take();
+    vm.legacy_input = vm.to_string_b(arg(&a, 0))?.take();
     Ok(Value::UNDEFINED)
 }
 
-fn legacy_last_match(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn legacy_last_match(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     legacy_this(vm, this)?;
     Ok(legacy_part(vm, |c, _| c[0]))
 }
 
-fn legacy_last_paren(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn legacy_last_paren(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     legacy_this(vm, this)?;
     Ok(legacy_part(vm, |c, _| if c.len() > 1 { c[c.len() - 1] } else { None }))
 }
 
-fn legacy_left_context(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn legacy_left_context(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     legacy_this(vm, this)?;
     Ok(legacy_part(vm, |c, _| c[0].map(|(a, _)| (0, a))))
 }
 
-fn legacy_right_context(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn legacy_right_context(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     legacy_this(vm, this)?;
     Ok(legacy_part(vm, |c, n| c[0].map(|(_, b)| (b, n))))
 }
 
 /// `RegExp.$1` … `RegExp.$9`.
-fn legacy_paren<const N: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn legacy_paren<const N: usize>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     legacy_this(vm, this)?;
     Ok(legacy_part(vm, |c, _| c.get(N).copied().flatten()))
 }
@@ -3071,11 +3071,11 @@ fn named_groups(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, u
     Ok(groups)
 }
 
-fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn regexp_exec(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // (A `RegExp` before the input is converted; its pattern once it is,
     // if that ran user code.)
     let re = this_regexp(this)?;
-    let x = arg(a, 0);
+    let x = arg(&a, 0);
     let quiet = is_string(x);
     // (ToString: no argument is "undefined", a symbol throws.)
     // take: rooted below; this_regexp doesn't collect.
@@ -3096,10 +3096,10 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn regexp_test(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // (Through a user's `exec`, as the spec has it.)
     if crate::props::is_object(this) && !pristine(vm, this)? {
-        let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
+        let s = vm.with_args(&[arg(&a, 0)], |vm, a| string_fn(vm, Value::UNDEFINED, a))?;
         // (`s`, maybe a new string, rooted across `exec`'s getter.)
         return Ok(Value::from_bool(
             !{
@@ -3111,7 +3111,7 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         ));
     }
     let re = this_regexp(this)?;
-    let x = arg(a, 0);
+    let x = arg(&a, 0);
     let quiet = is_string(x);
     // (Its pattern once the input is converted, if that ran user code;
     // ToString: a symbol throws, Codex on #38.)
@@ -3133,7 +3133,7 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-pub(crate) fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn regexp_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     // (Generic: any object's `source` and `flags`.)
     if !crate::props::is_object(this) {
         return Err(Error::type_error("RegExp.prototype.toString called on non-object"));
@@ -3177,16 +3177,16 @@ fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
 /// the String method, of the string argument, with this RegExp.
 #[cold]
 #[inline(never)]
-fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !crate::props::is_object(this) {
         return Err(Error::type_error("RegExp method called on an incompatible receiver"));
     }
-    let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
+    let s = vm.with_args(&[arg(&a, 0)], |vm, a| string_fn(vm, Value::UNDEFINED, a))?;
     // (`s`, maybe a new string, rooted: read after `this`'s getters run.)
     {
         let sc = Scope::new(vm);
         let _held = sc.roots([s]);
-        regexp_symbol_of::<K>(vm, this, s, a)
+        regexp_symbol_of::<K>(vm, this, s, &a)
     }
 }
 
@@ -3259,24 +3259,24 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
         args.extend_from_slice(a.get(1..).unwrap_or(&[]));
         // (On the VM stack: `f` runs `this`'s `toString` before it reads
         // them, and a `Vec` is no root.)
-        return crate::interp::with_args_on_stack(vm, &args, |vm, args| f(vm, this, args)).map(Some);
+        return vm.with_args(&args, |vm, a| f(vm, this, a)).map(Some);
     }
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
     vm.call_b(m.peek(), pattern, &args).map(|v| Some(v.take()))
 }
 
-fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_match_all(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype.matchAll called on null or undefined"));
     }
-    require_global(vm, arg(a, 0), "matchAll")?;
-    if let Some(r) = delegate(vm, "matchAll", this, a, string_match_all)? {
+    require_global(vm, arg(&a, 0), "matchAll")?;
+    if let Some(r) = delegate(vm, "matchAll", this, &a, string_match_all)? {
         return Ok(r);
     }
     // (The receiver's ToString before the pattern's.)
     let s = this_units(this)?;
-    let pattern = arg(a, 0);
+    let pattern = arg(&a, 0);
     let rv = if regexp_of(pattern).is_some() {
         pattern
     } else {
@@ -3316,18 +3316,18 @@ fn match_all(vm: &mut Vm, this: Value, s: &[u16], rv: Value) -> Result<Value> {
 
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
 /// none).
-fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "match", this, a, string_match)? {
+fn string_match(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    if let Some(r) = delegate(vm, "match", this, &a, string_match)? {
         return Ok(r);
     }
-    match_fast(vm, this, a)
+    match_fast(vm, this, &a)
 }
 
 /// [`string_match`] without a pattern's own `Symbol.match`.
 #[inline(always)]
 fn match_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = this_units(this)?;
-    let rv = as_regexp(vm, arg(a, 0))?;
+    let rv = as_regexp(vm, arg(&a, 0))?;
     // (The RegExp, maybe made here, then the input, rooted; and each match
     // in the handles as it is made.)
     let input = {
@@ -3380,18 +3380,18 @@ fn match_with(vm: &mut Vm, s: &[u16], rv: Value, input: Value) -> Result<Value> 
     Ok(arr)
 }
 
-fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "search", this, a, string_search)? {
+fn string_search(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    if let Some(r) = delegate(vm, "search", this, &a, string_search)? {
         return Ok(r);
     }
-    search_fast(vm, this, a)
+    search_fast(vm, this, &a)
 }
 
 /// [`string_search`] without a pattern's own `Symbol.search`.
 #[inline(always)]
 fn search_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = this_units(this)?;
-    let rv = as_regexp(vm, arg(a, 0))?;
+    let rv = as_regexp(vm, arg(&a, 0))?;
     let re = regexp_of(rv).unwrap();
     let Some(caps) = re.exec(&s, 0) else { return Ok(Value::from_i32(-1)) };
     // (The RegExp, maybe made here, rooted while the input's string is.)
@@ -3408,24 +3408,24 @@ fn search_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// pattern, or of a regular expression (every one with `g`), replaced by
 /// a string (with `$&`, `$1`…, `$$`, `` $` ``, `$'`) or a function's
 /// result (called with the match, the groups, the index and `s`).
-fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "replace", this, a, string_replace)? {
+fn string_replace(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
+    if let Some(r) = delegate(vm, "replace", this, &a, string_replace)? {
         return Ok(r);
     }
-    replace(vm, this, a, false)
+    replace(vm, this, &a, false)
 }
 
 /// `s.replaceAll(pattern, replacement)`: every match replaced (a
 /// `RegExp` pattern must be global).
-fn string_replace_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn string_replace_all(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype.replaceAll called on null or undefined"));
     }
-    require_global(vm, arg(a, 0), "replaceAll")?;
-    if let Some(r) = delegate(vm, "replace", this, a, string_replace_all)? {
+    require_global(vm, arg(&a, 0), "replaceAll")?;
+    if let Some(r) = delegate(vm, "replace", this, &a, string_replace_all)? {
         return Ok(r);
     }
-    replace(vm, this, a, true)
+    replace(vm, this, &a, true)
 }
 
 /// `replaceAll`'s and `matchAll`'s first step: a TypeError for a RegExp
@@ -3734,7 +3734,7 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
 // ---- Errors ----
 
 /// `new Error(message)` (or a call) for kind `K` of [`ERROR_KINDS`].
-fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let message = match a.first() {
         Some(v) if !v.is_undefined() => Some(units(*v).into_owned()),
         _ => None,
@@ -3745,7 +3745,7 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
     let held = Scope::new(vm);
     let _rooted = held.roots([e]);
     // `{ cause }` in the options: its own `cause`.
-    let options = arg(a, 1);
+    let options = arg(&a, 1);
     if crate::props::is_object(options) {
         let a_cause = vm.intern_name("cause");
         if vm.has_key(options, crate::vm::Key::Name(a_cause))? {
@@ -3759,15 +3759,15 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
 
 /// `Error.isError(v)`: whether `v` is an error object (has
 /// [[ErrorData]]), not one that only inherits from `Error.prototype`.
-fn error_is_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
+fn error_is_error(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let v = arg(&a, 0);
     Ok(Value::from_bool(crate::props::is_object(v) && crate::object::is_error(as_object(v))))
 }
 
 /// `get Error.prototype.stack`: for an error object, a string of its kind
 /// and its own `message` (cloison records no stack trace); `undefined`
 /// for any other object.
-fn error_stack_get(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn error_stack_get(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if !crate::props::is_object(this) {
         return Err(Error::type_error("Error.prototype.stack getter called on a non-object"));
     }
@@ -3793,11 +3793,11 @@ fn error_stack_get(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `set Error.prototype.stack`: a string `v` as the receiver's own `stack`
 /// (SetterThatIgnoresPrototypeProperties: never on `Error.prototype`).
-fn error_stack_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn error_stack_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     if !crate::props::is_object(this) {
         return Err(Error::type_error("Error.prototype.stack setter called on a non-object"));
     }
-    let v = arg(a, 0);
+    let v = arg(&a, 0);
     if !is_string(v) {
         return Err(Error::type_error("Error.prototype.stack must be set to a string"));
     }
@@ -3849,7 +3849,7 @@ pub(crate) fn caught(vm: &mut Vm, e: &Error) -> Value {
 
 /// `Error.prototype.toString`: `name: message`, or either alone if the
 /// other is empty.
-pub(crate) fn error_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn error_to_string(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if !crate::props::is_object(this) {
         return Err(Error::type_error("Error.prototype.toString called on a non-object"));
     }
@@ -4058,7 +4058,7 @@ fn rx_exec(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     if regexp_of(r).is_none() {
         return Err(Error::type_error("RegExp method called on an incompatible receiver"));
     }
-    regexp_exec(vm, r, &[s])
+    vm.with_args(&[s], |vm, a| regexp_exec(vm, r, a))
 }
 
 /// ToString(Get(o, name)), as units.
@@ -4659,7 +4659,7 @@ fn regexp_string_iterator(vm: &mut Vm, matcher: Value, s: Value, global: bool, u
 /// `%RegExpStringIteratorPrototype%.next()` (22.2.9.2.1): one RegExpExec
 /// of the matcher; past an empty match of a global one, `lastIndex`
 /// advanced.
-pub(crate) fn regexp_string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn regexp_string_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     if !is_class(this, Class::RegExpStringIterator) {
         return Err(Error::type_error("%RegExpStringIteratorPrototype%.next called on an incompatible receiver"));
     }

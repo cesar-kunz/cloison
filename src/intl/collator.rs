@@ -11,7 +11,7 @@ use super::{
     Kind, Root, bool_option, canonicalize_locale_list, coerce_options, create, data_error, require, resolve_locale,
     root, slot, string_array, string_option, supported_locales,
 };
-use crate::brand::Scope;
+use crate::brand::{Args, Scope};
 use crate::object::{Obj, object_value};
 use crate::temporal::arg;
 use crate::value::Value;
@@ -70,12 +70,12 @@ pub(super) fn install(vm: &mut Vm, intl: Obj) {
 }
 
 /// `Intl.Collator(locales, options)`, with `new` or without.
-fn collator_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn collator_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let construct = vm.is_construct();
     let f = vm.callee_obj();
     let default = object_value(root(vm, Root::CollatorPrototype).ptr());
     let proto = if construct { vm.take_new_target(f, default)? } else { default };
-    let (handle, locale, flags) = initialize(vm, arg(a, 0), arg(a, 1))?;
+    let (handle, locale, flags) = initialize(vm, arg(&a, 0), arg(&a, 1))?;
     let locale = crate::temporal::string(vm, &locale);
     let slots = [Value::from_i32(handle as i32), Value::UNDEFINED, locale, Value::from_i32(flags.pack())];
     Ok(create(vm, proto, Kind::Collator, &slots))
@@ -193,7 +193,7 @@ fn this_collator(this: Value, what: &str) -> Result<Obj> {
 
 /// `get Intl.Collator.prototype.compare`: the collator's bound compare
 /// function, made on first read.
-fn compare_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn compare_getter(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_collator(this, "compare")?;
     let f = slot(o, BOUND_COMPARE);
     if !f.is_undefined() {
@@ -207,19 +207,19 @@ fn compare_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// A collator's bound compare function (a closure of its handle):
 /// CompareStrings of its arguments as strings.
-fn bound_compare(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn bound_compare(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let h = slot(vm.callee_obj(), 0).as_i32_unchecked() as usize;
     // (`x`, a new string maybe, held across `y`'s conversion: rooted.)
     let sc = Scope::new(vm);
-    let x = vm.to_string_b(arg(a, 0))?.root(&sc).v();
+    let x = vm.to_string_b(arg(&a, 0))?.root(&sc).v();
     let sc_y = Scope::new(vm);
-    let y = vm.to_string_b(arg(a, 1))?.root(&sc_y);
+    let y = vm.to_string_b(arg(&a, 1))?.root(&sc_y);
     let ord = vm.intl.collators[h].compare(string_units(x).unwrap_or(&[]), string_units(y.peek()).unwrap_or(&[]));
     Ok(Value::from_i32(ord as i32))
 }
 
 /// `Intl.Collator.prototype.resolvedOptions()`.
-fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_collator(this, "resolvedOptions")?;
     let f = Flags::unpack(slot(o, FLAGS).as_i32_unchecked());
     let op = object_value(vm.object_prototype);
@@ -249,9 +249,9 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `Intl.Collator.supportedLocalesOf(locales, options)`.
-fn supported_locales_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let requested = canonicalize_locale_list(vm, arg(a, 0))?;
-    let options = coerce_options(vm, arg(a, 1))?;
+fn supported_locales_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    let requested = canonicalize_locale_list(vm, arg(&a, 0))?;
+    let options = coerce_options(vm, arg(&a, 1))?;
     string_option(vm, options, "localeMatcher", &["lookup", "best fit"])?;
     let found = supported_locales(vm, &requested)?;
     string_array(vm, &found)

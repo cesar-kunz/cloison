@@ -597,7 +597,7 @@ mod tests {
     /// array `b`'s store's address and far array `a`'s store's stamp: what
     /// the list of `a`'s store would be, freed, for `b`'s made at its
     /// address.
-    fn fake(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    fn fake(vm: &mut Vm, _: Value, args: crate::brand::Args<'_>) -> Result<Value> {
         let (a, b) = (super::store(Obj::of(args[0])), super::store(Obj::of(args[1])));
         vm.far_keys.store = b.ptr() as usize;
         vm.far_keys.mutations = super::stamp_of(a);

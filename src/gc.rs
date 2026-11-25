@@ -5624,7 +5624,7 @@ mod tests {
 
     /// `fail_marker()`: the marker to panic as it next traces, a
     /// concurrent cycle asked for at the next safepoint.
-    fn fail_marker(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+    fn fail_marker(vm: &mut Vm, _: Value, _: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         use std::sync::atomic::Ordering::Relaxed;
         vm.heap.gc.marker.get_or_insert_with(Marker::start).shared.fail.store(true, Relaxed);
         vm.heap.gc.external_full = true;
@@ -5735,7 +5735,7 @@ mod tests {
 
     /// `verify()`: `Heap::verify` in a run, and whether the marker was
     /// marking then (it must be marking again after).
-    fn verify_now(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+    fn verify_now(vm: &mut Vm, _: Value, _: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         use std::sync::atomic::Ordering::Relaxed;
         let busy = vm.heap.gc.marker.as_ref().is_some_and(|m| m.shared.state().busy);
         vm.verify_heap();
@@ -5745,11 +5745,11 @@ mod tests {
         Ok(Value::from_bool(busy))
     }
 
-    fn marking(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+    fn marking(vm: &mut Vm, _: Value, _: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         Ok(Value::from_bool(vm.heap.gc.marking))
     }
 
-    fn stop_cycles(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+    fn stop_cycles(vm: &mut Vm, _: Value, _: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         vm.heap.gc.cycles = false;
         Ok(Value::UNDEFINED)
     }
@@ -5835,7 +5835,7 @@ mod tests {
     /// the sweep held after the final where the marker left it, and then
     /// `Vm::int_fields_to_doubles`. Whether the sweep and a shape cycle
     /// were still on for it.
-    fn stop_after_final(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+    fn stop_after_final(vm: &mut Vm, _: Value, _: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         let p: *mut Vm = vm;
         vm.heap.finish_sweep();
         for kind in [Collection::Start, Collection::Final] {
@@ -5854,7 +5854,7 @@ mod tests {
     }
 
     /// `int32s(o)`: whether every number in `o`'s own memory is an int32.
-    fn int32s(_: &mut Vm, _: Value, a: &[Value]) -> crate::vm::Result<Value> {
+    fn int32s(_: &mut Vm, _: Value, a: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         let o = crate::object::as_object(a[0]);
         unsafe {
             let s = &*(*o).shape;

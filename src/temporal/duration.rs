@@ -994,6 +994,7 @@ fn options_or_string(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
         return Err(type_err("options parameter is required"));
     }
     if is_string(v) {
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let o = vm.mu().new_plain(Value::NULL).v();
         let a = vm.intern_name(name);
         vm.add_property(Obj::of(o), a, v);

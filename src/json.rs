@@ -14,6 +14,7 @@ use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, s
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let json = vm.mu().new_plain(op).obj();
     let a_json = vm.intern_name("JSON");
     vm.add_property_with(g, a_json, object_value(json.ptr()), DONT_ENUM);
@@ -135,12 +136,12 @@ fn stringify_rooted(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         let op = object_value(vm.object_prototype);
         // (The holder and key a `toJSON` or replacer gets: rooted.)
         let sc = Scope::new(vm);
-        let wrapper = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
-        let empty = vm.mu().new_string(&[]).root(&sc).v();
+        let wrapper = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+        let empty = vm.mu().new_string(&[]).root(&sc);
         let a_empty = vm.intern_name("");
-        vm.create_data_property(wrapper, Key::Name(a_empty), arg(a, 0))?;
+        vm.create_data_property(wrapper.v(), Key::Name(a_empty), arg(a, 0))?;
         let mut out = Vec::new();
-        Ok(match property(vm, &mut st, empty, wrapper, &mut out)? {
+        Ok(match property(vm, &mut st, empty.v(), wrapper.v(), &mut out)? {
             true => vm.mu().new_string(&out).v(),
             false => Value::UNDEFINED,
         })
@@ -412,8 +413,8 @@ fn value_rooted(
             None if vm.proxies_exist && crate::proxy::is_proxy(vm, o) => {
                 let mut ks = Vec::new();
                 for key in crate::proxy::enumerable_own_keys(vm, o)? {
-                    let s = vm.mu().key_string(key).root(&sc).v();
-                    ks.push((PKey::Str(s), u32::MAX));
+                    let s = vm.mu().key_string(key).root(&sc);
+                    ks.push((PKey::Str(s.v()), u32::MAX));
                 }
                 ks
             }
@@ -595,12 +596,12 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let (v, record) = parse_text(vm, &u, true)?;
         let sc = Scope::new(vm);
         let op = object_value(vm.object_prototype);
-        let root = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
+        let root = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
         let empty = vm.intern_name("");
-        vm.create_data_property(root, Key::Name(empty), v)?;
-        let key = vm.mu().new_string(&[]).root(&sc).v();
+        vm.create_data_property(root.v(), Key::Name(empty), v)?;
+        let key = vm.mu().new_string(&[]).root(&sc);
         let a_source = vm.intern_name("source");
-        internalize(vm, reviver, root, key, Some(&record), &u, a_source)
+        internalize(vm, reviver, root.v(), key.v(), Some(&record), &u, a_source)
     })
 }
 
@@ -658,8 +659,8 @@ fn internalize(
     let sc = Scope::new(vm);
     let v = vm.get_keyed_b(holder, name)?.root(&sc).v();
     let op = object_value(vm.object_prototype);
-    let context = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
-    internalize_value(vm, reviver, holder, name, v, context, record, text, a_source)
+    let context = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
+    internalize_value(vm, reviver, holder, name, v, context.v(), record, text, a_source)
 }
 
 /// [`internalize`] of `v`, `holder[name]` as read, with its `context`.
@@ -679,8 +680,9 @@ fn internalize_value(
     if let Some(&Record { kind: RecordKind::Source(start, end), .. }) = record
         && !is_object(v)
     {
-        let source = vm.mu().new_string(&text[start..end]).v();
-        vm.create_data_property(context, Key::Name(a_source), source)?;
+        let sc_source = Scope::new(vm);
+        let source = vm.mu().new_string(&text[start..end]).root(&sc_source);
+        vm.create_data_property(context, Key::Name(a_source), source.v())?;
     }
     if is_object(v) {
         let o = Obj::of(v);
@@ -739,13 +741,15 @@ fn json_raw_json(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::new_syntax("JSON.rawJSON: not a primitive's JSON text"));
     }
     parse_text(vm, &u, false)?;
-    let o = vm.mu().new_plain(Value::NULL).obj();
-    let s = vm.mu().new_string(&u).v();
+    let sc_o = Scope::new(vm);
+    let o = vm.mu().new_plain(Value::NULL).root(&sc_o);
+    let sc_s = Scope::new(vm);
+    let s = vm.mu().new_string(&u).root(&sc_s);
     let a_raw = vm.intern_name("rawJSON");
-    vm.create_data_property(object_value(o.ptr()), Key::Name(a_raw), s)?;
-    unsafe { (*o.ptr()).flags |= RAW_JSON };
-    vm.seal(o, true);
-    Ok(object_value(o.ptr()))
+    vm.create_data_property(object_value(o.obj().ptr()), Key::Name(a_raw), s.v())?;
+    unsafe { (*o.obj().ptr()).flags |= RAW_JSON };
+    vm.seal(o.obj(), true);
+    Ok(object_value(o.obj().ptr()))
 }
 
 fn json_is_raw_json(_: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
@@ -862,8 +866,9 @@ impl<'a> Parser<'a> {
             }
             Some('[') if self.peek() < Some(128) => {
                 self.i += 1;
-                let arr = vm.mu().new_array().v();
-                let ao = Obj::of(arr);
+                let sc_arr = Scope::new(vm);
+                let arr = vm.mu().new_array().root(&sc_arr);
+                let ao = Obj::of(arr.v());
                 let mut n = 0;
                 if !self.eat(b']') {
                     loop {
@@ -882,7 +887,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                (arr, Some(false))
+                (arr.v(), Some(false))
             }
             Some('"') if self.peek() < Some(128) => {
                 let s = self.string()?;

@@ -64,6 +64,7 @@ fn root(vm: &Vm, r: Root) -> Obj {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let intl = vm.mu().new_plain(op).obj();
     let a = vm.intern_name("Intl");
     vm.add_property_with(g, a, object_value(intl.ptr()), DONT_ENUM);
@@ -351,6 +352,7 @@ fn bool_option(vm: &mut Vm, options: Value, name: &str) -> Result<Option<bool>> 
 
 /// An array of `strings`.
 fn string_array(vm: &mut Vm, strings: &[String]) -> Result<Value> {
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let arr = vm.mu().new_array().v();
     for s in strings {
         let v = crate::temporal::string(vm, s);

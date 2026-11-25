@@ -244,11 +244,12 @@ fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
     if n > u32::MAX as f64 {
         return Err(Error::range_error("Invalid array length"));
     }
-    let a = vm.mu().new_array().v();
+    let sc_a = Scope::new(vm);
+    let a = vm.mu().new_array().root(&sc_a);
     if n > 0.0 {
-        vm.set_array_length(Obj::of(a), Value::number(n))?;
+        vm.set_array_length(Obj::of(a.v()), Value::number(n))?;
     }
-    Ok(a)
+    Ok(a.v())
 }
 
 /// ArraySpeciesCreate(original, n): a new array, or (an array whose
@@ -410,6 +411,7 @@ fn array_flat_map(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 /// A new array of `values`.
 pub(crate) fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let a = vm.mu().new_array().v();
     array_push(vm, a, values)?;
     Ok(a)
@@ -1728,8 +1730,8 @@ fn array_from(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         return Ok(out);
     }
     let sc = Scope::new(vm);
-    let out = vm.mu().new_array().root(&sc).v();
-    array_from_list(vm, items, out, mapfn, that)
+    let out = vm.mu().new_array().root(&sc);
+    array_from_list(vm, items, out.v(), mapfn, that)
 }
 
 /// [`array_from`] of an array-like or string `items`, into `out`.
@@ -1740,6 +1742,7 @@ fn array_from_list(vm: &mut Vm, items: Value, out: Value, mapfn: Value, that: Va
         while i < u.len() {
             let c = u[i];
             let pair = (0xD800..0xDC00).contains(&c) && i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]);
+            // take: given at once to the map function, or to create.
             let s = if pair { vm.mu().new_string(&u[i..i + 2]).v() } else { vm.single_char(c) };
             i += if pair { 2 } else { 1 };
             let v = if mapfn.is_undefined() { s } else { vm.call_b(mapfn, that, &[s, Value::number(n)])?.take() };
@@ -1838,14 +1841,14 @@ fn array_from_fn(vm: &mut Vm, len: f64, mut f: impl FnMut(&mut Vm, f64) -> Resul
     }
     // (Held across `f`'s getters: rooted.)
     let sc = Scope::new(vm);
-    let out = vm.mu().new_array().root(&sc).v();
+    let out = vm.mu().new_array().root(&sc);
     let mut i = 0.0;
     while i < len {
         let v = f(vm, i)?;
-        create(vm, out, i, v)?;
+        create(vm, out.v(), i, v)?;
         i += 1.0;
     }
-    Ok(out)
+    Ok(out.v())
 }
 
 /// `toReversed()`: a reversed copy.

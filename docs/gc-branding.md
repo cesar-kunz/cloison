@@ -4,7 +4,8 @@ Status: 2026-11-25, on the `gc-handles` branch. Every module's calls that
 may collect are branded, and every raw value taken out of a branded
 result either is checked by the compiler or states why it is safe.
 Natives take their arguments as `Args<'s>`, which only rooted values can
-become. Allocation through `vm.mu()` is next.
+become, and allocate through `vm.mu()`, which gives each new cell as a
+`Gc` the compiler tracks.
 
 This page explains the idea for someone who knows Rust but not the
 collector: what can go wrong, how a few types make the compiler catch
@@ -196,19 +197,6 @@ Across the whole branch:
 - the module microbenchmarks are within +0.4%, except a few accepted
   ones up to +1.8% (`join`, `defineProperties`) from step 2.
 
-## What isn't checked yet
-
-- **The `take()`s**: 93 of them, each reviewed and given a reason.
-- **Raw values that never came from a `Fresh`**:
-  - an allocation's result made outside `vm.mu()`;
-  - a value read from an object's slot.
-
-  These are plain `Value`s and can still be held across a call.
-- **The interpreter and the JIT**: their values live in the VM stack,
-  which the collector scans precisely. Branding doesn't apply there.
-
-CI's stress run stays as the safety net for all of these.
-
 ## A native's arguments: `Args<'s>`
 
 A native is a Rust function the VM calls with `(vm, this, args)`. Its
@@ -240,12 +228,67 @@ through the `get` and `set` natives. The rest use `with_args`.
 The interpreter's and the JIT's calls build `Args` from their frames
 directly, so the check costs nothing at run time: Octane is unchanged.
 
-## Next: allocation through `Mu`
+## New cells: allocation through `Mu`
 
-A new object or string should come back as a `Gc<'a>`, which can't be
-held across a call that may collect: it has to be rooted or used. Today
-`vm.new_array()` returns a plain `Value`. With that, most raw `Value`
-locals leave natives. What stays raw is inside `Mu` code, where nothing
-collects, and in the interpreter and the JIT.
+`vm.new_array()` used to return a plain `Value`: a native could hold a
+new array across a call that runs JavaScript, and nothing would notice.
+Allocation goes through `vm.mu()` now:
+
+```rust
+let out = vm.mu().new_array();        // Gc<'_>: borrows the VM, like a Fresh
+vm.call_b(f, this, &[out.v()])?;      // fine: given at once
+let n = vm.length_of(o)?;             // error[E0499] if `out` is used after
+```
+
+A `Gc` is to a new cell what `Fresh` is to a call's result. Keeping one
+means rooting it, `vm.mu().new_array().root(&scope)`. Taking its raw
+value into a name, with `.v()` or `.obj()`, is the same escape hatch as
+`take()`, and `scripts/brand-takes.py` asks for its reason too.
+
+clippy enforces the routing. `clippy.toml` forbids the VM's allocators
+(`new_array`, `new_string`, `new_plain`, `new_object_with`, `array_of`,
+`new_string_with`, `new_wrapper`, …) everywhere except `brand.rs`,
+where `Mu` calls them, the interpreter, and the VM's own core
+functions. Those say `#[allow(clippy::disallowed_methods)]`, one by
+one. A native calling `vm.new_array()` directly is a lint error in CI.
+Two allocators that look like they need this don't: `key_string` and
+`atom_string` give the VM's string constants, which are always rooted.
+
+Allocation never collects in cloison: it only *requests* a collection,
+which happens at the interpreter's next safepoint. So a `Gc` held while
+the code fills its object (stores, `array_push` onto it,
+`create_data_property` on it, more allocation) is safe. It's the next
+call that may run JavaScript that needs a root. The migration used
+that rule:
+
+- 157 allocation results bound to a name became `Gc` bindings;
+- the borrow checker flagged those used across another VM call;
+- where every call in between was one that never collects (a fixed
+  list: the VM's fields, its store and allocation methods, filling a
+  fresh object, realm setup's helpers), the value stays raw with that
+  reason;
+- the rest were rooted, and the hot ones measured. A root on a path
+  where nothing collects went back to a reasoned raw value. That left
+  34 roots: values really held across a call that may collect
+  (a regexp's match pieces across `construct`, a key across
+  `ToPropertyKey`, a module's source across JSON parsing).
+
+The cost is within 1% on the microbenchmarks and nothing on Octane.
+
+## What isn't checked yet
+
+- **The `take()`s and raw `Gc` values**: each one reviewed and given a
+  reason, checked by CI to be there.
+- **Raw values that never came from a `Fresh` or a `Gc`**:
+  - a value read from an object's slot;
+  - what a module's own helper returns (`str_value`, `closure`, …),
+    which allocates through `vm.mu()` itself but returns a plain
+    `Value`.
+
+  These are plain `Value`s and can still be held across a call.
+- **The interpreter and the JIT**: their values live in the VM stack,
+  which the collector scans precisely. Branding doesn't apply there.
+
+CI's stress run stays as the safety net for all of these.
 
 [gc-arena]: https://github.com/kyren/gc-arena

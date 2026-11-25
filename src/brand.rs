@@ -450,6 +450,12 @@ impl Handle<'_> {
         // SAFETY: as `v`.
         unsafe { *(&mut (*self.vm.cast_mut()).handles).get_unchecked_mut(self.slot) = v }
     }
+
+    /// The object, as now.
+    #[inline(always)]
+    pub(crate) fn obj(self) -> Obj {
+        Obj::of(self.v())
+    }
 }
 
 /// The calls that may collect, their results branded ([`Fresh`]).

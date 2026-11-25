@@ -422,13 +422,15 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (strings, raw) = if a.len() == 3 && crate::props::is_object(a[1]) {
         (a[1], a[2])
     } else {
-        let strings = vm.mu().new_array().v();
+        let sc_strings = Scope::new(vm);
+        let strings = vm.mu().new_array().root(&sc_strings);
+        // take: only calls that don't collect follow (allocation, stores, filling it).
         let raw = vm.mu().new_array().v();
         for pair in a[1..].chunks(2) {
-            crate::vm::array_push(vm, strings, &[pair[0]])?;
+            crate::vm::array_push(vm, strings.v(), &[pair[0]])?;
             crate::vm::array_push(vm, raw, &[pair[1]])?;
         }
-        (strings, raw)
+        (strings.v(), raw)
     };
     vm.seal(Obj::of(raw), true);
     let a_raw = vm.intern_name("raw");
@@ -548,15 +550,16 @@ fn class_setup(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         (p.peek(), h)
     };
-    let proto = vm.mu().new_plain(proto_parent).v();
+    let sc_proto = Scope::new(vm);
+    let proto = vm.mu().new_plain(proto_parent).root(&sc_proto);
     let a_constructor = vm.intern_name("constructor");
     let d = Desc::data(f, true, false, true);
-    vm.define_own_property(Obj::of(proto), Key::Name(a_constructor), &d)?;
+    vm.define_own_property(Obj::of(proto.v()), Key::Name(a_constructor), &d)?;
     let a_prototype = vm.a_prototype;
-    let d = Desc::data(proto, false, false, false);
+    let d = Desc::data(proto.v(), false, false, false);
     vm.define_own_property(Obj::of(f), Key::Name(a_prototype), &d)?;
     vm.set_prototype_of(Obj::of(f), ctor_parent);
-    Ok(proto)
+    Ok(proto.v())
 }
 
 /// A class's method: `[o, key, f, computed]`, not enumerable (a computed
@@ -593,6 +596,7 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
         let s = vm.to_string_b(k)?;
         crate::vm::push_string(&mut units, s.peek())?;
     }
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let name = vm.mu().new_string(&units).v();
     let a_name = vm.a_name;
     let d = Desc::data(name, false, false, true);
@@ -827,6 +831,7 @@ fn pattern_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// An array pattern's rest: `[iterator]`'s remaining values.
 fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    // take: rooted below; nothing between collects.
     let out = vm.mu().new_array().v();
     if a[0].is_undefined() {
         return Ok(out);
@@ -880,7 +885,7 @@ fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
     };
     let sc = Scope::new(vm);
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
     for key in crate::proxy::own_keys(vm, src)? {
         if excluded.contains(&key)
             || !crate::proxy::get_own_property(vm, src, key)?.is_some_and(|d| d.enumerable == Some(true))
@@ -889,9 +894,9 @@ fn object_rest_of(vm: &mut Vm, src: Obj, keys: Value) -> Result<Value> {
         }
         // take: given at once to the next call.
         let v = vm.get_key_b(object_value(src.ptr()), key)?.take();
-        vm.create_data_property(out, key, v)?;
+        vm.create_data_property(out.v(), key, v)?;
     }
-    Ok(out)
+    Ok(out.v())
 }
 
 /// A direct `eval(source)`: `[eval, source, shape, this, flags
@@ -977,10 +982,11 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     if a.get(5) == Some(&Value::TRUE) && !own_strict && declared.iter().any(|&n| vm.atom_name(n) == "arguments") {
         return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None, 0));
     }
-    let local = vm.mu().new_plain(Value::NULL).v();
+    let sc_local = Scope::new(vm);
+    let local = vm.mu().new_plain(Value::NULL).root(&sc_local);
     // (Declared in the function's scope object, under the scope objects
     // of the other bindings it sees: see `Gen::call`.)
-    let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
+    let target = if own_strict || !crate::props::is_object(decl) { local.v() } else { decl };
     // A `var` by a block-scoped binding's name (but a catch parameter's)
     // between the function's scope and the `eval` is an error. (Not Annex
     // B's of a function in a block, not made then: see `eval_annex_b`.)
@@ -1024,8 +1030,8 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
         }
     }
-    let fenv = if crate::props::is_object(decl) { decl } else { local };
-    let envs = [Value::UNDEFINED, local, fenv].into_iter().chain(scopes.iter().copied());
+    let fenv = if crate::props::is_object(decl) { decl } else { local.v() };
+    let envs = [Value::UNDEFINED, local.v(), fenv].into_iter().chain(scopes.iter().copied());
     vm.with_eval_envs(envs, |vm| crate::interp::run_script_with(vm, code, this, kept, std::ptr::null_mut()))
 }
 
@@ -1230,6 +1236,7 @@ fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) 
     let mut made = Vec::new();
     for i in 0..=scopes.len() {
         if places.contains(&i) {
+            // take: rooted below; nothing between collects.
             let s = vm.mu().new_plain(Value::NULL).v();
             vm.handles.push(s);
             bound_accessors(vm, s, carrier, &bindings, i)?;
@@ -1932,9 +1939,10 @@ fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let o = if crate::props::is_object(a[3]) {
         a[3]
     } else {
-        let o = vm.mu().new_plain(Value::NULL).v();
-        bound_accessors(vm, o, bindings, &site_bindings(a[2]).2, place)?;
-        o
+        let sc_o = Scope::new(vm);
+        let o = vm.mu().new_plain(Value::NULL).root(&sc_o);
+        bound_accessors(vm, o.v(), bindings, &site_bindings(a[2]).2, place)?;
+        o.v()
     };
     for t in a[4..].chunks(4) {
         let key = to_property_key(vm, t[0])?;

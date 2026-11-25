@@ -42,6 +42,7 @@ const WORD: usize = Granularity::Word as usize;
 
 pub(super) fn install(vm: &mut Vm, intl: Obj) {
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let proto = vm.mu().new_plain(op).obj();
     let c = vm.define_native(intl, "Segmenter", segmenter_ctor, 0, crate::jit::Ty::Any, true);
     crate::builtins::link_constructor(vm, c, proto);
@@ -50,6 +51,7 @@ pub(super) fn install(vm: &mut Vm, intl: Obj) {
     crate::symbol::to_string_tag(vm, proto, "Intl.Segmenter");
     vm.intl_roots[Root::SegmenterPrototype as usize] = proto.ptr();
 
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let segments = vm.mu().new_plain(op).obj();
     vm.define_natives(segments, &[("containing", containing as NativeFn, 1)]);
     let iterator = vm.native_function("[Symbol.iterator]", segments_iterator, 0, crate::jit::Ty::Any, false);
@@ -58,6 +60,7 @@ pub(super) fn install(vm: &mut Vm, intl: Obj) {
     vm.intl_roots[Root::SegmentsPrototype as usize] = segments.ptr();
 
     let ip = object_value((vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize]).ptr());
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let iterators = vm.mu().new_plain(ip).obj();
     vm.define_natives(iterators, &[("next", iterator_next as NativeFn, 0)]);
     crate::symbol::to_string_tag(vm, iterators, "Segmenter String Iterator");
@@ -100,6 +103,7 @@ fn supported_locales_of(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = require(this, Kind::Segmenter, "Intl.Segmenter.prototype.resolvedOptions")?;
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let r = vm.mu().new_plain(op).obj();
     let a = vm.intern_name("locale");
     vm.add_property(r, a, slot(o, LOCALE));
@@ -240,6 +244,7 @@ fn segment_data(vm: &mut Vm, o: Obj, start: usize, end: usize, word_like: bool) 
     let string = slot(o, STRING);
     let segment = crate::builtins::part(vm, string, string_units(string).unwrap_or(&[]), start, end);
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let r = vm.mu().new_plain(op).obj();
     let a = vm.intern_name("segment");
     vm.add_property(r, a, segment);

@@ -526,6 +526,7 @@ pub(crate) fn big_of(v: Value) -> Big {
 /// A new BigInt of `b`.
 pub(crate) fn new_bigint(vm: &mut Vm, b: Big) -> Value {
     let proto = if vm.bigint_prototype.is_null() { Value::NULL } else { object_value(vm.bigint_prototype) };
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_object_with(Class::BigInt, proto, 0).obj();
     unsafe {
         *Object::aux(o.ptr()) = b.neg as u32;
@@ -790,6 +791,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let proto = vm.mu().new_plain(op).obj();
     vm.bigint_prototype = proto.ptr();
     let c = vm.define_native(g, "BigInt", bigint_fn, 1, any, true);

@@ -21,7 +21,7 @@ mod plain;
 pub(crate) mod tz;
 mod zoned;
 
-use crate::brand::{Args, Fresh};
+use crate::brand::{Args, Fresh, Scope};
 use crate::raw::ObjectPtr;
 use std::collections::HashMap;
 
@@ -122,6 +122,7 @@ pub(crate) fn slots(v: Value) -> Option<Slots> {
 /// A new object of `slots`'s class (its intrinsic prototype).
 pub(crate) fn create(vm: &mut Vm, slots: Slots) -> Value {
     let proto = object_value(vm.temporal.protos[slots.kind() as usize]);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_object_with(Class::Temporal, proto, 0).obj();
     let bytes = vm.heap.alloc_bytes(size_of::<Slots>());
     unsafe {
@@ -250,6 +251,7 @@ pub(crate) fn options_object(vm: &mut Vm, v: Value) -> Result<Value> {
         let o = match vm.temporal.no_options {
             Some(o) => o,
             None => {
+                // take: stored in the VM's table at once.
                 let o = vm.mu().new_plain(Value::NULL).obj().ptr();
                 *vm.temporal.no_options.insert(o)
             }
@@ -802,10 +804,11 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
-    let temporal = vm.mu().new_plain(op).obj();
+    let sc_temporal = Scope::new(vm);
+    let temporal = vm.mu().new_plain(op).root(&sc_temporal);
     let a = vm.intern_name("Temporal");
-    vm.add_property_with(g, a, object_value(temporal.ptr()), crate::object::DONT_ENUM);
-    crate::symbol::to_string_tag(vm, temporal, "Temporal");
+    vm.add_property_with(g, a, object_value(temporal.obj().ptr()), crate::object::DONT_ENUM);
+    crate::symbol::to_string_tag(vm, temporal.obj(), "Temporal");
     vm.temporal.protos = vec![std::ptr::null_mut(); 8];
     vm.temporal.ctors = vec![std::ptr::null_mut(); 8];
     let specs = [
@@ -819,8 +822,9 @@ pub(crate) fn install(vm: &mut Vm) {
         duration::spec(),
     ];
     for spec in specs {
+        // take: only calls that don't collect follow (allocation, stores, filling it).
         let proto = vm.mu().new_plain(op).obj();
-        let c = vm.define_native(temporal, spec.name, spec.ctor, spec.length, any, true);
+        let c = vm.define_native(temporal.obj(), spec.name, spec.ctor, spec.length, any, true);
         crate::builtins::link_constructor(vm, c, proto);
         vm.define_natives(c, spec.statics);
         for &(name, f) in spec.getters {
@@ -832,5 +836,5 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.temporal.protos[spec.kind as usize] = proto.ptr();
         vm.temporal.ctors[spec.kind as usize] = c.ptr();
     }
-    zoned::install_now(vm, temporal);
+    zoned::install_now(vm, temporal.obj());
 }

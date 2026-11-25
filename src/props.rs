@@ -600,6 +600,7 @@ impl Vm {
     /// A new array of `values` (on the native stack, which the collector
     /// scans): its elements' type found once, then each only written.
     pub(crate) fn array_of(&mut self, values: &[Value]) -> Value {
+        // take: only calls that don't collect follow (allocation, stores, filling it).
         let a = self.mu().new_array().v();
         if values.is_empty() {
             return a;
@@ -624,6 +625,7 @@ impl Vm {
 
     /// A new array of the `n` values `at` gives (it may allocate).
     pub(crate) fn array_of_with(&mut self, n: usize, mut at: impl FnMut(&mut Vm, usize) -> Value) -> Value {
+        // take: only allocation and stores into it follow: nothing collects.
         let a = self.mu().new_array().v();
         let o = Obj::of(a);
         self.reserve_elems(o, n);
@@ -1357,6 +1359,7 @@ impl Vm {
     }
 
     fn descriptor_object(&mut self, d: &Desc, proto: Value) -> Value {
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let o = self.mu().new_plain(proto).obj();
         let fields: [(Atom, Option<Value>); 6] = [
             (self.a_value, d.value),
@@ -1726,12 +1729,12 @@ fn object_create(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         return Err(Error::type_error("Object prototype may only be an Object or null"));
     }
     let sc = Scope::new(vm);
-    let o = vm.mu().make(|vm| vm.mu().new_plain(proto).v()).root(&sc).v();
+    let o = vm.mu().make(|vm| vm.mu().new_plain(proto).v()).root(&sc);
     if !arg(&a, 1).is_undefined() {
         let descs = descriptors(vm, arg(&a, 1))?.root(&sc);
-        define_all(vm, Obj::of(o), &descs)?;
+        define_all(vm, Obj::of(o.v()), &descs)?;
     }
-    Ok(o)
+    Ok(o.v())
 }
 
 /// `Object.getOwnPropertyDescriptor(o, key)`.
@@ -1772,6 +1775,7 @@ fn keys_array(vm: &mut Vm, o: Obj, all: bool) -> Result<Value> {
             .v());
     }
     let keys = vm.own_keys(o);
+    // take: only allocation and stores into it follow: nothing collects.
     let arr = vm.mu().new_array().v();
     let mut values = Vec::with_capacity(keys.len());
     vm.handle_scope(|vm| {
@@ -2032,6 +2036,7 @@ fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
         // (The pair made, and filled, where nothing collects.)
         let item = if entries {
             let k = vm.key_string(key);
+            // take: only calls that don't collect follow (allocation, stores, filling it).
             let pair = vm.mu().new_array().v();
             crate::vm::array_push(vm, pair, &[k, v])?;
             pair
@@ -2058,16 +2063,17 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: Args<'_>) -> Re
     let sc = Scope::new(vm);
     let o = Obj::of(vm.to_object_b(arg(&a, 0))?.root(&sc).v());
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
     for key in crate::proxy::own_keys(vm, o)? {
         if let Some(d) = vm.own_property_b(o, key)?.take() {
             // (Its object made where nothing collects; defined on a new
             // ordinary object, which runs no JS.)
+            // take: only calls that don't collect follow (allocation, stores, filling it).
             let dv = vm.mu().from_descriptor(&d).v();
-            vm.create_data_property(out, key, dv)?;
+            vm.create_data_property(out.v(), key, dv)?;
         }
     }
-    Ok(out)
+    Ok(out.v())
 }
 
 /// `Object.fromEntries(iterable)`: a plain object of its `[key, value]`
@@ -2081,7 +2087,7 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     // and conversion after it: rooted.)
     let sc = Scope::new(vm);
     let op = object_value(vm.object_prototype);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(op).v()).root(&sc);
     crate::symbol::iterate(vm, it, |vm, entry| {
         if !is_object(entry) {
             return Err(Error::type_error(format!(
@@ -2093,9 +2099,9 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         let k = vm.get_key_b(entry, Key::Index(0))?.root(&step);
         let v = vm.get_key_b(entry, Key::Index(1))?.root(&step);
         let key = crate::intrinsics::to_property_key(vm, k.v())?;
-        vm.create_data_property(out, key, v.v())
+        vm.create_data_property(out.v(), key, v.v())
     })?;
-    Ok(out)
+    Ok(out.v())
 }
 
 /// `Object.hasOwn(o, key)`.
@@ -2135,23 +2141,24 @@ pub(crate) fn group_by(
 /// `Object.groupBy(items, callback)`: a null-prototype object of arrays.
 fn object_group_by(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let sc = Scope::new(vm);
-    let out = vm.mu().make(|vm| vm.mu().new_plain(Value::NULL).v()).root(&sc).v();
+    let out = vm.mu().make(|vm| vm.mu().new_plain(Value::NULL).v()).root(&sc);
     group_by(vm, &a, |vm, key, v| {
         let key = crate::intrinsics::to_property_key(vm, key)?;
         // (`out` has no prototype and only these arrays: reading, defining
         // and pushing run no JS.)
-        let group = match vm.own_property(Obj::of(out), key) {
-            Some(_) => vm.get_key_b(out, key)?.take(),
+        let group = match vm.own_property(Obj::of(out.v()), key) {
+            Some(_) => vm.get_key_b(out.v(), key)?.take(),
             None => {
+                // take: only calls that don't collect follow (allocation, stores, filling it).
                 let g = vm.mu().new_array().v();
-                vm.create_data_property(out, key, g)?;
+                vm.create_data_property(out.v(), key, g)?;
                 g
             }
         };
         crate::vm::array_push(vm, group, &[v])?;
         Ok(())
     })?;
-    Ok(out)
+    Ok(out.v())
 }
 
 /// `Object.prototype.hasOwnProperty(key)`.

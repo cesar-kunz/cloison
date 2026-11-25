@@ -345,7 +345,8 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
     };
     let m = vm.modules.records.len();
     let mut info = ModuleInfo::default();
-    let env = vm.mu().new_plain(Value::NULL).v();
+    let sc_env = Scope::new(vm);
+    let env = vm.mu().new_plain(Value::NULL).root(&sc_env);
     let source = if kind == Kind::Bytes { String::new() } else { String::from_utf8_lossy(&bytes).into_owned() };
     let mut source_object = Value::UNDEFINED;
     if kind == Kind::Js {
@@ -368,7 +369,7 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
             _ => crate::typed::immutable_bytes(vm, &bytes)?,
         };
         let a = vm.intern_name("default");
-        vm.set(env, a, v)?;
+        vm.set(env.v(), a, v)?;
         info.local_exports.push(("default".into(), "default".into()));
     }
     vm.modules.records.push(Record {
@@ -378,7 +379,7 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
         info,
         requested: Vec::new(),
         status: if kind == Kind::Js { Status::New } else { Status::Linked },
-        env,
+        env: env.v(),
         namespace: Value::UNDEFINED,
         deferred: Value::UNDEFINED,
         source_object,
@@ -547,20 +548,23 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     // The target: what the proxy's invariants check its traps against
     // (a deferred namespace's `"then"` is an ordinary property's key: it
     // has none).
-    let target = vm.mu().new_plain(Value::NULL).obj();
+    let sc_target = Scope::new(vm);
+    let target = vm.mu().new_plain(Value::NULL).root(&sc_target);
     for name in &names {
         if deferred && name.as_slice() == "then".encode_utf16().collect::<Vec<u16>>().as_slice() {
             continue;
         }
-        let s = vm.mu().new_string(name).v();
-        let key = crate::intrinsics::to_property_key(vm, s)?;
-        vm.define_own_property(target, key, &Desc::data(Value::UNDEFINED, true, true, false))?;
+        let sc_s = Scope::new(vm);
+        let s = vm.mu().new_string(name).root(&sc_s);
+        let key = crate::intrinsics::to_property_key(vm, s.v())?;
+        vm.define_own_property(target.obj(), key, &Desc::data(Value::UNDEFINED, true, true, false))?;
     }
     let tag = string(vm, if deferred { "Deferred Module" } else { "Module" });
     let a_tag = vm.a_sym_to_string_tag;
-    vm.define_own_property(target, Key::Name(a_tag), &Desc::data(tag, false, false, false))?;
-    vm.prevent_extensions(target);
-    let handler = vm.mu().new_plain(Value::NULL).obj();
+    vm.define_own_property(target.obj(), Key::Name(a_tag), &Desc::data(tag, false, false, false))?;
+    vm.prevent_extensions(target.obj());
+    let sc_handler = Scope::new(vm);
+    let handler = vm.mu().new_plain(Value::NULL).root(&sc_handler);
     let traps = [
         Template::Get,
         Template::Set,
@@ -574,9 +578,9 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     for (t, n) in traps.into_iter().zip(trap_names) {
         let f = closure(vm, t, &[Value::from_i32(m as i32), Value::from_bool(deferred)]);
         let a = vm.intern_name(n);
-        vm.set(object_value(handler.ptr()), a, f)?;
+        vm.set(object_value(handler.obj().ptr()), a, f)?;
     }
-    let ns = crate::proxy::create(vm, object_value(target.ptr()), object_value(handler.ptr()))?;
+    let ns = crate::proxy::create(vm, object_value(target.obj().ptr()), object_value(handler.obj().ptr()))?;
     let r = rec_mut(vm, m);
     if deferred {
         r.deferred = ns;
@@ -744,12 +748,14 @@ fn ns_own_keys(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
     let then: Vec<u16> = "then".encode_utf16().collect();
     let names: Vec<Vec<u16>> =
         rec(vm, m).exports.iter().map(|(n, _)| n.clone()).filter(|n| !deferred || *n != then).collect();
+    // take: rooted below; nothing between collects.
     let out = vm.mu().new_array().v();
     vm.handle_scope(|vm| {
         vm.handles.push(out);
         for n in names {
-            let s = vm.mu().new_string(&n).v();
-            crate::vm::array_push(vm, out, &[s])?;
+            let sc_s = Scope::new(vm);
+            let s = vm.mu().new_string(&n).root(&sc_s);
+            crate::vm::array_push(vm, out, &[s.v()])?;
         }
         let tag = vm.key_value(Key::Name(vm.a_sym_to_string_tag));
         crate::vm::array_push(vm, out, &[tag])?;
@@ -1377,6 +1383,7 @@ fn import_job(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
             // (Each one's evaluation awaited, as by `Promise.all`, with no
             // `then` called.)
             let deps = async_dependencies(vm, m, &mut Vec::new());
+            // take: rooted on the next line.
             let count = vm.mu().new_array().v();
             // (`count`, then `done`, rooted across the evaluations, which
             // run the modules.)
@@ -1440,6 +1447,7 @@ fn defer_done(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
 pub(crate) fn install(vm: &mut Vm, host: Obj) {
     let any = crate::jit::Ty::Any;
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let proto = vm.mu().new_plain(op).obj();
     let c = vm.native_function("AbstractModuleSource", abstract_source_ctor, 0, any, true);
     crate::builtins::link_constructor(vm, c, proto);
@@ -1452,6 +1460,7 @@ pub(crate) fn install(vm: &mut Vm, host: Obj) {
 /// `symbol::install`).
 pub(crate) fn install_symbols(vm: &mut Vm) {
     let Some(&proto) = vm.modules.abstract_source.get(1) else { return };
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let holder = vm.mu().new_plain(Value::NULL).obj();
     let f = vm.define_native(holder, "get [Symbol.toStringTag]", abstract_source_tag, 0, crate::jit::Ty::Any, false);
     let a_tag = vm.a_sym_to_string_tag;
@@ -1477,8 +1486,8 @@ fn abstract_source_tag(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
 pub(crate) fn import_meta(vm: &mut Vm, m: Value) -> Result<Value> {
     let m = m.as_i32_unchecked() as usize;
     if rec(vm, m).meta.is_undefined() {
-        let o = vm.mu().new_plain(Value::NULL).v();
-        rec_mut(vm, m).meta = o;
+        let o = vm.mu().new_plain(Value::NULL);
+        rec_mut(vm, m).meta = o.v();
     }
     Ok(rec(vm, m).meta)
 }

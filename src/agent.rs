@@ -336,6 +336,7 @@ fn agent_monotonic_now(_: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
 pub(crate) fn install(vm: &mut Vm, host: Obj) {
     EPOCH.get_or_init(Instant::now);
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let agent = vm.mu().new_plain(op).obj();
     let a_agent = vm.intern_name("agent");
     vm.add_property_with(host, a_agent, object_value(agent.ptr()), crate::object::DONT_ENUM);

@@ -421,6 +421,7 @@ fn entries(o: Obj) -> Vec<(u32, Value)> {
 
 /// A new store of `buckets` buckets for an array of length `len`.
 fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> Obj {
+    // take: a test's; nothing collects.
     let e = Obj::of(vm.mu().new_array().v());
     let n = BASE + 2 * buckets;
     vm.reserve_elems(e, n);

@@ -124,7 +124,9 @@ pub(crate) fn create(vm: &mut Vm, f: Obj) -> Result<Value> {
         if crate::props::is_object(p.peek()) { p.peek() } else { object_value((vm.symbol_roots[root as usize]).ptr()) };
     let code = f.code();
     let n = cells_for(code.live().kind) + code.live().nregs as usize;
+    // take: stored into the generator below; only allocation between.
     let queue = if is_async { vm.mu().new_array().v() } else { Value::UNDEFINED };
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let g = vm.mu().new_object_with(Class::Generator, proto, 0).obj();
     let st = vm.heap.alloc_values(n);
     let mut cells = vec![
@@ -472,19 +474,22 @@ fn generator_throw(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 /// `%GeneratorPrototype%`: next, return, throw; its iterator itself.
 pub(crate) fn install(vm: &mut Vm) {
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
-    let gp = vm.mu().new_plain(object_value(ip.ptr())).obj();
-    vm.symbol_roots.push(gp);
+    let sc_gp = Scope::new(vm);
+    let gp = vm.mu().new_plain(object_value(ip.ptr())).root(&sc_gp);
+    vm.symbol_roots.push(gp.obj());
     // `%AsyncIteratorPrototype%` (its async iterator itself) and
     // `%AsyncGeneratorPrototype%`.
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let aip = vm.mu().new_plain(op).obj();
     let a_async_iterator = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     let f = vm.native_function("[Symbol.asyncIterator]", return_this, 0, crate::jit::Ty::Any, false);
     vm.add_property_with(aip, a_async_iterator, object_value(f.ptr()), DONT_ENUM);
-    let agp = vm.mu().new_plain(object_value(aip.ptr())).obj();
-    vm.symbol_roots.push(agp);
+    let sc_agp = Scope::new(vm);
+    let agp = vm.mu().new_plain(object_value(aip.ptr())).root(&sc_agp);
+    vm.symbol_roots.push(agp.obj());
     vm.define_natives(
-        agp,
+        agp.obj(),
         &[
             ("next", async_generator_next as crate::vm::NativeFn, 1),
             ("return", async_generator_return, 1),
@@ -495,9 +500,9 @@ pub(crate) fn install(vm: &mut Vm) {
     let s = vm.string_constant(&u);
     let a = vm.a_sym_to_string_tag;
     let d = crate::props::Desc::data(s, false, false, true);
-    let _ = vm.define_own_property(agp, crate::vm::Key::Name(a), &d);
+    let _ = vm.define_own_property(agp.obj(), crate::vm::Key::Name(a), &d);
     vm.define_natives(
-        gp,
+        gp.obj(),
         &[
             ("next", generator_next as crate::vm::NativeFn, 1),
             ("return", generator_return, 1),
@@ -508,7 +513,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let s = vm.string_constant(&u);
     let a = vm.a_sym_to_string_tag;
     let d = crate::props::Desc::data(s, false, false, true);
-    let _ = vm.define_own_property(gp, crate::vm::Key::Name(a), &d);
+    let _ = vm.define_own_property(gp.obj(), crate::vm::Key::Name(a), &d);
 
     // `%GeneratorFunction%` and `%AsyncFunction%`: constructors (not
     // globals) inheriting `Function`, their prototypes `Function.
@@ -520,37 +525,41 @@ pub(crate) fn install(vm: &mut Vm) {
     };
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
     for (name, ctor, instances) in [
-        ("GeneratorFunction", crate::builtins::generator_function_ctor as crate::vm::NativeFn, gp.ptr()),
+        ("GeneratorFunction", crate::builtins::generator_function_ctor as crate::vm::NativeFn, gp.obj().ptr()),
         ("AsyncFunction", crate::builtins::async_function_ctor, std::ptr::null_mut()),
-        ("AsyncGeneratorFunction", crate::builtins::async_generator_function_ctor, agp.ptr()),
+        ("AsyncGeneratorFunction", crate::builtins::async_generator_function_ctor, agp.obj().ptr()),
     ] {
         let generator = !instances.is_null();
-        let proto = vm.mu().new_plain(fp).obj();
-        vm.symbol_roots.push(proto);
+        let sc_proto = Scope::new(vm);
+        let proto = vm.mu().new_plain(fp).root(&sc_proto);
+        vm.symbol_roots.push(proto.obj());
         let c = vm.native_function(name, ctor, 1, crate::jit::Ty::Any, true);
         vm.symbol_roots.push(c);
         vm.set_prototype_of(c, function);
-        let d = crate::props::Desc::data(object_value(proto.ptr()), false, false, false);
+        let d = crate::props::Desc::data(object_value(proto.obj().ptr()), false, false, false);
         let _ = vm.define_own_property(c, crate::vm::Key::Name(a_p), &d);
         let d = crate::props::Desc::data(object_value(c.ptr()), false, false, true);
-        let _ = vm.define_own_property(proto, crate::vm::Key::Name(a_c), &d);
+        let _ = vm.define_own_property(proto.obj(), crate::vm::Key::Name(a_c), &d);
         if generator {
             let d = crate::props::Desc::data(object_value(instances), false, false, true);
-            let _ = vm.define_own_property(proto, crate::vm::Key::Name(a_p), &d);
-            let d = crate::props::Desc::data(object_value(proto.ptr()), false, false, true);
+            let _ = vm.define_own_property(proto.obj(), crate::vm::Key::Name(a_p), &d);
+            let d = crate::props::Desc::data(object_value(proto.obj().ptr()), false, false, true);
             let _ = vm.define_own_property(unsafe { Obj::from_ptr(instances) }, crate::vm::Key::Name(a_c), &d);
         }
         let u: Vec<u16> = name.encode_utf16().collect();
         let s = vm.string_constant(&u);
         let d = crate::props::Desc::data(s, false, false, true);
-        let _ = vm.define_own_property(proto, crate::vm::Key::Name(a), &d);
+        let _ = vm.define_own_property(proto.obj(), crate::vm::Key::Name(a), &d);
         // (The same capacity as `function_shape`'s: upvalues where
         // compiled code reads them.)
-        let root =
-            vm.root_shape(crate::object::Class::Function, object_value(proto.ptr()), crate::vm::FUNCTION_CAPACITY);
+        let root = vm.root_shape(
+            crate::object::Class::Function,
+            object_value(proto.obj().ptr()),
+            crate::vm::FUNCTION_CAPACITY,
+        );
         if !generator {
             vm.async_function_shape = root;
-        } else if instances == gp.ptr() {
+        } else if instances == gp.obj().ptr() {
             vm.generator_function_shape = vm.transition_with(root, a_p, DONT_ENUM | DONT_DELETE);
         } else {
             vm.async_generator_function_shape = vm.transition_with(root, a_p, DONT_ENUM | DONT_DELETE);

@@ -276,24 +276,25 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
         vm.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let proto = object_value(vm.shared.prototype);
-    let o = vm.mu().new_object_with(Class::SharedArrayBuffer, proto, 0).obj();
+    let sc_o = Scope::new(vm);
+    let o = vm.mu().new_object_with(Class::SharedArrayBuffer, proto, 0).root(&sc_o);
     unsafe {
-        (*o.ptr()).elems = bytes_of(b).cast();
-        o.set_elems_len((*b).len.load(SeqCst) as u32);
+        (*o.obj().ptr()).elems = bytes_of(b).cast();
+        o.obj().set_elems_len((*b).len.load(SeqCst) as u32);
         if growable {
-            o.set_flags(o.flags() | RESIZABLE);
-            *Object::aux(o.ptr()) = (*b).room as u32;
+            o.obj().set_flags(o.obj().flags() | RESIZABLE);
+            *Object::aux(o.obj().ptr()) = (*b).room as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o.ptr()).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
+            (*o.obj().ptr()).code = object_value(views.ptr()).to_bits() as *const crate::vm::Code;
         }
     }
     let live = vm.shared.live;
-    crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(live) }, object_value(o.ptr()))?;
+    crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(live) }, object_value(o.obj().ptr()))?;
     if growable {
         let growing = vm.shared.growing;
-        crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(growing) }, object_value(o.ptr()))?;
+        crate::collections::weak_set_insert(vm, unsafe { Obj::from_ptr(growing) }, object_value(o.obj().ptr()))?;
     }
-    Ok(object_value(o.ptr()))
+    Ok(object_value(o.obj().ptr()))
 }
 
 /// Shared buffer `o`'s length, as its block has it now (another agent
@@ -911,6 +912,7 @@ fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(Obj, TypedKind
 /// `{async, value}`: what `Atomics.waitAsync` returns.
 fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let r = vm.mu().new_plain(op).obj();
     let a_async = vm.intern_name("async");
     let a_value = vm.intern_name("value");
@@ -1041,6 +1043,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let sp = vm.mu().new_plain(op).obj();
     vm.shared.prototype = sp.ptr();
     let c = vm.define_native(g, "SharedArrayBuffer", shared_ctor, 1, any, true);
@@ -1051,6 +1054,7 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, sp, "maxByteLength", shared_max_byte_length);
     vm.define_natives(sp, &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
 
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let atomics = vm.mu().new_plain(op).obj();
     let a_atomics = vm.intern_name("Atomics");
     vm.add_property_with(g, a_atomics, object_value(atomics.ptr()), crate::object::DONT_ENUM);

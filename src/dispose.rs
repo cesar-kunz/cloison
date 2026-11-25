@@ -53,9 +53,10 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
 
     // `SuppressedError`, an error kind of its own (as `AggregateError`).
     let ep = object_value((vm.error_prototypes[0]).ptr());
-    let sep = vm.mu().new_plain(ep).obj();
+    let sc_sep = Scope::new(vm);
+    let sep = vm.mu().new_plain(ep).root(&sc_sep);
     let sc = vm.define_native(g, "SuppressedError", suppressed_error_ctor, 3, any, true);
-    link_constructor(vm, sc, sep);
+    link_constructor(vm, sc, sep.obj());
     // (Its prototype is `Error`, as the other kinds'.)
     let a_error = vm.intern_name("Error");
     let sc_error = Scope::new(vm);
@@ -63,19 +64,20 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     vm.set_prototype_of(sc, error.peek());
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = str_value(vm, "SuppressedError");
-    vm.add_property_with(sep, a_name, name, DONT_ENUM);
+    vm.add_property_with(sep.obj(), a_name, name, DONT_ENUM);
     let empty = str_value(vm, "");
-    vm.add_property_with(sep, a_message, empty, DONT_ENUM);
+    vm.add_property_with(sep.obj(), a_message, empty, DONT_ENUM);
 
     // `DisposableStack` and `AsyncDisposableStack`.
     let a_dispose = vm.intern_name(&format!("{mark}Symbol.dispose"));
     let a_async_dispose = vm.intern_name(&format!("{mark}Symbol.asyncDispose"));
     let a_tag = vm.a_sym_to_string_tag;
-    let dsp = vm.mu().new_plain(op).obj();
+    let sc_dsp = Scope::new(vm);
+    let dsp = vm.mu().new_plain(op).root(&sc_dsp);
     let dc = vm.define_native(g, "DisposableStack", stack_ctor::<false>, 0, any, true);
-    link_constructor(vm, dc, dsp);
+    link_constructor(vm, dc, dsp.obj());
     vm.define_natives(
-        dsp,
+        dsp.obj(),
         &[
             ("adopt", stack_adopt::<false> as NativeFn, 2),
             ("defer", stack_defer::<false>, 1),
@@ -83,17 +85,18 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
             ("use", stack_use::<false>, 1),
         ],
     );
-    let dispose = vm.define_native(dsp, "dispose", stack_dispose, 0, any, false);
-    vm.add_property_with(dsp, a_dispose, object_value(dispose.ptr()), DONT_ENUM);
-    getter(vm, dsp, "disposed", stack_disposed::<false>);
+    let dispose = vm.define_native(dsp.obj(), "dispose", stack_dispose, 0, any, false);
+    vm.add_property_with(dsp.obj(), a_dispose, object_value(dispose.ptr()), DONT_ENUM);
+    getter(vm, dsp.obj(), "disposed", stack_disposed::<false>);
     let tag = str_value(vm, "DisposableStack");
-    let _ = vm.define_own_property(dsp, Key::Name(a_tag), &Desc::data(tag, false, false, true));
+    let _ = vm.define_own_property(dsp.obj(), Key::Name(a_tag), &Desc::data(tag, false, false, true));
 
-    let adsp = vm.mu().new_plain(op).obj();
+    let sc_adsp = Scope::new(vm);
+    let adsp = vm.mu().new_plain(op).root(&sc_adsp);
     let adc = vm.define_native(g, "AsyncDisposableStack", stack_ctor::<true>, 0, any, true);
-    link_constructor(vm, adc, adsp);
+    link_constructor(vm, adc, adsp.obj());
     vm.define_natives(
-        adsp,
+        adsp.obj(),
         &[
             ("adopt", stack_adopt::<true> as NativeFn, 2),
             ("defer", stack_defer::<true>, 1),
@@ -101,11 +104,11 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
             ("use", stack_use::<true>, 1),
         ],
     );
-    let dispose_async = vm.define_native(adsp, "disposeAsync", stack_dispose_async, 0, any, false);
-    vm.add_property_with(adsp, a_async_dispose, object_value(dispose_async.ptr()), DONT_ENUM);
-    getter(vm, adsp, "disposed", stack_disposed::<true>);
+    let dispose_async = vm.define_native(adsp.obj(), "disposeAsync", stack_dispose_async, 0, any, false);
+    vm.add_property_with(adsp.obj(), a_async_dispose, object_value(dispose_async.ptr()), DONT_ENUM);
+    getter(vm, adsp.obj(), "disposed", stack_disposed::<true>);
     let tag = str_value(vm, "AsyncDisposableStack");
-    let _ = vm.define_own_property(adsp, Key::Name(a_tag), &Desc::data(tag, false, false, true));
+    let _ = vm.define_own_property(adsp.obj(), Key::Name(a_tag), &Desc::data(tag, false, false, true));
 
     // `%IteratorPrototype%[Symbol.dispose]` and
     // `%AsyncIteratorPrototype%[Symbol.asyncDispose]`.
@@ -116,8 +119,12 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     let f = vm.native_function("[Symbol.asyncDispose]", async_iterator_dispose, 0, any, false);
     vm.add_property_with(aip, a_async_dispose, object_value(f.ptr()), DONT_ENUM);
 
-    vm.dispose_roots =
-        vec![object_value(dsp.ptr()), object_value(adsp.ptr()), object_value(sep.ptr()), Value::UNDEFINED];
+    vm.dispose_roots = vec![
+        object_value(dsp.obj().ptr()),
+        object_value(adsp.obj().ptr()),
+        object_value(sep.obj().ptr()),
+        Value::UNDEFINED,
+    ];
     Ok(())
 }
 
@@ -164,6 +171,7 @@ const RESOURCES: usize = 2;
 
 /// A new capability's state: `[async, disposed, resources]`.
 pub(crate) fn new_state(vm: &mut Vm, async_: bool) -> Result<Value> {
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let resources = vm.mu().new_array().v();
     crate::array::new_array_of(vm, &[Value::from_bool(async_), Value::FALSE, resources])
 }
@@ -239,6 +247,7 @@ fn thrown(vm: &mut Vm, e: Error) -> Result<Value> {
 /// message (DisposeResources').
 fn suppressed_error(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
     let proto = root(vm, Root::SuppressedErrorPrototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_plain(proto).obj();
     unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
@@ -261,8 +270,8 @@ pub(crate) fn dispose_resources(vm: &mut Vm, state: Value, completion: Result<Va
     let held = Scope::new(vm);
     let _rooted = held.roots([resources, kept]);
     let at = vm.handles.len() - 1;
-    let empty = vm.mu().new_array().v();
-    put(state, RESOURCES, empty);
+    let empty = vm.mu().new_array();
+    put(state, RESOURCES, empty.v());
     let mut completion = completion;
     let n = len(resources) / 3;
     for k in (0..n).rev() {
@@ -358,8 +367,8 @@ fn helper_suppress(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 /// after a throw of `error` (if `has_error`): a promise.
 pub(crate) fn dispose_resources_async(vm: &mut Vm, state: Value, has_error: bool, error: Value) -> Result<Value> {
     let resources = elem(state, RESOURCES);
-    let empty = vm.mu().new_array().v();
-    put(state, RESOURCES, empty);
+    let empty = vm.mu().new_array();
+    put(state, RESOURCES, empty.v());
     let h = async_helper(vm)?;
     vm.call_b(h, Value::UNDEFINED, &[resources, Value::from_bool(has_error), error]).map(Fresh::take)
 }
@@ -380,6 +389,7 @@ fn suppressed_error_ctor(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
         _ => None,
     };
     let proto = root(vm, Root::SuppressedErrorPrototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_plain(proto).obj();
     unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
@@ -401,9 +411,9 @@ fn name(async_: bool) -> &'static str {
 fn new_stack(vm: &mut Vm, async_: bool) -> Result<Value> {
     let state = new_state(vm, async_)?;
     let proto = root(vm, if async_ { Root::AsyncStackPrototype } else { Root::StackPrototype });
-    let o = vm.mu().new_object_with(Class::DisposableStack, proto, 0).obj();
-    unsafe { (*o.ptr()).code = state.to_bits() as *const crate::vm::Code };
-    Ok(object_value(o.ptr()))
+    let o = vm.mu().new_object_with(Class::DisposableStack, proto, 0);
+    unsafe { (*o.obj().ptr()).code = state.to_bits() as *const crate::vm::Code };
+    Ok(object_value(o.obj().ptr()))
 }
 
 fn stack_ctor<const ASYNC: bool>(vm: &mut Vm, _: Value, _: Args<'_>) -> Result<Value> {
@@ -467,8 +477,8 @@ fn stack_move<const ASYNC: bool>(vm: &mut Vm, this: Value, _: Args<'_>) -> Resul
     let out = new_stack(vm, ASYNC)?;
     let to = Value::from_bits(Obj::of(out).code() as u64);
     put(to, RESOURCES, elem(state, RESOURCES));
-    let empty = vm.mu().new_array().v();
-    put(state, RESOURCES, empty);
+    let empty = vm.mu().new_array();
+    put(state, RESOURCES, empty.v());
     put(state, DISPOSED, Value::TRUE);
     Ok(out)
 }

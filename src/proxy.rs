@@ -188,9 +188,9 @@ pub(crate) fn private_holder(vm: &mut Vm, p: Obj, make: bool) -> Option<Obj> {
     if !make {
         return None;
     }
-    let h = vm.mu().new_plain(Value::NULL).obj();
-    set_slot(p, 2, object_value(h.ptr()));
-    Some(h)
+    let h = vm.mu().new_plain(Value::NULL);
+    set_slot(p, 2, object_value(h.obj().ptr()));
+    Some(h.obj())
 }
 
 fn arg(a: &[Value], i: usize) -> Value {

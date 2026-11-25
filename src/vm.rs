@@ -8637,6 +8637,7 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
 /// `Array(…)` and `new Array(…)`: `Array(n)` has length `n` (holes), any
 /// other arguments are the elements.
 fn array_constructor(vm: &mut Vm, _: Value, args: Args<'_>) -> Result<Value> {
+    // take: filled where nothing collects, then returned.
     let a = vm.mu().new_array().v();
     let o = Obj::of(a);
     let elems: Vec<Value> = match &*args {

@@ -58,6 +58,7 @@ impl Flags {
 
 pub(super) fn install(vm: &mut Vm, intl: Obj) {
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let proto = vm.mu().new_plain(op).obj();
     let c = vm.define_native(intl, "Collator", collator_ctor, 0, crate::jit::Ty::Any, true);
     crate::builtins::link_constructor(vm, c, proto);
@@ -223,6 +224,7 @@ fn resolved_options(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     let o = this_collator(this, "resolvedOptions")?;
     let f = Flags::unpack(slot(o, FLAGS).as_i32_unchecked());
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let r = vm.mu().new_plain(op).obj();
     let usage = if f.search { "search" } else { "sort" };
     let strings = [

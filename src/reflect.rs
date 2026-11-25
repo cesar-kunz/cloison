@@ -37,6 +37,7 @@ fn list(vm: &mut Vm, v: Value) -> Result<Fresh<'_, Vec<Value>>> {
 
 pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let r = vm.mu().new_plain(op).obj();
     vm.define_natives(
         r,
@@ -141,6 +142,7 @@ pub(crate) fn reflect_own_keys(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Val
     let s = Scope::new(vm);
     let out = vm.mu().new_array().root(&s);
     for key in keys {
+        // take: only calls that don't collect follow (allocation, stores, filling it).
         let k = vm.mu().key_string(key).v();
         crate::vm::array_push(vm, out.v(), &[k])?;
     }

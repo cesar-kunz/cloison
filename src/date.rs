@@ -390,9 +390,9 @@ fn str_value(vm: &mut Vm, s: &str) -> Value {
 /// A new `Date` of time value `t`.
 fn new_date(vm: &mut Vm, t: f64) -> Value {
     let dp = object_value(vm.date_prototype);
-    let o = vm.mu().new_object_with(Class::Date, dp, 0).obj();
-    unsafe { (*o.ptr()).code = t.to_bits() as *const Code };
-    object_value(o.ptr())
+    let o = vm.mu().new_object_with(Class::Date, dp, 0);
+    unsafe { (*o.obj().ptr()).code = t.to_bits() as *const Code };
+    object_value(o.obj().ptr())
 }
 
 // ---- The constructor and its functions ----

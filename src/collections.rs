@@ -53,6 +53,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
     for _ in 0..9 {
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let p = vm.mu().new_plain(op).obj();
         vm.collection_prototypes.push(p);
     }
@@ -363,6 +364,7 @@ fn new_index(vm: &mut Vm, e: Obj, s: usize, n: usize) -> Result<Value> {
             ix[b] = Value::from_i32(j as i32);
         }
     }
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let a = vm.mu().new_array().v();
     array_push(vm, a, &ix)?;
     Ok(a)
@@ -408,6 +410,7 @@ fn new_entries(vm: &mut Vm, from: Option<Obj>, s: usize) -> Result<Obj> {
     }
     let count = (kv.len() - BASE) / s;
     kv[COUNT] = Value::from_i32(count as i32);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let fresh = vm.mu().new_array().v();
     array_push(vm, fresh, &kv)?;
     let e = Obj::of(fresh);
@@ -470,6 +473,7 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<Obj> {
     let s = if matches!(class, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
     let e = new_entries(vm, None, s)?;
     let p = object_value((vm.collection_prototypes[proto as usize]).ptr());
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_object_with(class, p, 0).obj();
     hold_entries(o, object_value(e.ptr()));
     if class != Class::WeakRef {
@@ -604,6 +608,7 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
 /// `{ value, done }`.
 fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let r = vm.mu().new_plain(op).obj();
     let (a_value, a_done) = (vm.intern_name("value"), vm.intern_name("done"));
     vm.add_property(r, a_value, value);
@@ -615,13 +620,13 @@ fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
 fn new_iterator(vm: &mut Vm, o: Obj, mode: IterMode) -> Value {
     let s = stride(o);
     let proto = vm.collection_prototypes[if s == 2 { Proto::MapIterator } else { Proto::SetIterator } as usize];
-    let it = vm.mu().new_object_with(Class::CollectionIterator, object_value(proto.ptr()), 0).obj();
-    hold_entries(it, Value::from_bits(o.code() as u64));
+    let it = vm.mu().new_object_with(Class::CollectionIterator, object_value(proto.ptr()), 0);
+    hold_entries(it.obj(), Value::from_bits(o.code() as u64));
     unsafe {
-        *Object::aux(it.ptr()) = mode as u32 | (s as u32) << 2;
-        it.set_elems_len(BASE as u32);
+        *Object::aux(it.obj().ptr()) = mode as u32 | (s as u32) << 2;
+        it.obj().set_elems_len(BASE as u32);
     }
-    object_value(it.ptr())
+    object_value(it.obj().ptr())
 }
 
 // ---- Map ----
@@ -834,6 +839,7 @@ pub(crate) fn step(vm: &mut Vm, it: Obj) -> Result<Option<Value>> {
             0 => k,
             1 => v,
             _ => {
+                // take: only calls that don't collect follow (allocation, stores, filling it).
                 let pair = vm.mu().new_array().v();
                 array_push(vm, pair, &[k, v])?;
                 pair

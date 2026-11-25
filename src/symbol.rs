@@ -142,6 +142,7 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     }
     let atom = name.map(|n| vm.intern_name(&n));
     let proto = object_value(root(vm, Root::SymbolPrototype).ptr());
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_object_with(Class::Symbol, proto, 0).obj();
     unsafe {
         (*o.ptr()).code = desc.to_bits() as *const crate::vm::Code;
@@ -252,6 +253,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value>
     } else {
         own_symbol_keys(vm, o)
     };
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let out = vm.mu().new_array().v();
     for s in keys {
         crate::vm::array_push(vm, out, &[s])?;
@@ -306,6 +308,7 @@ pub(crate) fn to_string_tag(vm: &mut Vm, o: Obj, tag: &str) {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let sp = vm.mu().new_plain(op).obj();
     vm.symbol_roots = vec![sp];
     let ctor = vm.define_native(g, "Symbol", symbol_ctor, 0, crate::jit::Ty::Any, true);
@@ -342,6 +345,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let _ = vm.define_own_property(unsafe { Obj::from_ptr(dp) }, Key::Name(a_tp), &d);
     // `Array.prototype[Symbol.unscopables]`: what `with` over an array
     // doesn't find (ES2015 on).
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let u = vm.mu().new_plain(Value::NULL).obj();
     for name in [
         "at",
@@ -398,19 +402,23 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 
     // Iterators.
-    let ip = vm.mu().new_plain(op).obj();
-    vm.symbol_roots.push(ip);
+    let sc_ip = Scope::new(vm);
+    let ip = vm.mu().new_plain(op).root(&sc_ip);
+    vm.symbol_roots.push(ip.obj());
     let a_iter = vm.a_sym_iterator;
-    define_symbol_native(vm, ip, a_iter, "[Symbol.iterator]", return_this, 0);
-    let aip = vm.mu().new_plain(object_value(ip.ptr())).obj();
+    define_symbol_native(vm, ip.obj(), a_iter, "[Symbol.iterator]", return_this, 0);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
+    let aip = vm.mu().new_plain(object_value(ip.obj().ptr())).obj();
     vm.symbol_roots.push(aip);
     vm.define_natives(aip, &[("next", array_iterator_next as NativeFn, 0)]);
     to_string_tag(vm, aip, "Array Iterator");
-    let sip = vm.mu().new_plain(object_value(ip.ptr())).obj();
+    // take: only calls that don't collect follow (allocation, stores, filling it).
+    let sip = vm.mu().new_plain(object_value(ip.obj().ptr())).obj();
     vm.symbol_roots.push(sip);
     vm.define_natives(sip, &[("next", string_iterator_next as NativeFn, 0)]);
     to_string_tag(vm, sip, "String Iterator");
-    let rsip = vm.mu().new_plain(object_value(ip.ptr())).obj();
+    // take: only calls that don't collect follow (allocation, stores, filling it).
+    let rsip = vm.mu().new_plain(object_value(ip.obj().ptr())).obj();
     vm.symbol_roots.push(rsip);
     vm.define_natives(rsip, &[("next", crate::builtins::regexp_string_iterator_next as NativeFn, 0)]);
     to_string_tag(vm, rsip, "RegExp String Iterator");
@@ -442,7 +450,7 @@ pub(crate) fn install(vm: &mut Vm) {
     }
     for (p, tag) in [(Proto::MapIterator, "Map Iterator"), (Proto::SetIterator, "Set Iterator")] {
         let o = cp[p as usize];
-        vm.set_prototype_of(o, object_value(ip.ptr()));
+        vm.set_prototype_of(o, object_value(ip.obj().ptr()));
         to_string_tag(vm, o, tag);
     }
     crate::promise::install_symbols(vm);
@@ -491,9 +499,9 @@ fn new_iterator(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Result<Va
 /// value) inheriting from `proto`, its state the hidden array `state`.
 pub(crate) fn iterator_with_state(vm: &mut Vm, class: Class, proto: Root, state: Value) -> Value {
     let p = object_value(root(vm, proto).ptr());
-    let it = vm.mu().new_object_with(class, p, 0).obj();
-    unsafe { (*it.ptr()).code = state.to_bits() as *const crate::vm::Code };
-    object_value(it.ptr())
+    let it = vm.mu().new_object_with(class, p, 0);
+    unsafe { (*it.obj().ptr()).code = state.to_bits() as *const crate::vm::Code };
+    object_value(it.obj().ptr())
 }
 
 fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {
@@ -662,6 +670,7 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> 
         if (0xD800..0xDC00).contains(&c) && u.get(i + 1).is_some_and(|d| (0xDC00..0xE000).contains(d)) { 2 } else { 1 };
     let piece: Vec<u16> = u[i..i + n].to_vec();
     vm.set_keyed(state, Value::from_i32(1), Value::from_i32((i + n) as i32))?;
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let s = vm.mu().new_string(&piece).v();
     iter_result(vm, s, false)
 }
@@ -716,8 +725,8 @@ fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     let s = Scope::new(vm);
     let it = s.root(it);
     let next = vm.get_atom_b(it.v(), a_next)?.root(&s);
-    let o = vm.mu().new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32).v();
-    let o = crate::object::as_object(o);
+    let o = vm.mu().new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32);
+    let o = crate::object::as_object(o.v());
     for (i, v) in [it.v(), next.v()].into_iter().chain(done).enumerate() {
         unsafe {
             let at = crate::object::Object::inline(o, i);
@@ -1305,6 +1314,7 @@ mod tests {
     #[test]
     fn array_states_step_past_int32_indices() {
         let mut vm = Vm::new();
+        // take: a test's; no JS runs while it is held (no setters on the way).
         let a = vm.mu().new_array().v();
         let top = 2f64.powi(31);
         for (k, x) in [(top - 1.0, 1), (top, 2)] {

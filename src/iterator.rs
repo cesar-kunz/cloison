@@ -112,9 +112,11 @@ pub(crate) fn install(vm: &mut Vm) {
         );
     }
 
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let hp = vm.mu().new_plain(object_value(ip.ptr())).obj();
     vm.define_natives(hp, &[("next", helper_next as NativeFn, 0), ("return", helper_return, 0)]);
     crate::symbol::to_string_tag(vm, hp, "Iterator Helper");
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let wp = vm.mu().new_plain(object_value(ip.ptr())).obj();
     vm.define_natives(wp, &[("next", wrap_next as NativeFn, 0), ("return", wrap_return, 0)]);
     vm.iterator_roots = vec![c, hp, wp];
@@ -270,9 +272,9 @@ fn new_helper(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, count: V
         &[Value::from_i32(kind), Value::from_i32(START), it, next, f, count, Value::UNDEFINED, Value::UNDEFINED],
     )?;
     let proto = vm.iterator_roots[if kind == WRAP { WRAP_PROTOTYPE } else { HELPER_PROTOTYPE }];
-    let o = vm.mu().new_object_with(Class::IteratorHelper, object_value(proto.ptr()), 0).obj();
-    unsafe { (*o.ptr()).code = state.to_bits() as *const crate::vm::Code };
-    Ok(object_value(o.ptr()))
+    let o = vm.mu().new_object_with(Class::IteratorHelper, object_value(proto.ptr()), 0);
+    unsafe { (*o.obj().ptr()).code = state.to_bits() as *const crate::vm::Code };
+    Ok(object_value(o.obj().ptr()))
 }
 
 /// The state of `this`, a helper (`wrap`: a wrapper), else a TypeError.
@@ -569,6 +571,7 @@ fn from(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 /// `Iterator.concat(...items)`: their values in turn (each item an
 /// iterable object).
 fn concat(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
+    // take: rooted below; nothing between collects.
     let list = vm.mu().new_array().v();
     {
         let held = Scope::new(vm);
@@ -728,6 +731,7 @@ fn reduce(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 }
 
 fn to_array(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
+    // take: rooted on the next line.
     let out = vm.mu().new_array().v();
     vm.rooted(&[out], |vm| {
         each(vm, this, None, "toArray", |vm, v, _| crate::vm::array_push(vm, out, &[v]).map(|_| None))
@@ -766,16 +770,17 @@ fn find(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 
 /// A copy of array `a` from index `from` on (`CreateArrayFromList`).
 fn copy(vm: &mut Vm, a: Value, from: f64) -> Result<Value> {
-    let out = vm.mu().new_array().v();
+    let sc_out = Scope::new(vm);
+    let out = vm.mu().new_array().root(&sc_out);
     let len = vm.length_of(a)?;
     let mut i = from;
     while i < len {
         // take: given at once to the next call.
         let v = vm.get_keyed_b(a, Value::number(i))?.take();
-        crate::vm::array_push(vm, out, &[v])?;
+        crate::vm::array_push(vm, out.v(), &[v])?;
         i += 1.0;
     }
-    Ok(out)
+    Ok(out.v())
 }
 
 /// Whether `v` is the string `s`.
@@ -1214,12 +1219,13 @@ fn zip_results(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
     if keys.is_undefined() {
         return crate::array::new_array_of(vm, &results).map(Some);
     }
-    let o = vm.mu().new_plain(Value::NULL).v();
+    let sc_o = Scope::new(vm);
+    let o = vm.mu().new_plain(Value::NULL).root(&sc_o);
     for (i, v) in results.into_iter().enumerate() {
         let sc_k = Scope::new(vm);
         let k = vm.get_keyed_b(keys, Value::from_i32(i as i32))?.root(&sc_k);
         let key = crate::intrinsics::to_property_key(vm, k.peek())?;
-        vm.create_data_property(o, key, v)?;
+        vm.create_data_property(o.v(), key, v)?;
     }
-    Ok(Some(o))
+    Ok(Some(o.v()))
 }

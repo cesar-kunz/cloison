@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Check that every `Fresh::take()` bound to a name has its reason.
+"""Check that every raw value bound to a name out of a branded result
+(`Fresh::take()`, or a `Gc`'s `.v()`/`.obj()` from `vm.mu()`) has its
+reason.
 
-A branded call's result (`Fresh`) can't be held across another call
-that may collect: the borrow checker sees to it. `take()` gives the raw
-value, which it no longer can check, so a binding of one must say why
-it is safe, on the line above: `// take: <reason>`. A value used at
+A branded call's result (`Fresh`) or a new cell (`Gc`) can't be held
+across a call that may collect: the borrow checker sees to it. `take()`,
+`.v()` and `.obj()` give the raw value, which it no longer can check, so
+a binding of one must say why it is safe, on the line above:
+`// take: <reason>`. A value used at
 once (an argument, a test) needs none.
 
 Usage: scripts/brand-takes.py [--list]
@@ -13,12 +16,12 @@ import pathlib, re, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 # A binding, of one name or a pattern, whose value is a taken Fresh.
-BIND = re.compile(r'^\s*let\b.*(\?\.take\(\)|Fresh::take)')
+BIND = re.compile(r'^\s*let\b.*(\?\.take\(\)|Fresh::take|\.mu\(\)\.\w+\(.*\)\.(v|obj)\(\))')
 # ... but not one that is a number or a boolean made of it (no cell), one
 # rooted at once, or a closure's definition.
 EXEMPT = re.compile(
     r'to_boolean\(|to_number\(|\.as_number\(\)|\.as_i32|\.to_number\(\)|\.is_\w+\(\)'
-    r'|\bsc\.root\(|\.root\(&|=\s*\|vm\b|\|vm: &mut Vm'
+    r'|\bsc\.root\(|\.roots?\(|\.root\(&|=\s*\|vm\b|\|vm: &mut Vm'
 )
 
 

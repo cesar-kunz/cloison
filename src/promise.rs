@@ -90,6 +90,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let proto = vm.mu().new_plain(op).obj();
     let c = vm.define_native(g, "Promise", promise_ctor, 1, any, true);
     link_constructor(vm, c, proto);
@@ -101,6 +102,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // `AggregateError`, as the error kinds are made in `builtins`.
     let ep = object_value((vm.error_prototypes[0]).ptr());
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let aep = vm.mu().new_plain(ep).obj();
     let ac = vm.define_native(g, "AggregateError", aggregate_error_ctor, 2, any, true);
     link_constructor(vm, ac, aep);
@@ -431,6 +433,7 @@ pub(crate) fn set_slot(o: Obj, i: usize, v: Value) {
 /// A new pending promise (of `Promise.prototype`).
 pub(crate) fn new_promise(vm: &mut Vm) -> Value {
     let proto = object_value(root(vm, Root::Prototype).ptr());
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_object_with(Class::Promise, proto, 0).obj();
     let st = vm.heap.alloc_values(3);
     unsafe {
@@ -1000,6 +1003,7 @@ fn promise_with_resolvers(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value
     let mut cap = vm.fresh(|vm| new_capability(vm, c))?.take();
     materialize(vm, &mut cap);
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_plain(op).obj();
     let names = [vm.intern_name("promise"), vm.intern_name("resolve"), vm.intern_name("reject")];
     vm.add_properties(o, &names, &[cap.promise, cap.resolve, cap.reject], 0);
@@ -1350,6 +1354,7 @@ fn settled_reject(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 
 fn settled_result(vm: &mut Vm, status: &str, key: &str, v: Value) -> Value {
     let op = object_value(vm.object_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_plain(op).obj();
     let names = [vm.intern_name("status"), vm.intern_name(key)];
     let status = string(vm, status);
@@ -1370,10 +1375,12 @@ fn any_element(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
 /// A new `AggregateError` of `errors` (an array), with `message` if given.
 fn new_aggregate_error(vm: &mut Vm, errors: Value, message: Option<&[u16]>) -> Value {
     let proto = object_value(root(vm, Root::AggregateErrorPrototype).ptr());
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_plain(proto).obj();
     unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
         let a = vm.intern_name("message");
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let m = vm.mu().new_string(m).v();
         vm.add_property_with(o, a, m, DONT_ENUM);
     }

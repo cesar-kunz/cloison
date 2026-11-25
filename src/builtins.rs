@@ -141,6 +141,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
 
     // `Boolean`, a conversion; booleans' methods.
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let bp = vm.mu().new_object_with(Class::Wrapper, object_value(op.ptr()), 4).obj();
     unsafe { (*bp.ptr()).code = Value::FALSE.to_bits() as *const crate::vm::Code };
     vm.boolean_prototype = bp.ptr();
@@ -236,6 +237,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     crate::date::install(vm);
     // The test262 host hooks (`$262`), as a shell has them.
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let host = vm.mu().new_plain(object_value(op.ptr())).obj();
     let a_host = vm.intern_name("$262");
     vm.add_property_with(g, a_host, object_value(host.ptr()), DONT_ENUM);
@@ -273,6 +275,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let mut error_ctor = Value::UNDEFINED;
     for (k, kind) in ERROR_KINDS.iter().enumerate() {
         let parent = vm.error_prototypes.first().copied().unwrap_or(op);
+        // take: only calls that don't collect follow (allocation, stores, filling it).
         let proto = vm.mu().new_plain(object_value(parent.ptr())).obj();
         let c = vm.define_native(g, kind, CTORS[k], 1, any, true);
         link_constructor(vm, c, proto);
@@ -283,8 +286,10 @@ pub(crate) fn install(vm: &mut Vm) {
         } else {
             vm.set_prototype_of(c, error_ctor);
         }
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let name = vm.mu().new_string(&kind.encode_utf16().collect::<Vec<_>>()).v();
         vm.add_property_with(proto, a_name, name, DONT_ENUM);
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let empty = vm.mu().new_string(&[]).v();
         vm.add_property_with(proto, a_message, empty, DONT_ENUM);
         if k == 0 {
@@ -926,6 +931,7 @@ fn split_key(this: Value, a: &[Value]) -> Option<(u64, u64, usize)> {
 /// A new array of the elements of `from`, an array `split` made (plain,
 /// of the array shape with its elements' type).
 fn array_copy(vm: &mut Vm, from: Value) -> Value {
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let arr = vm.mu().new_array().v();
     let (o, from) = (Obj::of(arr), Obj::of(from));
     let n = from.elems_len() as usize;
@@ -954,6 +960,7 @@ fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     match a.first() {
         Some(v) if !v.is_undefined() => {
             let sep = units(*v);
+            // take: rooted below; nothing between collects.
             let arr = vm.mu().new_array().v();
             let mut n = 0;
             vm.rooted(&[arr], |vm| {
@@ -979,6 +986,7 @@ fn split_uncached(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             Ok(arr)
         }
         _ => {
+            // take: rooted below; nothing between collects.
             let arr = vm.mu().new_array().v();
             if limit > 0 {
                 let v = {
@@ -1360,6 +1368,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     vm.handle_scope(|vm| {
         let list = if many { crate::array::new_array_of(vm, a.get(1..).unwrap_or(&[]))? } else { Value::EMPTY };
         vm.handles.push(list);
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let name = vm.mu().new_string(&units).v();
         vm.handles.push(name);
         let full = vm.root_shape(Class::Native, proto, (BOUND_OWN + 2 + nslots) as u32);
@@ -1573,6 +1582,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         }
     }
     let op = object_value(vm.object_prototype);
+    // take: only allocation and stores into it follow: nothing collects.
     let o = vm.mu().new_plain(op).obj();
     let a_length = vm.a_length;
     vm.add_property_with(o, a_length, Value::from_i32(values.len() as i32), DONT_ENUM);
@@ -2405,6 +2415,7 @@ fn install_regexps(vm: &mut Vm) {
     let g = vm.global_obj();
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let rp = vm.mu().new_plain(op).obj();
     vm.regexp_prototype = rp.ptr();
     let c = vm.define_native(g, "RegExp", regexp_ctor, 2, any, true);
@@ -2581,6 +2592,7 @@ pub(crate) fn regexp_literal(vm: &mut Vm, pattern: Value, flags: Value) -> Resul
 /// `RegExp.prototype.source` reads).
 fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) -> Value {
     let proto = object_value(vm.regexp_prototype);
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_object_with(Class::RegExp, proto, 3).obj();
     unsafe { (*o.ptr()).code = re.cast() };
     let props = [(vm.a_last_index, Value::from_i32(0)), (vm.a_regexp_source, source)];
@@ -2911,9 +2923,10 @@ fn legacy_paren<const N: usize>(vm: &mut Vm, this: Value, _: Args<'_>) -> Result
 
 /// The legacy static accessors on `RegExp` (`c`).
 fn install_legacy(vm: &mut Vm, c: Obj) {
-    let holder = vm.mu().new_plain(Value::NULL).obj();
+    let sc_holder = Scope::new(vm);
+    let holder = vm.mu().new_plain(Value::NULL).root(&sc_holder);
     let native = |vm: &mut Vm, name: &str, f: NativeFn, n: u32| {
-        object_value((vm.define_native(holder, name, f, n, Ty::Any, false)).ptr())
+        object_value((vm.define_native(holder.obj(), name, f, n, Ty::Any, false)).ptr())
     };
     let input_get = native(vm, "get input", legacy_input_get, 0);
     let input_set = native(vm, "set input", legacy_input_set, 1);
@@ -2969,6 +2982,7 @@ fn match_array(
     s: &[u16],
     input: Value,
 ) -> Result<Value> {
+    // take: only allocation and stores into it follow: nothing collects.
     let arr = vm.mu().new_array().v();
     let o = Obj::of(arr);
     vm.reserve_elems(o, caps.len());
@@ -3023,10 +3037,12 @@ fn match_array(
 fn match_indices(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>]) -> Result<Value> {
     let pair = |vm: &mut Vm, c: Option<(usize, usize)>| -> Result<Value> {
         let Some((a, b)) = c else { return Ok(Value::UNDEFINED) };
+        // take: only calls that don't collect follow (allocation, stores, filling it).
         let p = vm.mu().new_array().v();
         crate::vm::array_push(vm, p, &[Value::from_i32(a as i32), Value::from_i32(b as i32)])?;
         Ok(p)
     };
+    // take: only allocation and stores into it follow: nothing collects.
     let indices = vm.mu().new_array().v();
     for &c in caps {
         let p = pair(vm, c)?;
@@ -3035,6 +3051,7 @@ fn match_indices(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, 
     let groups = if re.names.is_empty() {
         Value::UNDEFINED
     } else {
+        // take: only allocation and stores into it follow: nothing collects.
         let groups = vm.mu().new_plain(Value::NULL).v();
         for (k, (name, _)) in re.names.iter().enumerate() {
             if re.names[..k].iter().any(|(n, _)| n == name) {
@@ -3060,6 +3077,7 @@ fn group_match(names: &[(String, usize)], name: &str, caps: &[Option<(usize, usi
 /// A match's named groups: a null-prototype object of their matches
 /// (`undefined` where a group didn't match), in their names' first order.
 fn named_groups(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>], s: &[u16]) -> Result<Value> {
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let groups = vm.mu().new_plain(Value::NULL).v();
     for (k, (name, _)) in re.names.iter().enumerate() {
         if re.names[..k].iter().any(|(n, _)| n == name) {
@@ -3259,6 +3277,7 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
         if vm.conv_thrown {
             return Err(vm.take_conv_error());
         }
+        // take: copied to the VM stack by with_args below; nothing between collects.
         let mut args = vec![vm.mu().new_string(&u).v()];
         args.extend_from_slice(a.get(1..).unwrap_or(&[]));
         // (On the VM stack: `f` runs `this`'s `toString` before it reads
@@ -3312,10 +3331,10 @@ fn match_all(vm: &mut Vm, this: Value, s: &[u16], rv: Value) -> Result<Value> {
     let input = sc.root(input).v();
     let source = vm.get_atom_b(rv, a_source)?.root(&sc);
     crate::gc::mark_regexp(re);
-    let matcher = vm.mu().make(|vm| regexp_object(vm, re, source.peek())).root(&sc).v();
+    let matcher = vm.mu().make(|vm| regexp_object(vm, re, source.peek())).root(&sc);
     let li = get_length(vm, rv, "lastIndex")?;
-    set_last_index(vm, matcher, li)?;
-    regexp_string_iterator(vm, matcher, input, global, unicode)
+    set_last_index(vm, matcher.v(), li)?;
+    regexp_string_iterator(vm, matcher.v(), input, global, unicode)
 }
 
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
@@ -3379,6 +3398,7 @@ fn match_with(vm: &mut Vm, s: &[u16], rv: Value, input: Value) -> Result<Value> 
     if found.is_empty() {
         return Ok(Value::NULL);
     }
+    // take: only calls that don't collect follow (allocation, stores, filling it).
     let arr = vm.mu().new_array().v();
     crate::vm::array_push(vm, arr, &found)?;
     Ok(arr)
@@ -3668,6 +3688,7 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
         Some(v) if !v.is_undefined() => crate::interp::to_int32(to_number(v)) as u32 as usize,
         _ => usize::MAX,
     };
+    // take: only allocation and stores into it follow: nothing collects.
     let arr = vm.mu().new_array().v();
     if limit == 0 {
         return Ok(arr);
@@ -3682,8 +3703,9 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
     let mut caps = crate::regexp::Captures::new();
     if s.is_empty() {
         if !re.exec_into(s, 0, &mut caps) {
-            let v = vm.mu().new_string(&[]).v();
-            push(vm, v);
+            let sc_v = Scope::new(vm);
+            let v = vm.mu().new_string(&[]).root(&sc_v);
+            push(vm, v.v());
         }
     } else {
         let (mut p, mut q) = (0, 0);
@@ -3826,10 +3848,12 @@ fn error_stack_set(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
 /// nothing pending, see `Vm::new_string_with`).
 pub(crate) fn make_error(vm: &mut Vm, k: usize, message: Option<&[u16]>) -> Value {
     let proto = vm.error_prototypes[k];
+    // take: only calls that don't collect follow (allocation, stores, the VM's fields).
     let o = vm.mu().new_plain(object_value(proto.ptr())).obj();
     unsafe { (*o.ptr()).flags |= crate::object::ERROR };
     if let Some(m) = message {
         let a = vm.intern_name("message");
+        // take: only calls that don't collect follow (allocation, stores, the VM's fields).
         let m = vm.mu().new_string(&m[..m.len().min(crate::vm::MAX_STRING_LEN)]).v();
         vm.add_property_with(o, a, m, DONT_ENUM);
     }
@@ -4138,6 +4162,7 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
     set_last_index(vm, r, 0.0)?;
     let su = string_units(s).unwrap_or(&[]).to_vec();
+    // take: rooted below; nothing between collects.
     let out = vm.mu().new_array().v();
     let mut n = 0;
     // (`out` rooted across `exec`'s calls.)
@@ -4155,8 +4180,9 @@ fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
             let _held = sc.roots([res]);
             get_units(vm, res, "0")
         }?;
-        let mv = vm.mu().new_string(&m).v();
-        crate::vm::array_push(vm, out, &[mv])?;
+        let sc_mv = Scope::new(vm);
+        let mv = vm.mu().new_string(&m).root(&sc_mv);
+        crate::vm::array_push(vm, out, &[mv.v()])?;
         n += 1;
         if m.is_empty() {
             let i = get_length(vm, r, "lastIndex")?;
@@ -4262,8 +4288,9 @@ fn substitution(
             }
             0x3C if !named.is_undefined() => match t[i + 2..].iter().position(|&c| c == b'>' as u16) {
                 Some(k) => {
-                    let name = vm.mu().new_string(&t[i + 2..i + 2 + k]).v();
-                    let key = crate::intrinsics::to_property_key(vm, name)?;
+                    let sc_name = Scope::new(vm);
+                    let name = vm.mu().new_string(&t[i + 2..i + 2 + k]).root(&sc_name);
+                    let key = crate::intrinsics::to_property_key(vm, name.v())?;
                     let sc_v = Scope::new(vm);
                     let v = vm.get_key_b(named, key)?.root(&sc_v);
                     if !v.peek().is_undefined() {
@@ -4362,6 +4389,7 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
                     // (Each string in the handles as it is made: a `Vec` is no
                     // root.)
                     let v = vm.handle_scope(|vm| {
+                        // take: pushed to vm.handles on the next line.
                         let mut args = vec![vm.mu().new_string(&matched).v()];
                         vm.handles.push(args[0]);
                         for c in &caps {
@@ -4537,8 +4565,9 @@ fn rx_split(vm: &mut Vm, r: Value, s: Value, limit: Value) -> Result<Value> {
         if !flags_have(&flags, b'y') {
             flags.push(b'y' as u16);
         }
-        let fv = vm.mu().new_string(&flags).v();
-        Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv])?, unicode))
+        let sc_fv = Scope::new(vm);
+        let fv = vm.mu().new_string(&flags).root(&sc_fv);
+        Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv.v()])?, unicode))
     })?;
     let out = {
         let sc = Scope::new(vm);
@@ -4592,8 +4621,9 @@ fn rx_split_with(vm: &mut Vm, s: Value, limit: Value, splitter: Value, out: Valu
             q = advance(&su, q as f64, unicode) as usize;
             continue;
         }
-        let part = vm.mu().new_string(&su[p..q]).v();
-        crate::vm::array_push(vm, out, &[part])?;
+        let sc_part = Scope::new(vm);
+        let part = vm.mu().new_string(&su[p..q]).root(&sc_part);
+        crate::vm::array_push(vm, out, &[part.v()])?;
         n += 1.0;
         if n == lim {
             return Ok(out);
@@ -4611,8 +4641,9 @@ fn rx_split_with(vm: &mut Vm, s: Value, limit: Value, splitter: Value, out: Valu
         }
         q = p;
     }
-    let part = vm.mu().new_string(&su[p.min(size)..]).v();
-    crate::vm::array_push(vm, out, &[part])?;
+    let sc_part = Scope::new(vm);
+    let part = vm.mu().new_string(&su[p.min(size)..]).root(&sc_part);
+    crate::vm::array_push(vm, out, &[part.v()])?;
     Ok(out)
 }
 
@@ -4627,8 +4658,9 @@ fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
     // across the getters and conversion after.)
     let (matcher, flags) = vm.rooted(&[c], |vm| {
         let flags = get_units(vm, r, "flags")?;
-        let fv = vm.mu().new_string(&flags).v();
-        Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv])?, flags))
+        let sc_fv = Scope::new(vm);
+        let fv = vm.mu().new_string(&flags).root(&sc_fv);
+        Ok::<_, Error>((crate::intrinsics::construct(vm, c, &[r, fv.v()])?, flags))
     })?;
     let held = Scope::new(vm);
     let _rooted = held.roots([matcher]);

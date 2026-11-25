@@ -73,6 +73,7 @@ and KetteVM:
 - [cloison in depth](docs/README-long.md): how it works, design choices,
   standards support, testing, building, where it falls short
 - [docs/gc.md](docs/gc.md): the collector
+- [docs/gc-branding.md](docs/gc-branding.md): branded cells, the compiler checking GC safety in natives
 - [docs/object-model.md](docs/object-model.md): objects, shapes, escape analysis
 - [docs/direct-calls.md](docs/direct-calls.md): the call convention
 - [docs/sparse-arrays.md](docs/sparse-arrays.md): sparse arrays and their defaults

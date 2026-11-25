@@ -28,6 +28,9 @@ jobs:
       - run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
+      # (Again with each `brand::Scope` checking that nothing was pushed to
+      # `vm.handles` by hand above its roots, which its end would drop.)
+      - run: cargo test --release --features scope-check
 
   debug-assertions:
     name: Tests (debug assertions)
@@ -55,7 +58,8 @@ jobs:
       # nor pins (`CLOISON_GC_NO_NATIVE_ROOTS=drop`) and a collection at
       # every safepoint: a Rust local holding a cell across one that isn't
       # rooted otherwise (`Vm::rooted`) makes its script crash or differ.
-      # Each script runs interpreted and compiled (see tests/scripts.rs).
+      # Each script runs interpreted and compiled (see tests/scripts.rs),
+      # its Scopes checked (`scope-check`).
       CLOISON_GC_NO_NATIVE_ROOTS: drop
       CLOISON_GC_STRESS: "1"
       CLOISON_GC_STW: "1"
@@ -63,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --test scripts
+      - run: cargo test --release --features scope-check --test scripts
 
   lint:
     name: rustfmt and clippy

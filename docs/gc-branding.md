@@ -300,6 +300,12 @@ it. Such code takes the value and pushes it, with its reason
 (`// take: pushed to vm.handles on the next line.`), rather than
 rooting it in a `Scope` of its own.
 
+The `scope-check` cargo feature checks this at run time: each `Scope`,
+as it ends, panics if anything but its own roots is above where it
+began. CI runs the tests and the drop+stress scripts with it. It is off
+by default because it deepens recursive frames: a 10,000-deep proxy
+chain then overflows a test thread's stack in a debug-assertions build.
+
 ## What isn't checked yet
 
 - **The `take()`s and raw `Gc` values**: each one reviewed and given a

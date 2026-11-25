@@ -1133,6 +1133,10 @@ pub struct Vm {
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
+    /// (The `scope-check` feature: how many of `handles` live Scopes rooted, for their
+    /// check that nothing else was pushed above them; see `brand::Scope`.)
+    #[cfg(feature = "scope-check")]
+    pub(crate) scope_roots: usize,
     /// How many of `handles` are the slots of the host's open handle
     /// scopes (`crate::handles`): always a prefix, as the host takes them
     /// only between runs and operations, which truncate `handles` to no
@@ -1631,6 +1635,8 @@ impl Vm {
             open_upvalues: Vec::new(),
             type_names: [None; 11],
             handles: Vec::new(),
+            #[cfg(feature = "scope-check")]
+            scope_roots: 0,
             host_slots: 0,
             globals: Default::default(),
             host_error: None,

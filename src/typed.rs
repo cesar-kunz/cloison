@@ -1116,16 +1116,21 @@ fn typed_from(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // (`iterate_with`'s values in `vm.handles`, the `Vec`'s copies valid in
     // this handle scope, where no cell moves.)
     vm.handle_scope(|vm| {
-        let sc = Scope::new(vm);
         let (values, src) = if !m.peek().is_undefined() && !m.peek().is_null() {
             if !is_callable(m.peek()) {
                 return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m.peek()))));
             }
             (Some(iterate_with(vm, source, m.peek())?.take()), Value::UNDEFINED)
         } else {
-            // (A wrapper held across getters: rooted, until the scope ends.)
-            (None, vm.to_object_b(source)?.root(&sc).v())
+            // (A wrapper held across getters: rooted in the handle scope.)
+            // take: pushed to vm.handles on the next line.
+            let w = vm.to_object_b(source)?.take();
+            vm.handles.push(w);
+            (None, w)
         };
+        // (After `iterate_with`'s values, pushed into the handle scope: its
+        // end would drop them.)
+        let sc = Scope::new(vm);
         let n = match &values {
             Some(v) => v.len(),
             None => vm.length_of(src)? as usize,

@@ -3454,11 +3454,12 @@ fn match_with_raw(vm: &mut Vm, s: &[u16], rv: Value, input: Value) -> Result<Val
     }
     let mut found = Vec::new();
     let mut at = 0;
+    let sc_found = Scope::new(vm);
     while let Some(caps) = re.exec(s, at) {
         let (x, y) = caps[0].unwrap();
         note_legacy(vm, rv, input, &caps);
         let m = string(vm, &s[x..y]);
-        vm.handles.push(m);
+        sc_found.root(m);
         found.push(m);
         at = if y == x { advance(s, y as f64, re.unicode) as usize } else { y };
         if at > s.len() {

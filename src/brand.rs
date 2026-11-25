@@ -392,14 +392,37 @@ impl<'a> Mu<'a> {
 #[must_use]
 pub struct Scope {
     vm: *mut Vm,
+    /// `vm.handles`' depth where it began; with the `scope-check` feature, with
+    /// `vm.scope_roots` then in its high half (the struct no bigger: deep
+    /// recursions' frames as release's).
     depth: usize,
 }
+
+/// (`scope-check`: `Scope::depth`'s low half, the handles' depth.)
+#[cfg(feature = "scope-check")]
+const LOW: usize = u32::MAX as usize;
 
 impl Scope {
     /// A scope from `vm.handles`' current depth.
     #[inline(always)]
     pub fn new(vm: &mut Vm) -> Scope {
-        Scope { depth: vm.handles.len(), vm }
+        #[cfg(feature = "scope-check")]
+        let depth = {
+            debug_assert!(vm.handles.len() <= LOW && vm.scope_roots <= LOW);
+            vm.handles.len() | vm.scope_roots << 32
+        };
+        #[cfg(not(feature = "scope-check"))]
+        let depth = vm.handles.len();
+        Scope { depth, vm }
+    }
+
+    /// The handles' depth where it began.
+    #[inline(always)]
+    fn base(&self) -> usize {
+        #[cfg(feature = "scope-check")]
+        return self.depth & LOW;
+        #[cfg(not(feature = "scope-check"))]
+        self.depth
     }
 
     /// `vs` rooted until the scope ends, at once (one growth check).
@@ -407,6 +430,10 @@ impl Scope {
     pub fn roots<const N: usize>(&self, vs: [Value; N]) -> [Handle<'_>; N] {
         // SAFETY: as `root`.
         let at = unsafe {
+            #[cfg(feature = "scope-check")]
+            {
+                (*self.vm).scope_roots += N;
+            }
             let h = &mut (*self.vm).handles;
             h.extend_from_slice(&vs);
             h.len() - N
@@ -428,11 +455,40 @@ impl Scope {
         // SAFETY: the scope doesn't outlive its VM, and nothing else
         // borrows `handles` while it is pushed to.
         let slot = unsafe {
+            #[cfg(feature = "scope-check")]
+            {
+                (*self.vm).scope_roots += 1;
+            }
             let h = &mut (*self.vm).handles;
             h.push(v);
             h.len() - 1
         };
         Handle { vm: self.vm, slot, _s: PhantomData }
+    }
+
+    /// With `scope-check`, as it ends: only its own roots (and its inner
+    /// scopes', ended) above where it began. A value pushed to
+    /// `vm.handles` by hand after it began would be dropped with them, its
+    /// root gone while its pusher still counts on it.
+    #[cfg(feature = "scope-check")]
+    #[inline(always)]
+    fn check_own(&self, vm: &mut Vm) {
+        let then = self.depth >> 32;
+        let own = vm.scope_roots - then;
+        vm.scope_roots = then;
+        if vm.handles.len() != self.base() + own {
+            unrooted_pushes(vm.handles.len() - (self.base() + own));
+        }
+    }
+}
+
+/// [`Scope::check_own`]'s failure.
+#[cfg(feature = "scope-check")]
+#[cold]
+#[inline(never)]
+fn unrooted_pushes(n: usize) {
+    if !std::thread::panicking() {
+        panic!("a Scope ends dropping {n} handle(s) it didn't root (pushed to vm.handles by hand)");
     }
 }
 
@@ -440,7 +496,10 @@ impl Drop for Scope {
     #[inline(always)]
     fn drop(&mut self) {
         // SAFETY: as `root`.
-        unsafe { (*self.vm).handles.truncate(self.depth) };
+        let vm = unsafe { &mut *self.vm };
+        #[cfg(feature = "scope-check")]
+        self.check_own(vm);
+        vm.handles.truncate(self.base());
     }
 }
 

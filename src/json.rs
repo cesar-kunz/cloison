@@ -874,21 +874,22 @@ impl<'a> Parser<'a> {
                         if !self.eat(b':') {
                             return Err(self.error());
                         }
-                        let sc_v = Scope::new(vm);
-                        let v = self.value(vm)?.root(&sc_v);
+                        // take: parsing only allocates, nothing collects (and
+                        // no Scope here: its end would drop the records' roots).
+                        let v = self.value(vm)?.take();
                         // (A name the object has, stored in its slot, a
                         // new one added: no string of it, no descriptor.)
                         match property_key(vm, &k) {
                             Key::Name(a) => {
                                 let ob = Obj::of(o);
                                 match ob.shape().live().lookup(a) {
-                                    Some(slot) => vm.store_field(ob, slot, v.peek()),
+                                    Some(slot) => vm.store_field(ob, slot, v),
                                     None => {
-                                        vm.add_property_keyed(ob, a, v.peek());
+                                        vm.add_property_keyed(ob, a, v);
                                     }
                                 }
                             }
-                            key => vm.create_data_property(o, key, v.peek())?,
+                            key => vm.create_data_property(o, key, v)?,
                         }
                         if self.track {
                             keys.push(k.into_owned());
@@ -905,9 +906,10 @@ impl<'a> Parser<'a> {
             }
             Some('[') if self.peek() < Some(128) => {
                 self.i += 1;
-                let sc_arr = Scope::new(vm);
-                let arr = vm.mu().new_array().root(&sc_arr);
-                let ao = Obj::of(arr.v());
+                // take: parsing only allocates, nothing collects (and no
+                // Scope here: its end would drop the records' roots).
+                let arr = vm.mu().new_array().v();
+                let ao = Obj::of(arr);
                 let mut n = 0;
                 if !self.eat(b']') {
                     loop {
@@ -927,7 +929,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                (arr.v(), Some(false))
+                (arr, Some(false))
             }
             Some('"') if self.peek() < Some(128) => {
                 let s = self.string()?;

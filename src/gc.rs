@@ -502,6 +502,10 @@ impl Heap {
             if self.gc.marking {
                 crate::layout::copy_words(src, dst, n);
             } else {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "not marking: no other thread reads the slots (see `Heap::move_values`)"
+                )]
                 std::ptr::copy(src, dst, n);
             }
         }
@@ -518,6 +522,10 @@ impl Heap {
                 }
             } else if n > 0 {
                 // (`p` is null in an array without elements: no slice.)
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "not marking: no other thread reads the slots (see `Heap::move_values`)"
+                )]
                 std::slice::from_raw_parts_mut(p, n).fill(v);
             }
         }
@@ -1188,6 +1196,7 @@ unsafe fn marked_cells(start: usize, color: u8) -> Vec<(usize, usize)> {
 
 /// Copy the cell at `p`, of `n` bytes, to `q`, and forward it there
 /// ([`FORWARDED`] in its metadata, `q` in its second word).
+#[expect(clippy::disallowed_methods, reason = "the final pause's evacuation: the marker is paused")]
 unsafe fn copy_cell(p: usize, n: usize, q: usize) {
     // Large cells never move: string slices point into their units (see
     // `Vm::slice_string`), and the evacuation leaves them (`why` 0).
@@ -1436,12 +1445,71 @@ impl Visit for CardMarking {
     }
 }
 
-/// A heap shared by the card-scanning threads, which only read it (but
-/// for the young cells' metadata, claimed atomically).
+/// What scanning cards reads of a heap but its cells and metadata: its
+/// blocks, whether blocks are being swept and the latest color. `Sync`
+/// by its fields', no `unsafe impl`: the threads scanning cards in
+/// parallel get one, not the heap (see [`Heap::scan_cards`]).
 #[derive(Clone, Copy)]
-struct SharedHeap(*const Heap);
-unsafe impl Send for SharedHeap {}
-unsafe impl Sync for SharedHeap {}
+struct Cards<'h> {
+    blocks: crate::heap::Blocks<'h>,
+    sweeping: bool,
+    color: u8,
+}
+
+impl Cards<'_> {
+    /// Mark the young cells the old cells' words in `lo..hi` refer to,
+    /// and all of an object's that starts there: compiled code marks an
+    /// object's own card for a store to any of its in-object slots, Rust
+    /// code the slot's (see `heap::card_mark`). Old cells are found from
+    /// the metadata alone (their first granules have a color), so the
+    /// young cells most dirty cards hold, written as they were made, cost
+    /// nothing.
+    unsafe fn scan(&self, lo: usize, hi: usize, m: &mut impl Visit) {
+        unsafe {
+            // (The metadata is read whole, `meta_load` and `meta_word`:
+            // on several threads, the others mark young cells' bytes
+            // meanwhile, `CardMarking::cell`.)
+            // An old cell from before the card reaching into it.
+            // (While blocks are swept, a dead old cell keeps an old color:
+            // only cells of the current color are live.)
+            let live = |b: u8| b & COLOR != 0 && (!self.sweeping || b & COLOR == self.color);
+            if let Some(p) = self.blocks.cell_start_before(lo)
+                && p < lo
+                && live(crate::heap::meta_load(p))
+                && p + cell_size(p as *const u8) > lo
+            {
+                trace(m, p, lo, hi);
+            }
+            // Old cells starting on it: eight granules' bytes at a time.
+            let mut g = lo;
+            while g < hi {
+                let w = crate::heap::meta_word(g);
+                if w & 0x0303_0303_0303_0303 == 0 {
+                    g += 8 * GRANULE;
+                    continue;
+                }
+                for k in 0..8 {
+                    let p = g + k * GRANULE;
+                    if live(crate::heap::meta_load(p)) {
+                        if *(p as *const u64) & 1 == 0 {
+                            trace(m, p, 0, usize::MAX);
+                        } else {
+                            trace(m, p, lo, hi);
+                        }
+                    }
+                }
+                g += 8 * GRANULE;
+            }
+        }
+    }
+}
+
+impl Heap {
+    /// What scanning its cards reads of it (see [`Cards`]).
+    fn cards(&self) -> Cards<'_> {
+        Cards { blocks: self.blocks_view(), sweeping: self.gc.sweeping, color: self.color }
+    }
+}
 
 /// Dirty cards (at [`heap::CARD`](crate::heap::CARD) bytes) from which a
 /// minor collection scans them on several threads, and the most cards a
@@ -2117,6 +2185,8 @@ struct Shared {
     wake: std::sync::Condvar,
     /// Asked to stop at the next check (the mutator wants a pause).
     pause: std::sync::atomic::AtomicBool,
+    /// Where to ask for the final pause: the heap's `requested`.
+    request: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Panic before tracing the next work (for the tests: #224).
     #[cfg(test)]
     fail: std::sync::atomic::AtomicBool,
@@ -2140,8 +2210,6 @@ struct MarkerState {
     busy: bool,
     /// Ran out of work since the mutator last handed it some.
     done: bool,
-    /// Where to ask for the final pause (`Heap::requested`).
-    request: usize,
     quit: bool,
     /// Bytes traced in this cycle.
     marked: usize,
@@ -2162,12 +2230,13 @@ struct MarkerState {
 
 impl Marker {
     #[cfg(test)]
-    fn start() -> Marker {
-        Self::try_start().expect("the marker thread")
+    fn start(request: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Marker {
+        Self::try_start(request).expect("the marker thread")
     }
 
-    /// The marker, its thread started; `None` if it can't be.
-    fn try_start() -> Option<Marker> {
+    /// The marker, its thread started, asking for the final pause through
+    /// `request`; `None` if it can't be started.
+    fn try_start(request: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<Marker> {
         if spawn_refused(true) {
             return None;
         }
@@ -2175,6 +2244,7 @@ impl Marker {
             state: Default::default(),
             wake: std::sync::Condvar::new(),
             pause: std::sync::atomic::AtomicBool::new(false),
+            request: request.clone(),
             #[cfg(test)]
             fail: Default::default(),
         });
@@ -2213,24 +2283,23 @@ impl Marker {
         let sh = &self.shared;
         let mut st = sh.state();
         if st.run && st.work.is_empty() && !st.busy {
-            ask_final(&mut st);
+            ask_final(sh, &mut st);
         }
         sh.pause.store(false, std::sync::atomic::Ordering::Relaxed);
         sh.wake.notify_all();
     }
 
     /// Hand it `more` work and let it run.
-    fn resume(&self, more: &mut Vec<usize>, request: usize) {
+    fn resume(&self, more: &mut Vec<usize>) {
         let sh = &self.shared;
         let mut st = sh.state();
         st.work.append(more);
-        st.request = request;
         // Nothing to trace (a start pause that shaded nothing): done, and
         // the next safepoint is the final pause, which the marker, waiting
         // for work, would never ask for.
         debug_assert!(st.panicked.is_none(), "work for a marker that panicked");
         if st.work.is_empty() && !st.busy {
-            ask_final(&mut st);
+            ask_final(sh, &mut st);
         } else {
             (st.run, st.done) = (true, false);
         }
@@ -2262,11 +2331,9 @@ impl Shared {
 }
 
 /// Out of work: the mutator's next safepoint is the final pause.
-fn ask_final(st: &mut MarkerState) {
+fn ask_final(sh: &Shared, st: &mut MarkerState) {
     (st.run, st.done) = (false, true);
-    unsafe {
-        (*(st.request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed)
-    };
+    sh.request.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The marker thread. A panic in it (a bug) is recorded and the mutator
@@ -2282,7 +2349,7 @@ fn marker_loop(sh: &Shared) {
     (st.busy, st.sweeping) = (false, false);
     st.panicked = Some(e.unwrap_or_else(|| "a panic".into()));
     if marking && !sh.pause.load(std::sync::atomic::Ordering::Relaxed) {
-        ask_final(&mut st);
+        ask_final(sh, &mut st);
     }
     sh.wake.notify_all();
 }
@@ -2353,7 +2420,7 @@ fn marker_work(sh: &Shared) {
         st.work.append(&mut stack);
         st.busy = false;
         if st.work.is_empty() && !sh.pause.load(Relaxed) {
-            ask_final(&mut st);
+            ask_final(sh, &mut st);
         }
         sh.wake.notify_all();
     }
@@ -2765,7 +2832,6 @@ impl Vm {
         self.heap.collected(next, full);
         // Shaded cells are the marker's to trace.
         if self.heap.gc.marking {
-            let request = &raw const self.heap.requested as usize;
             // (Started for the cycle's start: `collect_from`.)
             let mk = self.heap.gc.marker.as_ref().expect("the marker thread");
             {
@@ -2775,7 +2841,7 @@ impl Vm {
                 st.shapes = self.heap.gc.shape_cycle;
                 st.cand = self.heap.candidates_map();
             }
-            mk.resume(&mut shade, request);
+            mk.resume(&mut shade);
         } else if self.heap.gc.sweeping
             && let Some(mk) = &self.heap.gc.marker
         {
@@ -4315,6 +4381,7 @@ impl Vm {
                 *crate::heap::meta(p) = 0;
                 *crate::heap::meta(p + n - GRANULE) = 0;
                 if poison {
+                    #[expect(clippy::disallowed_methods, reason = "a cell found dead: nothing reads it")]
                     std::ptr::write_bytes(p as *mut u8, POISON, n);
                 }
             }
@@ -5067,20 +5134,20 @@ impl Heap {
                 let mut refs = CardRefs::new(m);
                 for &(lo, hi) in &runs {
                     if cand.map != 0 {
-                        self.scan_card(lo, hi, &mut Rec(&mut refs));
+                        self.cards().scan(lo, hi, &mut Rec(&mut refs));
                     } else {
-                        self.scan_card(lo, hi, &mut refs);
+                        self.cards().scan(lo, hi, &mut refs);
                     }
                 }
                 refs.flush();
             } else {
                 // On several threads, each taking runs in turn.
                 let next = std::sync::atomic::AtomicUsize::new(0);
-                let heap = SharedHeap(self);
+                // What the threads read of the heap: a `Cards`, `Sync`.
+                let cards = self.cards();
                 let (runs, next) = (&runs[..], &next);
                 let (mode, range) = (m.mode, m.heap);
                 let work = move || {
-                    let heap = heap;
                     let mut cm =
                         CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new(), cand, rec: Vec::new() };
                     let mut refs = CardRefs::new(&mut cm);
@@ -5091,9 +5158,9 @@ impl Heap {
                         }
                         for &(lo, hi) in &runs[i..(i + RUNS_PER_TAKE).min(runs.len())] {
                             if cand.map != 0 {
-                                (*heap.0).scan_card(lo, hi, &mut Rec(&mut refs));
+                                cards.scan(lo, hi, &mut Rec(&mut refs));
                             } else {
-                                (*heap.0).scan_card(lo, hi, &mut refs);
+                                cards.scan(lo, hi, &mut refs);
                             }
                         }
                     }
@@ -5115,52 +5182,6 @@ impl Heap {
                 });
             }
             self.gc.card_runs = runs;
-        }
-    }
-
-    /// Mark the young cells the old cells' words in `lo..hi` refer to,
-    /// and all of an object's that starts there: compiled code marks an
-    /// object's own card for a store to any of its in-object slots, Rust
-    /// code the slot's (see `heap::card_mark`). Old cells are found from
-    /// the metadata alone (their first granules have a color), so the
-    /// young cells most dirty cards hold, written as they were made, cost
-    /// nothing.
-    unsafe fn scan_card(&self, lo: usize, hi: usize, m: &mut impl Visit) {
-        unsafe {
-            // (The metadata is read whole, `meta_load` and `meta_word`:
-            // on several threads, the others mark young cells' bytes
-            // meanwhile, `CardMarking::cell`.)
-            // An old cell from before the card reaching into it.
-            // (While blocks are swept, a dead old cell keeps an old color:
-            // only cells of the current color are live.)
-            let live = |b: u8| b & COLOR != 0 && (!self.gc.sweeping || b & COLOR == self.color);
-            if let Some(p) = self.cell_start_before(lo)
-                && p < lo
-                && live(crate::heap::meta_load(p))
-                && p + cell_size(p as *const u8) > lo
-            {
-                trace(m, p, lo, hi);
-            }
-            // Old cells starting on it: eight granules' bytes at a time.
-            let mut g = lo;
-            while g < hi {
-                let w = crate::heap::meta_word(g);
-                if w & 0x0303_0303_0303_0303 == 0 {
-                    g += 8 * GRANULE;
-                    continue;
-                }
-                for k in 0..8 {
-                    let p = g + k * GRANULE;
-                    if live(crate::heap::meta_load(p)) {
-                        if *(p as *const u64) & 1 == 0 {
-                            trace(m, p, 0, usize::MAX);
-                        } else {
-                            trace(m, p, lo, hi);
-                        }
-                    }
-                }
-                g += 8 * GRANULE;
-            }
         }
     }
 
@@ -5199,6 +5220,7 @@ impl Heap {
                         let n = cell_size(p as *const u8);
                         if *self.meta(p) == YOUNG {
                             *self.meta(p) = 0;
+                            #[expect(clippy::disallowed_methods, reason = "a cell found dead: nothing reads it")]
                             std::ptr::write_bytes(p as *mut u8, POISON, n);
                             freed += n;
                         }
@@ -5297,7 +5319,10 @@ impl Heap {
     unsafe fn clear_cards(&mut self) {
         let (base, end) = self.space_range();
         let (c0, c1) = (crate::heap::card(base), crate::heap::card(end));
-        unsafe { std::ptr::write_bytes(c0, 0, c1 as usize - c0 as usize) };
+        #[expect(clippy::disallowed_methods, reason = "the cards, in a pause: no other thread reads them")]
+        unsafe {
+            std::ptr::write_bytes(c0, 0, c1 as usize - c0 as usize)
+        };
     }
 
     /// The final pause marked with `color`: free the unmarked large cells,
@@ -5345,7 +5370,7 @@ impl Heap {
             self.gc.marker_retry -= 1;
             return false;
         }
-        self.gc.marker = Marker::try_start();
+        self.gc.marker = Marker::try_start(&self.requested);
         if self.gc.marker.is_none() {
             self.gc.marker_retry = self.gc.marker_retry_every;
             return false;
@@ -5484,6 +5509,7 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
                 // are zero anyway).
                 meta_store(p, 0);
                 if poison {
+                    #[expect(clippy::disallowed_methods, reason = "a cell found dead: nothing reads it")]
                     std::ptr::write_bytes(p as *mut u8, POISON, cell_size(p as *const u8));
                 }
                 p += GRANULE;
@@ -5512,6 +5538,7 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
                 meta_store(p, 0);
                 meta_store(q, 0);
                 if poison {
+                    #[expect(clippy::disallowed_methods, reason = "a cell found dead: nothing reads it")]
                     std::ptr::write_bytes(p as *mut u8, POISON, n);
                 }
             }
@@ -5611,10 +5638,10 @@ mod tests {
     #[test]
     fn a_marker_panic_is_recorded() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        let requested = AtomicBool::new(false);
-        let mk = Marker::start();
+        let requested = std::sync::Arc::new(AtomicBool::new(false));
+        let mk = Marker::start(&requested);
         mk.shared.fail.store(true, Relaxed);
-        mk.resume(&mut vec![0], &requested as *const AtomicBool as usize);
+        mk.resume(&mut vec![0]);
         let t0 = Instant::now();
         while !requested.load(Relaxed) {
             assert!(t0.elapsed() < Duration::from_secs(60), "the marker never asked for a pause");
@@ -5630,7 +5657,8 @@ mod tests {
     /// concurrent cycle asked for at the next safepoint.
     fn fail_marker(vm: &mut Vm, _: Value, _: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         use std::sync::atomic::Ordering::Relaxed;
-        vm.heap.gc.marker.get_or_insert_with(Marker::start).shared.fail.store(true, Relaxed);
+        let request = vm.heap.requested.clone();
+        vm.heap.gc.marker.get_or_insert_with(|| Marker::start(&request)).shared.fail.store(true, Relaxed);
         vm.heap.gc.external_full = true;
         vm.heap.requested.store(true, Relaxed);
         Ok(Value::UNDEFINED)
@@ -5723,13 +5751,12 @@ mod tests {
     #[test]
     fn a_marker_out_of_work_asks_as_it_goes_on() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        let requested = AtomicBool::new(false);
-        let mk = Marker::start();
+        let requested = std::sync::Arc::new(AtomicBool::new(false));
+        let mk = Marker::start(&requested);
         mk.pause();
         {
             let mut st = mk.shared.state();
             (st.run, st.done) = (true, false);
-            st.request = &requested as *const AtomicBool as usize;
         }
         mk.go_on();
         assert!(requested.load(Relaxed));

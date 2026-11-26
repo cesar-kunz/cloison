@@ -1053,6 +1053,7 @@ mod tests {
 
     /// [`super::copy_words`] as `ptr::copy`, at every overlap.
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "a test's own memory")]
     fn copy_words_is_memmove() {
         for n in [0, 1, 2, 7, 16] {
             for src in 0..9 {

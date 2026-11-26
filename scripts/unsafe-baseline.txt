@@ -10,7 +10,7 @@
 11 src/date.rs
 5 src/dispose.rs
 11 src/far.rs
-245 src/gc.rs
+242 src/gc.rs
 15 src/generator.rs
 49 src/heap.rs
 126 src/interp.rs

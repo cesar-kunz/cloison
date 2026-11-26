@@ -723,6 +723,10 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Val
                 }
             } else if n > 1 {
                 // (`elems` is null where none were allocated: no slice.)
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "not marking: no other thread reads the slots (see `Heap::move_values`)"
+                )]
                 std::slice::from_raw_parts_mut(e, n).reverse();
             }
             // (Every slot may now hold what was elsewhere: barriered.)

@@ -3140,6 +3140,7 @@ impl Vm {
                 let cap = (old * 2).max(4).max(i + 1);
                 let p = self.heap.alloc_values(cap as usize);
                 if !o.props().is_null() {
+                    #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                     std::ptr::copy_nonoverlapping(o.props(), p, old as usize);
                 }
                 crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).props, p);
@@ -6152,6 +6153,7 @@ impl Vm {
             let far = crate::far::is_far(o);
             let e = self.heap.alloc_values_from(cap + far as usize, len);
             if len > 0 {
+                #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                 std::ptr::copy_nonoverlapping(o.elems(), e, len);
             }
             if far {
@@ -6331,6 +6333,7 @@ impl Vm {
             fill(data);
             // The room past the units zero, not what memory held.
             debug_assert!(4 * words >= len);
+            #[expect(clippy::disallowed_methods, reason = "a new string's units: young, which the marker skips")]
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
             (*o.ptr()).elems = data.cast();
             o.set_elems_len(u32::try_from(len).expect("string too long"));
@@ -6368,8 +6371,10 @@ impl Vm {
             let words = len.div_ceil(4);
             let o = self.alloc_string(words);
             let data = o.ptr().cast::<u8>().add(STRING_UNITS).cast::<u16>();
+            #[expect(clippy::disallowed_methods, reason = "a new string's units: young, which the marker skips")]
             fill(std::slice::from_raw_parts_mut(data, len));
             // The room past the units zero, not what memory held.
+            #[expect(clippy::disallowed_methods, reason = "a new string's units: young, which the marker skips")]
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
             (*o.ptr()).elems = data.cast();
             o.set_elems_len(u32::try_from(len).expect("string too long"));
@@ -7127,6 +7132,7 @@ impl Vm {
                 let want = (n - cap).max(old * 2).max(4);
                 let p = self.heap.alloc_values(want);
                 if !o.props().is_null() {
+                    #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                     std::ptr::copy_nonoverlapping(o.props(), p, old);
                 }
                 crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).props, p);
@@ -9556,6 +9562,7 @@ unsafe fn copy_units(o: Obj, buf: *mut u16) {
                 stack.push(s.props().cast::<Object>());
             } else {
                 let n = s.elems_len() as usize;
+                #[expect(clippy::disallowed_methods, reason = "a new string's units: young, which the marker skips")]
                 std::ptr::copy_nonoverlapping(s.elems().cast::<u16>(), buf.add(at), n);
                 at += n;
             }

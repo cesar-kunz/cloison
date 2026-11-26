@@ -1576,6 +1576,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         if !values.is_empty() {
             unsafe {
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
+                #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
                 crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).elems, e);
                 o.set_elems_len(values.len() as u32);
@@ -1599,6 +1600,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
             vm.store_field(o, 3, vm.strict_arguments_callee);
             if !values.is_empty() {
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
+                #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
                 crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).elems, e);
                 o.set_elems_len(values.len() as u32);

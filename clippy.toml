@@ -1,6 +1,14 @@
 # A cell a native allocates is a `Gc` (brand.rs): it can't be held across a
 # call that may collect without the compiler seeing it. The VM's core, which
 # roots its values itself, allows these (`#![allow(clippy::disallowed_methods)]`).
+#
+# A word of a cell the marker thread may be reading is written whole, with
+# an atomic store (layout.rs, "Words the marker reads"): a bulk copy or fill
+# (`memmove` may copy bytes at a time) or a `&mut` slice over it races the
+# marker, who would follow a torn value as a cell (#221). So these go
+# through `layout::copy_words` and `Heap::move_values`/`fill_values` where
+# the marker may read, and say why not elsewhere, with
+# `#[expect(clippy::disallowed_methods, reason = "...")]`.
 disallowed-methods = [
     { path = "cloison::vm::Vm::new_array", reason = "allocate through vm.mu(), which gives a Gc" },
     { path = "cloison::vm::Vm::new_string", reason = "allocate through vm.mu(), which gives a Gc" },
@@ -13,4 +21,13 @@ disallowed-methods = [
     { path = "cloison::vm::Vm::new_wrapper", reason = "allocate through vm.mu(), which gives a Gc" },
     { path = "cloison::vm::Vm::new_cons", reason = "allocate through vm.mu(), which gives a Gc" },
     { path = "cloison::vm::Vm::from_descriptor", reason = "allocate through vm.mu(), which gives a Gc" },
+    { path = "core::ptr::copy", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "core::ptr::copy_nonoverlapping", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "core::ptr::write_bytes", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "core::slice::from_raw_parts_mut", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "pointer::copy_from", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "pointer::copy_from_nonoverlapping", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "pointer::copy_to", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "pointer::copy_to_nonoverlapping", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
+    { path = "pointer::write_bytes", reason = "a cell the marker may read is written word by word (layout::copy_words); elsewhere say why: #[expect(clippy::disallowed_methods, reason)]" },
 ]

@@ -93,6 +93,7 @@ pub(crate) unsafe fn copy(src: *const u8, dst: *mut u8, n: usize) {
 ///
 /// # Safety
 /// As [`copy`].
+#[expect(clippy::disallowed_methods, reason = "not shared: no other thread reads it")]
 pub(crate) unsafe fn copy_if(shared: bool, src: *const u8, dst: *mut u8, n: usize) {
     unsafe { if shared { copy(src, dst, n) } else { std::ptr::copy(src, dst, n) } }
 }
@@ -101,6 +102,7 @@ pub(crate) unsafe fn copy_if(shared: bool, src: *const u8, dst: *mut u8, n: usiz
 mod tests {
     /// [`super::copy`] as `memmove`, at every alignment and overlap.
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "a test's own memory")]
     fn copy_is_memmove() {
         for n in [0, 1, 7, 8, 9, 23, 64] {
             for src in 0..17 {

@@ -83,9 +83,6 @@
 //! caller's `regs`. Neither touches the native stack, so JS recursion
 //! depth is bounded by the VM stack, not Rust's.
 
-// (The interpreter: its values live in the VM stack, which the collector
-// scans; it allocates directly.)
-#![allow(clippy::disallowed_methods)]
 use crate::bigint::BinOp as BigOp;
 use crate::brand::Fresh;
 use crate::bytecode::Op;
@@ -3700,6 +3697,9 @@ fn create_object(regs: *mut Value, ic: u32, n: u32) -> Value {
 }
 
 #[inline(never)]
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#[allow(clippy::disallowed_methods)]
 fn new_array(regs: *mut Value) -> Value {
     unsafe {
         (*frame_vm(regs)).safepoint(regs);
@@ -3716,6 +3716,9 @@ fn new_array(regs: *mut Value) -> Value {
 /// `a + b` where at least one side is not a number.
 #[cold]
 #[inline(never)]
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     if let Some(v) = concat_fast(a, b) {
         return v;
@@ -3792,6 +3795,9 @@ use crate::layout::CONS_MIN;
 /// they were written a unit at a time stalled each copy (no store
 /// forwarding from narrower stores): 2% of DeltaBlue's cycles.
 #[inline(always)]
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#[allow(clippy::disallowed_methods)]
 fn concat_fast(a: Value, b: Value) -> Option<Value> {
     // (Taken only for strings: a test may add other values with no VM.)
     let vm = || unsafe { &mut *current_vm() };
@@ -3859,6 +3865,9 @@ fn raw_units(v: Value) -> Option<(*const u16, usize)> {
 }
 
 /// `i`'s decimal string.
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#[allow(clippy::disallowed_methods)]
 fn int_string(vm: &mut Vm, i: i32) -> Value {
     let n = int_len(i);
     vm.new_string_raw(n, n.div_ceil(4), |out| unsafe { write_int(out, i, n) })
@@ -3980,6 +3989,9 @@ impl Piece<'_> {
 }
 
 /// `p + q` as a new string.
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#[allow(clippy::disallowed_methods)]
 fn concat(p: Piece, q: Piece) -> Value {
     let (m, n) = (p.len(), q.len());
     unsafe {
@@ -4195,6 +4207,9 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
 }
 
 /// [`to_primitive_hint`] of an object `v`.
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#[allow(clippy::disallowed_methods)]
 unsafe fn to_primitive_object(vm: &mut Vm, v: Value, hint: u8) -> Value {
     unsafe {
         // An earlier conversion threw, its error not taken yet: no more of
@@ -4919,11 +4934,13 @@ pub(crate) fn with_args_on_stack(
         if top.add(n + HEADER) > vm.stack_end {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
+        #[expect(clippy::disallowed_methods, reason = "the VM stack: only this thread reads it")]
         std::ptr::copy_nonoverlapping(args.as_ptr(), top, n);
         vm.native_top = top.add(n);
         let r = f(vm, std::slice::from_raw_parts(top, n));
         vm.native_top = top;
         // (Not left for the VM stack's scan to keep alive.)
+        #[expect(clippy::disallowed_methods, reason = "the VM stack: only this thread reads it")]
         std::slice::from_raw_parts_mut(top, n).fill(Value::UNDEFINED);
         r
     }
@@ -5182,6 +5199,9 @@ pub(crate) unsafe fn sloppy_this(vm: *mut Vm, this: Value) -> Value {
 
 #[cold]
 #[inline(never)]
+// (The interpreter: its values live in the VM stack, which the collector
+// scans; it allocates directly.)
+#[allow(clippy::disallowed_methods)]
 unsafe fn box_this(vm: *mut Vm, this: Value) -> Value {
     unsafe {
         if this == Value::UNDEFINED || this == Value::NULL {
@@ -5252,6 +5272,7 @@ unsafe fn keep_callee(ic: *mut Ic, old: Obj, new: Obj) {
             }
         }
         // Megamorphic: the oldest goes.
+        #[expect(clippy::disallowed_methods, reason = "an inline cache's ways: Rust memory only this thread reads")]
         std::ptr::copy(ic.add(2), ic.add(1), IC_WAYS - 2);
         (*ic.add(IC_WAYS - 1)).holder = old.ptr();
         log_ways(ic);

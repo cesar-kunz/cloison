@@ -212,7 +212,10 @@ pub(crate) fn immutable_bytes<'v>(vm: &'v mut Vm, bytes: &[u8]) -> Result<Fresh<
 fn immutable_bytes_raw(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
     let sc_b = Scope::new(vm);
     let b = new_buffer_max(vm, bytes.len(), None)?.root(&sc_b);
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.obj().elems().cast::<u8>(), bytes.len()) };
+    #[expect(clippy::disallowed_methods, reason = "a new buffer's bytes: no other thread reads them")]
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.obj().elems().cast::<u8>(), bytes.len())
+    };
     make_immutable(vm, b.obj());
     new_view(vm, TypedKind::U8, b.obj(), 0, Some(bytes.len())).map(Fresh::take)
 }
@@ -521,6 +524,10 @@ fn buffer_resize(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     unsafe {
         let old = b.elems_len() as usize;
         if n > old {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an ArrayBuffer's bytes, never shared: no other thread reads them"
+            )]
             std::ptr::write_bytes(b.elems().cast::<u8>().add(old), 0, n - old);
         }
         b.set_elems_len(n as u32);
@@ -569,7 +576,13 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     let current = b.elems_len() as usize;
     if first < current {
         let count = n.min(current - first);
-        unsafe { std::ptr::copy(b.elems().cast::<u8>().add(first), o.elems().cast::<u8>(), count) };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an ArrayBuffer's bytes, never shared: no other thread reads them"
+        )]
+        unsafe {
+            std::ptr::copy(b.elems().cast::<u8>().add(first), o.elems().cast::<u8>(), count)
+        };
     }
     Ok(out.v())
 }
@@ -593,7 +606,10 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
     let sc_out = Scope::new(vm);
     let out = new_buffer_max(vm, n, max)?.root(&sc_out);
     let count = n.min(b.elems_len() as usize);
-    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.obj().elems().cast::<u8>(), count) };
+    #[expect(clippy::disallowed_methods, reason = "a new buffer's bytes: no other thread reads them")]
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.obj().elems().cast::<u8>(), count)
+    };
     detach(vm, b)?;
     Ok(object_value(out.obj().ptr()))
 }
@@ -614,7 +630,10 @@ fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Va
     let sc_out = Scope::new(vm);
     let out = new_buffer_max(vm, n, None)?.root(&sc_out);
     let count = n.min(b.elems_len() as usize);
-    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.obj().elems().cast::<u8>(), count) };
+    #[expect(clippy::disallowed_methods, reason = "a new buffer's bytes: no other thread reads them")]
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.elems().cast::<u8>(), out.obj().elems().cast::<u8>(), count)
+    };
     detach(vm, b)?;
     make_immutable(vm, out.obj());
     Ok(object_value(out.obj().ptr()))
@@ -641,7 +660,10 @@ fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value
     }
     // raw: nothing collects before its last use.
     let out = new_buffer_max(vm, n, None)?.raw();
-    unsafe { std::ptr::copy_nonoverlapping(b.elems().cast::<u8>().add(first), out.v().elems().cast::<u8>(), n) };
+    #[expect(clippy::disallowed_methods, reason = "a new buffer's bytes: no other thread reads them")]
+    unsafe {
+        std::ptr::copy_nonoverlapping(b.elems().cast::<u8>().add(first), out.v().elems().cast::<u8>(), n)
+    };
     make_immutable(vm, out.v());
     Ok(object_value(out.v().ptr()))
 }
@@ -801,12 +823,20 @@ fn fill_range(o: Obj, s: usize, e: usize, v: Value) {
         let (size, base) = (k.size(), p.add(s * k.size()));
         let total = (e - s) * size;
         if size == 1 {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an unshared buffer's bytes (a shared one's are handled above): no other thread reads them"
+            )]
             std::ptr::write_bytes(base, *base, total);
             return;
         }
         let mut done = size;
         while done < total {
             let n = done.min(total - done);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an unshared buffer's bytes (a shared one's are handled above): no other thread reads them"
+            )]
             std::ptr::copy_nonoverlapping(base, base.add(done), n);
             done += n;
         }
@@ -1491,6 +1521,10 @@ fn typed_reverse(vm: &mut Vm, this: Value, _: Args<'_>) -> Result<Value> {
     unsafe {
         let p = o.elems().cast::<u8>();
         if size == 1 {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an unshared buffer's bytes (a shared one's are handled above): no other thread reads them"
+            )]
             std::slice::from_raw_parts_mut(p, len).reverse();
         } else {
             for i in 0..len / 2 {

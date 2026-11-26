@@ -251,7 +251,10 @@ fn new_uint8_array<'v>(vm: &'v mut Vm, bytes: &[u8]) -> Result<Fresh<'v>> {
 
 fn new_uint8_array_raw(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
     let ta = crate::typed::allocate(vm, TypedKind::U8, bytes.len())?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), Obj::of(ta.peek()).elems().cast::<u8>(), bytes.len()) };
+    #[expect(clippy::disallowed_methods, reason = "a new buffer's bytes: no other thread reads them")]
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), Obj::of(ta.peek()).elems().cast::<u8>(), bytes.len())
+    };
     Ok(ta.peek())
 }
 

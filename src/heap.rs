@@ -319,8 +319,9 @@ pub struct Heap {
     /// Bytes handed out after which the next collection is requested.
     pub(crate) budget: usize,
     /// A collection is due at the next safepoint (`Vm::safepoint`); the
-    /// marker thread sets it too, for the final pause.
-    pub(crate) requested: std::sync::atomic::AtomicBool,
+    /// marker thread sets it too, for the final pause: it shares it, as an
+    /// `Arc` (not its address in the heap, which moves with the VM).
+    pub(crate) requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The color the latest collection marked with (`COLOR`).
     pub(crate) color: u8,
     /// Since the last collection: holes taken, holes too small for the
@@ -422,7 +423,7 @@ impl Heap {
             budget: gc.budget(),
             holes: [0; 3],
             swept: [0; 4],
-            requested: std::sync::atomic::AtomicBool::new(false),
+            requested: Default::default(),
             color: 1,
             gc,
             candidates: Vec::new(),
@@ -833,6 +834,29 @@ impl Heap {
     /// in: the nearest one before it where a cell starts, unless a cell
     /// ends in between.
     pub(crate) fn cell_start_before(&self, a: usize) -> Option<usize> {
+        self.blocks_view().cell_start_before(a)
+    }
+
+    /// What the card-scanning threads read of the heap's own fields.
+    pub(crate) fn blocks_view(&self) -> Blocks<'_> {
+        Blocks { base: self.base, blocks: &self.blocks }
+    }
+}
+
+/// A heap's blocks, as the threads of a pause read them (see
+/// [`Heap::blocks_view`]): `Sync` by its fields', with no `unsafe impl`,
+/// so that what such a thread reads of the heap is what is here. (Its
+/// cells' memory and metadata, which they also read, are read with
+/// atomic loads: `meta_load`, `meta_word`.)
+#[derive(Clone, Copy)]
+pub(crate) struct Blocks<'h> {
+    base: usize,
+    blocks: &'h [Block],
+}
+
+impl Blocks<'_> {
+    /// [`Heap::cell_start_before`].
+    pub(crate) fn cell_start_before(&self, a: usize) -> Option<usize> {
         let mut b = (a - self.base) / BLOCK;
         match *self.blocks.get(b)? {
             Block::Free | Block::Header => None,
@@ -860,7 +884,9 @@ impl Heap {
             }
         }
     }
+}
 
+impl Heap {
     /// Record the current hole's allocations as a region.
     pub(crate) fn end_region(&mut self) {
         if self.ptr > self.hole {
@@ -917,10 +943,16 @@ impl Heap {
         self.clear_meta(self.block_addr(b) as usize, n);
         if RELEASED_ZERO {
             for k in kept {
-                unsafe { std::ptr::write_bytes(self.block_addr(k as usize), 0, BLOCK) };
+                #[expect(clippy::disallowed_methods, reason = "free blocks: nothing reads them")]
+                unsafe {
+                    std::ptr::write_bytes(self.block_addr(k as usize), 0, BLOCK)
+                };
             }
         } else {
-            unsafe { std::ptr::write_bytes(self.block_addr(b), 0, n * BLOCK) };
+            #[expect(clippy::disallowed_methods, reason = "free blocks: nothing reads them")]
+            unsafe {
+                std::ptr::write_bytes(self.block_addr(b), 0, n * BLOCK)
+            };
         }
         Some(b)
     }
@@ -943,6 +975,10 @@ impl Heap {
             if self.gc.marking {
                 meta_clear(a, len);
             } else {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "not marking: no other thread reads this metadata (see above)"
+                )]
                 std::ptr::write_bytes(meta(a), 0, len);
             }
         }
@@ -1086,6 +1122,7 @@ impl Heap {
                 slots.add(i).write(Value::UNDEFINED);
             }
             if extra > 0 {
+                #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                 std::ptr::write_bytes(slots.add(cap), 0, extra);
             }
         }
@@ -1125,6 +1162,7 @@ impl Heap {
         unsafe {
             *p = BYTES | len << 32;
             if bytes <= LARGE {
+                #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                 std::ptr::write_bytes(p.add(1).cast::<u8>(), 0, bytes - 8);
             }
             p.add(1).cast()
@@ -1137,6 +1175,7 @@ impl Heap {
         let p = self.alloc(32).cast::<u64>();
         unsafe {
             *p = UPVALUE;
+            #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
             std::ptr::write_bytes(p.add(1), 0, 3);
             p.add(1).cast()
         }
@@ -1360,6 +1399,7 @@ pub(crate) mod tests {
     /// Small cells share blocks without crossing their ends, large ones get
     /// blocks of their own; every cell is zeroed, aligned and walkable.
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "a test's own memory")]
     fn cells_and_blocks() {
         let mut heap = Heap::new();
         let mut seen = Vec::new();
@@ -1405,6 +1445,7 @@ pub(crate) mod tests {
     /// A heap of a few blocks of small cells, the second's metadata
     /// cleared but for an old cell near its end without its `END`, and an
     /// `END` at the third's first granule: the second block's start.
+    #[expect(clippy::disallowed_methods, reason = "a test's own memory")]
     pub(crate) fn block_with_a_cell_without_end(heap: &mut Heap) -> usize {
         let first = heap.alloc_bytes(8) as usize - 8;
         for _ in 0..8000 {

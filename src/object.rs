@@ -1621,6 +1621,7 @@ impl Obj {
 /// Only a cell's new address, never null, may be written through them
 /// (as the collector does when it moves one): `Obj` holds a non-null
 /// pointer to a live cell.
+#[expect(clippy::disallowed_methods, reason = "a slice of `Obj`s in Rust memory, not the heap")]
 pub(crate) unsafe fn obj_slots(v: &mut [Obj]) -> &mut [*mut Object] {
     // SAFETY: `Obj` is a transparent `NonNull<Object>`, of `*mut Object`'s
     // layout.
@@ -1709,6 +1710,7 @@ mod tests {
             // (Memory the thread's first chunk takes, `used` and all set.)
             let m = unsafe {
                 let m = std::alloc::alloc(ShapeSlab::layout());
+                #[expect(clippy::disallowed_methods, reason = "fresh `malloc` memory, not the heap")]
                 std::ptr::write_bytes(m, 1, ShapeSlab::layout().size());
                 std::alloc::dealloc(std::hint::black_box(m), ShapeSlab::layout());
                 m as usize

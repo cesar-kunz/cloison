@@ -2591,6 +2591,7 @@ impl ExecMem {
         ExecMem { ptr: unsafe { start.add(offset) }, len, offset }
     }
 
+    #[expect(clippy::disallowed_methods, reason = "the JIT's executable memory, not the heap")]
     fn bytes(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
@@ -17169,6 +17170,10 @@ impl JitFunction {
             }
         }
         let entry = self.index_of(pc);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the frame's registers, in the VM stack: only this thread reads it"
+        )]
         let regs = unsafe { std::slice::from_raw_parts_mut(regs, self.nregs) };
         let actual = self.entry_types(entry, acc, regs);
         let index = self.version(entry, &actual, &mut acc, regs);
@@ -18113,6 +18118,10 @@ unsafe fn vm_run_(vm: &mut crate::vm::Vm, code: &crate::vm::Code, regs: *mut Val
                 }
             };
         };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the frame's registers, in the VM stack: only this thread reads it"
+        )]
         let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };
         let outcome = unsafe { jit_code.enter(entry_acc, regs_slice) };
         // A runtime call the code made panicked: on with it, out of the

@@ -5181,12 +5181,17 @@ impl Vm {
         if !crate::props::is_object(p) {
             return Err(Error::type_error("Function has non-object prototype in instanceof check"));
         }
-        if self.proxies_exist {
-            return self.rooted(&[p, v], |vm| vm.has_instance_through_proxies(v, p));
-        }
         let mut o = as_object(v);
         loop {
-            let proto = unsafe { Obj::from_ptr(o) }.shape().live().proto;
+            // A proxy on the chain: on through its traps, from it, rooted
+            // (only then: snap's every `instanceof` pushed both handles
+            // once a proxy existed anywhere, 3% of its instructions).
+            let ob = unsafe { Obj::from_ptr(o) };
+            if self.proxies_exist && crate::proxy::is_proxy(self, ob) {
+                let at = object_value(o);
+                return self.rooted(&[p, at], |vm| vm.has_instance_through_proxies(at, p));
+            }
+            let proto = ob.shape().live().proto;
             if !proto.is_cell() {
                 return Ok(false);
             }

@@ -365,7 +365,8 @@ fn this_time(this: Value) -> Result<f64> {
 
 /// Set the time value of the `Date` `this` (checked by the caller).
 fn set_date_value(this: Value, t: f64) {
-    unsafe { (*as_object(this)).code = t.to_bits() as *const Code };
+    // (A number: the marker doesn't follow it.)
+    unsafe { (*as_object(this)).code.set_relaxed(t.to_bits() as *const Code) };
 }
 
 /// ToNumber, with what its `valueOf` threw.
@@ -391,7 +392,8 @@ fn str_value(vm: &mut Vm, s: &str) -> Value {
 fn new_date(vm: &mut Vm, t: f64) -> Value {
     let dp = object_value(vm.date_prototype);
     let o = vm.mu().new_object_with(Class::Date, dp, 0);
-    unsafe { (*o.obj().ptr()).code = t.to_bits() as *const Code };
+    // (A number: the marker doesn't follow it.)
+    unsafe { (*o.obj().ptr()).code.set_relaxed(t.to_bits() as *const Code) };
     object_value(o.obj().ptr())
 }
 

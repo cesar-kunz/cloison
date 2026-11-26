@@ -8317,8 +8317,8 @@ s;
     let s = vm.run(&module).unwrap();
     let o = cloison::object::as_object(s.value());
     unsafe {
-        assert!(!(*o).elems.is_null(), "not flat");
-        let code = cloison::value::Value::from_bits_unchecked((*o).code as u64);
+        assert!(!(*o).elems.get().is_null(), "not flat");
+        let code = cloison::value::Value::from_bits_unchecked((*o).code.get() as u64);
         assert_ne!(code.to_bits() >> 32, 0, "no atom cached");
         assert!(!code.is_cell(), "code word {:#x} reads as a cell", code.to_bits());
     }

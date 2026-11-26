@@ -271,9 +271,20 @@ pub(crate) unsafe fn store(host: *const u8, a: *mut Value, v: Value) {
 /// # Safety
 /// `a` must be a payload pointer's word of the cell at `host`.
 #[inline(always)]
-pub(crate) unsafe fn store_young<T: crate::layout::Word>(host: *const u8, a: *mut T, p: T) {
-    unsafe { crate::layout::store_word(a, p) };
-    barrier_young(host, a);
+pub(crate) unsafe fn store_young<T: crate::layout::Word>(host: *const u8, a: &crate::layout::Racy<T>, p: T) {
+    a.set(p);
+    barrier_young(host, a.addr());
+}
+
+/// [`store_young`] of a word the marker follows into Rust data or reads
+/// as a value (an object's `code`): a Release store, then the barrier.
+///
+/// # Safety
+/// As [`store_young`].
+#[inline(always)]
+pub(crate) unsafe fn publish_young<T: crate::layout::Word>(host: *const u8, a: &crate::layout::Published<T>, p: T) {
+    a.publish(p);
+    barrier_young(host, a.addr());
 }
 
 crate::layout::same_layout!(Heap, crate::layout::HeapPtrs: ptr, end);
@@ -1329,7 +1340,7 @@ unsafe fn size_from(p: *const u8, w: u64) -> usize {
             let mut words = crate::layout::extra_words((*o).class) + Object::inline_cap(o);
             match (*o).class {
                 Class::String => words += Object::string_words(o),
-                Class::Function => words += (&(*(*o).code).upvalues).len(),
+                Class::Function => words += (&(*(*o).code.get()).upvalues).len(),
                 _ => {}
             }
             return object_bytes(words);

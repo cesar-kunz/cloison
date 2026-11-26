@@ -418,7 +418,7 @@ pub(crate) fn native_closure(vm: &mut Vm, template: Obj, data: &[Value]) -> Valu
     let o = vm.heap.alloc_object(full.live());
     unsafe {
         crate::object::set_shape(o, bare);
-        (*o).code = template.code();
+        (*o).code.init(template.code());
         for (i, &v) in data.iter().enumerate() {
             set_slot(Obj::from_ptr(o), i, v);
         }
@@ -436,7 +436,7 @@ pub(crate) fn binding_accessor(vm: &mut Vm, setter: bool, data: &[Value]) -> Val
 /// Whether `v` is a direct `eval`'s binding's getter.
 pub(crate) fn is_binding_get(vm: &Vm, v: Value) -> bool {
     crate::builtins::is_class(v, Class::Native)
-        && unsafe { Obj::of(v).code() == (*root(vm, Root::BindingGet).ptr()).code }
+        && unsafe { Obj::of(v).code() == (*root(vm, Root::BindingGet).ptr()).code.get() }
 }
 
 pub(crate) fn slot(o: Obj, i: usize) -> Value {
@@ -460,7 +460,7 @@ pub(crate) fn new_promise(vm: &mut Vm) -> Value {
     let st = vm.heap.alloc_values(3);
     unsafe {
         *st.add(STATE) = Value::from_i32(PENDING);
-        crate::heap::store_young(o.v().ptr().cast(), &raw mut (*o.v().ptr()).code, st as *const Code);
+        crate::heap::publish_young(o.v().ptr().cast(), &(*o.v().ptr()).code, st as *const Code);
     }
     object_value(o.v().ptr())
 }
@@ -1349,7 +1349,7 @@ fn element_done_raw(vm: &mut Vm, me: Obj, v: Value) -> Result<Value> {
     let remaining = elem(s, 0).as_i32_unchecked() - 1;
     put(s, 0, Value::from_i32(remaining));
     if remaining == 0 {
-        let any = me.code() == unsafe { (*root(vm, Root::AnyElement).ptr()).code };
+        let any = me.code() == unsafe { (*root(vm, Root::AnyElement).ptr()).code.get() };
         let result = if Object::inline_cap(me.ptr().cast_const()) > KEYS {
             keyed_result(vm, slot(me, KEYS), values)?.take()
         } else if any {

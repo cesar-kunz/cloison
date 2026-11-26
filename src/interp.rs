@@ -306,7 +306,7 @@ macro_rules! handlers {
             // compiled code, once its call countdown has run out.
             macro_rules! enter {
                 ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
-                    let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code;
+                    let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code.get();
                     let this: Value = $this;
                     let new = push_frame($regs, $fo, callee, callee.live().ics().as_ptr(), this, $args, $argc, $flags, $pc.add($size));
                     // (Thrown from the call: a `catch` around it catches it.)
@@ -349,7 +349,7 @@ macro_rules! handlers {
                 };
                 ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr, $first:ident) => {{
                     let this: Value = $this;
-                    let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code;
+                    let callee: *const Code = (*crate::raw::ObjectPtr::object_ptr($fo)).code.get();
                     let Some(ics) = callee.live().ics_if_made() else {
                         tail!($first, this)
                     };
@@ -1512,7 +1512,7 @@ handlers! {
     fn op_lda_global(pc, acc, regs, tag) {
         let g = (*frame_vm(regs)).global;
         let ic = ic_at(regs, pc, 1);
-        if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
+        if (*g).shape.get() == (*ic).shape && (*ic).holder.is_null() {
             next!(any, Op::LdaGlobal.size(), *Object::slot(g, (*ic).loc))
         }
         tail!(slow_lda_global, acc)
@@ -1521,11 +1521,11 @@ handlers! {
     fn op_lda_global_inside_typeof(pc, acc, regs, tag) {
         let g = (*frame_vm(regs)).global;
         let ic = ic_at(regs, pc, 1);
-        if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
+        if (*g).shape.get() == (*ic).shape && (*ic).holder.is_null() {
             next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(g, (*ic).loc))
         }
         let l = (*frame_vm(regs)).global_lexicals;
-        if (*l).shape == (*ic).shape {
+        if (*l).shape.get() == (*ic).shape {
             next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(l, (*ic).loc))
         }
         let r = with_top_acc(regs, acc, |vm| vm.get_global_typeof_miss(&*frame_code(regs), index_at(pc, 1)));
@@ -1655,7 +1655,7 @@ handlers! {
     fn op_sta_global(pc, acc, regs, tag) {
         let g = (*frame_vm(regs)).global;
         let ic = ic_at(regs, pc, 1);
-        if (*g).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
+        if (*g).shape.get() == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
             let at = Object::slot(g, (*ic).loc);
             let v = as_named(tag, (*ic).holder as u64, acc);
             crate::heap::store(g.cast(), at, v);
@@ -1669,7 +1669,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let ic = ic_at(regs, pc, 2);
-            if (*o).shape == (*ic).shape {
+            if (*o).shape.get() == (*ic).shape {
                 let holder = (*ic).holder;
                 if holder.is_null() {
                     next!(any, Op::GetNamed.size(), *Object::slot(o, (*ic).loc))
@@ -1692,7 +1692,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let ic = ic_at(regs, pc, 2);
-            if (*o).shape == (*ic).shape {
+            if (*o).shape.get() == (*ic).shape {
                 let holder = (*ic).holder;
                 if holder.is_null() {
                     let v = *Object::slot(o, (*ic).loc);
@@ -1716,7 +1716,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let ic = ic_at(regs, pc, 2);
-            if (*o).shape == (*ic).shape {
+            if (*o).shape.get() == (*ic).shape {
                 let holder = (*ic).holder;
                 if holder.is_null() {
                     let v = *Object::slot(o, (*ic).loc);
@@ -1770,7 +1770,7 @@ handlers! {
         }
         for k in 1..IC_WAYS {
             let w = ic.add(k);
-            if (*o.ptr()).shape == (*w).shape {
+            if (*o.ptr()).shape.get() == (*w).shape {
                 let holder = (*w).holder;
                 if holder.is_null() {
                     next!(any, Op::GetNamed.size(), *Object::slot(o.ptr(), (*w).loc))
@@ -1818,7 +1818,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let ic = ic_at(regs, pc, 2);
-            if (*o).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
+            if (*o).shape.get() == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
                     // (See `Ic::epoch`.)
@@ -1845,7 +1845,7 @@ handlers! {
         let ic = ic_at(regs, pc, 2);
         for k in 1..IC_WAYS {
             let w = ic.add(k);
-            if (*o).shape == (*w).shape {
+            if (*o).shape.get() == (*w).shape {
                 if fits_field(tag, (*w).holder as u64, acc) {
                     let new = (*w).new_shape;
                     if !new.is_null() {
@@ -1874,7 +1874,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let ic = ic_at(regs, pc, 2);
-            if (*o).shape == (*ic).shape && ((*ic).holder as u64) <= 2 {
+            if (*o).shape.get() == (*ic).shape && ((*ic).holder as u64) <= 2 {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
                     // (See `Ic::epoch`.)
@@ -2140,7 +2140,7 @@ handlers! {
         // `Vm::get_global_lexical`.)
         let l = (*frame_vm(regs)).global_lexicals;
         let ic = ic_at(regs, pc, 1);
-        if (*l).shape == (*ic).shape {
+        if (*l).shape.get() == (*ic).shape {
             next!(any, Op::LdaGlobal.size(), *Object::slot(l, (*ic).loc))
         }
         let r = with_top_acc(regs, acc, |vm| vm.get_global_miss(&*frame_code(regs), index_at(pc, 1)));
@@ -2152,7 +2152,7 @@ handlers! {
     fn slow_sta_global(pc, acc, regs, tag) {
         let l = (*frame_vm(regs)).global_lexicals;
         let ic = ic_at(regs, pc, 1);
-        if (*l).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
+        if (*l).shape.get() == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
             let at = Object::slot(l, (*ic).loc);
             let v = as_named(tag, (*ic).holder as u64, acc);
             crate::heap::store(l.cast(), at, v);
@@ -3202,7 +3202,7 @@ handlers! {
     fn op_lda_global_star(pc, acc, regs, tag) {
         let g = (*frame_vm(regs)).global;
         let ic = ic_at(regs, pc, 1);
-        if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
+        if (*g).shape.get() == (*ic).shape && (*ic).holder.is_null() {
             star!(Op::LdaGlobal.size(), *Object::slot(g, (*ic).loc))
         }
         tail!(slow_lda_global, acc)
@@ -4978,7 +4978,7 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
             return Err(Error::unsupported(NO_TOP));
         }
         let fo = as_object(f);
-        let callee = (*fo).code;
+        let callee = (*fo).code.get();
         let new = top.add(HEADER);
         let n = callee.live().nregs as usize;
         // (Past the compiled calls' limit, the callee is interpreted: its
@@ -5321,7 +5321,7 @@ unsafe fn is_leaf(tag: NumberTag, f: Value) -> bool {
 unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value, argc: usize) -> Option<Value> {
     unsafe {
         let o = as_object(f);
-        let code = (*o).code;
+        let code = (*o).code.get();
         let args = std::slice::from_raw_parts(args, argc);
         if args.iter().any(|a| a.is_cell()) {
             return None;
@@ -5970,7 +5970,7 @@ pub(crate) unsafe fn call_from_jit(
             }
         }
         let fo = as_object(fv);
-        let callee = (*fo).code;
+        let callee = (*fo).code.get();
         // (A `Call` the JIT made of `f.call(that, …)` passes `that`.)
         let this = if op == Op::Construct {
             // (A derived class's `this` is its base's, from `super()`, as

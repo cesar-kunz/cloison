@@ -14,7 +14,10 @@
 //! `unsafe`, its contract that the pointer is to a live cell (or table)
 //! of the kind it names.
 
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{
+    AtomicPtr, AtomicU8, AtomicU64, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
+};
 
 use crate::value::Value;
 
@@ -443,6 +446,18 @@ pub trait Word: Copy {
     /// # Safety
     /// `p` must be aligned and point to a writable word.
     unsafe fn store(p: *mut Self, v: Self);
+
+    /// `v` stored at `p`, with a Release atomic store.
+    ///
+    /// # Safety
+    /// As [`Word::store`].
+    unsafe fn store_release(p: *mut Self, v: Self);
+
+    /// The word at `p`, with an Acquire atomic load.
+    ///
+    /// # Safety
+    /// As [`Word::load`].
+    unsafe fn load_acquire(p: *const Self) -> Self;
 }
 
 impl Word for Value {
@@ -453,6 +468,14 @@ impl Word for Value {
     #[inline(always)]
     unsafe fn store(p: *mut Self, v: Self) {
         unsafe { AtomicU64::from_ptr(p.cast()).store(v.to_bits(), Relaxed) }
+    }
+    #[inline(always)]
+    unsafe fn store_release(p: *mut Self, v: Self) {
+        unsafe { AtomicU64::from_ptr(p.cast()).store(v.to_bits(), Release) }
+    }
+    #[inline(always)]
+    unsafe fn load_acquire(p: *const Self) -> Self {
+        unsafe { Value::from_bits(AtomicU64::from_ptr(p as *mut u64).load(Acquire)) }
     }
 }
 
@@ -465,6 +488,14 @@ impl Word for u64 {
     unsafe fn store(p: *mut Self, v: Self) {
         unsafe { AtomicU64::from_ptr(p).store(v, Relaxed) }
     }
+    #[inline(always)]
+    unsafe fn store_release(p: *mut Self, v: Self) {
+        unsafe { AtomicU64::from_ptr(p).store(v, Release) }
+    }
+    #[inline(always)]
+    unsafe fn load_acquire(p: *const Self) -> Self {
+        unsafe { AtomicU64::from_ptr(p.cast_mut()).load(Acquire) }
+    }
 }
 
 impl Word for usize {
@@ -475,6 +506,14 @@ impl Word for usize {
     #[inline(always)]
     unsafe fn store(p: *mut Self, v: Self) {
         unsafe { AtomicUsize::from_ptr(p).store(v, Relaxed) }
+    }
+    #[inline(always)]
+    unsafe fn store_release(p: *mut Self, v: Self) {
+        unsafe { AtomicUsize::from_ptr(p).store(v, Release) }
+    }
+    #[inline(always)]
+    unsafe fn load_acquire(p: *const Self) -> Self {
+        unsafe { AtomicUsize::from_ptr(p.cast_mut()).load(Acquire) }
     }
 }
 
@@ -487,6 +526,14 @@ impl<T> Word for *mut T {
     unsafe fn store(p: *mut Self, v: Self) {
         unsafe { AtomicPtr::from_ptr(p).store(v, Relaxed) }
     }
+    #[inline(always)]
+    unsafe fn store_release(p: *mut Self, v: Self) {
+        unsafe { AtomicPtr::from_ptr(p).store(v, Release) }
+    }
+    #[inline(always)]
+    unsafe fn load_acquire(p: *const Self) -> Self {
+        unsafe { AtomicPtr::from_ptr(p.cast_mut()).load(Acquire) }
+    }
 }
 
 impl<T> Word for *const T {
@@ -497,6 +544,14 @@ impl<T> Word for *const T {
     #[inline(always)]
     unsafe fn store(p: *mut Self, v: Self) {
         unsafe { AtomicPtr::from_ptr(p.cast()).store(v.cast_mut(), Relaxed) }
+    }
+    #[inline(always)]
+    unsafe fn store_release(p: *mut Self, v: Self) {
+        unsafe { AtomicPtr::from_ptr(p.cast()).store(v.cast_mut(), Release) }
+    }
+    #[inline(always)]
+    unsafe fn load_acquire(p: *const Self) -> Self {
+        unsafe { AtomicPtr::<T>::from_ptr(p.cast_mut().cast()).load(Acquire).cast_const() }
     }
 }
 
@@ -552,6 +607,127 @@ pub unsafe fn swap_words(a: *mut Value, b: *mut Value) {
         let (x, y) = (*a, *b);
         store_word(a, y);
         store_word(b, x);
+    }
+}
+
+/// A field of an object's header the marker thread reads while the
+/// mutator writes it (`object::Object`'s `shape`, `props`, `elems`): its
+/// stores are Relaxed atomic ones ([`Racy::set`]), or Release ones where
+/// the marker follows the word into memory written just before
+/// ([`Racy::publish`]), and there is no plain store, so that one can't be
+/// written by mistake (#217, #220). The mutator, its only writer, reads it
+/// plainly ([`Racy::get`]); another thread reads it with an atomic load
+/// ([`Racy::load`]). A store costs what a plain one does: a `mov`, a
+/// `str` (`stlr` for `publish` on arm64).
+#[repr(transparent)]
+pub struct Racy<T: Word>(core::cell::UnsafeCell<T>);
+
+impl<T: Word> Racy<T> {
+    /// The word, read by the mutator (which alone writes it), or in a
+    /// pause.
+    #[inline(always)]
+    pub fn get(&self) -> T {
+        unsafe { *self.0.get() }
+    }
+
+    /// The word, read on another thread than the mutator's (the marker's).
+    #[inline(always)]
+    pub fn load(&self) -> T {
+        unsafe { T::load(self.0.get()) }
+    }
+
+    /// Store `v`, with a Relaxed atomic store.
+    #[inline(always)]
+    pub fn set(&self, v: T) {
+        unsafe { T::store(self.0.get(), v) }
+    }
+
+    /// Store `v` with a Release store, for the marker to read with
+    /// [`Racy::acquire`]: what was written before it is seen with it.
+    #[inline(always)]
+    pub fn publish(&self, v: T) {
+        unsafe { T::store_release(self.0.get(), v) }
+    }
+
+    /// The word, read on another thread with an Acquire load (see
+    /// [`Racy::publish`]).
+    #[inline(always)]
+    pub fn acquire(&self) -> T {
+        unsafe { T::load_acquire(self.0.get()) }
+    }
+
+    /// Where the word is (for a barrier's card, or compiled code).
+    #[inline(always)]
+    pub fn addr(&self) -> *const T {
+        self.0.get()
+    }
+}
+
+/// A field of an object's header the marker reads and follows into Rust
+/// data (`object::Object`'s `code`: a function's `Code`, a `RegExp`'s
+/// compiled pattern): stored with Release ([`Published::publish`]) and
+/// loaded by the marker with Acquire ([`Published::acquire`]), so that it
+/// never sees the pointer before what it points to (#217). A new cell's,
+/// which no other thread reads yet, may be stored plainly
+/// ([`Published::init`]: `stlr` costs on arm64, and every closure made
+/// stores one).
+#[repr(transparent)]
+pub struct Published<T: Word>(core::cell::UnsafeCell<T>);
+
+impl<T: Word> Published<T> {
+    /// The word, read by the mutator (which alone writes it), or in a
+    /// pause.
+    #[inline(always)]
+    pub fn get(&self) -> T {
+        unsafe { *self.0.get() }
+    }
+
+    /// The word, read on another thread with a Relaxed load: where it
+    /// isn't followed into memory written before it (a string's count),
+    /// or is never replaced once the cell is old (a function's code),
+    /// stored before a pause, which orders it.
+    #[inline(always)]
+    pub fn load(&self) -> T {
+        unsafe { T::load(self.0.get()) }
+    }
+
+    /// Store `v` with a Relaxed store.
+    ///
+    /// # Safety
+    /// The marker must not follow the word into memory written before it,
+    /// for this cell's class: a number (a string's count and atom, a
+    /// date's time), or a value, which it marks as any slot's.
+    #[inline(always)]
+    pub unsafe fn set_relaxed(&self, v: T) {
+        unsafe { T::store(self.0.get(), v) }
+    }
+
+    /// Store `v` with a Release store.
+    #[inline(always)]
+    pub fn publish(&self, v: T) {
+        unsafe { T::store_release(self.0.get(), v) }
+    }
+
+    /// Store `v` in a new cell's header.
+    ///
+    /// # Safety
+    /// The cell must be young (the marker skips it), or the store made in
+    /// a pause: no other thread reads the word meanwhile.
+    #[inline(always)]
+    pub unsafe fn init(&self, v: T) {
+        unsafe { *self.0.get() = v }
+    }
+
+    /// The word, read on another thread with an Acquire load.
+    #[inline(always)]
+    pub fn acquire(&self) -> T {
+        unsafe { T::load_acquire(self.0.get()) }
+    }
+
+    /// Where the word is.
+    #[inline(always)]
+    pub fn addr(&self) -> *const T {
+        self.0.get()
     }
 }
 

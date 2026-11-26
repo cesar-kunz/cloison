@@ -379,4 +379,9 @@ allocations are new ordinary objects). What it finds and was reviewed
 safe is in `tools/gc-hazards/safe.txt`, each with its reason. CI's
 stress run stays the safety net for the paths the tests reach.
 
+Branding is about when cells are freed. Which thread may touch them is
+typed apart: a `Vm` and its values are neither `Send` nor `Sync` (see
+`Vm`'s "Threads"), and what the concurrent marker reads is written
+atomically by type ([gc.md](gc.md#what-the-compiler-checks-of-the-concurrent-marking)).
+
 [gc-arena]: https://github.com/kyren/gc-arena

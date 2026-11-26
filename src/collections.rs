@@ -294,7 +294,9 @@ fn entries(o: Obj) -> Obj {
 /// Set `o`'s entries array to `e`.
 fn hold_entries(o: Obj, e: Value) {
     unsafe {
-        crate::heap::store(o.ptr().cast(), (&raw mut (*o.ptr()).code).cast(), e);
+        // (A value: marked as any slot's.)
+        (*o.ptr()).code.set_relaxed(e.to_bits() as *const crate::vm::Code);
+        crate::heap::barrier(o.ptr().cast(), (*o.ptr()).code.addr(), e);
     }
 }
 
@@ -873,7 +875,7 @@ fn step_raw(vm: &mut Vm, it: Obj) -> Result<Option<Value>> {
         return Ok(Some(value));
     }
     // (`it` may be old: the marker may be reading `code`.)
-    unsafe { crate::layout::store_word(&raw mut (*it.ptr()).code, std::ptr::null()) };
+    unsafe { (*it.ptr()).code.publish(std::ptr::null()) };
     Ok(None)
 }
 

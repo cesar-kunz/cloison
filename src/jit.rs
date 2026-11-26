@@ -4579,7 +4579,7 @@ fn typed_lengths_standard() -> bool {
             return false;
         }
         let at = Object::slot(sp, ss.location(k));
-        if !crate::typed::is_length_getter(*(*as_object(*at)).elems) {
+        if !crate::typed::is_length_getter(*(*as_object(*at)).elems.get()) {
             return false;
         }
         for &p in &vm.typed_prototypes {
@@ -4638,7 +4638,7 @@ fn typed_length_known(t: Ty) -> bool {
                     return false;
                 }
                 let at = Object::slot(o, ps.location(k));
-                if !crate::typed::is_length_getter(*(*as_object(*at)).elems) {
+                if !crate::typed::is_length_getter(*(*as_object(*at)).elems.get()) {
                     return false;
                 }
                 break at;
@@ -16296,7 +16296,8 @@ impl Lowering<'_> {
         // that code after it.)
         let taken = |k: usize| {
             (0..k).any(|a| {
-                case_by_code(Some(shapes[a]), 0, false, fos[a], i) && unsafe { (*fos[a]).code == (*fos[k]).code }
+                case_by_code(Some(shapes[a]), 0, false, fos[a], i)
+                    && unsafe { (*fos[a]).code.get() == (*fos[k]).code.get() }
             })
         };
         let cases: Vec<usize> = (0..fos.len()).filter(|&k| !taken(k)).collect();
@@ -16477,7 +16478,7 @@ impl Lowering<'_> {
                 return None;
             }
             let at = Object::slot(h, s.location(slot));
-            let fv = *(*as_object(*at)).elems.add(usize::from(set));
+            let fv = *(*as_object(*at)).elems.get().add(usize::from(set));
             if !fv.is_cell() || Obj::of(fv).class() != Class::Function {
                 return None;
             }
@@ -16536,7 +16537,7 @@ impl Lowering<'_> {
                 return None;
             }
             let at = Object::slot(h, s.location(slot));
-            if !crate::typed::is_length_getter(*(*crate::object::as_object(*at)).elems) {
+            if !crate::typed::is_length_getter(*(*crate::object::as_object(*at)).elems.get()) {
                 return None;
             }
             let shapes: Vec<u64> = (0..crate::vm::IC_WAYS)

@@ -1909,7 +1909,7 @@ impl Vm {
         let op = object_value(vm.object_prototype);
         // `Function.prototype` is itself a function (returning `undefined`).
         let fp = vm.new_object_with(Class::Native, op, 0);
-        unsafe { (*fp.ptr()).code = vm.native_code("", function_prototype_fn, 0, crate::jit::Ty::Any, false) };
+        unsafe { (*fp.ptr()).code.init(vm.native_code("", function_prototype_fn, 0, crate::jit::Ty::Any, false)) };
         vm.function_prototype = fp.ptr();
         vm.array_prototype = vm.new_plain(op).ptr();
         // `String.prototype` is a string object (of `""`, set below) and
@@ -1947,7 +1947,7 @@ impl Vm {
             unsafe { (*vm.string_shape.cast_mut()).elems_code = NO_ELEMENTS };
         }
         let empty = vm.new_string(&[]);
-        unsafe { (*vm.string_prototype).code = empty.to_bits() as *const Code };
+        unsafe { (*vm.string_prototype).code.init(empty.to_bits() as *const Code) };
         let ap = vm.array_prototype_obj();
         vm.array_push_fn = vm.define_native(ap, "push", array_push_method, 1, crate::jit::Ty::I32, false).ptr();
         vm.array_pop_fn = vm.define_native(ap, "pop", crate::array::array_pop, 0, crate::jit::Ty::Any, false).ptr();
@@ -1966,7 +1966,7 @@ impl Vm {
             vm.add_property_with(g, a, v, READ_ONLY | DONT_ENUM | DONT_DELETE);
         }
         vm.number_prototype = vm.new_object_with(Class::Wrapper, op, 4).ptr();
-        unsafe { (*vm.number_prototype).code = Value::from_i32(0).to_bits() as *const Code };
+        unsafe { (*vm.number_prototype).code.init(Value::from_i32(0).to_bits() as *const Code) };
         let np = vm.number_prototype_obj();
         vm.define_native(np, "toFixed", number_to_fixed, 1, crate::jit::Ty::Any, false);
         vm.define_native(np, "toPrecision", number_to_precision, 1, crate::jit::Ty::Any, false);
@@ -3143,7 +3143,7 @@ impl Vm {
                     #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                     std::ptr::copy_nonoverlapping(o.props(), p, old as usize);
                 }
-                crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).props, p);
+                crate::heap::store_young(o.ptr().cast(), &(*o.ptr()).props, p);
             }
         }
     }
@@ -4228,7 +4228,7 @@ impl Vm {
             self.string_prototype
         };
         let o = self.new_object_with(Class::Wrapper, object_value(proto), 0);
-        unsafe { (*o.ptr()).code = v.to_bits() as *const Code };
+        unsafe { (*o.ptr()).code.init(v.to_bits() as *const Code) };
         object_value(o.ptr())
     }
 
@@ -4629,7 +4629,7 @@ impl Vm {
             }
             if typed && h != o && self.is_accessor(h, slot) {
                 let at = Object::slot(h.ptr(), h.shape().live().location(slot));
-                if crate::typed::is_length_getter(*(*as_object(*at)).elems) {
+                if crate::typed::is_length_getter(*(*as_object(*at)).elems.get()) {
                     self.heap.note(object_value(h.ptr()));
                     note_accessor(ic, o.shape(), h, self.proto_epoch);
                     self.note_typed_length(o, h, at);
@@ -6159,7 +6159,7 @@ impl Vm {
             if far {
                 *e.add(cap) = *crate::far::store_slot(o);
             }
-            crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).elems, e);
+            crate::heap::store_young(o.ptr().cast(), &(*o.ptr()).elems, e);
         }
     }
 
@@ -6335,7 +6335,7 @@ impl Vm {
             debug_assert!(4 * words >= len);
             #[expect(clippy::disallowed_methods, reason = "a new string's units: young, which the marker skips")]
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
-            (*o.ptr()).elems = data.cast();
+            (*o.ptr()).elems.set(data.cast());
             o.set_elems_len(u32::try_from(len).expect("string too long"));
             object_value(o.ptr())
         }
@@ -6376,7 +6376,7 @@ impl Vm {
             // The room past the units zero, not what memory held.
             #[expect(clippy::disallowed_methods, reason = "a new string's units: young, which the marker skips")]
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
-            (*o.ptr()).elems = data.cast();
+            (*o.ptr()).elems.set(data.cast());
             o.set_elems_len(u32::try_from(len).expect("string too long"));
             object_value(o.ptr())
         }
@@ -6462,10 +6462,10 @@ impl Vm {
         }
         unsafe {
             let o = self.alloc_string(0);
-            (*o.ptr()).elems = std::ptr::null_mut();
+            (*o.ptr()).elems.set(std::ptr::null_mut());
             o.set_elems_len(u32::try_from(len).expect("string too long"));
-            (*o.ptr()).props = as_object(a).cast();
-            (*o.ptr()).code = as_object(b).cast();
+            (*o.ptr()).props.set(as_object(a).cast());
+            (*o.ptr()).code.init(as_object(b).cast());
             object_value(o.ptr())
         }
     }
@@ -6499,9 +6499,9 @@ impl Vm {
                 return None;
             }
             let o = self.alloc_string(0);
-            (*o.ptr()).elems = (units + 2 * s) as *mut Value;
+            (*o.ptr()).elems.set((units + 2 * s) as *mut Value);
             o.set_elems_len((e - s) as u32);
-            (*o.ptr()).props = root.cast();
+            (*o.ptr()).props.set(root.cast());
             Some(object_value(o.ptr()))
         }
     }
@@ -6524,7 +6524,7 @@ impl Vm {
     pub(crate) fn new_closure(&mut self, callee: *const Code) -> Value {
         unsafe {
             let f = self.heap.alloc_object(&*self.closure_shape(callee));
-            (*f).code = callee;
+            (*f).code.init(callee);
             self.closure_prototype(Obj::from_ptr(f))
         }
     }
@@ -6556,7 +6556,7 @@ impl Vm {
                 }
                 o
             };
-            (*f).code = callee;
+            (*f).code.init(callee);
             self.closure_prototype(Obj::from_ptr(f))
         }
     }
@@ -6880,7 +6880,7 @@ impl Vm {
                 for &(i, b) in &kept {
                     *e.add(1 + i) = b;
                 }
-                crate::heap::store_young(r.ptr().cast(), &raw mut (*r.ptr()).elems, e);
+                crate::heap::store_young(r.ptr().cast(), &(*r.ptr()).elems, e);
                 r.set_elems_len(n as u32);
             }
             for &(i, _) in &kept {
@@ -7012,7 +7012,7 @@ impl Vm {
         let code = self.native_code(name, f, nparams, ret, constructs);
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
-        unsafe { (*fo.ptr()).code = code };
+        unsafe { (*fo.ptr()).code.init(code) };
         fo
     }
 
@@ -7135,7 +7135,7 @@ impl Vm {
                     #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                     std::ptr::copy_nonoverlapping(o.props(), p, old);
                 }
-                crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).props, p);
+                crate::heap::store_young(o.ptr().cast(), &(*o.ptr()).props, p);
             }
             crate::object::set_shape(o.ptr(), new);
             let first = n - names.len();
@@ -9537,14 +9537,10 @@ unsafe fn flatten(o: Obj) {
         // written here: `gc::trace`). They need no shading: the marking's
         // barrier is on stores, not deletions, a half still reachable is
         // marked where it is.
-        use std::sync::atomic::{
-            AtomicPtr, AtomicU64,
-            Ordering::{Relaxed, Release},
-        };
-        (*(&raw mut (*o.ptr()).props as *const AtomicU64)).store(0, Relaxed);
-        (*(&raw mut (*o.ptr()).code as *const AtomicU64)).store(0, Relaxed);
-        (*(&raw mut (*o.ptr()).elems as *const AtomicPtr<Value>)).store(buf.cast(), Release);
-        crate::heap::barrier_young(o.ptr().cast(), &raw const (*o.ptr()).elems);
+        (*o.ptr()).props.set(std::ptr::null_mut());
+        (*o.ptr()).code.set_relaxed(std::ptr::null());
+        (*o.ptr()).elems.publish(buf.cast());
+        crate::heap::barrier_young(o.ptr().cast(), (*o.ptr()).elems.addr());
     }
 }
 

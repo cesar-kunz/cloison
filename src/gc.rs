@@ -898,14 +898,11 @@ unsafe fn mark_function_code(p: usize, w: u64) {
         let o = p as *const Object;
         match (*o).class {
             // (A function's code is never replaced.)
-            Class::Function => mark_code((*o).code),
+            Class::Function => mark_code((*o).code.load()),
             Class::RegExp => {
                 // `RegExp.prototype.compile` may be replacing it, with
                 // Release (`builtins::regexp_compile`).
-                let code = std::sync::atomic::AtomicPtr::from_ptr(
-                    (&raw const (*o).code).cast_mut().cast::<*mut crate::regexp::Regex>(),
-                );
-                let re = code.load(std::sync::atomic::Ordering::Acquire);
+                let re = (*o).code.acquire() as *mut crate::regexp::Regex;
                 if !re.is_null() {
                     mark_regexp(re);
                 }
@@ -1211,8 +1208,8 @@ unsafe fn copy_cell(p: usize, n: usize, q: usize) {
             // A flat string's units are in it.
             let o = q as *mut Object;
             let old_units = p + crate::layout::slots_offset((*o).class);
-            if (*o).class == Class::String && (*o).elems as usize == old_units {
-                (*o).elems = (q + crate::layout::slots_offset((*o).class)) as *mut Value;
+            if (*o).class == Class::String && (*o).elems.get() as usize == old_units {
+                (*o).elems.set((q + crate::layout::slots_offset((*o).class)) as *mut Value);
             }
         } else if w & 7 == UPVALUE && *((p + 8) as *const usize) == p + 16 {
             // A closed upvalue's variable is its own.
@@ -2111,7 +2108,7 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
             Class::Function => {
                 // After the in-object slots it was allocated with, as
                 // `cell_size` has it: the marker thread reads no shape.
-                let ups = (&(*(*o).code).upvalues).len();
+                let ups = (&(*(*o).code.load()).upvalues).len();
                 let up = (slots + 8 * cap) as *const usize;
                 debug_assert_eq!(up as usize, crate::vm::Vm::upvalues(Obj::from_ptr(o)) as usize);
                 for k in 0..ups {
@@ -3123,13 +3120,13 @@ impl Vm {
     /// entries' width.
     unsafe fn ephemeron_entries(t: *mut Object) -> Option<(*mut Value, usize, usize)> {
         unsafe {
-            let e = Value::from_bits((*t).code as u64);
+            let e = Value::from_bits((*t).code.get() as u64);
             if !e.is_cell() {
                 return None;
             }
             let e = crate::object::as_object(e);
             let s = if matches!((*t).class, Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
-            Some(((*e).elems, (*e).elems_len as usize, s))
+            Some(((*e).elems.get(), (*e).elems_len as usize, s))
         }
     }
 
@@ -3869,17 +3866,17 @@ impl Vm {
             let k = if w & 1 == 0 {
                 let o = p as *const crate::object::Object;
                 unsafe {
-                    let used = (*(*o).shape).slots.len();
+                    let used = (*(*o).shape.get()).slots.len();
                     let inline = crate::object::Object::inline_cap(o);
                     inline_unused += 8 * inline.saturating_sub(used);
                     // (A string's `props` is no property storage: a cons
                     // string's left half, or a slice's parent.)
-                    if !(*o).props.is_null() && (*o).class != Class::String {
+                    if !(*o).props.get().is_null() && (*o).class != Class::String {
                         props_unused += 8
                             * (crate::object::Object::props_cap(o) as usize)
                                 .saturating_sub(used.saturating_sub(inline));
                     }
-                    if !(*o).elems.is_null()
+                    if !(*o).elems.get().is_null()
                         && !matches!(
                             (*o).class,
                             Class::String
@@ -4339,12 +4336,12 @@ impl Vm {
                 fw.object(t);
             }
             for &t in &self.weak_tables {
-                let e = Value::from_bits((*t).code as u64);
+                let e = Value::from_bits((*t).code.get() as u64);
                 if !e.is_cell() {
                     continue;
                 }
                 let e = crate::object::as_object(e);
-                let (buf, len) = ((*e).elems, (*e).elems_len as usize);
+                let (buf, len) = ((*e).elems.get(), (*e).elems_len as usize);
                 for i in crate::collections::BASE..len {
                     fw.value(buf.add(i));
                 }
@@ -4708,12 +4705,12 @@ impl Vm {
                     {
                         continue;
                     }
-                    let e = Value::from_bits((*t).code as u64);
+                    let e = Value::from_bits((*t).code.get() as u64);
                     if !e.is_cell() {
                         continue;
                     }
                     let e = crate::object::as_object(e);
-                    let (buf, len) = ((*e).elems, (*e).elems_len as usize);
+                    let (buf, len) = ((*e).elems.get(), (*e).elems_len as usize);
                     let mut i = crate::collections::BASE;
                     while i + 1 < len {
                         let (k, v) = (*buf.add(i), *buf.add(i + 1));
@@ -5888,7 +5885,7 @@ mod tests {
     fn int32s(_: &mut Vm, _: Value, a: crate::brand::Args<'_>) -> crate::vm::Result<Value> {
         let o = crate::object::as_object(a[0]);
         unsafe {
-            let s = &*(*o).shape;
+            let s = &*(*o).shape.get();
             let ok = (0..s.fields().len() as u32)
                 .map(|i| s.location(i))
                 .filter(|&l| l >= 0)

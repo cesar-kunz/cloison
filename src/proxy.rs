@@ -177,7 +177,7 @@ fn create_raw(vm: &mut Vm, target: Value, handler: Value) -> Result<Value> {
         crate::object::set_shape(o.ptr(), bare);
         if callable {
             let constructs = crate::intrinsics::is_constructor(target);
-            (*o.ptr()).code = vm.proxy_codes[usize::from(constructs)];
+            (*o.ptr()).code.init(vm.proxy_codes[usize::from(constructs)]);
         }
     }
     set_slot(o, 0, target);
@@ -224,7 +224,7 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let r = vm.heap.alloc_object(full.live());
     unsafe {
         crate::object::set_shape(r, bare);
-        (*r).code = vm.proxy_codes[2];
+        (*r).code.init(vm.proxy_codes[2]);
     }
     set_slot(unsafe { Obj::from_ptr(r) }, 0, p.peek());
     let out = {

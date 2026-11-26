@@ -439,7 +439,7 @@ fn new_stack_raw(vm: &mut Vm, async_: bool) -> Result<Value> {
     let state = new_state(vm, async_)?.root(&sc_state);
     let proto = root(vm, if async_ { Root::AsyncStackPrototype } else { Root::StackPrototype });
     let o = vm.mu().new_object_with(Class::DisposableStack, proto, 0);
-    unsafe { (*o.obj().ptr()).code = state.peek().to_bits() as *const crate::vm::Code };
+    unsafe { (*o.obj().ptr()).code.init(state.peek().to_bits() as *const crate::vm::Code) };
     Ok(object_value(o.obj().ptr()))
 }
 

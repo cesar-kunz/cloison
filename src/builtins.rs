@@ -143,7 +143,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // `Boolean`, a conversion; booleans' methods.
     // raw: only calls that don't collect follow (allocation, stores, the VM's fields).
     let bp = vm.mu().new_object_with(Class::Wrapper, object_value(op.ptr()), 4).raw_obj();
-    unsafe { (*bp.v().ptr()).code = Value::FALSE.to_bits() as *const crate::vm::Code };
+    unsafe { (*bp.v().ptr()).code.init(Value::FALSE.to_bits() as *const crate::vm::Code) };
     vm.boolean_prototype = bp.v().ptr();
     let boolean = vm.define_native(g, "Boolean", boolean_fn, 1, any, true);
     link_constructor(vm, boolean, bp.v());
@@ -1401,7 +1401,7 @@ fn function_bind(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
         let o = unsafe { Obj::from_ptr(vm.heap.alloc_object(full.live())) };
         unsafe {
             crate::object::set_shape(o.ptr(), own);
-            (*o.ptr()).code = (*vm.bound_fns[ctor as usize]).code;
+            (*o.ptr()).code.init((*vm.bound_fns[ctor as usize]).code.get());
             // (`this` and `a` are where a collection updates them: read
             // after the allocations.)
             crate::promise::set_slot(o, BOUND_OWN, this);
@@ -1578,7 +1578,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
                 #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
-                crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).elems, e);
+                crate::heap::store_young(o.ptr().cast(), &(*o.ptr()).elems, e);
                 o.set_elems_len(values.len() as u32);
             }
         }
@@ -1602,7 +1602,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
                 #[expect(clippy::disallowed_methods, reason = "into a new cell: young, which the marker skips")]
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
-                crate::heap::store_young(o.ptr().cast(), &raw mut (*o.ptr()).elems, e);
+                crate::heap::store_young(o.ptr().cast(), &(*o.ptr()).elems, e);
                 o.set_elems_len(values.len() as u32);
             }
             return object_value(o.ptr());
@@ -2632,7 +2632,7 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
     let proto = object_value(vm.regexp_prototype);
     // raw: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_object_with(Class::RegExp, proto, 3).raw_obj();
-    unsafe { (*o.v().ptr()).code = re.cast() };
+    unsafe { (*o.v().ptr()).code.init(re.cast()) };
     let props = [(vm.a_last_index, Value::from_i32(0)), (vm.a_regexp_source, source)];
     // The shape with both found once: then only their stores.
     let root = o.v().shape();
@@ -2727,11 +2727,7 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: Args<'_>) -> Result<Value> {
     // (`this` may be old, its `code` read by the marker thread, which
     // follows it into the `Regex` (`gc::mark_function_code`): published
     // with Release, after the `Regex`'s initialization.)
-    unsafe {
-        let code =
-            std::sync::atomic::AtomicPtr::from_ptr((&raw mut (*o.ptr()).code).cast::<*mut crate::regexp::Regex>());
-        code.store(re.cast_mut(), std::sync::atomic::Ordering::Release);
-    }
+    unsafe { (*o.ptr()).code.publish(re.cast()) };
     // (Its hidden source, the new one's (escaped), read-only to
     // `defineProperty` and `freeze`.)
     let a = vm.a_regexp_source;
@@ -4103,7 +4099,7 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
             let at = |i: usize| *Object::slot(rp, vm.regexp_slots[i]);
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
             // (An accessor's slot holds its getter-setter pair.)
-            let getter_ok = |i: usize| *(*as_object(at(i))).elems == object_value(vm.regexp_fns[i]);
+            let getter_ok = |i: usize| *(*as_object(at(i))).elems.get() == object_value(vm.regexp_fns[i]);
             return Ok(ok(0)
                 && k.is_none_or(|k| ok(1 + k) && (!copies(k) || ok(1)))
                 && (6..crate::vm::REGEXP_FNS).all(getter_ok));
@@ -4623,7 +4619,7 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
             let [pl, cl] = vm.regexp_species_slots;
             // (An accessor's slot holds its getter-setter pair.)
             return *Object::slot(rp, pl) == object_value(rc)
-                && *(*as_object(*Object::slot(rc, cl))).elems == vm.regexp_species_getter;
+                && *(*as_object(*Object::slot(rc, cl))).elems.get() == vm.regexp_species_getter;
         }
     }
     species_pristine_slow(vm, r)

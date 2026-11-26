@@ -302,7 +302,7 @@ fn new_helper_raw(vm: &mut Vm, kind: i32, it: Value, next: Value, f: Value, coun
     .raw();
     let proto = vm.iterator_roots[if kind == WRAP { WRAP_PROTOTYPE } else { HELPER_PROTOTYPE }];
     let o = vm.mu().new_object_with(Class::IteratorHelper, object_value(proto.ptr()), 0);
-    unsafe { (*o.obj().ptr()).code = state.v().to_bits() as *const crate::vm::Code };
+    unsafe { (*o.obj().ptr()).code.init(state.v().to_bits() as *const crate::vm::Code) };
     Ok(object_value(o.obj().ptr()))
 }
 

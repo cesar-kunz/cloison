@@ -145,7 +145,7 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     // raw: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_object_with(Class::Symbol, proto, 0).raw_obj();
     unsafe {
-        (*o.v().ptr()).code = desc.to_bits() as *const crate::vm::Code;
+        (*o.v().ptr()).code.init(desc.to_bits() as *const crate::vm::Code);
         o.v().set_elems_len(atom.map_or(NO_ATOM, |a| a.0));
         // (Its class's root shape takes no element store: see
         // `Vm::root_shape`. Not a unique shape of its own, which would
@@ -511,7 +511,7 @@ fn new_iterator_raw(vm: &mut Vm, target: Value, kind: i32, proto: Root) -> Resul
 pub(crate) fn iterator_with_state(vm: &mut Vm, class: Class, proto: Root, state: Value) -> Value {
     let p = object_value(root(vm, proto).ptr());
     let it = vm.mu().new_object_with(class, p, 0);
-    unsafe { (*it.obj().ptr()).code = state.to_bits() as *const crate::vm::Code };
+    unsafe { (*it.obj().ptr()).code.init(state.to_bits() as *const crate::vm::Code) };
     object_value(it.obj().ptr())
 }
 

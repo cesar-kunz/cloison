@@ -324,7 +324,7 @@ pub(crate) fn is_error(o: *mut Object) -> bool {
 pub struct Object {
     /// Read concurrently by the marker thread: changed only through
     /// [`set_shape`] (see "The header word" at `layout::Header`).
-    pub shape: *const Shape,
+    pub shape: crate::layout::Racy<*const Shape>,
     pub class: Class,
     pub flags: u8,
     /// A typed array's element type (see [`TypedKind`]); for any other
@@ -332,12 +332,12 @@ pub struct Object {
     pub kind: u8,
     cap_hi: u8,
     pub elems_len: u32,
-    pub props: *mut Value,
-    pub elems: *mut Value,
+    pub props: crate::layout::Racy<*mut Value>,
+    pub elems: crate::layout::Racy<*mut Value>,
     /// Past the header (`HEADER_BYTES`): only for the classes with it
     /// (`layout::extra_words`), a plain object's or an array's first slot
     /// otherwise.
-    pub code: *const Code,
+    pub code: crate::layout::Published<*const Code>,
 }
 
 /// Set in a string's cached atom ([`Object::string_atom`]): `code`'s bit
@@ -443,18 +443,7 @@ impl Object {
     /// `this` must be a string.
     #[inline(always)]
     pub unsafe fn string_words(this: *const Object) -> usize {
-        use std::sync::atomic::{
-            AtomicPtr, AtomicU64,
-            Ordering::{Acquire, Relaxed},
-        };
-        unsafe {
-            let elems = (*(&raw const (*this).elems as *const AtomicPtr<Value>)).load(Acquire);
-            if elems.is_null() {
-                0
-            } else {
-                (*(&raw const (*this).code as *const AtomicU64)).load(Relaxed) as u32 as usize
-            }
-        }
+        unsafe { if (*this).elems.acquire().is_null() { 0 } else { (*this).code.load() as usize as u32 as usize } }
     }
 
     /// Set [`Object::string_words`] (and no atom).
@@ -463,11 +452,11 @@ impl Object {
     /// `this` must be a new flat string.
     #[inline(always)]
     pub unsafe fn set_string_words(this: *mut Object, words: usize) {
-        unsafe { (*this).code = u32::try_from(words).expect("string too long") as usize as *const Code }
+        unsafe { (*this).code.init(u32::try_from(words).expect("string too long") as usize as *const Code) }
     }
 
     /// A flat string's atom as a property key plus one, once found (0:
-    /// none yet; see `Vm::property_key`): `code`'s high half, but for its
+    /// none yet); see `Vm::property_key`): `code`'s high half, but for its
     /// [`ATOM_TAG`].
     ///
     /// # Safety
@@ -494,14 +483,13 @@ impl Object {
     pub unsafe fn set_string_atom(this: *mut Object, a: u32) {
         // SAFETY: a live cell, never null here.
         let this = unsafe { Obj::from_ptr(this) };
-        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         unsafe {
             debug_assert!(this.class() == Class::String && !this.elems().is_null());
             debug_assert!(a < ATOM_TAG);
             let words = this.code() as usize as u32 as u64;
             let code = words | ((a | ATOM_TAG) as u64) << 32;
             debug_assert!(!Value::from_bits(code).is_cell());
-            (*(&raw const (*this.ptr()).code as *const AtomicU64)).store(code, Relaxed);
+            (*this.ptr()).code.set_relaxed(code as *const Code);
         }
     }
 
@@ -1103,8 +1091,7 @@ pub(crate) unsafe fn set_shape_unchecked(o: *mut Object, s: *const Shape) {
         // (Atomic: the marker thread reads an old object's header while
         // the mutator gives it a shape; `Vm::add_shape`'s fence orders a
         // new shape's fields before this store.)
-        use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
-        (*(&raw mut (*o).shape as *mut AtomicPtr<Shape>)).store(s.cast_mut(), Relaxed);
+        (*o).shape.set(s);
         mark_shape(s);
     }
 }

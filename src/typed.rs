@@ -157,7 +157,7 @@ pub(crate) fn writable_view(o: Obj) -> Result<()> {
 /// Make fixed-length buffer `b` immutable: from now on compiled code takes
 /// typed arrays' elements through the runtime (see the module docs).
 fn make_immutable(vm: &mut Vm, b: Obj) {
-    unsafe { (*b.ptr()).code = b.ptr().cast() };
+    unsafe { (*b.ptr()).code.publish(b.ptr().cast()) };
     if !vm.views_detached {
         vm.views_detached = true;
         vm.bump_code_epoch();
@@ -190,13 +190,13 @@ fn new_buffer_max_raw(vm: &mut Vm, n: usize, max: Option<usize>) -> Result<Obj> 
     // raw: only calls that don't collect follow (allocation, stores, filling it).
     let o = vm.mu().new_object_with(Class::ArrayBuffer, abp, 0).raw_obj();
     unsafe {
-        (*o.v().ptr()).elems = vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast();
+        (*o.v().ptr()).elems.set(vm.heap.alloc_bytes(8 * room.div_ceil(8).max(1)).cast());
         o.v().set_elems_len(n as u32);
         if let Some(max) = max {
             o.v().set_flags(o.v().flags() | RESIZABLE);
             *Object::aux(o.v().ptr()) = max as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o.v().ptr()).code = object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code;
+            (*o.v().ptr()).code.init(object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code);
         }
     }
     Ok(o.v())
@@ -277,7 +277,7 @@ pub(crate) fn detach(vm: &mut Vm, b: Obj) -> Result<()> {
 
 /// A view's byte offset in its buffer.
 pub(crate) fn offset_of(o: Obj) -> usize {
-    unsafe { o.elems().cast::<u8>().offset_from((*buffer_of(o).ptr()).elems.cast::<u8>()) as usize }
+    unsafe { o.elems().cast::<u8>().offset_from((*buffer_of(o).ptr()).elems.get().cast::<u8>()) as usize }
 }
 
 /// A typed array's length, `None` if out of bounds (or its buffer
@@ -342,8 +342,8 @@ fn make_view_raw(
         if class == Class::TypedArray {
             (*o.v().ptr()).kind = k as u8;
         }
-        (*o.v().ptr()).elems = b.elems().cast::<u8>().add(offset).cast();
-        (*o.v().ptr()).code = b.ptr().cast();
+        (*o.v().ptr()).elems.set(b.elems().cast::<u8>().add(offset).cast());
+        (*o.v().ptr()).code.init(b.ptr().cast());
         *Object::aux(o.v().ptr()) = len.map_or(TRACKING, |n| n as u32);
         (*o.v().ptr()).elems_len =
             if class == Class::TypedArray { ta_length(o.v()) } else { view_byte_length(o.v()) }.unwrap_or(0) as u32;
@@ -1950,7 +1950,7 @@ pub(crate) fn install(vm: &mut Vm) {
 /// `%TypedArray%.prototype[@@iterator]` (its `values`) and
 /// `[@@toStringTag]`, `ArrayBuffer.prototype[@@toStringTag]`.
 pub(crate) fn install_symbols(vm: &mut Vm) {
-    let shared = Obj::of(unsafe { (*(*(vm.typed_prototypes[0]).ptr()).shape).proto });
+    let shared = Obj::of(unsafe { (*(*(vm.typed_prototypes[0]).ptr()).shape.get()).proto });
     let a_values = vm.intern_name("values");
     let values = vm.get(object_value(shared.ptr()), a_values).unwrap_or(Value::UNDEFINED);
     let a_iter = vm.a_sym_iterator;

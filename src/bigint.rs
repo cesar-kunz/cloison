@@ -534,7 +534,7 @@ pub(crate) fn new_bigint(vm: &mut Vm, b: Big) -> Value {
             let p = vm.heap.alloc_bytes(4 * b.mag.len().next_multiple_of(2)).cast::<u32>();
             #[expect(clippy::disallowed_methods, reason = "a new bytes cell: the marker doesn't read bytes")]
             std::ptr::copy_nonoverlapping(b.mag.as_ptr(), p, b.mag.len());
-            (*o.v().ptr()).elems = p.cast();
+            (*o.v().ptr()).elems.set(p.cast());
         }
         o.v().set_elems_len(b.mag.len() as u32);
         // (Its class's root shape takes no element store: see

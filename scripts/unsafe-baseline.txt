@@ -22,7 +22,7 @@
 1 src/js/ast.rs
 1 src/js/mod.rs
 2 src/json.rs
-62 src/layout.rs
+97 src/layout.rs
 2 src/module.rs
 79 src/object.rs
 13 src/promise.rs

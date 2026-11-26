@@ -287,13 +287,13 @@ fn new_shared_raw(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<Value> {
     let sc_o = Scope::new(vm);
     let o = vm.mu().new_object_with(Class::SharedArrayBuffer, proto, 0).root(&sc_o);
     unsafe {
-        (*o.obj().ptr()).elems = bytes_of(b).cast();
+        (*o.obj().ptr()).elems.set(bytes_of(b).cast());
         o.obj().set_elems_len((*b).len.load(SeqCst) as u32);
         if growable {
             o.obj().set_flags(o.obj().flags() | RESIZABLE);
             *Object::aux(o.obj().ptr()) = (*b).room as u32;
             let views = crate::collections::new_weak_set(vm)?;
-            (*o.obj().ptr()).code = object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code;
+            (*o.obj().ptr()).code.init(object_value(views.peek().ptr()).to_bits() as *const crate::vm::Code);
         }
     }
     let live = vm.shared.live;

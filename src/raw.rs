@@ -89,7 +89,7 @@ pub(crate) trait ObjectPtr: Copy {
 
     #[inline(always)]
     fn shape(self) -> *const Shape {
-        unsafe { (*self.object_ptr()).shape }
+        unsafe { (*self.object_ptr()).shape.get() }
     }
 
     /// The word past the header (see `Object::code`). Panics for a class
@@ -99,7 +99,7 @@ pub(crate) trait ObjectPtr: Copy {
     #[track_caller]
     fn code(self) -> *const Code {
         assert!(crate::layout::extra_words(self.class()) > 0, "no code word in a {:?}", self.class());
-        unsafe { (*self.object_ptr()).code }
+        unsafe { (*self.object_ptr()).code.get() }
     }
 
     /// [`ObjectPtr::code`], or null for a class without the word: to tell
@@ -107,7 +107,7 @@ pub(crate) trait ObjectPtr: Copy {
     #[inline(always)]
     fn code_or_null(self) -> *const Code {
         if crate::layout::extra_words(self.class()) > 0 {
-            unsafe { (*self.object_ptr()).code }
+            unsafe { (*self.object_ptr()).code.get() }
         } else {
             std::ptr::null()
         }
@@ -116,12 +116,12 @@ pub(crate) trait ObjectPtr: Copy {
     /// The out-of-line slots (a cons string's half, see `Object::props`).
     #[inline(always)]
     fn props(self) -> *mut Value {
-        unsafe { (*self.object_ptr()).props }
+        unsafe { (*self.object_ptr()).props.get() }
     }
 
     #[inline(always)]
     fn elems(self) -> *mut Value {
-        unsafe { (*self.object_ptr()).elems }
+        unsafe { (*self.object_ptr()).elems.get() }
     }
 
     /// Element `i`, `i` checked as [`ObjectPtr::elem_at`] checks it (a hole

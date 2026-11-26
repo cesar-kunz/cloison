@@ -638,6 +638,32 @@ value: the mutator may give an old object a new shape
 meanwhile, published by `Vm::add_shape`'s Release fence (the contract
 is "The header word" at `layout::Header`).
 
+### What the compiler checks of the concurrent marking
+
+Of the rules above:
+- **The header's words** the marker reads, an object's `shape`, `props`,
+  `elems` and `code`, have types with no plain store
+  (`layout::Racy`, `layout::Published`): a store is atomic, Relaxed, or
+  Release where the marker follows the word into what was written
+  before (`code`: a function's `Code`, a `Regex`; a flat string's
+  `elems`). A plain store is only for a new cell's (`Published::init`,
+  `unsafe`), and a Relaxed one of `code` only where the marker doesn't
+  follow it (`Published::set_relaxed`, `unsafe`: a number, a value).
+- **Bulk copies and fills** (`ptr::copy`, `copy_nonoverlapping`,
+  `write_bytes`, `slice::from_raw_parts_mut`) are clippy's
+  `disallowed_methods`: where the marker may read, `layout::copy_words`
+  and `Heap::move_values`/`fill_values`; elsewhere each says why it
+  can't race, as `#[expect(clippy::disallowed_methods, reason = …)]`.
+- **What the GC's threads get** has no `unsafe impl Send` or `Sync`:
+  the marker asks for the final pause through the heap's `requested`, an
+  `Arc<AtomicBool>` (not its address, which moves with the VM), and the
+  threads scanning cards in a pause get a `Cards` view of the heap's
+  blocks, `Sync` by its fields.
+
+Not checked: the slots and elements written through `*mut Value`
+(`heap::store`, `layout::store_word`), the metadata, and compiled code's
+stores, which follow the same rules by hand.
+
 ### Pacing
 
 - **Nursery size**: the bytes allocated between minor collections. Its

@@ -127,7 +127,7 @@ pub(crate) fn create(vm: &mut Vm, slots: Slots) -> Value {
     let bytes = vm.heap.alloc_bytes(size_of::<Slots>());
     unsafe {
         bytes.cast::<Slots>().write_unaligned(slots);
-        (*o.v().ptr()).elems = bytes.cast();
+        (*o.v().ptr()).elems.set(bytes.cast());
     }
     object_value(o.v().ptr())
 }

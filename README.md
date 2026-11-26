@@ -107,6 +107,12 @@ analysis checks on every path, in CI: a rustc driver that follows each
 local holding a cell to where it is rooted
 ([docs/gc-hazards.md](docs/gc-hazards.md)).
 
+Threads are typed too. A `Vm` and its values can't be sent to another
+thread, so a host can't race the VM. Within the engine, the words the
+concurrent marker reads have types with no plain store, a bulk copy into
+the heap must say why it can't race, and nothing the collector's threads
+share needs an `unsafe impl Send` ([docs/gc.md](docs/gc.md#what-the-compiler-checks-of-the-concurrent-marking)).
+
 ## More
 
 - [cloison in depth](docs/README-long.md): how it works, design choices,

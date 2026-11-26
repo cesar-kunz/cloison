@@ -82,12 +82,12 @@ fn function_of(st: *mut Value) -> Obj {
 
 /// Whether state `st` is an async generator's (its function's kind).
 fn is_async_generator(st: *mut Value) -> bool {
-    unsafe { (*(*function_of(st).ptr()).code).kind == 6 }
+    unsafe { (*(*function_of(st).ptr()).code.get()).kind == 6 }
 }
 
 /// Cell `k` of state `st` (undefined past its cells: its registers follow).
 fn get(_: &mut Vm, st: *mut Value, k: i32) -> Value {
-    let cells = cells_for(unsafe { (*(*function_of(st).ptr()).code).kind });
+    let cells = cells_for(unsafe { (*(*function_of(st).ptr()).code.get()).kind });
     if (k as usize) < cells { unsafe { *st.add(k as usize) } } else { Value::UNDEFINED }
 }
 
@@ -148,7 +148,7 @@ fn create_raw(vm: &mut Vm, f: Obj) -> Result<Value> {
         for (k, &v) in cells.iter().enumerate() {
             *st.add(k) = v;
         }
-        crate::heap::store_young(g.v().ptr().cast(), &raw mut (*g.v().ptr()).code, st as *const Code);
+        crate::heap::publish_young(g.v().ptr().cast(), &(*g.v().ptr()).code, st as *const Code);
     }
     Ok(object_value(g.v().ptr()))
 }

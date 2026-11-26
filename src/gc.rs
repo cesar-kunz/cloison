@@ -143,7 +143,7 @@ impl ShapePhases {
 /// pins only (`Pin`, the default: what they point to stays where it is,
 /// but lives only if something else keeps it: Rust frames precise), as
 /// roots (`off`),
-/// as nothing (`Drop`, any other value: a Rust local holding a cell across
+/// as nothing (`drop`: a Rust local holding a cell across
 /// a safepoint then dies or moves, found by `CLOISON_GC_STRESS`), or as
 /// pins reported where they kept a cell (`report`: see
 /// `Vm::report_native_roots`). The words below the outermost run, compiled
@@ -158,6 +158,8 @@ pub(crate) enum NoNative {
 }
 
 /// The binary's code (`NoNative::Report`'s scan for return addresses).
+/// Linux only: `__executable_start` and `etext` are GNU ld's and lld's.
+#[cfg(target_os = "linux")]
 fn text_range() -> std::ops::Range<usize> {
     unsafe extern "C" {
         static __executable_start: u8;
@@ -168,7 +170,9 @@ fn text_range() -> std::ops::Range<usize> {
 
 /// The native stack's frames from here out, innermost first: each one's
 /// instruction pointer (a return address but for the first) and canonical
-/// frame address (its caller's stack pointer before the call).
+/// frame address (its caller's stack pointer before the call). Linux
+/// only, as `report` is.
+#[cfg(target_os = "linux")]
 fn unwind_frames() -> Vec<(usize, usize)> {
     use std::ffi::c_void;
     unsafe extern "C" {
@@ -184,6 +188,13 @@ fn unwind_frames() -> Vec<(usize, usize)> {
     let mut v: Vec<(usize, usize)> = Vec::new();
     unsafe { _Unwind_Backtrace(cb, (&mut v as *mut Vec<(usize, usize)>).cast()) };
     v
+}
+
+/// A `CLOISON_GC_*` setting of an unknown value: refused at start, with
+/// the values it takes.
+#[cold]
+fn bad_setting(name: &str, v: &str, values: &str) -> ! {
+    panic!("{name}={v:?}: unknown value (it takes {values})")
 }
 
 /// Milliseconds since `t`, and `t` now.
@@ -381,17 +392,22 @@ impl Gc {
             weak_now: false,
             frag_report: env("CLOISON_GC_FRAG"),
             slots_check: env("CLOISON_GC_SLOTS"),
+            // (An unknown value is refused, not taken for one: `drop`, the
+            // mode that makes unrooted locals crash, was any other once.)
             no_native_roots: match std::env::var("CLOISON_GC_NO_NATIVE_ROOTS").as_deref() {
                 Err(_) | Ok("pin") => NoNative::Pin,
                 Ok("0" | "off") => NoNative::Off,
-                Ok("report") => NoNative::Report,
-                Ok(_) => NoNative::Drop,
+                Ok("drop") => NoNative::Drop,
+                // (Its scan of the frames is Linux's: `text_range`.)
+                Ok("report") if cfg!(target_os = "linux") => NoNative::Report,
+                Ok(v) => bad_setting("CLOISON_GC_NO_NATIVE_ROOTS", v, "pin, off (0), drop, report (Linux)"),
             },
             native_words: Vec::new(),
             evacuate: match std::env::var("CLOISON_GC_EVACUATE").as_deref() {
                 Ok("0" | "off") => Evacuate::Off,
                 Ok("1" | "all") => Evacuate::All,
-                _ => Evacuate::Fragmented,
+                Err(_) | Ok("fragmented") => Evacuate::Fragmented,
+                Ok(v) => bad_setting("CLOISON_GC_EVACUATE", v, "off (0), all (1), fragmented"),
             },
             nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
@@ -2655,6 +2671,7 @@ impl Vm {
             } else {
                 m.drain(&|| false)
             };
+            #[cfg(target_os = "linux")]
             if self.heap.gc.no_native_roots == NoNative::Report {
                 self.report_native_roots(&mut m, kind);
             }
@@ -3217,6 +3234,7 @@ impl Vm {
     /// conservative roots), and reported once by the Rust frame holding
     /// it: `NNR <kind> <frame ip> <caller ips...>` on stderr, the ips to
     /// symbolize (`addr2line`, one less than a return address).
+    #[cfg(target_os = "linux")]
     #[cold]
     #[inline(never)]
     unsafe fn report_native_roots(&mut self, m: &mut Marking, kind: Collection) {

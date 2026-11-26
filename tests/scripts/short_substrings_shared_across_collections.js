@@ -3,6 +3,7 @@
 // substring made, dropped, collected (the nursery's memory reused), then
 // made again must be a new string, not the dead one the cache held: the
 // cache is emptied as each collection starts.
+// stress slow: 147 s collecting at every safepoint (nightly runs it)
 // expect: 0,true,alphabeta
 
 var src = "alpha beta gamma delta epsilon zeta eta theta", bad = 0, kept = [];

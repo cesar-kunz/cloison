@@ -5,6 +5,7 @@
 // them are dropped, so taking them again makes new ones. Fails under
 // `CLOISON_GC_VERIFY=2048` (with or without `CLOISON_GC_STW=1`) if an
 // object reachable has a dead shape.
+// stress slow: 112 s collecting at every safepoint (nightly runs it)
 // expect: 807503
 
 function make(k) {

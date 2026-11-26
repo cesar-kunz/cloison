@@ -8,6 +8,7 @@
 // runs in four (found by cloison-fuzz's hunt r20 as a nondeterministic
 // result). Generated, reduced: `__miss` counts the `new P1(x).z` that
 // didn't call the getter.
+// stress slow: 46 s collecting at every safepoint (nightly runs it)
 // expect: 0
 
 function __str(v, d) {

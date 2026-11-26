@@ -10,7 +10,10 @@
 //! a JSON string, for a result with line breaks, edge spaces or characters
 //! that don't show. The script is what follows that line, exactly. A
 //! `// release only: why` line before it leaves the test out of a debug
-//! build, whose larger frames reach a stack limit sooner. The script runs
+//! build, whose larger frames reach a stack limit sooner, and a `// stress
+//! slow: why` line leaves it out under `CLOISON_GC_STRESS` (a script that
+//! collects by design, thousands of times: CI's precise-roots job runs
+//! the rest, the nightly one all, with `--include-ignored`). The script runs
 //! with the interpreter only, tiering up after 1, 2 and 1000 back edges and
 //! with the default, each in a new `Vm` whose heap is verified at the end;
 //! all must agree.
@@ -164,9 +167,10 @@ fn main() {
         .map(|p| {
             let name = p.strip_prefix(&dir).unwrap().with_extension("").to_string_lossy().into_owned();
             let text = std::fs::read_to_string(&p).unwrap_or_default();
-            let release_only =
-                text.lines().take_while(|l| l.starts_with("//")).any(|l| l.starts_with("// release only:"));
-            Trial::test(name, move || check(&p)).with_ignored_flag(release_only && cfg!(debug_assertions))
+            let marked = |m: &str| text.lines().take_while(|l| l.starts_with("//")).any(|l| l.starts_with(m));
+            let ignored = marked("// release only:") && cfg!(debug_assertions)
+                || marked("// stress slow:") && std::env::var_os("CLOISON_GC_STRESS").is_some();
+            Trial::test(name, move || check(&p)).with_ignored_flag(ignored)
         })
         .collect();
     libtest_mimic::run(&args, trials).exit();

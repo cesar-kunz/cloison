@@ -7,6 +7,7 @@
 // keys left, in order, and their values are what V8, SpiderMonkey and
 // JavaScriptCore give.
 // release only: a debug build takes a minute
+// stress slow: 58 s collecting at every safepoint (nightly runs it)
 // expect: 200000:-2061899968 k1,k2,k4 210000:-2045108527 k299910,k299940,k299970 -30  1 true false 100:-303319470 k98,k99 100:-1749068046 k199900,k199901 1000:-1631265932 k999000 k999999
 var out = [];
 function sum(o) {

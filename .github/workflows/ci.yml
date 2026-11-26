@@ -60,7 +60,8 @@ jobs:
       # every safepoint: a Rust local holding a cell across one that isn't
       # rooted otherwise (`Vm::rooted`) makes its script crash or differ.
       # Each script runs interpreted and compiled (see tests/scripts.rs),
-      # its Scopes checked (`gc-check`).
+      # its Scopes checked (`gc-check`). The five marked `// stress slow:`
+      # (80% of the time) are left to the nightly run.
       CLOISON_GC_NO_NATIVE_ROOTS: drop
       CLOISON_GC_STRESS: "1"
       CLOISON_GC_STW: "1"

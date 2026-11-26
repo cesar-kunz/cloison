@@ -1,5 +1,6 @@
 // A chain of proxies forwarding `get` too deep for the stack: a
 // RangeError, not a native stack overflow.
+// stress slow: 63 s collecting at every safepoint (nightly runs it)
 // expect: RangeError,2
 
 var p = { x: 1 }; for (var i = 0; i < 1000000; i++) p = new Proxy(p, { has(t, k) { return k in t; } });

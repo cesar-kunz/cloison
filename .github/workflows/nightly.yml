@@ -1,7 +1,8 @@
 # Once a day (and by hand, from the Actions tab): the tests on arm64 and
-# with the `intl` feature, test262 against the failures known, and the
-# `intl` tests and test262 again with debug assertions (pull requests run
-# the default tests with them, ci.yml).
+# with the `intl` feature, all the scripts under precise Rust roots and
+# stress (the `// stress slow:` ones too), test262 against the failures
+# known, and the `intl` tests and test262 again with debug assertions
+# (pull requests run the default tests with them, ci.yml).
 name: Nightly
 
 on:
@@ -35,6 +36,21 @@ jobs:
       - run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --features intl
+
+  precise-roots:
+    name: Scripts, all (precise Rust roots)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # As ci.yml's precise-roots job, with the scripts it leaves out.
+      CLOISON_GC_NO_NATIVE_ROOTS: drop
+      CLOISON_GC_STRESS: "1"
+      CLOISON_GC_STW: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --features gc-check --test scripts -- --include-ignored
 
   debug-assertions:
     name: Tests and test262 (debug assertions)

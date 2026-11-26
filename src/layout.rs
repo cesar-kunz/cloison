@@ -731,6 +731,41 @@ impl<T: Word> Published<T> {
     }
 }
 
+/// The runtime functions compiled code calls that take its frame's
+/// registers as their third argument: those that may collect, which the
+/// collector then knows the VM stack's top from. The stencils call them
+/// through `rt_call_at!` and the others through `rt_call!`, which check
+/// it as they compile; the JIT's runtime wrapper passes the frame on to
+/// these (`jit::takes_frame`).
+pub const TAKES_FRAME: [&str; 6] = [
+    "cloison_rt_add",
+    "cloison_rt_for_in_keys",
+    "cloison_rt_create_object",
+    "cloison_rt_set_keyed",
+    "cloison_rt_from_char_code",
+    "cloison_rt_array_push",
+];
+
+/// Whether runtime function `name` takes the frame ([`TAKES_FRAME`]).
+pub const fn takes_frame(name: &str) -> bool {
+    let n = name.as_bytes();
+    let mut i = 0;
+    while i < TAKES_FRAME.len() {
+        let t = TAKES_FRAME[i].as_bytes();
+        if t.len() == n.len() {
+            let mut j = 0;
+            while j < n.len() && t[j] == n[j] {
+                j += 1;
+            }
+            if j == n.len() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 // ---- Shapes ----
 
 /// `object::Shape`'s first fields, which compiled code reads.

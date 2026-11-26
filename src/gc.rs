@@ -2446,6 +2446,14 @@ impl Vm {
     pub(crate) fn safepoint(&mut self, regs: *mut Value) {
         #[cfg(feature = "gc-check")]
         crate::brand::may_collect(self);
+        // (A frame's registers, or the VM stack's free top: the collector
+        // takes the deepest it is given for the stack's top, so one from
+        // elsewhere, a runtime call given no frame say (`layout::
+        // TAKES_FRAME`), would have it scan the stack short.)
+        debug_assert!(
+            regs.is_null() || (self.stack.as_ptr() as usize..=self.stack_limit()).contains(&(regs as usize)),
+            "a safepoint's registers out of the VM stack"
+        );
         if self.heap.requested.load(std::sync::atomic::Ordering::Relaxed) && self.heap.gc.stack_base != 0 {
             self.collect(regs);
         }

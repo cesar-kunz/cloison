@@ -203,7 +203,7 @@ unsafe extern "C" {
 ///   callee-saved under the C ABI anyway; x0–x6 and v0–v7 are in/out
 ///   operands.
 #[cfg(target_arch = "x86_64")]
-macro_rules! rt_call {
+macro_rules! rt_call_raw {
     ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {{
         let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
         let [mut g0, mut g1, mut g2, mut g3, mut g4, mut g5] = $s.g.map(Value::to_bits);
@@ -233,7 +233,7 @@ macro_rules! rt_call {
     }};
 }
 
-/// `rt_call!` on arm64, with the clobbers the OS decides (below).
+/// `rt_call_raw!` on arm64, with the clobbers the OS decides (below).
 #[cfg(target_arch = "aarch64")]
 macro_rules! rt_call_arm64 {
     ($s:ident, $f:ident, $a:expr, $b:expr; $($extra:tt)*) => {{
@@ -271,13 +271,13 @@ macro_rules! rt_call_arm64 {
 // x18 is a temporary on Linux, so C code may clobber it; on macOS it is
 // reserved (the platform register), never touched and not nameable.
 #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
-macro_rules! rt_call {
+macro_rules! rt_call_raw {
     ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {
         rt_call_arm64!($s, $f, $a, $b; out("x18") _, $($($extra)*)?)
     };
 }
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-macro_rules! rt_call {
+macro_rules! rt_call_raw {
     ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {
         rt_call_arm64!($s, $f, $a, $b; $($($extra)*)?)
     };
@@ -290,14 +290,47 @@ macro_rules! rt_call {
 /// its end.
 #[cfg(target_arch = "x86_64")]
 macro_rules! rt_call_at {
-    ($s:ident, $f:ident, $a:expr, $b:expr) => {
-        rt_call!($s, $f, $a, $b; in("r13") $s.regs)
-    };
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+        frame_check!($f, true);
+        rt_call_raw!($s, $f, $a, $b; in("r13") $s.regs)
+    }};
 }
 #[cfg(target_arch = "aarch64")]
 macro_rules! rt_call_at {
-    ($s:ident, $f:ident, $a:expr, $b:expr) => {
-        rt_call!($s, $f, $a, $b; in("x21") $s.regs)
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+        frame_check!($f, true);
+        rt_call_raw!($s, $f, $a, $b; in("x21") $s.regs)
+    }};
+}
+
+/// A runtime call of a function that doesn't take the frame
+/// (`layout::takes_frame`): the arguments in, the result out, as the
+/// register contract above says.
+macro_rules! rt_call {
+    ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {{
+        frame_check!($f, false);
+        rt_call_raw!($s, $f, $a, $b $(; $($extra)*)?)
+    }};
+}
+
+/// That runtime function `$f` takes the running frame's registers
+/// (`layout::takes_frame`, which the JIT's wrapper reads) if and only if
+/// it is called through `rt_call_at!` (`$at`), checked as the stencil
+/// compiles: the wrapper of one taking it passes on whatever the frame's
+/// register holds, and the collector, given no frame, may scan the VM
+/// stack short of live compiled frames (#373's review).
+macro_rules! frame_check {
+    ($f:ident, $at:literal) => {
+        const {
+            assert!(
+                layout::takes_frame(stringify!($f)) == $at,
+                concat!(
+                    "`",
+                    stringify!($f),
+                    "`: call it with rt_call_at! if and only if it is in layout::TAKES_FRAME"
+                )
+            )
+        }
     };
 }
 

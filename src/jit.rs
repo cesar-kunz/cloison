@@ -1557,19 +1557,10 @@ extern "C" fn cloison_rt_to_boolean(a: Value, _: Value) -> bool {
 }
 
 /// Whether runtime function `name` takes the running frame's registers as
-/// its third argument: those that may collect, which the collector then
-/// knows the VM stack's top from (`rt_call_at!` in the stencils holds
-/// `regs` in its register for the wrapper to pass on).
+/// its third argument (`layout::TAKES_FRAME`, which the stencils check
+/// their calls against as they compile).
 fn takes_frame(name: &str) -> bool {
-    matches!(
-        name,
-        "cloison_rt_add"
-            | "cloison_rt_for_in_keys"
-            | "cloison_rt_create_object"
-            | "cloison_rt_set_keyed"
-            | "cloison_rt_from_char_code"
-            | "cloison_rt_array_push"
-    )
+    crate::layout::takes_frame(name)
 }
 
 fn runtime_function(name: &str) -> usize {

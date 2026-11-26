@@ -18,7 +18,7 @@
 13 src/intrinsics.rs
 2 src/iterator.rs
 1 src/jit/rx.rs
-384 src/jit.rs
+393 src/jit.rs
 1 src/js/ast.rs
 1 src/js/mod.rs
 2 src/json.rs

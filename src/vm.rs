@@ -120,6 +120,14 @@ fn lookup_index(shape: *const crate::object::Shape, name: Atom) -> usize {
     ((shape as usize >> 4) ^ (name.0 as usize).wrapping_mul(0x9E37_79B1)) & (LOOKUPS - 1)
 }
 
+/// The TypeError of a call or `new` of `f`, which isn't `what`. Out of
+/// line (see `Vm::call_in_realm`).
+#[cold]
+#[inline(never)]
+fn not_callable(f: Value, what: &str) -> Error {
+    Error::type_error(format!("{} is not {what}", shown(f)))
+}
+
 /// A function implemented in Rust: `(vm, this, args)`.
 pub type NativeFn = fn(&mut Vm, Value, crate::brand::Args<'_>) -> Result<Value>;
 
@@ -7366,18 +7374,40 @@ impl Vm {
                 crate::interp::check_native_stack(self)?;
                 let native = o.code().live().native.unwrap();
                 if !self.realms.is_empty() && o.code().live().realm != self.realm {
-                    return crate::realm::run_in(self, o.code().live().realm, |vm| {
-                        vm.constructing = false;
-                        vm.callee = o.ptr();
-                        vm.run_native(|vm| native(vm, this, args))
-                    });
+                    return self.call_in_realm(o.code().live().realm, o.ptr(), native, this, args, false);
                 }
                 self.constructing = false;
                 self.callee = o.ptr();
                 return self.run_native(|vm| native(vm, this, args));
             }
         }
-        Err(Error::type_error(format!("{} is not a function", shown(f))))
+        Err(not_callable(f, "a function"))
+    }
+
+    /// [`call_own`](Self::call_own) or [`construct_own`](Self::construct_own)
+    /// of native `o` of another realm, in its `realm`. Out of line, as the
+    /// errors: inlined, their locals widened the frames of the calls from
+    /// compiled code (`cloison_rt_call`) and from natives, which a
+    /// recursion through them stacks once a level (ECharts' force layout
+    /// reached the compiled calls' native stack limit sooner).
+    #[cold]
+    #[inline(never)]
+    fn call_in_realm(
+        &mut self,
+        realm: u32,
+        o: *mut Object,
+        native: NativeFn,
+        this: Value,
+        args: crate::brand::Args<'_>,
+        constructing: bool,
+    ) -> Result<Value> {
+        crate::realm::run_in(self, realm, |vm| {
+            vm.constructing = constructing;
+            vm.callee = o;
+            let r = vm.run_native(|vm| native(vm, this, args));
+            vm.constructing = false;
+            r
+        })
     }
 
     /// `new f(…args)` when `f` isn't a bytecode function: a native that
@@ -7400,13 +7430,7 @@ impl Vm {
                 crate::interp::check_native_stack(self)?;
                 let native = o.code().live().native.unwrap();
                 if !self.realms.is_empty() && o.code().live().realm != self.realm {
-                    return crate::realm::run_in(self, o.code().live().realm, |vm| {
-                        vm.constructing = true;
-                        vm.callee = o.ptr();
-                        let r = vm.run_native(|vm| native(vm, Value::UNDEFINED, args));
-                        vm.constructing = false;
-                        r
-                    });
+                    return self.call_in_realm(o.code().live().realm, o.ptr(), native, Value::UNDEFINED, args, true);
                 }
                 self.constructing = true;
                 self.callee = o.ptr();
@@ -7415,7 +7439,7 @@ impl Vm {
                 return r;
             }
         }
-        Err(Error::type_error(format!("{} is not a constructor", shown(f))))
+        Err(not_callable(f, "a constructor"))
     }
 
     // ---- Loading and running ----

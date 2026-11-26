@@ -17365,6 +17365,26 @@ impl JitFunction {
     /// live values in `acc` and `regs` fit exactly (no int32 → double
     /// conversion), without building their `TypeState`.
     unsafe fn fitting_version(&self, pc: usize, acc: Value, regs: *mut Value) -> Option<(Rc<JitCode>, Value, usize)> {
+        let cached = self.fits.borrow().get(&pc).cloned();
+        // (None there: an empty list, as the entry scan finds nothing again
+        // till versions change.)
+        let vs = match cached {
+            Some(vs) => vs,
+            None => {
+                let vs = self.fits_at(pc).unwrap_or_else(|| Rc::from([]));
+                self.fits.borrow_mut().insert(pc, vs.clone());
+                vs
+            }
+        };
+        unsafe { self.fitting_of(&vs, acc, regs) }
+    }
+
+    /// The first of versions `vs` whose checks the live values pass.
+    ///
+    /// # Safety
+    /// `regs` must be a live frame of this function.
+    #[inline(always)]
+    unsafe fn fitting_of(&self, vs: &[Fit], acc: Value, regs: *mut Value) -> Option<(Rc<JitCode>, Value, usize)> {
         let fits = |t: Ty, v: Value| match t {
             Ty::Bot => false,
             Ty::Any => true,
@@ -17381,22 +17401,42 @@ impl JitFunction {
                 }
             }
         };
-        let cached = self.fits.borrow().get(&pc).cloned();
-        // (None there: an empty list, as the entry scan finds nothing again
-        // till versions change.)
-        let vs = match cached {
-            Some(vs) => vs,
-            None => {
-                let vs = self.fits_at(pc).unwrap_or_else(|| Rc::from([]));
-                self.fits.borrow_mut().insert(pc, vs.clone());
-                vs
-            }
-        };
         vs.iter().find_map(|f| {
             let ok = f.acc.is_none_or(|t| fits(t, acc))
                 && f.regs.iter().all(|&(r, t)| fits(t, unsafe { *regs.add(r as usize) }));
             ok.then(|| (f.code.clone(), acc, self.nregs))
         })
+    }
+
+    /// [`vm_prepare`](Self::vm_prepare)'s common case alone, small enough
+    /// to inline in `vm_run_` (whose frame stays under the compiled code):
+    /// nothing to redo, the entry's checks cached, a version passing them.
+    /// `None` leaves the rest to `vm_prepare`.
+    ///
+    /// # Safety
+    /// As `vm_prepare`'s.
+    #[inline(always)]
+    unsafe fn vm_prepare_fast(
+        &mut self,
+        pc: usize,
+        acc: Value,
+        regs: *mut Value,
+        stack_end: *mut Value,
+        epoch: u32,
+        field_epoch: u32,
+    ) -> Option<(Rc<JitCode>, Value, usize)> {
+        let vm = self.vm.as_ref()?;
+        // (A spent function's call is counted late there.)
+        if vm.dirty || vm.epoch != epoch || vm.field_epoch != field_epoch || vm.spent && pc == 0 {
+            return None;
+        }
+        let vs = self.fits.borrow().get(&pc).cloned()?;
+        let found = fits_stack(unsafe { self.fitting_of(&vs, acc, regs) }?, regs, stack_end)?;
+        self.used.set(true);
+        if pc != 0 {
+            self.stats.osr_entries += 1;
+        }
+        Some(found)
     }
 
     /// The checks of the versions at the entry at bytecode offset `pc`
@@ -18018,97 +18058,58 @@ pub(crate) unsafe fn vm_run(
     crate::brand::may_collect(vm);
     let r = unsafe { vm_run_(vm, code, regs, pc, acc) };
     if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) {
-        let how = match &r {
-            VmRun::Returned(_) => "returned",
-            VmRun::Exit(_) => "exit",
-            VmRun::Interpret => "interpret",
-            VmRun::NotCompiled => "not compiled",
-        };
-        let key = format!("{} enter @{pc}: {how}", code.name);
-        *EXITS.lock().unwrap().entry(key).or_default() += 1;
+        count_entry(code, pc, &r);
     }
     r
 }
 
+/// `CLOISON_EXITS`' count of an entry into compiled code and how it ended.
+/// Out of line, as all of [`vm_run_`] but the entry itself.
+#[cold]
+#[inline(never)]
+fn count_entry(code: &crate::vm::Code, pc: usize, r: &VmRun) {
+    let how = match r {
+        VmRun::Returned(_) => "returned",
+        VmRun::Exit(_) => "exit",
+        VmRun::Interpret => "interpret",
+        VmRun::NotCompiled => "not compiled",
+    };
+    let key = format!("{} enter @{pc}: {how}", code.name);
+    *EXITS.lock().unwrap().entry(key).or_default() += 1;
+}
+
+/// [`vm_run`]. Its frame stays on the native stack while the compiled
+/// code runs, and the code's calls through the runtime enter compiled
+/// code again from here, once a call deep: so all but the entry itself
+/// is out of line ([`vm_prepare_entry`], [`vm_left`]), the frame small.
+/// Inlined, they made it 1.6 KB, and deep calls (ECharts' force layout)
+/// reached the compiled calls' native stack limit sooner, interpreted
+/// past it.
 unsafe fn vm_run_(vm: &mut crate::vm::Vm, code: &crate::vm::Code, regs: *mut Value, pc: usize, acc: Value) -> VmRun {
     if pc == 0 && interp::native_stack_low(vm) || !vm.realms.is_empty() {
         return VmRun::Interpret;
     }
-    let vm_ptr: *mut crate::vm::Vm = vm;
     let (mut pc, mut acc) = (pc, acc);
     // After a tier-up exit: where the interpreter resumes if hot code can't
     // be entered there.
     let mut left: Option<(Rc<JitCode>, usize)> = None;
     loop {
-        let prepared = {
-            let mut slot = code.jit.borrow_mut();
-            let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
-            // Cooling after an exit: calls run in the interpreter (not
-            // `NotCompiled`, which would stop entering for good). Not out
-            // of compilations: no lowering comes after it (TypeScript's
-            // `innerScan` ran 889K calls interpreted, 1.6K compiled).
-            let spent = f.vm.as_ref().is_some_and(|v| f.stats.compiles >= v.max_compiles());
-            if left.is_none()
-                && pc == 0
-                && !spent
-                && let Some(v) = f.vm.as_mut()
-                && v.dirty
-                && v.cool > 0
-            {
-                v.cool -= 1;
-                // The window ends: another, longer one if the caches
-                // missed meanwhile.
-                let misses = code.ic_misses.get();
-                if v.cool == 0 && misses != v.settle_mark && v.settles < MAX_SETTLE && v.root_len >= SETTLE_SIZE {
-                    v.settles += 1;
-                    v.cool = COOL_ENTRIES << v.settles;
-                    v.settle_mark = misses;
-                }
-                return VmRun::Interpret;
-            }
-            let compiles = f.stats.compiles;
-            let prepared = unsafe {
-                f.vm_prepare(
-                    pc,
-                    acc,
-                    regs,
-                    vm.stack_end,
-                    vm.proto_epoch,
-                    vm.field_epoch.wrapping_add(code.field_deps.get()),
-                )
-            };
-            // Debugging: `CLOISON_JIT_DUMP=<file>` writes the last compilation's
-            // hot code (`CLOISON_JIT_LOG`: see `JitCode::log`), of the function
-            // named `CLOISON_JIT_DUMP_FN` if set (`name`, or `name:line:col`
-            // as `CLOISON_JIT_LOG` prints it); a `%n` in the name is the
-            // compilation's number, for a file each.
-            if f.stats.compiles != compiles
-                && let Some(c) = f.last_code()
-                && let Ok(path) = std::env::var("CLOISON_JIT_DUMP")
-                && std::env::var("CLOISON_JIT_DUMP_FN")
-                    .map_or(true, |n| n == code.name || n == format!("{}:{}:{}", code.name, code.line, code.col))
-            {
-                let path = path.replace("%n", &f.stats.compiles.to_string());
-                std::fs::write(path, c.main_code()).expect("writing CLOISON_JIT_DUMP");
-            }
-            if pc != 0 && prepared.is_some() {
-                f.stats.osr_entries += 1;
-            }
-            prepared
-        };
-        let Some((jit_code, entry_acc, nregs)) = prepared else {
-            return match left {
-                Some((code, frame)) => VmRun::Exit(unsafe { materialize(vm, regs, &code, frame, pc, acc) }),
-                None => {
-                    // Refused for good: calls stop trying (`run_new_frame`).
-                    let field_epoch = vm.field_epoch.wrapping_add(code.field_deps.get());
-                    let epochs = (vm.proto_epoch, field_epoch);
-                    if pc == 0 && code.jit.borrow().as_ref().unwrap().never_entered(epochs) {
-                        code.calls_interpret.set(true);
-                    }
-                    VmRun::NotCompiled
-                }
-            };
+        let fast = code.jit.borrow_mut().as_mut().and_then(|f| unsafe {
+            f.vm_prepare_fast(
+                pc,
+                acc,
+                regs,
+                vm.stack_end,
+                vm.proto_epoch,
+                vm.field_epoch.wrapping_add(code.field_deps.get()),
+            )
+        });
+        let (jit_code, entry_acc, nregs) = match fast {
+            Some(p) => p,
+            None => match unsafe { vm_prepare_entry(vm, code, regs, pc, acc, &mut left) } {
+                Ok(p) => p,
+                Err(r) => return r,
+            },
         };
         #[expect(
             clippy::disallowed_methods,
@@ -18124,25 +18125,137 @@ unsafe fn vm_run_(vm: &mut crate::vm::Vm, code: &crate::vm::Code, regs: *mut Val
             Outcome::Return(v) => return VmRun::Returned(v),
             Outcome::Exit { pc: record, acc } => (record, acc),
         };
-        let (frame, exit_pc) = {
-            let mut slot = code.jit.borrow_mut();
-            slot.as_mut().unwrap().vm_finish(&jit_code, pc, record)
-        };
-        // Warm code ran out of heat at a loop header: continue there in hot
-        // code (its registers are in the frame, as for the interpreter).
-        if record & TIER_UP as usize != 0 && frame == 0 {
-            (pc, acc) = (exit_pc, exit_acc);
-            left = Some((jit_code, frame));
-            continue;
+        match unsafe { vm_left(vm, code, regs, pc, jit_code, record, exit_acc) } {
+            Ok((p, a, l)) => {
+                (pc, acc) = (p, a);
+                left = Some(l);
+            }
+            Err(r) => return r,
         }
-        if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) {
-            let c = unsafe { &*jit_code.snap.as_ref().unwrap().frames[frame].code };
-            let op = Op::from_u8(c.bytecode[exit_pc]).map_or("?", |o| o.name());
-            let key = format!("{} @{exit_pc} {op}", c.name);
-            *EXITS.lock().unwrap().entry(key).or_default() += 1;
-        }
-        return VmRun::Exit(unsafe { materialize(vm, regs, &jit_code, frame, exit_pc, exit_acc) });
     }
+}
+
+/// [`vm_run_`]'s entry at `pc` with `acc`: the compiled code to enter, its
+/// accumulator and the frame's register count, compiling it if needed; or
+/// how the run ends without entering (cooling after exits, refused).
+///
+/// # Safety
+/// As [`vm_run`]'s.
+#[inline(never)]
+unsafe fn vm_prepare_entry(
+    vm: &mut crate::vm::Vm,
+    code: &crate::vm::Code,
+    regs: *mut Value,
+    pc: usize,
+    acc: Value,
+    left: &mut Option<(Rc<JitCode>, usize)>,
+) -> Result<(Rc<JitCode>, Value, usize), VmRun> {
+    let vm_ptr: *mut crate::vm::Vm = vm;
+    let prepared = {
+        let mut slot = code.jit.borrow_mut();
+        let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
+        // Cooling after an exit: calls run in the interpreter (not
+        // `NotCompiled`, which would stop entering for good). Not out
+        // of compilations: no lowering comes after it (TypeScript's
+        // `innerScan` ran 889K calls interpreted, 1.6K compiled).
+        let spent = f.vm.as_ref().is_some_and(|v| f.stats.compiles >= v.max_compiles());
+        if left.is_none()
+            && pc == 0
+            && !spent
+            && let Some(v) = f.vm.as_mut()
+            && v.dirty
+            && v.cool > 0
+        {
+            v.cool -= 1;
+            // The window ends: another, longer one if the caches
+            // missed meanwhile.
+            let misses = code.ic_misses.get();
+            if v.cool == 0 && misses != v.settle_mark && v.settles < MAX_SETTLE && v.root_len >= SETTLE_SIZE {
+                v.settles += 1;
+                v.cool = COOL_ENTRIES << v.settles;
+                v.settle_mark = misses;
+            }
+            return Err(VmRun::Interpret);
+        }
+        let compiles = f.stats.compiles;
+        let prepared = unsafe {
+            f.vm_prepare(
+                pc,
+                acc,
+                regs,
+                vm.stack_end,
+                vm.proto_epoch,
+                vm.field_epoch.wrapping_add(code.field_deps.get()),
+            )
+        };
+        // Debugging: `CLOISON_JIT_DUMP=<file>` writes the last compilation's
+        // hot code (`CLOISON_JIT_LOG`: see `JitCode::log`), of the function
+        // named `CLOISON_JIT_DUMP_FN` if set (`name`, or `name:line:col`
+        // as `CLOISON_JIT_LOG` prints it); a `%n` in the name is the
+        // compilation's number, for a file each.
+        if f.stats.compiles != compiles
+            && let Some(c) = f.last_code()
+            && let Ok(path) = std::env::var("CLOISON_JIT_DUMP")
+            && std::env::var("CLOISON_JIT_DUMP_FN")
+                .map_or(true, |n| n == code.name || n == format!("{}:{}:{}", code.name, code.line, code.col))
+        {
+            let path = path.replace("%n", &f.stats.compiles.to_string());
+            std::fs::write(path, c.main_code()).expect("writing CLOISON_JIT_DUMP");
+        }
+        if pc != 0 && prepared.is_some() {
+            f.stats.osr_entries += 1;
+        }
+        prepared
+    };
+    let Some((jit_code, entry_acc, nregs)) = prepared else {
+        return Err(match left.take() {
+            Some((code, frame)) => VmRun::Exit(unsafe { materialize(vm, regs, &code, frame, pc, acc) }),
+            None => {
+                // Refused for good: calls stop trying (`run_new_frame`).
+                let field_epoch = vm.field_epoch.wrapping_add(code.field_deps.get());
+                let epochs = (vm.proto_epoch, field_epoch);
+                if pc == 0 && code.jit.borrow().as_ref().unwrap().never_entered(epochs) {
+                    code.calls_interpret.set(true);
+                }
+                VmRun::NotCompiled
+            }
+        });
+    };
+    Ok((jit_code, entry_acc, nregs))
+}
+
+/// [`vm_run_`] after the compiled code `jit_code`, entered at `pc`, exited
+/// with `record` and `exit_acc`: where to go on in hotter code (a tier-up,
+/// `Ok`), or the exit the interpreter resumes at.
+///
+/// # Safety
+/// As [`vm_run`]'s.
+#[inline(never)]
+unsafe fn vm_left(
+    vm: &mut crate::vm::Vm,
+    code: &crate::vm::Code,
+    regs: *mut Value,
+    pc: usize,
+    jit_code: Rc<JitCode>,
+    record: usize,
+    exit_acc: Value,
+) -> Result<(usize, Value, (Rc<JitCode>, usize)), VmRun> {
+    let (frame, exit_pc) = {
+        let mut slot = code.jit.borrow_mut();
+        slot.as_mut().unwrap().vm_finish(&jit_code, pc, record)
+    };
+    // Warm code ran out of heat at a loop header: continue there in hot
+    // code (its registers are in the frame, as for the interpreter).
+    if record & TIER_UP as usize != 0 && frame == 0 {
+        return Ok((exit_pc, exit_acc, (jit_code, frame)));
+    }
+    if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) {
+        let c = unsafe { &*jit_code.snap.as_ref().unwrap().frames[frame].code };
+        let op = Op::from_u8(c.bytecode[exit_pc]).map_or("?", |o| o.name());
+        let key = format!("{} @{exit_pc} {op}", c.name);
+        *EXITS.lock().unwrap().entry(key).or_default() += 1;
+    }
+    Err(VmRun::Exit(unsafe { materialize(vm, regs, &jit_code, frame, exit_pc, exit_acc) }))
 }
 
 static EXITS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -18801,16 +18914,7 @@ fn rt_call(regs: Value, site: Value) -> Value {
         (*site.vm).safepoint(regs.to_bits() as *mut Value);
         // `CLOISON_EXITS`: also the calls through the runtime, by callee and why.
         if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) && !site.callee.is_null() {
-            let key = format!(
-                "rt_call {} entry={} pending={} exits={} claim={} bound={}",
-                site.callee.live().name,
-                site.entry != 0,
-                site.pending,
-                site.exits,
-                site.claim.is_some(),
-                site.bound
-            );
-            *EXITS.lock().unwrap().entry(key).or_default() += 1;
+            count_rt_call(site);
         }
         // A direct call of another bytecode function than the one bound,
         // often: its own site, which the call looks for in the table from
@@ -18860,6 +18964,25 @@ fn rt_call(regs: Value, site: Value) -> Value {
             site.frame,
         )
     }
+}
+
+/// `CLOISON_EXITS`' count of a call through the runtime at `site`. Out of
+/// line: inlined, its key's formatting widened `cloison_rt_call`'s frame,
+/// which compiled code calling compiled code through the runtime stacks
+/// once a call, toward the compiled calls' native stack limit.
+#[cold]
+#[inline(never)]
+fn count_rt_call(site: &CallSite) {
+    let key = format!(
+        "rt_call {} entry={} pending={} exits={} claim={} bound={}",
+        site.callee.live().name,
+        site.entry != 0,
+        site.pending,
+        site.exits,
+        site.claim.is_some(),
+        site.bound
+    );
+    *EXITS.lock().unwrap().entry(key).or_default() += 1;
 }
 
 /// What the JIT keeps (`CLOISON_SIZES`): the functions it lowered, their

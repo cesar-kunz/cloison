@@ -17166,7 +17166,7 @@ impl JitFunction {
                 self.refresh(epoch, field_epoch);
             }
             // Inlined frames' registers must fit the VM stack.
-            if unsafe { regs.add(self.nregs + interp::HEADER) } > stack_end {
+            if !interp::fits(regs, self.nregs + interp::HEADER, stack_end) {
                 return None;
             }
         }

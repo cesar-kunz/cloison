@@ -243,11 +243,11 @@ unsafe fn run(vm: &mut Vm, f: Obj, saved: *mut Value, pc: usize, v: Value) -> Re
         }
         vm.safepoint(top);
         let code = f.code();
-        let new = top.add(crate::interp::HEADER);
         let n = code.live().nregs as usize;
-        if new.add(n) > vm.stack_end || native_stack_low(vm) {
+        if !crate::interp::fits(top, crate::interp::HEADER + n, vm.stack_end) || native_stack_low(vm) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
+        let new = top.add(crate::interp::HEADER);
         write_frame_header(vm, new, code, std::ptr::null(), std::ptr::null_mut(), 0);
         crate::interp::set_frame_function(new, f.ptr());
         for i in 0..n {

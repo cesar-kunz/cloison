@@ -1041,7 +1041,7 @@ handlers! {
             tail!(op_unwind, Value::EMPTY)
         }
         let n = code.live().nregs as usize;
-        if regs.add(n) > (*frame_vm(regs)).stack_end {
+        if !fits(regs, n, (*frame_vm(regs)).stack_end) {
             (*frame_vm(regs)).error = Some(Error::range_error("Maximum call stack size exceeded"));
             tail!(op_unwind, Value::EMPTY)
         }
@@ -4931,7 +4931,7 @@ pub(crate) fn with_args_on_stack(
     }
     unsafe {
         let n = args.len();
-        if top.add(n + HEADER) > vm.stack_end {
+        if !fits(top, n + HEADER, vm.stack_end) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         #[expect(clippy::disallowed_methods, reason = "the VM stack: only this thread reads it")]
@@ -4979,13 +4979,13 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
         }
         let fo = as_object(f);
         let callee = (*fo).code.get();
-        let new = top.add(HEADER);
         let n = callee.live().nregs as usize;
         // (Past the compiled calls' limit, the callee is interpreted: its
         // calls take no native stack.)
-        if new.add(n) > vm.stack_end || native_stack_exhausted(vm) {
+        if !fits(top, HEADER + n, vm.stack_end) || native_stack_exhausted(vm) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
+        let new = top.add(HEADER);
         write_frame_header(vm, new, callee, std::ptr::null(), std::ptr::null_mut(), 0);
         set_header(new, FUNC, fo);
         *new = if callee.live().strict { this } else { sloppy_this(vm, this) };
@@ -5014,6 +5014,15 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
 
 /// Run the script `code` (`eval`'s, `Function`'s) in a new frame at the VM
 /// stack's free top (as [`call_function`]), `this` the global object.
+/// Whether `n` values from `p`, in the VM stack, end by `end`: compared as
+/// addresses, so that no pointer past the stack's allocation is formed
+/// to find out (`ptr::add` past it is undefined behavior, which an
+/// oversized frame's end would be, before the `RangeError`).
+#[inline(always)]
+pub(crate) fn fits(p: *const Value, n: usize, end: *const Value) -> bool {
+    (end as usize).saturating_sub(p as usize) / std::mem::size_of::<Value>() >= n
+}
+
 pub(crate) fn run_script_at(vm: &mut Vm, code: *const Code) -> crate::vm::Result<Value> {
     let g = object_value(vm.global);
     run_script_with(vm, code, g, false, std::ptr::null_mut())
@@ -5036,11 +5045,11 @@ pub(crate) fn run_script_with(
         if top.is_null() {
             return Err(Error::unsupported("eval from here (compiled code)"));
         }
-        let new = top.add(HEADER);
         let n = code.live().nregs as usize;
-        if new.add(n) > vm.stack_end || native_stack_low(vm) {
+        if !fits(top, HEADER + n, vm.stack_end) || native_stack_low(vm) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
+        let new = top.add(HEADER);
         write_frame_header(vm, new, code, std::ptr::null(), std::ptr::null_mut(), 0);
         set_header(new, FUNC, func);
         *new = this;
@@ -5365,11 +5374,12 @@ unsafe fn push_frame(
 ) -> *mut Value {
     unsafe {
         let vm = frame_vm(regs);
-        let new = regs.add((*frame_code(regs)).nregs as usize + HEADER);
+        let at = (*frame_code(regs)).nregs as usize + HEADER;
         let n = callee.live().nregs as usize;
-        if new.add(n) > (*vm).stack_end {
+        if !fits(regs, at + n, (*vm).stack_end) {
             return std::ptr::null_mut();
         }
+        let new = regs.add(at);
         *new.sub(BUDGET) = Value::from_bits(callee.live().loop_budget.get() as u64);
         clear_osr(new);
         set_header(new, CODE, callee);
@@ -5577,7 +5587,7 @@ pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -
 pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error> {
     unsafe {
         let n = code.live().nregs as usize;
-        if vm.stack.as_mut_ptr().add(HEADER + n) > vm.stack_end {
+        if !fits(vm.stack.as_ptr(), HEADER + n, vm.stack_end) {
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         let regs = vm.stack.as_mut_ptr().add(HEADER);
@@ -5981,11 +5991,11 @@ pub(crate) unsafe fn call_from_jit(
         } else {
             sloppy_this(vm, this)
         };
-        let new = regs.add(frame);
         let n = callee.live().nregs as usize;
-        if new.add(n) > vm.stack_end {
+        if !fits(regs, frame + n, vm.stack_end) {
             return throw(vm, Error::range_error("Maximum call stack size exceeded"));
         }
+        let new = regs.add(frame);
         // Too deep in native calls: the compiled code leaves, before the
         // call (`EMPTY` without an error), and the interpreter makes it,
         // in its own frames.

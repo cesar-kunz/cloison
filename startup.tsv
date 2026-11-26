@@ -1,0 +1,6 @@
+engine	empty_wall_ms	empty_cpu_ms	empty_Minstr	empty_rss_mb	hello_wall_ms	hello_cpu_ms	hello_Minstr	hello_rss_mb
+cloison	2.00	1.46	6.59	4.5	2.01	1.46	6.65	4.5
+v8	13.43	9.37	30.08	16.5	13.82	9.27	30.13	16.5
+jsc	16.14	14.67	79.11	31.5	16.40	13.41	79.24	32.2
+sm	10.82	10.10	49.43	19.5	15.32	16.66	49.95	20.2
+quickjs	1.36	0.93	3.91	3.0	1.57	1.10	3.93	3.0

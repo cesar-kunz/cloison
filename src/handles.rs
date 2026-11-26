@@ -245,6 +245,11 @@ pub struct ScopedLocal<'s> {
     brand: Brand<'s>,
 }
 
+// A slot of a scope of this thread's VM's: of no use on another, and kept
+// on this one as a value is (see `Vm`'s "Threads").
+impl !Send for ScopedLocal<'_> {}
+impl !Sync for ScopedLocal<'_> {}
+
 /// What a scope's operation threw: the error, and its value, rooted in
 /// the scope (an object thrown is reached, and read, as any value of the
 /// scope's).

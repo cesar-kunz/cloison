@@ -333,10 +333,13 @@ once references are offsets. But it is a separate decision and optional
 - **Mostly single-threaded.** JS runs on one thread per VM; the
   collector marks on a thread of its own (`docs/gc.md`), and test262's
   agents (`src/agent.rs`) are threads with VMs of their own sharing
-  `SharedArrayBuffer`s' memory (`src/shared.rs`). Shared buffers hold only
-  data, so the concurrent double fetches behind several V8 bypasses come
-  back mostly through reentrancy (a getter or native that changes the
-  object between two reads).
+  `SharedArrayBuffer`s' memory (`src/shared.rs`). The types say so: a
+  `Vm`, a `Value` and what holds one are neither `Send` nor `Sync` (see
+  `Vm`'s "Threads"), so a host can't hand them to another thread, and
+  what crosses holds no cell. Shared buffers hold only data, so the
+  concurrent double fetches behind several V8 bypasses come back mostly
+  through reentrancy (a getter or native that changes the object between
+  two reads).
 
 What would leave the sandbox today, if objects were inside one: cell
 `Value`s, `shape`, `props`, `elems` and `code`. Everything else in the

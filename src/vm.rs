@@ -866,6 +866,88 @@ const STACK_VALUES: usize = 1 << 18;
 /// stack to its real end, [`Vm::stack_limit`]).
 pub(crate) const STACK_SPARE: usize = 1;
 
+/// A JavaScript VM: its heap, its realms and what runs in them.
+///
+/// # Threads
+///
+/// A VM is used on the thread that made it, and nowhere else.
+///
+/// It is not `Sync`: its operations take `&mut Vm`, or read state a run
+/// changes, with no lock. It is not `Send` either, not even between
+/// runs: the VMs of a thread share state of the thread's, which a VM
+/// moved would leave behind, or share with the VMs of the thread it went
+/// to. That state is the shapes' slab and the field cells left unused
+/// (`object.rs`), the code bytes put in since the last full marking
+/// (`gc.rs`), the compiled versions not dropped (`jit.rs`), and the
+/// stack's bound (`stack.rs`).
+///
+/// Nor is a [`Value`]: a cell's is its address in the heap of a VM of
+/// the thread, which only that VM may read, and which its collector
+/// frees or moves. So neither is what holds one: a [`Local`], a
+/// [`Global`], an [`Error`], a [`ScopedLocal`](crate::handles::ScopedLocal).
+/// What crosses threads is made of owned data, atomics and `Arc`s (a
+/// shared buffer's block, a number), with no `unsafe impl Send`.
+///
+/// Each case below fails with E0277 ("cannot be sent between threads
+/// safely", "cannot be shared between threads safely"):
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// send(cloison::vm::Vm::new());
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn share<T: Sync>(_: &T) {}
+/// share(&cloison::vm::Vm::new());
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// send(cloison::value::Value::UNDEFINED);
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn share<T: Sync>(_: &T) {}
+/// share(&cloison::value::Value::UNDEFINED);
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>(_: T) {}
+/// send(cloison::vm::Local::UNDEFINED);
+/// ```
+///
+/// ```compile_fail,E0277
+/// let mut vm = cloison::vm::Vm::new();
+/// let g = cloison::vm::Global::new(&vm, cloison::vm::Local::UNDEFINED);
+/// std::thread::spawn(move || drop(g));
+/// ```
+///
+/// ```compile_fail,E0277
+/// let mut vm = cloison::vm::Vm::new();
+/// let e = vm.run(&cloison::js::compile("throw 1").unwrap()).unwrap_err();
+/// std::thread::spawn(move || drop(e));
+/// ```
+///
+/// ```compile_fail,E0277
+/// let mut vm = cloison::vm::Vm::new();
+/// vm.with_handles(|s| {
+///     let g = s.global_object();
+///     std::thread::scope(|t| {
+///         t.spawn(move || drop(g));
+///     });
+/// });
+/// ```
+///
+/// A number, or a message, goes where a value can't:
+///
+/// ```
+/// let mut vm = cloison::vm::Vm::new();
+/// let n = vm.run(&cloison::js::compile("6 * 7").unwrap()).unwrap();
+/// let n = n.value().as_number().unwrap();
+/// let e = vm.run(&cloison::js::compile("throw new Error('no')").unwrap()).unwrap_err();
+/// let message = e.0.clone();
+/// std::thread::spawn(move || assert!(n == 42.0 && message.contains("no"))).join().unwrap();
+/// ```
 // Shapes (in slabs: `object::ShapeBox`) and code are boxed so their
 // addresses stay put as the vectors grow.
 #[allow(clippy::vec_box)]
@@ -1489,6 +1571,12 @@ pub struct Vm {
     /// `ShadowRealm.prototype`, … (see `shadow::Root`).
     pub(crate) shadow_roots: Vec<Obj>,
 }
+
+// See `Vm`'s "Threads" for why neither is `Send` or `Sync`.
+impl !Send for Vm {}
+impl !Sync for Vm {}
+impl !Send for Value {}
+impl !Sync for Value {}
 
 impl Vm {
     /// The VM stack's real end: `stack_end` and its spare slots.

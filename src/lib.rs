@@ -9,6 +9,7 @@
 #![feature(explicit_tail_calls)]
 #![feature(rust_preserve_none_cc)]
 #![feature(fn_align)]
+#![feature(negative_impls)]
 #![allow(incomplete_features)]
 // Clippy's style lints this code departs from on purpose, so that
 // `cargo clippy --all-targets` reports only what deserves a look:

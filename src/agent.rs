@@ -32,15 +32,13 @@ fn arg(a: &[Value], i: usize) -> Value {
 }
 
 /// A broadcast: the buffer's block (a reference to it for the agent), and
-/// whether it's growable, and the number sent with it.
+/// whether it's growable, and the number sent with it (if one was). No
+/// value: a cell's is of the VM that sent it (see `Vm`'s "Threads").
 struct Message {
     block: usize,
     growable: bool,
-    id: Value,
+    id: Option<f64>,
 }
-
-// (A number or `undefined`: no cell.)
-unsafe impl Send for Message {}
 
 /// An agent's mailbox: the broadcast it hasn't taken yet, and whether
 /// the agent has ended (then it takes none: a broadcast skips it).
@@ -235,7 +233,7 @@ fn run_agent_vm(mut vm: Vm, src: &[u16], mailbox: &Mailbox, reports: Reports) {
             crate::shared::catch_up(vm);
             let sab = sab?;
             vm.handles.push(sab);
-            vm.call_b(callback, Value::UNDEFINED, &[sab, m.id]).map(Fresh::take)
+            vm.call_b(callback, Value::UNDEFINED, &[sab, m.id.map_or(Value::UNDEFINED, Value::number)]).map(Fresh::take)
         });
         if let Err(e) = r {
             report_error(format_args!("uncaught {}", vm.uncaught_message(&e)));
@@ -258,7 +256,7 @@ fn agent_broadcast(vm: &mut Vm, _: Value, a: Args<'_>) -> Result<Value> {
     let block = crate::shared::block_of(o);
     let growable = crate::typed::is_resizable(o);
     let id = arg(&a, 1);
-    let id = if id.is_number() { Value::number(id.to_number()) } else { Value::UNDEFINED };
+    let id = if id.is_number() { Some(id.to_number()) } else { None };
     let agents: Vec<Arc<Mailbox>> = vm.agent.started.iter().map(|a| a.mailbox.clone()).collect();
     // (An agent that ends meanwhile is closed: skipped, not waited for.)
     for m in &agents {

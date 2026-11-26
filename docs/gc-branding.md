@@ -63,6 +63,11 @@ let n = vm.length_of(o)?;                 // fine: `raw` no longer borrows `vm`
 vm.get_keyed_b(raw.v(), 0)?;              // fine: still alive, and moved if it moved
 ```
 
+A `Scope` doesn't borrow the VM, so nothing stops it outliving it:
+`Scope::new` is the crate's own. Code outside the crate gets a scope
+for a call, `Scope::with(vm, |vm, s| …)`, which neither the scope nor
+its handles can leave.
+
 This is the same trick as [gc-arena]'s `Gc<'gc>`, used differently.
 gc-arena collects only *between* calls into the heap, so its brand
 lasts a whole callback. Cloison collects *inside* natives, so the brand

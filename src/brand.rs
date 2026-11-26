@@ -51,12 +51,15 @@
 //! ```
 //! # use cloison::{brand::Scope, vm::Vm, value::Value};
 //! # fn f(vm: &mut Vm, o: Value) -> cloison::vm::Result<f64> {
-//! let s = Scope::new(vm);
-//! let raw = vm.get_b(o, "raw")?.root(&s);
+//! # Scope::with(vm, |vm, s| {
+//! let raw = vm.get_b(o, "raw")?.root(s);
 //! let n = vm.length_of_b(o)?;
 //! let m = vm.length_of_b(raw.v())?;
-//! # Ok(n + m) }
+//! # Ok(n + m) }) }
 //! ```
+//!
+//! (The crate's code makes its scopes with `let s = Scope::new(vm)`;
+//! outside it, [`Scope::with`] gives one for a call.)
 //!
 //! A `Gc` held across a call that may collect:
 //!
@@ -73,11 +76,11 @@
 //! ```
 //! # use cloison::{brand::Scope, vm::Vm, value::Value};
 //! # fn f(vm: &mut Vm, o: Value) -> cloison::vm::Result<f64> {
-//! let s = Scope::new(vm);
-//! let a = vm.mu().new_array().root(&s);
+//! # Scope::with(vm, |vm, s| {
+//! let a = vm.mu().new_array().root(s);
 //! let n = vm.length_of_b(o)?;
 //! let _ = a.v();
-//! # Ok(n) }
+//! # Ok(n) }) }
 //! ```
 //!
 //! A native called with arguments no frame roots (they go through
@@ -95,15 +98,12 @@
 //!
 //! A handle outliving its scope:
 //!
-//! ```compile_fail,E0597
+//! ```compile_fail,E0521
 //! # use cloison::{brand::Scope, vm::Vm, value::Value};
 //! # fn f(vm: &mut Vm) {
-//! let h;
-//! {
-//!     let s = Scope::new(vm);
-//!     h = vm.mu().new_array().root(&s);
-//! }
-//! let _ = h.v();
+//! let mut h = None;
+//! Scope::with(vm, |vm, s| h = Some(vm.mu().new_array().root(s)));
+//! let _ = h.map(|h| h.v());
 //! # }
 //! ```
 // (Mu is where the VM's allocators are called: see clippy.toml.)
@@ -532,8 +532,11 @@ impl<'a> Mu<'a> {
 }
 
 /// Values rooted until it ends: slots of `Vm::handles`, cut back as it
-/// drops. It doesn't borrow the VM (calls that collect come meanwhile);
-/// it must not outlive it.
+/// drops. It doesn't borrow the VM (calls that collect come meanwhile),
+/// so it must not outlive it, which nothing checks: the crate's code
+/// makes one with [`Scope::new`], and code outside the crate gets one
+/// only for a call, from [`Scope::with`] (a `Scope` kept past its VM had
+/// it write freed memory as it dropped).
 #[must_use]
 pub struct Scope {
     vm: *mut Vm,
@@ -548,9 +551,39 @@ pub struct Scope {
 const LOW: usize = u32::MAX as usize;
 
 impl Scope {
-    /// A scope from `vm.handles`' current depth.
+    /// `f` given `vm` and a scope open for the call, which ends as `f`
+    /// returns or unwinds: neither the scope nor its handles can leave
+    /// `f` (`T` is chosen outside it).
+    ///
+    /// ```
+    /// # use cloison::{brand::Scope, vm::Vm};
+    /// let mut vm = Vm::new();
+    /// let n = Scope::with(&mut vm, |vm, s| {
+    ///     let a = vm.mu().new_array().root(s);
+    ///     vm.length_of_b(a.v())
+    /// });
+    /// assert_eq!(n.unwrap(), 0.0);
+    /// ```
+    ///
+    /// [`Scope::new`] is the crate's: a scope kept past its VM.
+    ///
+    /// ```compile_fail,E0624
+    /// let s = {
+    ///     let mut vm = cloison::vm::Vm::new();
+    ///     cloison::brand::Scope::new(&mut vm)
+    /// };
+    /// drop(s);
+    /// ```
+    #[inline]
+    pub fn with<T>(vm: &mut Vm, f: impl FnOnce(&mut Vm, &Scope) -> T) -> T {
+        let s = Scope::new(vm);
+        f(vm, &s)
+    }
+
+    /// A scope from `vm.handles`' current depth; the caller keeps it from
+    /// outliving `vm` (see [`Scope`]).
     #[inline(always)]
-    pub fn new(vm: &mut Vm) -> Scope {
+    pub(crate) fn new(vm: &mut Vm) -> Scope {
         #[cfg(feature = "gc-check")]
         let depth = {
             debug_assert!(vm.handles.len() <= LOW && vm.scope_roots <= LOW);

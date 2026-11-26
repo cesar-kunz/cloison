@@ -7,10 +7,6 @@ Natives take their arguments as `Args<'s>`, which only rooted values can
 become, and allocate through `vm.mu()`, which gives each new cell as a
 `Gc` the compiler tracks.
 
-This page explains the idea for someone who knows Rust but not the
-collector: what can go wrong, how a few types make the compiler catch
-it, and where the checking stops.
-
 ## The problem
 
 Cloison's collector frees objects nothing refers to, and moves some of
@@ -98,6 +94,181 @@ There are three ways to use a `Fresh`:
 `Fresh` is generic. A descriptor, an `Option`, a `Vec` of values or a
 tuple roots to the same shape with handles inside (the `Rootable`
 trait). Natives never write handles by hand.
+
+## How the types are built
+
+Each type is a plain value with a lifetime parameter. A
+`PhantomData` field ties it to a borrow: of the VM, or of a `Scope`.
+Nothing is checked at run time; the borrow checker does all the work.
+These are the definitions in `src/brand.rs`, trimmed.
+
+**`Fresh`: a result that holds the call's `&mut Vm` borrow.**
+
+```rust
+#[must_use = "a fresh value is to be rooted, or given on at once"]
+pub struct Fresh<'a, T = Value> {
+    v: T,
+    _vm: PhantomData<&'a mut Vm>,
+}
+
+impl Vm {
+    pub fn get_b(&mut self, o: Value, name: &str) -> Result<Fresh<'_>> { … }
+    pub fn call_b(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Fresh<'_>> { … }
+}
+```
+
+The `'_` in the return type is lifetime elision: the result borrows
+`self` for as long as it lives, exactly as if it held the `&mut Vm`
+itself. Non-lexical lifetimes end that borrow at the `Fresh`'s last
+use, not at the end of the block. So `peek()` (it takes `&self`) keeps
+the borrow going while the value is read, and `root` or `take` (they
+take `self`) end it there. `#[must_use]` warns about a result that is
+neither used nor rooted.
+
+**`Scope` and `Handle`: roots that don't borrow the VM.**
+
+```rust
+#[must_use]
+pub struct Scope {
+    vm: *mut Vm,
+    depth: usize,          // `vm.handles`' length when it began
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        unsafe { &mut *self.vm }.handles.truncate(self.depth);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Handle<'s> {
+    vm: *const Vm,
+    slot: usize,           // its index in `vm.handles`
+    _s: PhantomData<&'s Scope>,
+}
+```
+
+Rooting pushes the value onto `vm.handles`, a stack the collector
+scans and updates when it moves a cell. A `Handle` is that slot's
+index, and `h.v()` reads the slot. So it gives the cell's current
+address, after any number of collections. The `Handle` borrows its
+`Scope` (`Fresh::root<'s>(self, s: &'s Scope) -> Handle<'s>`), so one
+used after its scope ends is a compile error (E0597, or E0505 for a
+`drop(s)`). `Drop` pops a scope's roots in LIFO order, as Rust drops
+locals.
+
+A `Scope` holds a raw pointer, not `&mut Vm`. If it borrowed the VM,
+no call could be made while it lives, which is the whole point of
+rooting. The cost is that the compiler doesn't stop a `Scope`
+outliving its VM. So `Scope::new` is `pub(crate)`, and code outside
+the crate gets one from a closure:
+
+```rust
+pub fn with<T>(vm: &mut Vm, f: impl FnOnce(&mut Vm, &Scope) -> T) -> T {
+    let s = Scope::new(vm);
+    f(vm, &s)
+}
+```
+
+`T` is chosen by the caller, outside the closure, so it can't name the
+`&Scope`'s lifetime: returning the scope or a `Handle` from the closure
+fails with "lifetime may not live long enough". `Scope::new` outside
+the crate is E0624, which a doctest checks.
+
+**`Rootable`: rooting a whole record.** A generic associated type maps
+each shape of result to its rooted form:
+
+```rust
+pub trait Rootable {
+    type Rooted<'s>;
+    fn root_in(self, s: &Scope) -> Self::Rooted<'_>;
+}
+impl Rootable for Value { type Rooted<'s> = Handle<'s>; … }
+```
+
+The same goes for `Option<T>`, `Vec<T>`, a few pairs and property
+descriptors (a `RootedDesc<'s>`, its value, getter and setter as
+handles). `Fresh<'a, T>` is generic over it, so
+`vm.own_property_b(o, k)?.root(&s)` is an `Option<RootedDesc<'_>>`
+without any code written for that case.
+
+**`Mu` and `Gc`: a context where nothing collects.**
+
+```rust
+pub struct Mu<'a> {
+    vm: *mut Vm,
+    _vm: PhantomData<&'a mut Vm>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Gc<'a> {
+    v: Value,
+    _vm: PhantomData<&'a Vm>,
+}
+
+impl Vm {
+    pub fn mu(&mut self) -> Mu<'_> { … }
+}
+impl<'a> Mu<'a> {
+    pub fn new_array(&self) -> Gc<'a> { … }
+    pub(crate) fn new_plain(&self, proto: Value) -> Gc<'a> { … }
+}
+```
+
+`vm.mu()` takes the VM's exclusive borrow for `'a`. `Mu`'s methods take
+`&self`, so several allocations can be live at once. Each returns a
+`Gc<'a>` carrying that same `'a`. While a `Mu` or any `Gc` made from it
+is still used, `'a` is alive, and so is the exclusive borrow: a call on
+`vm` there is E0499. `Mu` only offers operations that never collect
+(allocating, interning, adding a property to its own new cells). So
+inside that borrow, holding a raw cell is safe by construction. A `Gc`
+is `Copy`, being a shared borrow; `gc.root(&s)` keeps one past the
+block.
+
+**`Args`: a slice only the dispatch can make.**
+
+```rust
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Args<'s>(&'s [Value]);
+
+impl<'s> Args<'s> {
+    /// # Safety: every value stays rooted for `'s`.
+    pub unsafe fn rooted(a: &'s [Value]) -> Args<'s> { Args(a) }
+}
+impl std::ops::Deref for Args<'_> { type Target = [Value]; … }
+
+pub type NativeFn = fn(&mut Vm, Value, Args<'_>) -> Result<Value>;
+```
+
+The field is private, so outside `brand.rs` an `Args` comes only from
+the `unsafe` constructor (the interpreter's and JIT's dispatch, over a
+frame's registers) or from `vm.with_args`, which copies to the VM stack
+first. A native called with `&[key, v]` is a type mismatch (E0308).
+`repr(transparent)` and `Deref` keep it the same as a slice in memory
+and in use: `a.len()`, `a[0]`, `for v in a.iter()`.
+
+**`Raw`: where the borrow checker can't see.** `fresh.raw()` takes the
+value out like `take()`, as a `Raw<T>` that is read with `.v()`. In a
+normal build it is the bare value. With the `gc-check` feature it also
+stores the VM's count of points that may collect, and `#[track_caller]`
+records where it was taken. Each `.v()` then compares the count and
+panics if it changed. That is a run-time check, for the places where
+the calls in between are the VM's own and not `Mu`'s.
+
+**What the borrow checker proves, then:**
+
+- a `Fresh` or `Gc` isn't held across a call on the VM, because two
+  live borrows of `vm` don't compile (E0499);
+- a `Handle` isn't used after its `Scope`'s roots are popped (E0597);
+- a native's arguments are rooted (E0308 otherwise; `Args::rooted` is
+  `unsafe`, with its contract);
+- outside the crate, a `Scope` doesn't outlive its call (E0624, and
+  the closure's lifetime).
+
+It can't see why a `take()` or `.raw()` is safe, nor values that never
+came out of a branded call. Those are what the rest of this page, the
+`// take:` lint, `gc-check` and the hazard analysis are for.
 
 ## `take()`: the escape hatch
 

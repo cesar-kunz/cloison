@@ -425,7 +425,10 @@ measurement says the old generation fills with cells that die soon after.
    picks how those words count: `pin` (the default), `off` (roots, as
    compiled code's), `drop` (neither roots nor pins: with
    `CLOISON_GC_STRESS`, a local not rooted makes its script crash or
-   differ, which CI runs the scripts under), `report` (pins, and the
+   differ, which CI runs the scripts under; it checks that Rust keeps
+   cells alive, not that its copies follow a cell evacuation moves,
+   which only pinning makes safe, see gc-hazards.md's "What it takes
+   on trust"), `report` (pins, and the
    frames whose words kept a cell printed as `NNR` lines). The scripts
    find the locals their paths reach; `scripts/gc-hazards.sh` looks on
    every path, statically: a rustc driver (tools/gc-hazards) that follows

@@ -1,6 +1,6 @@
 # GC hazard analysis: checking every path for unrooted cells
 
-Status: 2026-11-25. `scripts/gc-hazards.sh` runs it locally and as CI's
+Status: 2026-11-26. `scripts/gc-hazards.sh` runs it locally and as CI's
 "GC hazards" job. It knows the branded cells ([gc-branding.md](gc-branding.md)),
 and the hazards it finds are all fixed or reviewed safe: the baseline of
 unreviewed ones is empty.
@@ -100,6 +100,20 @@ It is a heuristic, not a proof:
   `defineProperty` bug below went unseen at first.
 - A call it can't resolve is taken not to collect, unless it goes
   through a pointer.
+- "Rooted" means kept alive, not kept up to date. A copy of a value
+  that a handle, the VM stack or a rooted object holds counts as rooted,
+  but a collection that moves the cell updates only the handle or slot,
+  not the copy. That is sound in the default mode, where the native
+  stack's words pin the cells they point to, so a cell a Rust local
+  holds never moves. Under `CLOISON_GC_NO_NATIVE_ROOTS=drop` they
+  neither root nor pin, and with evacuation the copies go stale:
+  `var x = {a: 1}` crashes under `drop` with `CLOISON_GC_FULL=1
+  CLOISON_GC_EVACUATE=all CLOISON_GC_STRESS=1` (`set_global_miss` gets
+  `acc` as a parameter, while only its slot on the VM stack is updated).
+  So the analysis, and `safe.txt`'s "held by" reasons, don't cover
+  precise roots with a moving collector: that needs every copy held
+  across a call that may collect re-read through its handle, a stricter
+  rule than the one checked here. CI's `drop` run doesn't evacuate.
 
 What it can't see is stated in `tools/gc-hazards/annotations.txt`, each
 directive with its reason:
@@ -189,6 +203,13 @@ Then:
   - a proxy with no `defineProperty` trap forwarding to its target after
     being revoked, either by the trap lookup's getter or by the define's
     own `length` conversion. The target was then held only by Rust.
+
+- **Review of `safe.txt`, 2026-11-26:** all 46 entries checked again
+  against the code, each claim attacked from JavaScript (proxies from
+  constructors and species, revocable proxies, `Array.prototype` index
+  accessors, re-entrant async generators, `super()` returning a proxy)
+  under `drop` and stress: all safe, no new bug. It found the limit on
+  moving cells above.
 
 To check that it still finds what it should, plant a hazard (a value
 taken out of a `Fresh` and held across another `get_atom_b`) and run the

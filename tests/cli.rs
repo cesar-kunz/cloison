@@ -465,3 +465,27 @@ print(out.join(" "));
         Some("en-US+en-GB en-US+en-GB en-US+en-GB en-US+en-GB en-US+en-GB")
     );
 }
+
+/// A script's value is held while the jobs it queued run, and those may
+/// collect and move it: the run returns it from its handle, not the copy
+/// in its own frame, which is above the native stack's base and so pins
+/// nothing. (It gave whatever the collection had moved into the old
+/// copy's place: here an object.) Every collection full and moving cells
+/// (`CLOISON_GC_EVACUATE=all`), one every 64 bytes: a process of its own,
+/// as the frame's layout is the CLI's.
+#[test]
+fn a_scripts_value_moved_by_its_jobs_collections_is_returned() {
+    let src = "Promise.resolve().then(() => {\n\
+               \x20 var junk = [];\n\
+               \x20 for (var i = 0; i < 3000; i++) junk.push({ i });\n\
+               });\n\
+               \"ran\";";
+    let out = cloison("value-moved", src)
+        .env("CLOISON_GC_FULL", "1")
+        .env("CLOISON_GC_EVACUATE", "all")
+        .env("CLOISON_GC_VERIFY", "64")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}

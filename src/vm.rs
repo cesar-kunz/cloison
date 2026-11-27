@@ -7971,9 +7971,7 @@ impl Vm {
         let r = unsafe { crate::interp::run_script(vm, code) };
         // The script done, the promise jobs it queued run (and theirs),
         // and the outermost's event loop until no async waiter is left.
-        // (The completion value rooted while they run.)
-        let r =
-            r.and_then(|v| vm.rooted(&[v], |vm| if outer { vm.run_event_loop() } else { vm.run_jobs() }).map(|()| v));
+        let r = r.and_then(|v| vm.jobs_keeping(v, outer));
         vm.no_pending_error(r)
     }
 
@@ -8032,8 +8030,19 @@ impl Vm {
             vm.native_top = saved;
             r
         });
-        let r = r.and_then(|v| vm.run_event_loop().map(|()| v));
+        let r = r.and_then(|v| vm.jobs_keeping(v, true));
         vm.no_pending_error(r)
+    }
+
+    /// After a run's value `v`, the jobs it queued (`outer`: and the event
+    /// loop), `v` rooted meanwhile and read back from its handle: the
+    /// run's frame is above the native stack's base (`RunState::new`'s
+    /// `here`), so no word of it pins `v`, which a collection may move.
+    fn jobs_keeping(&mut self, v: Value, outer: bool) -> Result<Value> {
+        let at = self.handles.len();
+        let _held = self.root_scope(&[v]);
+        if outer { self.run_event_loop() } else { self.run_jobs() }?;
+        Ok(self.handles[at])
     }
 
     /// Whether `Atomics.wait` may block (test262's `CanBlockIsTrue`, the

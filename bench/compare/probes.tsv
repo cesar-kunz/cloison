@@ -50,3 +50,12 @@ cloison	m8	depth	18727
 cloison	m8	string	1073741824
 cloison	f3	us_per_realm	840
 cloison	f3	kb_per_realm	688.8
+cloison	m7	before_mb	6.4
+cloison	m7	peak_mb	416.9
+cloison	m7	after_mb	135.6
+cloison	m7	after_0_5s_mb	135.6
+cloison	m7	after_2s_mb	135.6
+cloison	m8	depth	18727
+cloison	m8	string	1073741824
+cloison	f3	us_per_realm	892
+cloison	f3	kb_per_realm	689.6

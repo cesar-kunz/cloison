@@ -130,3 +130,25 @@ cloison	Map entry	bytes	110.0
 cloison	Map entry	bytes_at_2n	106.3
 cloison	array element (int)	bytes	16.9
 cloison	array element (int)	bytes_at_2n	17.1
+cloison	empty {}	bytes	48.7
+cloison	empty {}	bytes_at_2n	49.5
+cloison	{a,b,c} literal	bytes	81.9
+cloison	{a,b,c} literal	bytes_at_2n	83.7
+cloison	ctor, 3 fields	bytes	83.3
+cloison	ctor, 3 fields	bytes_at_2n	83.6
+cloison	{10 props} literal	bytes	150.3
+cloison	{10 props} literal	bytes_at_2n	143.3
+cloison	array [i,i,i]	bytes	118.2
+cloison	array [i,i,i]	bytes_at_2n	100.2
+cloison	array of 3 doubles	bytes	81.8
+cloison	array of 3 doubles	bytes_at_2n	83.6
+cloison	closure	bytes	191.3
+cloison	closure	bytes_at_2n	193.0
+cloison	string, 16 chars	bytes	131.1
+cloison	string, 16 chars	bytes_at_2n	116.7
+cloison	heap double	bytes	-0.0
+cloison	heap double	bytes_at_2n	0.1
+cloison	Map entry	bytes	122.6
+cloison	Map entry	bytes_at_2n	118.9
+cloison	array element (int)	bytes	16.9
+cloison	array element (int)	bytes_at_2n	17.1

@@ -106,14 +106,14 @@ It is a heuristic, not a proof:
   not the copy. That is sound in the default mode, where the native
   stack's words pin the cells they point to, so a cell a Rust local
   holds never moves. Under `CLOISON_GC_NO_NATIVE_ROOTS=drop` they
-  neither root nor pin, and with evacuation the copies go stale:
-  `var x = {a: 1}` crashes under `drop` with `CLOISON_GC_FULL=1
-  CLOISON_GC_EVACUATE=all CLOISON_GC_STRESS=1` (`set_global_miss` gets
-  `acc` as a parameter, while only its slot on the VM stack is updated).
-  So the analysis, and `safe.txt`'s "held by" reasons, don't cover
-  precise roots with a moving collector: that needs every copy held
-  across a call that may collect re-read through its handle, a stricter
-  rule than the one checked here. CI's `drop` run doesn't evacuate.
+  neither root nor pin, so nothing moves there either: `drop` turns
+  evacuation off, and checks liveness only. So the analysis, and
+  `safe.txt`'s "held by" reasons, don't cover precise roots with a
+  moving collector: that would need every copy held across a call that
+  may collect re-read through its handle, a stricter rule than the one
+  checked here, through the whole runtime. It isn't the design: the
+  native stack pins a few KiB per collection (at most 0.034 MiB on
+  Octane and the web apps, 2026-11-27), not worth that rewrite.
 
 What it can't see is stated in `tools/gc-hazards/annotations.txt`, each
 directive with its reason:

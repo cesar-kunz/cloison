@@ -144,7 +144,9 @@ impl ShapePhases {
 /// but lives only if something else keeps it: Rust frames precise), as
 /// roots (`off`),
 /// as nothing (`drop`: a Rust local holding a cell across
-/// a safepoint then dies or moves, found by `CLOISON_GC_STRESS`), or as
+/// a safepoint then dies, found by `CLOISON_GC_STRESS`; nothing moves
+/// then, evacuation off, as a rooted cell's copies aren't updated, L12's
+/// design: `drop` checks liveness only), or as
 /// pins reported where they kept a cell (`report`: see
 /// `Vm::report_native_roots`). The words below the outermost run, compiled
 /// code's and the Rust frames' it calls, are roots in any case.
@@ -424,19 +426,33 @@ impl Gc {
                 .max(1),
             ..Default::default()
         }
+        .no_moving_under_drop()
+    }
+
+    /// Under `CLOISON_GC_NO_NATIVE_ROOTS=drop`, evacuation off whatever
+    /// was asked: a value rooted is kept alive, its Rust copies not
+    /// updated, and with no native stack word pinning them a moved cell
+    /// would leave them stale (see [`NoNative`]).
+    fn no_moving_under_drop(mut self) -> Self {
+        if self.no_native_roots == NoNative::Drop {
+            self.evacuate = Evacuate::Off;
+        }
+        self
     }
 
     /// Whether full collections move cells (as `CLOISON_GC_EVACUATE=0`
     /// does, off; for tests).
     #[cfg(test)]
     pub(crate) fn set_evacuate(&mut self, on: bool) {
-        self.evacuate = if on { Evacuate::Fragmented } else { Evacuate::Off };
+        self.evacuate = if on && self.no_native_roots != NoNative::Drop { Evacuate::Fragmented } else { Evacuate::Off };
     }
 
     /// See `Vm::set_gc_evacuate_all`.
     pub(crate) fn set_evacuate_all(&mut self) {
         self.always_full = true;
-        self.evacuate = Evacuate::All;
+        if self.no_native_roots != NoNative::Drop {
+            self.evacuate = Evacuate::All;
+        }
     }
 
     /// An evacuation not worth it (`why`): the next cycles choose no
@@ -452,7 +468,9 @@ impl Gc {
     /// See `Vm::set_gc_evacuate_cycles`.
     pub(crate) fn set_evacuate_cycles(&mut self) {
         self.cycles = true;
-        self.evacuate = Evacuate::All;
+        if self.no_native_roots != NoNative::Drop {
+            self.evacuate = Evacuate::All;
+        }
         self.slots_check = true;
     }
 

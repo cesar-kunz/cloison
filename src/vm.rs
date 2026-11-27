@@ -8410,7 +8410,8 @@ impl Vm {
 
     /// Every collection full, stopping the world, and moving what it can
     /// of every other small block in use, the old copies poisoned, as
-    /// `CLOISON_GC_FULL` and `CLOISON_GC_EVACUATE=all` do (for tests).
+    /// `CLOISON_GC_FULL` and `CLOISON_GC_EVACUATE=all` do (for tests;
+    /// nothing moves under `CLOISON_GC_NO_NATIVE_ROOTS=drop`).
     pub fn set_gc_evacuate_all(&mut self) {
         self.heap.gc.set_evacuate_all();
     }
@@ -8425,7 +8426,8 @@ impl Vm {
     /// Every full collection due a concurrent cycle, each moving what it
     /// can of every other small block in use, and checking that no
     /// reference to a cell moved is left, as `CLOISON_GC_CYCLES`,
-    /// `CLOISON_GC_EVACUATE=all` and `CLOISON_GC_SLOTS` do (for tests).
+    /// `CLOISON_GC_EVACUATE=all` and `CLOISON_GC_SLOTS` do (for tests;
+    /// nothing moves under `CLOISON_GC_NO_NATIVE_ROOTS=drop`).
     pub fn set_gc_evacuate_cycles(&mut self) {
         self.heap.gc.set_evacuate_cycles();
     }

@@ -489,3 +489,30 @@ fn a_scripts_value_moved_by_its_jobs_collections_is_returned() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n", "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// An `await using` block's resources, taken out of its state for the
+/// async disposal, are rooted while the helper that disposes of them is
+/// made and called: the list was only the native's then, and a full
+/// collection meanwhile freed it (`dispose::dispose_resources_async`; a
+/// crash). Every collection full, one every KiB allocated: a process of
+/// its own, as the `Vm` API collects no more often than every 64 bytes,
+/// never at the point it takes.
+#[test]
+fn resources_disposed_asynchronously_survive_full_collections() {
+    let src = "var log = [];\n\
+               (async function () {\n\
+               \x20 for (var i = 0; i < 3; i++) {\n\
+               \x20   await using a = { async [Symbol.asyncDispose]() { log.push('a' + i); } };\n\
+               \x20   await using b = { [Symbol.asyncDispose]() { log.push('b' + i); } };\n\
+               \x20 }\n\
+               })().then(() => print(log.join()));\n\
+               0";
+    let out = cloison("dispose-async", src).env("CLOISON_GC_FULL", "1").env("CLOISON_GC_VERIFY", "1").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "b0,a0,b1,a1,b2,a2\n0\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}

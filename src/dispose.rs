@@ -387,9 +387,14 @@ pub(crate) fn dispose_resources_async(vm: &mut Vm, state: Value, has_error: bool
 
 fn dispose_resources_async_raw(vm: &mut Vm, state: Value, has_error: bool, error: Value) -> Result<Value> {
     let resources = elem(state, RESOURCES);
+    let sc_h = Scope::new(vm);
+    // (Out of `state` from here, `resources` is only this frame's, and a
+    // native stack word pins a cell but keeps nothing alive: rooted
+    // before the allocation and the helper's compile and run, which
+    // collect. As `error`, which only the caller may hold.)
+    let _held = sc_h.roots([resources, error]);
     let empty = vm.mu().new_array();
     put(state, RESOURCES, empty.v());
-    let sc_h = Scope::new(vm);
     let h = async_helper(vm)?.root(&sc_h);
     vm.call_b(h.peek(), Value::UNDEFINED, &[resources, Value::from_bool(has_error), error]).map(Fresh::take)
 }
